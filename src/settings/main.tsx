@@ -44,6 +44,8 @@ function SettingsApp() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [exportText, setExportText] = useState("");
+  const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
+  const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
 
   useEffect(() => {
     void refresh();
@@ -57,7 +59,11 @@ function SettingsApp() {
     return () => window.removeEventListener("hashchange", handleHashChange);
   }, []);
 
-  async function refresh() {
+  async function refresh(options: { showProgress?: boolean } = {}) {
+    if (options.showProgress) {
+      setIsRefreshingEligible(true);
+      setMessage("Refreshing eligible items...");
+    }
     setError("");
     try {
       const [loadedSettings, loadedItems, loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
@@ -85,34 +91,54 @@ function SettingsApp() {
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       setExportText(JSON.stringify(loadedSettings, null, 2));
+      if (options.showProgress) {
+        setMessage("Eligible items refreshed.");
+      }
     } catch (loadError) {
+      if (options.showProgress) {
+        setMessage("");
+      }
       setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      if (options.showProgress) {
+        setIsRefreshingEligible(false);
+      }
     }
   }
 
-  async function forceRefreshAccessData(tokens = tokenStatus) {
-    const latestTokens = tokens || await sendMessage<TokenStatus>({ action: "getTokenStatus" });
-    const tokenCacheKey = buildTokenCacheKey(latestTokens);
-    const [eligible, active] = await Promise.all([
-      sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActivationItems" }),
-      sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
-    ]);
-    const fetchedAt = Date.now();
-    const nextCache: QuickPimDataCache = {
-      eligible: { ...eligible, fetchedAt, cacheKey: tokenCacheKey },
-      active: { ...active, fetchedAt, cacheKey: tokenCacheKey }
-    };
-    await saveDataCache(nextCache);
-    const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [
-      ...eligible.items,
-      ...active.items
-    ]);
-    await saveReferenceData(nextReferenceData);
-    setTokenStatus(latestTokens);
-    setDataCache(nextCache);
-    setReferenceData(nextReferenceData);
-    setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
-    setMessage("Access data refreshed.");
+  async function forceRefreshAccessData(tokens?: TokenStatus) {
+    setIsRefreshingAccess(true);
+    setError("");
+    setMessage("Refreshing access data...");
+    try {
+      const latestTokens = tokens ?? await sendMessage<TokenStatus>({ action: "getTokenStatus" });
+      const tokenCacheKey = buildTokenCacheKey(latestTokens);
+      const [eligible, active] = await Promise.all([
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActivationItems" }),
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
+      ]);
+      const fetchedAt = Date.now();
+      const nextCache: QuickPimDataCache = {
+        eligible: { ...eligible, fetchedAt, cacheKey: tokenCacheKey },
+        active: { ...active, fetchedAt, cacheKey: tokenCacheKey }
+      };
+      await saveDataCache(nextCache);
+      const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [
+        ...eligible.items,
+        ...active.items
+      ]);
+      await saveReferenceData(nextReferenceData);
+      setTokenStatus(latestTokens);
+      setDataCache(nextCache);
+      setReferenceData(nextReferenceData);
+      setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
+      setMessage("Access data refreshed.");
+    } catch (refreshError) {
+      setMessage("");
+      setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+    } finally {
+      setIsRefreshingAccess(false);
+    }
   }
 
   async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
@@ -155,8 +181,15 @@ function SettingsApp() {
             <p>Aliases, saved reasons, bundles, and local preferences.</p>
           </div>
         </div>
-        <button className="btn" onClick={() => void refresh()}>
-          Refresh eligible items
+        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible}>
+          {isRefreshingEligible ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Refreshing eligible items...</span>
+            </span>
+          ) : (
+            "Refresh eligible items"
+          )}
         </button>
       </header>
 
@@ -178,6 +211,7 @@ function SettingsApp() {
                 settings={settings}
                 tokenStatus={tokenStatus}
                 dataCache={dataCache}
+                isRefreshingAccess={isRefreshingAccess}
                 onSave={persist}
                 onRefreshAccessData={forceRefreshAccessData}
                 onClearReferenceData={clearLearnedReferences}
@@ -253,6 +287,7 @@ function AccessSetupPanel({
   settings,
   tokenStatus,
   dataCache,
+  isRefreshingAccess,
   onSave,
   onRefreshAccessData,
   onClearReferenceData
@@ -260,6 +295,7 @@ function AccessSetupPanel({
   settings: QuickPimSettings;
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
+  isRefreshingAccess: boolean;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
   onRefreshAccessData: (tokens?: TokenStatus) => Promise<void>;
   onClearReferenceData: () => Promise<void>;
@@ -333,16 +369,42 @@ function AccessSetupPanel({
       </div>
 
       <div className="button-row" style={{ marginBottom: 12 }}>
-        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || !setupTargets.length}>
-          {isRunningSetup ? "Checking portal access..." : "Open missing portal pages"}
+        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRefreshingAccess || !setupTargets.length}>
+          {isRunningSetup ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Checking portal access...</span>
+            </span>
+          ) : (
+            "Open missing portal pages"
+          )}
         </button>
-        <button className="btn" onClick={() => void onRefreshAccessData()}>
-          Recheck now
+        <button className="btn" onClick={() => void onRefreshAccessData()} disabled={isRunningSetup || isRefreshingAccess}>
+          {isRefreshingAccess ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Rechecking access...</span>
+            </span>
+          ) : (
+            "Recheck now"
+          )}
         </button>
         <button className="btn danger" onClick={() => void onClearReferenceData()}>
           Clear learned names
         </button>
       </div>
+      {isRunningSetup ? (
+        <section className="loading-panel" aria-live="polite">
+          <span className="spinner large" aria-hidden="true" />
+          <span>Waiting for Microsoft portal token capture...</span>
+        </section>
+      ) : null}
+      {isRefreshingAccess ? (
+        <section className="loading-panel" aria-live="polite">
+          <span className="spinner large" aria-hidden="true" />
+          <span>Refreshing access data...</span>
+        </section>
+      ) : null}
       <p className="muted">
         QuickPIM only uses tokens captured from Microsoft portal pages. If a page asks you to sign in or load PIM data, complete that
         step in the opened tab, then return here.
