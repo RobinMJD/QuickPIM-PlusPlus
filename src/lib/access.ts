@@ -45,8 +45,9 @@ export function buildAccessCapabilityItems(
   cache: QuickPimDataCache | undefined
 ): AccessCapabilityItem[] {
   const diagnostics = collectDiagnostics(cache);
+  const loadedTargets = collectLoadedTargets(cache);
   return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[]).map((target) =>
-    buildAccessCapabilityItem(target, tokenStatus, diagnostics.filter((item) => item.target === target))
+    buildAccessCapabilityItem(target, tokenStatus, diagnostics.filter((item) => item.target === target), loadedTargets.has(target))
   );
 }
 
@@ -77,7 +78,8 @@ export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined):
 function buildAccessCapabilityItem(
   target: AccessSetupTarget,
   tokenStatus: TokenStatus | null | undefined,
-  diagnostics: AccessDiagnostic[]
+  diagnostics: AccessDiagnostic[],
+  hasLoadedItems: boolean
 ): AccessCapabilityItem {
   const token = getTokenStatusForTarget(target, tokenStatus);
   const latestDiagnostic = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))[0];
@@ -112,6 +114,15 @@ function buildAccessCapabilityItem(
       status: "ready",
       detail: "Last API check succeeded.",
       lastSuccessAt: latestSuccess.checkedAt
+    };
+  }
+
+  if (hasLoadedItems) {
+    return {
+      target,
+      label: TARGET_LABELS[target],
+      status: "ready",
+      detail: "Loaded eligible or active items."
     };
   }
 
@@ -152,6 +163,14 @@ function getTokenStatusForTarget(
 
 function collectDiagnostics(cache: QuickPimDataCache | undefined): AccessDiagnostic[] {
   return [cache?.eligible, cache?.active].flatMap((entry) => entry?.diagnostics || []);
+}
+
+function collectLoadedTargets(cache: QuickPimDataCache | undefined): Set<AccessSetupTarget> {
+  return new Set(
+    [cache?.eligible, cache?.active]
+      .flatMap((entry) => entry?.items || [])
+      .map((item) => item.type)
+  );
 }
 
 function isPermissionOrAuthFailure(error: string | undefined): boolean {

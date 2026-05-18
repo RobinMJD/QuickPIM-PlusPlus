@@ -15,6 +15,7 @@ import {
   getAccessSetupTargets,
   type AccessCapabilityItem
 } from "../lib/access";
+import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
 import {
   coerceDurationForItems,
   formatLoadMessages,
@@ -159,10 +160,13 @@ function PopupApp() {
       const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, [...eligible.items, ...active.items]);
       await saveReferenceData(nextReferenceData);
 
+      const nextAccessCapabilities = buildAccessCapabilityItems(loadedTokens, nextCache);
+      const loadErrors = filterLoadErrorsForAccessState([...(eligible.errors || []), ...(active.errors || [])], nextAccessCapabilities);
+
       setSettings(loadedSettings);
       setTokenStatus(loadedTokens);
       setReferenceData(nextReferenceData);
-      setAccessCapabilities(buildAccessCapabilityItems(loadedTokens, nextCache));
+      setAccessCapabilities(nextAccessCapabilities);
       setEligibleItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
       setActiveItems(applyDisplayData(active.items, loadedSettings, nextReferenceData));
       const cacheMessage =
@@ -171,7 +175,7 @@ function PopupApp() {
           : options.force
             ? "Forced refresh completed."
             : "";
-      setMessage(formatLoadMessages([...(eligible.errors || []), ...(active.errors || []), cacheMessage].filter(Boolean)).join("\n"));
+      setMessage(formatLoadMessages([...loadErrors, cacheMessage].filter(Boolean)).join("\n"));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {

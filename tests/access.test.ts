@@ -62,6 +62,69 @@ describe("portal-driven access setup", () => {
     });
   });
 
+  test("uses loaded cached items as a ready signal when old caches have no diagnostics", () => {
+    const cache: QuickPimDataCache = {
+      eligible: {
+        items: [
+          {
+            id: "directoryRole:reader:/",
+            type: "directoryRole",
+            sourceName: "Global Reader",
+            displayName: "Global Reader",
+            principalId: "user-1",
+            roleDefinitionId: "reader",
+            directoryScopeId: "/",
+            scopeLabel: "Tenant",
+            status: "eligible"
+          }
+        ],
+        errors: [],
+        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z")
+      }
+    };
+
+    const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
+
+    expect(status.find((item) => item.target === "directoryRole")).toMatchObject({
+      status: "ready",
+      detail: "Loaded eligible or active items."
+    });
+  });
+
+  test("keeps explicit failed diagnostics above cached item presence", () => {
+    const cache: QuickPimDataCache = {
+      eligible: {
+        items: [
+          {
+            id: "pimGroup:group-1:member",
+            type: "pimGroup",
+            sourceName: "Ops Group",
+            displayName: "Ops Group",
+            principalId: "user-1",
+            groupId: "group-1",
+            accessId: "member",
+            scopeLabel: "Group",
+            status: "eligible"
+          }
+        ],
+        errors: [],
+        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+        diagnostics: [
+          {
+            target: "pimGroup",
+            success: false,
+            checkedAt: "2026-05-18T12:01:00.000Z",
+            error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
+          }
+        ]
+      }
+    };
+
+    const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
+
+    expect(status.find((item) => item.target === "pimGroup")).toMatchObject({ status: "limited" });
+  });
+
   test("isolates feature failures instead of marking every feature limited", () => {
     const cache: QuickPimDataCache = {
       eligible: {
