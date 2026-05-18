@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildAccessCapabilityItems,
+  buildTokenCacheKey,
   getAccessSetupTargets,
   getPortalUrlsForTargets
 } from "../src/lib/access";
@@ -91,7 +92,7 @@ describe("portal-driven access setup", () => {
     });
   });
 
-  test("keeps explicit failed diagnostics above cached item presence", () => {
+  test("uses loaded items over stale failed diagnostics", () => {
     const cache: QuickPimDataCache = {
       eligible: {
         items: [
@@ -122,7 +123,10 @@ describe("portal-driven access setup", () => {
 
     const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
 
-    expect(status.find((item) => item.target === "pimGroup")).toMatchObject({ status: "limited" });
+    expect(status.find((item) => item.target === "pimGroup")).toMatchObject({
+      status: "ready",
+      detail: "Loaded eligible or active items."
+    });
   });
 
   test("isolates feature failures instead of marking every feature limited", () => {
@@ -152,5 +156,36 @@ describe("portal-driven access setup", () => {
     expect(status.find((item) => item.target === "directoryRole")).toMatchObject({ status: "ready" });
     expect(status.find((item) => item.target === "pimGroup")).toMatchObject({ status: "limited" });
     expect(status.find((item) => item.target === "azureRole")).toMatchObject({ status: "ready" });
+  });
+
+  test("builds cache keys from token capability instead of capture time", () => {
+    const first = buildTokenCacheKey({
+      graph: {
+        hasToken: true,
+        capturedAt: 1,
+        expiresAt: "2026-05-18T14:00:00.000Z",
+        grantedScopes: ["RoleManagement.Read.Directory", "RoleEligibilitySchedule.Read.Directory"]
+      },
+      azureManagement: {
+        hasToken: true,
+        capturedAt: 1,
+        expiresAt: "2026-05-18T14:00:00.000Z"
+      }
+    });
+    const second = buildTokenCacheKey({
+      graph: {
+        hasToken: true,
+        capturedAt: 2,
+        expiresAt: "2026-05-18T14:00:00.000Z",
+        grantedScopes: ["RoleEligibilitySchedule.Read.Directory", "RoleManagement.Read.Directory"]
+      },
+      azureManagement: {
+        hasToken: true,
+        capturedAt: 2,
+        expiresAt: "2026-05-18T14:00:00.000Z"
+      }
+    });
+
+    expect(second).toBe(first);
   });
 });

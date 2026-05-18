@@ -70,9 +70,18 @@ export function getPortalUrlsForTargets(targets: AccessSetupTarget[]): string[] 
 
 export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined): string {
   return [
-    `graph:${tokenStatus?.graph.capturedAt || 0}:${tokenStatus?.graph.expiresAt || ""}`,
-    `azure:${tokenStatus?.azureManagement.capturedAt || 0}:${tokenStatus?.azureManagement.expiresAt || ""}`
+    buildTokenCachePart("graph", tokenStatus?.graph),
+    buildTokenCachePart("azure", tokenStatus?.azureManagement)
   ].join("|");
+}
+
+function buildTokenCachePart(label: string, token: TokenStatusEntry | undefined): string {
+  if (!token?.hasToken || token.isExpired) {
+    return `${label}:missing`;
+  }
+
+  const scopes = [...(token.grantedScopes || [])].sort((a, b) => a.localeCompare(b)).join(",");
+  return `${label}:${token.expiresAt || ""}:${scopes}`;
 }
 
 function buildAccessCapabilityItem(
@@ -96,17 +105,6 @@ function buildAccessCapabilityItem(
     };
   }
 
-  if (latestDiagnostic && !latestDiagnostic.success && isPermissionOrAuthFailure(latestDiagnostic.error)) {
-    return {
-      target,
-      label: TARGET_LABELS[target],
-      status: "limited",
-      detail: "The portal token was captured, but this feature is still blocked by Microsoft API access.",
-      lastSuccessAt: latestSuccess?.checkedAt,
-      lastError: latestDiagnostic.error
-    };
-  }
-
   if (latestSuccess) {
     return {
       target,
@@ -123,6 +121,16 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "ready",
       detail: "Loaded eligible or active items."
+    };
+  }
+
+  if (latestDiagnostic && !latestDiagnostic.success && isPermissionOrAuthFailure(latestDiagnostic.error)) {
+    return {
+      target,
+      label: TARGET_LABELS[target],
+      status: "limited",
+      detail: "The portal token was captured, but this feature is still blocked by Microsoft API access.",
+      lastError: latestDiagnostic.error
     };
   }
 

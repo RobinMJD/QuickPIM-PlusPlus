@@ -2,7 +2,7 @@ import type { CachedActivationEntry, QuickPimDataCache } from "./types";
 
 export const DATA_CACHE_KEY = "quickPimDataCache.v1";
 export const DEFAULT_ELIGIBLE_CACHE_TTL_MS = 10 * 60 * 1000;
-export const DEFAULT_ACTIVE_CACHE_TTL_MS = 60 * 1000;
+export const DEFAULT_ACTIVE_CACHE_TTL_MS = 10 * 60 * 1000;
 
 export function isCacheEntryFresh(
   entry: CachedActivationEntry | undefined,

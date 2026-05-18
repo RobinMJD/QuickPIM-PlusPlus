@@ -193,7 +193,7 @@ function shouldKeepCurrentToken(current: Record<string, any>, incoming: Record<s
   }
   const currentExpiry = Number(current.exp) || 0;
   const incomingExpiry = Number(incoming.exp) || 0;
-  return currentScore === incomingScore && currentExpiry > incomingExpiry;
+  return currentScore === incomingScore && currentExpiry >= incomingExpiry;
 }
 
 function getTokenCaptureScore(decoded: Record<string, any>, tokenKind: TokenKind): number {

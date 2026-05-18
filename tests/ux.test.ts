@@ -56,6 +56,7 @@ describe("popup cache helpers", () => {
     expect(
       isCacheEntryFresh({ items: [], errors: [], fetchedAt: now - DEFAULT_ACTIVE_CACHE_TTL_MS - 1 }, DEFAULT_ACTIVE_CACHE_TTL_MS, now)
     ).toBe(false);
+    expect(DEFAULT_ACTIVE_CACHE_TTL_MS).toBeGreaterThanOrEqual(10 * 60 * 1000);
   });
 
   test("formats cache age in minutes for status copy", () => {
