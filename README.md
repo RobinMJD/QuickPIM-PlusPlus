@@ -1,67 +1,73 @@
 # QuickPIM
 
-![X (formerly Twitter) Follow](https://img.shields.io/twitter/follow/DanielatOCN)
-[![LinkedIn: Daniel Bradley](https://img.shields.io/badge/LinkedIn-Daniel%20Bradley-blue?style=flat-square&logo=linkedin)](https://www.linkedin.com/in/danielbradley2/) 
-[![Website](https://img.shields.io/badge/Blog-Our%20Cloud%20Network-orange?style=flat-square&logo=internet-explorer)](https://ourcloudnetwork.com/)
-
-A Chrome extension that allows you to activate multiple PIM (Privileged Identity Management) roles simultaneously in Microsoft Entra and Azure resources.
-
-## Overview
-
-QuickPIM streamlines the process of activating multiple PIM roles in Microsoft Entra and Azure subscriptions. Instead of activating each role individually, this extension allows you to select and activate multiple roles at once, saving time and reducing administrative overhead.
-
-<p align="left">
-  <img src="preview/QuickPIM1.png" alt="QuickPIM Interface" width="600">
-</p>
-
-It works by obtaining bearer tokens from your browser's requests to Microsoft Graph and Azure Management APIs. It then stores those tokens within your Chrome storage and uses them to obtain and activate your selected PIM roles.
+QuickPIM is a Chrome MV3 extension for quickly activating Microsoft Entra PIM roles, Azure resource PIM roles, and PIM-enabled groups from one compact interface.
 
 ## Features
 
-- Activate multiple PIM roles simultaneously (Entra ID and Azure resources)
-- Customisable activation duration
-- Simple and intuitive user interface
-- Secure authentication using existing browser bearer token
-- Notification system for role activation status
+- Activate eligible Entra roles, Azure roles, and PIM groups.
+- Resolve friendly role and group names, with custom local aliases when an API still returns an opaque ID.
+- Save reusable justifications and quickly reuse recent justifications.
+- Create bundles of roles and groups with optional default duration, justification, and ticket metadata.
+- Sort and filter by name, type, scope, last use, and activation count.
+- Manage aliases, bundles, justifications, preferences, and JSON import/export from the settings page.
 
-## Installation
+## How It Works
 
-### From Chrome Web Store
-1. Visit the [QuickPIM extension page](https://chromewebstore.google.com/detail/quickpim/gnhcemgacdhjljehgcnnjglhkegebikb) on the Chrome Web Store
-2. Click "Add to Chrome"
-3. Confirm the installation when prompted
-https://github.com/DanielBradley1/MiToken
-### Manual Installation
-1. Download the latest release from the [Releases page](https://github.com/DanielBradley1/QuickPIM/releases)
-2. Open Chrome and navigate to `chrome://extensions/`
-3. Enable "Developer mode" in the top right
-4. Click "Load unpacked" and select the downloaded extension folder
+QuickPIM watches browser requests to Microsoft Graph and Azure Management endpoints and stores the bearer tokens locally in Chrome storage. Those tokens are then used from the extension background worker to read eligible PIM assignments and submit self-activation requests.
+
+Tokens and settings remain in the local browser profile. QuickPIM does not send data to any service other than Microsoft Graph and Azure Management APIs.
+
+## Development
+
+Requirements:
+
+- Node.js 20 or newer
+- npm
+- Chrome or another Chromium browser for manual extension testing
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run tests:
+
+```bash
+npm test
+```
+
+Build the extension:
+
+```bash
+npm run build
+```
+
+Load `dist/` as an unpacked extension from `chrome://extensions`.
 
 ## Usage
 
-1. Open the Microsoft Entra portal and click around briefly
-2. Click on the QuickPIM icon in your Chrome toolbar
-3. Select the roles you want to activate from the displayed list
-4. Set the activation duration (optional)
-5. Click "Activate Selected Roles"
-6. Confirm the activation in the Azure AD prompt if required
+1. Sign in to the Azure Portal or Microsoft Entra admin center.
+2. Navigate around briefly so Graph and Azure Management API requests are made and tokens are captured.
+3. Open QuickPIM from the browser toolbar.
+4. Select roles or groups, choose a saved or recent justification, then activate.
+5. Open Settings to define aliases, saved justifications, bundles, and preferences.
+
+## Manual Verification
+
+After building, load `dist/` and verify:
+
+- Graph and Azure token status appears in the popup header.
+- Eligible Entra roles, Azure roles, and PIM groups display friendly names.
+- A single role/group activation submits successfully with justification and optional ticket info.
+- A saved bundle activates all available included roles/groups.
+- Aliases, saved justifications, recent justifications, bundles, sorting, and usage counters persist after reopening the popup.
 
 ## Limitations
 
-- Unable to activate roles protected by Authentication Contexts
-
-## Privacy
-
-QuickPIM does not collect or transmit any personal data. All authentication is handled directly within the browser.
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-If you encounter any issues or have questions, please open an issue on GitHub.
+- Roles protected by authentication contexts may still require extra interactive steps outside the extension.
+- QuickPIM depends on tokens already captured from Microsoft first-party portals; it does not perform its own OAuth sign-in flow.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
