@@ -10,6 +10,7 @@ import {
   ENTRA_PORTAL_URLS,
   formatLoadMessages,
   getActivationRequirements,
+  coerceDurationForItems,
   getDurationOptions,
   getPortalUrlForTab,
   tokenStatusText
@@ -185,9 +186,49 @@ describe("popup model helpers", () => {
   });
 
   test("uses duration labels instead of localized fractional numeric text", () => {
-    expect(getDurationOptions()[0]).toEqual({ value: 0.5, label: "30 minutes" });
-    expect(getDurationOptions().find((option) => option.value === 1)?.label).toBe("1 hour");
-    expect(getDurationOptions().find((option) => option.value === 2)?.label).toBe("2 hours");
+    expect(getDurationOptions([directoryRole])[0]).toEqual({ value: 0.5, label: "30 minutes" });
+    expect(getDurationOptions([directoryRole]).find((option) => option.value === 1)?.label).toBe("1 hour");
+    expect(getDurationOptions([directoryRole]).find((option) => option.value === 2)?.label).toBe("2 hours");
+  });
+
+  test("hides duration choices until at least one item is selected", () => {
+    expect(getDurationOptions([])).toEqual([]);
+  });
+
+  test("caps duration choices to the strictest selected item maximum", () => {
+    const cappedDirectoryRole: ActivationItem = {
+      ...directoryRole,
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 4
+      }
+    };
+    const cappedAzureRole: ActivationItem = {
+      ...azureRole,
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 8
+      }
+    };
+
+    expect(getDurationOptions([cappedDirectoryRole, cappedAzureRole]).map((option) => option.value)).toEqual([0.5, 1, 2, 4]);
+    expect(coerceDurationForItems(8, [cappedDirectoryRole, cappedAzureRole])).toBe(4);
+    expect(coerceDurationForItems(1, [cappedDirectoryRole, cappedAzureRole])).toBe(1);
+  });
+
+  test("includes exact nonstandard maximum duration as a selectable value", () => {
+    const cappedRole: ActivationItem = {
+      ...directoryRole,
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 3
+      }
+    };
+
+    expect(getDurationOptions([cappedRole]).map((option) => option.value)).toEqual([0.5, 1, 2, 3]);
   });
 });
 

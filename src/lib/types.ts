@@ -24,6 +24,7 @@ export interface BaseActivationItem {
   activationRequirements?: {
     justification?: boolean;
     ticket?: boolean;
+    maxDurationHours?: number;
   };
   raw?: unknown;
 }
@@ -159,6 +160,39 @@ export interface DirectoryRoleDefinitionApi {
   id?: string;
   templateId?: string;
   displayName?: string;
+}
+
+export interface RoleManagementPolicyRuleApi {
+  id?: string;
+  ruleType?: string;
+  maximumDuration?: string;
+  enabledRules?: string[];
+  target?: {
+    caller?: string;
+    level?: string;
+  };
+  setting?: {
+    isRequestorJustificationRequired?: boolean;
+  };
+}
+
+export interface RoleManagementPolicyAssignmentApi {
+  id?: string;
+  roleDefinitionId?: string;
+  scopeId?: string;
+  policy?: {
+    rules?: RoleManagementPolicyRuleApi[];
+    effectiveRules?: RoleManagementPolicyRuleApi[];
+  };
+  properties?: {
+    roleDefinitionId?: string;
+    scope?: string;
+    effectiveRules?: RoleManagementPolicyRuleApi[];
+    policy?: {
+      rules?: RoleManagementPolicyRuleApi[];
+      effectiveRules?: RoleManagementPolicyRuleApi[];
+    };
+  };
 }
 
 export interface AzureRoleApi {

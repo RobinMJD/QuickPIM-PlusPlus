@@ -10,6 +10,7 @@ import {
 } from "../src/lib/settings";
 import {
   buildActivationRequest,
+  extractActivationRequirementsFromPolicyRules,
   durationHoursToIso,
   normalizeAzureRole,
   normalizeDirectoryRole,
@@ -105,6 +106,33 @@ describe("PIM item normalization", () => {
       accessId: "owner",
       groupId: "group-1",
       scopeLabel: "Owner"
+    });
+  });
+
+  test("extracts activation maximum duration from PIM policy rules", () => {
+    expect(
+      extractActivationRequirementsFromPolicyRules([
+        {
+          id: "Expiration_EndUser_Assignment",
+          maximumDuration: "PT4H",
+          target: {
+            caller: "EndUser",
+            level: "Assignment"
+          }
+        },
+        {
+          id: "Enablement_EndUser_Assignment",
+          enabledRules: ["Justification", "Ticketing"],
+          target: {
+            caller: "EndUser",
+            level: "Assignment"
+          }
+        }
+      ])
+    ).toEqual({
+      justification: true,
+      ticket: true,
+      maxDurationHours: 4
     });
   });
 });

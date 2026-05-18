@@ -10,6 +10,7 @@ import {
   saveDataCache
 } from "../lib/cache";
 import {
+  coerceDurationForItems,
   formatLoadMessages,
   getActivationRequirements,
   getDurationOptions,
@@ -81,6 +82,13 @@ function PopupApp() {
     [itemsById, selectedIds]
   );
   const requirements = useMemo(() => getActivationRequirements(selectedItems), [selectedItems]);
+  const durationOptions = useMemo(() => getDurationOptions(selectedItems), [selectedItems]);
+
+  useEffect(() => {
+    if (durationOptions.length) {
+      setDurationHours((current) => coerceDurationForItems(current, selectedItems));
+    }
+  }, [durationOptions, selectedItems]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -153,7 +161,7 @@ function PopupApp() {
 
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
     const effectiveJustification = bundle?.defaultJustification || justification;
-    const effectiveDuration = bundle?.defaultDurationHours || durationHours;
+    const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, items);
     const effectiveTicketInfo: TicketInfo = {
       ticketSystem: bundle?.defaultTicketSystem || ticketSystem || undefined,
       ticketNumber: bundle?.defaultTicketNumber || ticketNumber || undefined
@@ -312,6 +320,7 @@ function PopupApp() {
             setTicketNumber={setTicketNumber}
             settings={settings}
             requirements={requirements}
+            durationOptions={durationOptions}
             selectedCount={selectedItems.length}
             isActivating={isActivating}
             onActivate={() => void activate(selectedItems)}
@@ -441,31 +450,37 @@ function ActivationBar(props: {
   setTicketNumber: (value: string) => void;
   settings: QuickPimSettings;
   requirements: ReturnType<typeof getActivationRequirements>;
+  durationOptions: Array<{ value: number; label: string }>;
   selectedCount: number;
   isActivating: boolean;
   onActivate: () => void;
   onSaveJustification: () => void;
 }) {
   const justificationOptions = [...props.settings.savedJustifications, ...props.settings.recentJustifications];
-  const durationOptions = getDurationOptions();
+  const hasSelection = props.selectedCount > 0;
+  const selectedDuration = props.durationOptions.some((option) => option.value === props.durationHours)
+    ? props.durationHours
+    : props.durationOptions[0]?.value;
   return (
     <section className="activation-bar">
-      <div className="field">
-        <label>Activation time</label>
-        <select
-          className="select"
-          value={String(props.durationHours)}
-          onChange={(event) => props.setDurationHours(Number(event.target.value))}
-          title="Activation duration"
-        >
-          {durationOptions.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      {props.requirements.needsJustification ? (
+      {hasSelection && props.durationOptions.length ? (
+        <div className="field">
+          <label>Activation time</label>
+          <select
+            className="select"
+            value={String(selectedDuration)}
+            onChange={(event) => props.setDurationHours(Number(event.target.value))}
+            title="Activation duration"
+          >
+            {props.durationOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
+      {hasSelection && props.requirements.needsJustification ? (
         <div className="field" style={{ marginTop: 8 }}>
           <label>Justification</label>
           <textarea
@@ -477,7 +492,7 @@ function ActivationBar(props: {
           />
         </div>
       ) : null}
-      {props.requirements.needsJustification && justificationOptions.length ? (
+      {hasSelection && props.requirements.needsJustification && justificationOptions.length ? (
         <div className="chip-row">
           {justificationOptions.slice(0, 4).map((item) => (
             <button className="justification-chip" key={item} onClick={() => props.setJustification(item)}>
@@ -486,21 +501,23 @@ function ActivationBar(props: {
           ))}
         </div>
       ) : null}
-      {props.requirements.needsTicket ? (
+      {hasSelection && props.requirements.needsTicket ? (
         <div className="activation-grid" style={{ marginTop: 8 }}>
           <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
           <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
         </div>
       ) : null}
       <div className="button-row">
-        {props.requirements.needsJustification ? (
+        {hasSelection && props.requirements.needsJustification ? (
           <button className="btn subtle" onClick={props.onSaveJustification} disabled={!props.justification.trim()}>
             Save justification
           </button>
         ) : null}
-        <button className="btn primary" onClick={props.onActivate} disabled={!props.selectedCount || props.isActivating}>
-          Activate {props.selectedCount || ""} selected
-        </button>
+        {hasSelection ? (
+          <button className="btn primary" onClick={props.onActivate} disabled={props.isActivating}>
+            Activate {props.selectedCount} selected
+          </button>
+        ) : null}
         <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
           Settings
         </button>

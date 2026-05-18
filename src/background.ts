@@ -1,6 +1,8 @@
 import {
+  applyActivationRequirements,
   buildDirectoryRoleDefinitionNameMap,
   buildActivationRequest,
+  extractActivationRequirementsFromPolicyRules,
   normalizeAzureRole,
   normalizeDirectoryRole,
   normalizePimGroup,
@@ -15,6 +17,7 @@ import type {
   DirectoryRoleApi,
   GroupInfo,
   PimGroupApi,
+  RoleManagementPolicyAssignmentApi,
   TicketInfo,
   TokenKind,
   TokenStatus
@@ -42,6 +45,8 @@ interface StoredTokens {
   azureManagementTokenTimestamp?: number;
   azureManagementTokenSource?: string;
 }
+
+type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => captureToken(details),
@@ -213,8 +218,18 @@ async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> 
     graphToken
   );
   const definitions = await getDirectoryRoleDefinitionsBestEffort(graphToken);
+  const policyRequirements = await getDirectoryRolePolicyRequirementsBestEffort(graphToken);
 
-  return roles.map((role) => normalizeDirectoryRole(withDirectoryRoleDefinitionName(role, definitions)));
+  return roles.map((role) => {
+    const namedRole = withDirectoryRoleDefinitionName(role, definitions);
+    const item = normalizeDirectoryRole(namedRole);
+    return applyActivationRequirements(
+      item,
+      policyRequirements[item.roleDefinitionId.toLowerCase()] ||
+        policyRequirements[(namedRole.roleDefinition?.id || "").toLowerCase()] ||
+        policyRequirements[(namedRole.roleDefinition?.templateId || "").toLowerCase()]
+    );
+  });
 }
 
 async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<string, string>> {
@@ -232,6 +247,28 @@ async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promis
     console.warn("QuickPIM could not resolve directory role definitions:", error);
     return {};
   }
+}
+
+async function getDirectoryRolePolicyRequirementsBestEffort(
+  graphToken: string
+): Promise<Record<string, Partial<ActivationRequirements>>> {
+  const scopeTypes = ["DirectoryRole", "Directory"];
+  const results = await Promise.allSettled(
+    scopeTypes.map((scopeType) => {
+      const query = new URLSearchParams({
+        "$filter": `scopeId eq '/' and scopeType eq '${scopeType}'`,
+        "$expand": "policy($expand=rules)"
+      });
+      return fetchAllPages<RoleManagementPolicyAssignmentApi>(
+        `https://graph.microsoft.com/beta/policies/roleManagementPolicyAssignments?${query.toString()}`,
+        graphToken
+      );
+    })
+  );
+
+  return buildRolePolicyRequirementMap(
+    results.flatMap((result) => (result.status === "fulfilled" ? result.value : []))
+  );
 }
 
 function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Record<string, string>): DirectoryRoleApi {
@@ -253,12 +290,51 @@ async function getPimGroups(graphToken: string): Promise<ActivationItem[]> {
     "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules/filterByCurrentUser(on='principal')",
     graphToken
   );
+  const groupIds = [...new Set(schedules.map((schedule) => schedule.groupId).filter(Boolean) as string[])];
   const groupInfos = await getGroupInfos(
     graphToken,
-    [...new Set(schedules.map((schedule) => schedule.groupId).filter(Boolean) as string[])]
+    groupIds
   );
+  const policyRequirements = await getPimGroupPolicyRequirementsBestEffort(graphToken, groupIds);
 
-  return schedules.map((schedule) => normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]));
+  return schedules.map((schedule) => {
+    const item = normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]);
+    const groupPolicy = policyRequirements[item.groupId];
+    return applyActivationRequirements(item, groupPolicy?.[item.accessId] || groupPolicy?.default);
+  });
+}
+
+async function getPimGroupPolicyRequirementsBestEffort(
+  graphToken: string,
+  groupIds: string[]
+): Promise<Record<string, Record<string, Partial<ActivationRequirements>>>> {
+  const entries = await Promise.all(
+    groupIds.map(async (groupId) => {
+      try {
+        const query = new URLSearchParams({
+          "$filter": `scopeId eq '${groupId}' and scopeType eq 'Group'`,
+          "$expand": "policy($expand=rules)"
+        });
+        const assignments = await fetchAllPages<RoleManagementPolicyAssignmentApi>(
+          `https://graph.microsoft.com/beta/policies/roleManagementPolicyAssignments?${query.toString()}`,
+          graphToken
+        );
+        const requirementsByRole = buildRolePolicyRequirementMap(assignments);
+        return [
+          groupId,
+          Object.fromEntries(
+            Object.entries(requirementsByRole).map(([roleDefinitionId, requirements]) => [
+              roleDefinitionId.toLowerCase().includes("owner") ? "owner" : roleDefinitionId.toLowerCase().includes("member") ? "member" : "default",
+              requirements
+            ])
+          )
+        ] as const;
+      } catch {
+        return [groupId, {}] as const;
+      }
+    })
+  );
+  return Object.fromEntries(entries);
 }
 
 async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Record<string, GroupInfo>> {
@@ -297,10 +373,37 @@ async function getAzureRoles(azureManagementToken: string): Promise<ActivationIt
     })
   );
 
-  return applyAzureRoleDefinitionNames(
-    roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])),
-    azureManagementToken
+  const items = roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []));
+  const itemsWithPolicies = await applyAzureRolePolicyRequirements(items, azureManagementToken);
+  return applyAzureRoleDefinitionNames(itemsWithPolicies, azureManagementToken);
+}
+
+async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
+  const azureItems = items.filter((item): item is Extract<ActivationItem, { type: "azureRole" }> => item.type === "azureRole");
+  const uniqueScopes = [...new Set(azureItems.map((item) => item.scope))];
+  const policyEntries = await Promise.all(
+    uniqueScopes.map(async (scope) => {
+      try {
+        const assignments = await fetchAllPages<RoleManagementPolicyAssignmentApi>(
+          `https://management.azure.com${scope}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=2020-10-01`,
+          token
+        );
+        return [scope, buildRolePolicyRequirementMap(assignments)] as const;
+      } catch {
+        return [scope, {}] as const;
+      }
+    })
   );
+  const requirementsByScope = Object.fromEntries(policyEntries);
+
+  return items.map((item) => {
+    if (item.type !== "azureRole") {
+      return item;
+    }
+
+    const requirements = requirementsByScope[item.scope]?.[item.roleDefinitionId.toLowerCase()];
+    return applyActivationRequirements(item, requirements);
+  });
 }
 
 async function getSubscriptions(token: string): Promise<Array<{ subscriptionId: string; displayName: string }>> {
@@ -523,6 +626,35 @@ async function safeJson(response: Response): Promise<any> {
 
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
   return [...new Map(items.map((item) => [item.id, item])).values()];
+}
+
+function buildRolePolicyRequirementMap(
+  assignments: RoleManagementPolicyAssignmentApi[]
+): Record<string, Partial<ActivationRequirements>> {
+  const entries = assignments.flatMap((assignment) => {
+    const roleDefinitionId = getPolicyAssignmentRoleDefinitionId(assignment);
+    const rules = getPolicyAssignmentRules(assignment);
+    if (!roleDefinitionId || !rules.length) {
+      return [];
+    }
+    return [[roleDefinitionId.toLowerCase(), extractActivationRequirementsFromPolicyRules(rules)] as const];
+  });
+  return Object.fromEntries(entries);
+}
+
+function getPolicyAssignmentRoleDefinitionId(assignment: RoleManagementPolicyAssignmentApi): string {
+  return assignment.roleDefinitionId || assignment.properties?.roleDefinitionId || "";
+}
+
+function getPolicyAssignmentRules(assignment: RoleManagementPolicyAssignmentApi) {
+  return (
+    assignment.policy?.rules ||
+    assignment.policy?.effectiveRules ||
+    assignment.properties?.effectiveRules ||
+    assignment.properties?.policy?.rules ||
+    assignment.properties?.policy?.effectiveRules ||
+    []
+  );
 }
 
 function requirePrincipalId(token: string): string {

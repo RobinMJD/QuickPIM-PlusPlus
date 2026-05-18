@@ -9,6 +9,7 @@ import type {
   GroupInfo,
   PimGroupApi,
   PimGroupItem,
+  RoleManagementPolicyRuleApi,
   TicketInfo
 } from "./types";
 
@@ -31,6 +32,50 @@ export function buildDirectoryRoleDefinitionNameMap(
   });
 
   return Object.fromEntries(entries);
+}
+
+export function extractActivationRequirementsFromPolicyRules(
+  rules: RoleManagementPolicyRuleApi[]
+): Partial<NonNullable<ActivationItem["activationRequirements"]>> {
+  const endUserAssignmentRules = rules.filter(isEndUserAssignmentRule);
+  const expirationRule = endUserAssignmentRules.find((rule) => rule.id === "Expiration_EndUser_Assignment" || rule.maximumDuration);
+  const enablementRule = endUserAssignmentRules.find((rule) => rule.id === "Enablement_EndUser_Assignment" || rule.enabledRules);
+  const approvalRule = endUserAssignmentRules.find((rule) => rule.id === "Approval_EndUser_Assignment" || rule.setting);
+  const enabledRules = enablementRule?.enabledRules || [];
+  const maximumDuration = expirationRule?.maximumDuration;
+  const requirements: Partial<NonNullable<ActivationItem["activationRequirements"]>> = {};
+
+  if (maximumDuration) {
+    requirements.maxDurationHours = parseIsoDurationMs(maximumDuration) / 3600000;
+  }
+
+  if (enablementRule) {
+    requirements.justification = enabledRules.includes("Justification");
+    requirements.ticket = enabledRules.includes("Ticketing");
+  }
+
+  if (approvalRule?.setting?.isRequestorJustificationRequired === true) {
+    requirements.justification = true;
+  }
+
+  return requirements;
+}
+
+export function applyActivationRequirements<T extends ActivationItem>(
+  item: T,
+  requirements: Partial<NonNullable<ActivationItem["activationRequirements"]>> | undefined
+): T {
+  if (!requirements) {
+    return item;
+  }
+
+  return {
+    ...item,
+    activationRequirements: {
+      ...item.activationRequirements,
+      ...requirements
+    }
+  };
 }
 
 export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleItem {
@@ -244,6 +289,14 @@ function addTicketInfo(target: Record<string, unknown>, ticketInfo: TicketInfo) 
       ticketNumber: ticketInfo.ticketNumber || "N/A"
     };
   }
+}
+
+function isEndUserAssignmentRule(rule: RoleManagementPolicyRuleApi): boolean {
+  const target = rule.target;
+  return (
+    (target?.caller === "EndUser" && target.level === "Assignment") ||
+    Boolean(rule.id?.includes("_EndUser_Assignment"))
+  );
 }
 
 function extractScopeFromRoleDefinitionId(roleDefinitionId: string, subscriptionId?: string): string {

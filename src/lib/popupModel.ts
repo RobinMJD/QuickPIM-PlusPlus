@@ -45,16 +45,47 @@ export function formatLoadMessages(messages: string[]): string[] {
     });
 }
 
-export function getDurationOptions(): Array<{ value: number; label: string }> {
-  return [
-    { value: 0.5, label: "30 minutes" },
-    { value: 1, label: "1 hour" },
-    { value: 2, label: "2 hours" },
-    { value: 4, label: "4 hours" },
-    { value: 8, label: "8 hours" },
-    { value: 12, label: "12 hours" },
-    { value: 24, label: "24 hours" }
-  ];
+export function getDurationOptions(items: ActivationItem[]): Array<{ value: number; label: string }> {
+  if (!items.length) {
+    return [];
+  }
+
+  const maxDurationHours = getSelectedMaxDurationHours(items);
+  const values = maxDurationHours ? [...BASE_DURATION_VALUES, maxDurationHours] : BASE_DURATION_VALUES;
+  return [...new Set(values)]
+    .filter((value) => !maxDurationHours || value <= maxDurationHours)
+    .sort((a, b) => a - b)
+    .map((value) => ({ value, label: formatDurationLabel(value) }));
+}
+
+export function coerceDurationForItems(durationHours: number, items: ActivationItem[]): number {
+  const options = getDurationOptions(items);
+  if (!options.length) {
+    return durationHours;
+  }
+
+  if (options.some((option) => option.value === durationHours)) {
+    return durationHours;
+  }
+
+  return [...options].reverse().find((option) => option.value <= durationHours)?.value || options[0].value;
+}
+
+const BASE_DURATION_VALUES = [0.5, 1, 2, 4, 8, 12, 24];
+
+function getSelectedMaxDurationHours(items: ActivationItem[]): number | undefined {
+  const maximums = items
+    .map((item) => item.activationRequirements?.maxDurationHours)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0);
+  return maximums.length ? Math.min(...maximums) : undefined;
+}
+
+function formatDurationLabel(value: number): string {
+  if (value < 1) {
+    return `${Math.round(value * 60)} minutes`;
+  }
+
+  return `${value} hour${value === 1 ? "" : "s"}`;
 }
 
 export function tokenStatusTone(status: TokenStatusEntry | undefined): "ok" | "warn" {
