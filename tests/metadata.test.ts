@@ -15,7 +15,18 @@ describe("versioning and extension manifest", () => {
   });
 
   test("uses only required host permissions and an explicit extension CSP", () => {
-    expect(manifest.host_permissions).toEqual(["https://graph.microsoft.com/*", "https://management.azure.com/*"]);
+    expect(manifest.host_permissions).toEqual([
+      "https://graph.microsoft.com/*",
+      "https://management.azure.com/*",
+      "https://entra.microsoft.com/*"
+    ]);
+    expect(manifest.content_scripts).toEqual([
+      {
+        matches: ["https://entra.microsoft.com/*"],
+        js: ["portalTokenCollector.js"],
+        run_at: "document_idle"
+      }
+    ]);
     expect(manifest.content_security_policy?.extension_pages).toContain("script-src 'self'");
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'none'");
   });

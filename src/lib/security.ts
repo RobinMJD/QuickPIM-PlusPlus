@@ -5,6 +5,7 @@ const API_HOSTS: Record<TokenKind, string> = {
   graph: "graph.microsoft.com",
   azureManagement: "management.azure.com"
 };
+const PORTAL_TOKEN_HOSTS = new Set(["entra.microsoft.com"]);
 
 const GRAPH_AUDIENCES = new Set(["https://graph.microsoft.com", "00000003-0000-0000-c000-000000000000"]);
 const AZURE_MANAGEMENT_AUDIENCES = new Set([
@@ -46,6 +47,11 @@ export function assertAllowedApiUrl(url: string, tokenKind?: TokenKind): void {
   }
 }
 
+export function isAllowedPortalTokenSource(url: string | undefined): boolean {
+  const parsed = safeUrl(url || "");
+  return Boolean(parsed && parsed.protocol === "https:" && PORTAL_TOKEN_HOSTS.has(parsed.hostname));
+}
+
 export function validateCapturedToken(token: string, tokenKind: TokenKind, now = Date.now()): TokenValidationResult {
   const decoded = decodeToken(token);
   if (!decoded) {
@@ -63,10 +69,6 @@ export function validateCapturedToken(token: string, tokenKind: TokenKind, now =
 
   if (!isAllowedAudience(decoded.aud, tokenKind)) {
     return { ok: false, reason: "Token audience does not match the requested API." };
-  }
-
-  if (tokenKind === "graph" && !hasUsablePrincipalClaim(decoded)) {
-    return { ok: false, reason: "Graph token does not contain a usable principal claim." };
   }
 
   return { ok: true, decoded };
@@ -91,10 +93,6 @@ function isAllowedAudience(audience: unknown, tokenKind: TokenKind): boolean {
   const audiences = Array.isArray(audience) ? audience : [audience];
   const allowed = tokenKind === "graph" ? GRAPH_AUDIENCES : AZURE_MANAGEMENT_AUDIENCES;
   return audiences.some((item) => typeof item === "string" && allowed.has(item));
-}
-
-function hasUsablePrincipalClaim(decoded: Record<string, any>): boolean {
-  return typeof decoded.oid === "string" && decoded.oid.trim().length > 0;
 }
 
 function safeUrl(url: string): URL | undefined {

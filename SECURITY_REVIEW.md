@@ -4,18 +4,19 @@ Reviewed for v2.0.0.
 
 ## Threat Model
 
-QuickPIM is a local MV3 browser extension that captures Microsoft Graph and Azure Management bearer tokens from first-party Microsoft portal traffic. The main risks are token exposure, over-broad extension permissions, untrusted runtime messages, unsafe imported settings, and unintended API calls outside Microsoft Graph or Azure Management.
+QuickPIM is a local MV3 browser extension that captures Microsoft Graph and Azure Management bearer tokens from first-party Microsoft portal traffic. It also runs a narrow content script on `https://entra.microsoft.com/*` to collect access-token candidates already present in that page's MSAL cache, then validates API audience and expiry in the background worker before storing anything. The main risks are token exposure, over-broad extension permissions, untrusted runtime messages, unsafe imported settings, and unintended API calls outside Microsoft Graph or Azure Management.
 
 ## Token Handling
 
 - Captured tokens stay in `chrome.storage.local` and are not sent anywhere except Microsoft Graph and Azure Management APIs.
-- Tokens are validated before storage for API audience, parseable expiry, non-expired status, and Graph principal claim presence.
+- Tokens are validated before storage for API audience, parseable expiry, and non-expired status. Graph principal IDs are read from the token when present or resolved through Microsoft Graph `/me` when needed.
 - Expired or invalid stored tokens are cleared when detected.
 - Errors are redacted before being displayed or returned from the background worker.
 
 ## Access And Messaging
 
-- Host permissions are limited to `https://graph.microsoft.com/*` and `https://management.azure.com/*`.
+- Host permissions are limited to `https://graph.microsoft.com/*`, `https://management.azure.com/*`, and `https://entra.microsoft.com/*`.
+- Entra content-script token messages are accepted only from the `entra.microsoft.com` origin and still pass the same token validation before storage.
 - Extension pages use an explicit MV3 content security policy.
 - Background runtime messages are accepted only from this extension and are validated before privileged actions run.
 - Unsupported token injection paths are not exposed; users can clear captured tokens from Settings.

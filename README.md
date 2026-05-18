@@ -18,7 +18,7 @@ Original author: Daniel Bradley. This repository continues the original QuickPIM
 
 ## How It Works
 
-QuickPIM watches browser requests to Microsoft Graph and Azure Management endpoints and stores the bearer tokens locally in Chrome storage. Those tokens are then used from the extension background worker to read eligible PIM assignments and submit self-activation requests.
+QuickPIM watches browser requests to Microsoft Graph and Azure Management endpoints and stores the bearer tokens locally in Chrome storage. When the guided Access Setup opens Microsoft Entra pages, QuickPIM also reads validated access-token candidates from that Entra page's local MSAL cache because some portal views no longer make direct Graph requests that extensions can observe. Those tokens are then used from the extension background worker to read eligible PIM assignments and submit self-activation requests.
 
 Tokens and settings remain in the local browser profile. QuickPIM does not send data to any service other than Microsoft Graph and Azure Management APIs.
 

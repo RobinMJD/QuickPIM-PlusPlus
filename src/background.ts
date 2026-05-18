@@ -11,7 +11,13 @@ import {
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
 import { mapWithConcurrency } from "./lib/concurrency";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
-import { assertAllowedApiUrl, getAllowedTokenKindForUrl, sanitizeErrorMessage, validateCapturedToken } from "./lib/security";
+import {
+  assertAllowedApiUrl,
+  getAllowedTokenKindForUrl,
+  isAllowedPortalTokenSource,
+  sanitizeErrorMessage,
+  validateCapturedToken
+} from "./lib/security";
 import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
 import type {
   ActivationItem,
@@ -39,11 +45,13 @@ interface StoredTokens {
 }
 
 type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
+const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
+const TOKEN_KINDS: TokenKind[] = ["graph", "azureManagement"];
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => captureToken(details),
   { urls: ["https://graph.microsoft.com/*", "https://management.azure.com/*"] },
-  ["requestHeaders"]
+  REQUEST_HEADER_OPTIONS
 );
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -60,7 +68,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  handleMessage(validatedMessage)
+  handleMessage(validatedMessage, sender)
     .then((data) => sendResponse({ success: true, data }))
     .catch((error: unknown) => {
       const message = sanitizeErrorMessage(error);
@@ -70,7 +78,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>): Promise<unknown> {
+async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender): Promise<unknown> {
   switch (message.action) {
     case "getTokenStatus":
       return getTokenStatus();
@@ -81,6 +89,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getActivationItems();
     case "getActiveItems":
       return getActiveItems();
+    case "capturePortalTokens":
+      return capturePortalTokens(message.tokens, message.source, sender);
     case "activateItems":
       return activateItems(message.items, message.durationHours, message.justification, message.ticketInfo || {});
     default:
@@ -102,25 +112,119 @@ function captureToken(details: chrome.webRequest.WebRequestHeadersDetails): void
   const token = authHeader.value.slice(7);
   const validation = validateCapturedToken(token, tokenKind);
   if (!validation.ok) {
-    void clearTokenKind(tokenKind);
     return;
   }
 
-  if (tokenKind === "graph") {
-    void chrome.storage.local.set({
-      graphToken: token,
-      tokenTimestamp: Date.now(),
-      tokenSource: details.url
-    });
+  void storeCapturedToken(tokenKind, token, details.url);
+}
+
+async function capturePortalTokens(
+  tokens: string[],
+  source: string | undefined,
+  sender: chrome.runtime.MessageSender
+): Promise<{ captured: TokenKind[] }> {
+  const sourceUrl = sender.url || sender.tab?.url;
+  if (!isAllowedPortalTokenSource(sourceUrl)) {
+    throw new Error("Portal token capture is only allowed from Microsoft Entra pages.");
   }
 
-  if (tokenKind === "azureManagement") {
-    void chrome.storage.local.set({
-      azureManagementToken: token,
-      azureManagementTokenTimestamp: Date.now(),
-      azureManagementTokenSource: details.url
-    });
+  const candidates = new Map<TokenKind, { token: string; score: number }>();
+  for (const token of tokens) {
+    for (const tokenKind of TOKEN_KINDS) {
+      const validation = validateCapturedToken(token, tokenKind);
+      if (!validation.ok) {
+        continue;
+      }
+      const score = getTokenCaptureScore(validation.decoded, tokenKind);
+      const current = candidates.get(tokenKind);
+      if (!current || score > current.score) {
+        candidates.set(tokenKind, { token, score });
+      }
+    }
   }
+
+  const captured: TokenKind[] = [];
+  for (const [tokenKind, candidate] of candidates) {
+    const stored = await storeCapturedToken(tokenKind, candidate.token, source || sourceUrl || "entra.microsoft.com storage");
+    if (stored) {
+      captured.push(tokenKind);
+    }
+  }
+  return { captured };
+}
+
+async function storeCapturedToken(tokenKind: TokenKind, token: string, source: string, timestamp = Date.now()): Promise<boolean> {
+  const validation = validateCapturedToken(token, tokenKind, timestamp);
+  if (!validation.ok) {
+    return false;
+  }
+
+  const tokens = await getStoredTokens();
+  const currentToken = tokenKind === "graph" ? tokens.graphToken : tokens.azureManagementToken;
+  if (currentToken) {
+    const currentValidation = validateCapturedToken(currentToken, tokenKind, timestamp);
+    if (currentValidation.ok && shouldKeepCurrentToken(currentValidation.decoded, validation.decoded, tokenKind)) {
+      return false;
+    }
+  }
+
+  if (tokenKind === "graph") {
+    await chrome.storage.local.set({
+      graphToken: token,
+      tokenTimestamp: timestamp,
+      tokenSource: source
+    });
+    return true;
+  }
+
+  await chrome.storage.local.set({
+    azureManagementToken: token,
+    azureManagementTokenTimestamp: timestamp,
+    azureManagementTokenSource: source
+  });
+  return true;
+}
+
+function shouldKeepCurrentToken(current: Record<string, any>, incoming: Record<string, any>, tokenKind: TokenKind): boolean {
+  const currentScore = getTokenCaptureScore(current, tokenKind);
+  const incomingScore = getTokenCaptureScore(incoming, tokenKind);
+  if (currentScore > incomingScore) {
+    return true;
+  }
+  const currentExpiry = Number(current.exp) || 0;
+  const incomingExpiry = Number(incoming.exp) || 0;
+  return currentScore === incomingScore && currentExpiry > incomingExpiry;
+}
+
+function getTokenCaptureScore(decoded: Record<string, any>, tokenKind: TokenKind): number {
+  if (tokenKind === "azureManagement") {
+    return 1;
+  }
+
+  const scopes = getGrantedTokenScopes(decoded);
+  const privilegedScopes = [
+    "RoleEligibilitySchedule.Read.Directory",
+    "RoleEligibilitySchedule.ReadWrite.Directory",
+    "RoleManagement.Read.Directory",
+    "RoleManagement.ReadWrite.Directory",
+    "PrivilegedEligibilitySchedule.Read.AzureADGroup",
+    "PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup",
+    "PrivilegedAccess.Read.AzureADGroup",
+    "PrivilegedAccess.ReadWrite.AzureADGroup"
+  ];
+  if (privilegedScopes.some((scope) => scopes.has(scope))) {
+    return 20;
+  }
+  if ([...scopes].some((scope) => /^RoleManagement\.Read/i.test(scope) || /^Privileged/i.test(scope))) {
+    return 10;
+  }
+  return 1;
+}
+
+function getGrantedTokenScopes(decoded: Record<string, any>): Set<string> {
+  const scopes = typeof decoded.scp === "string" ? decoded.scp.split(/\s+/).filter(Boolean) : [];
+  const roles = Array.isArray(decoded.roles) ? decoded.roles.filter((role): role is string => typeof role === "string") : [];
+  return new Set([...scopes, ...roles]);
 }
 
 async function getStoredTokens(): Promise<StoredTokens> {
@@ -261,7 +365,7 @@ async function fetchItemGroup(
 
 async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
-  const principalId = requirePrincipalId(graphToken);
+  const principalId = await getPrincipalId(graphToken);
   const query = new URLSearchParams({
     "$filter": `principalId eq '${principalId}'`,
     "$expand": "roleDefinition"
@@ -725,11 +829,22 @@ function getPolicyAssignmentRules(assignment: RoleManagementPolicyAssignmentApi)
   );
 }
 
-function requirePrincipalId(token: string): string {
+async function getPrincipalId(token: string): Promise<string> {
+  const tokenPrincipalId = getTokenPrincipalId(token);
+  if (tokenPrincipalId) {
+    return tokenPrincipalId;
+  }
+
+  const me = await fetchJson<{ id?: string }>(graphApiUrl("/v1.0/me?$select=id"), token);
+  if (typeof me.id === "string" && me.id.trim()) {
+    return me.id;
+  }
+
+  throw new Error("Could not determine the signed-in principal from the captured token.");
+}
+
+function getTokenPrincipalId(token: string): string | undefined {
   const decoded = decodeToken(token);
   const principalId = decoded?.oid;
-  if (!principalId) {
-    throw new Error("Could not determine the signed-in principal from the captured token.");
-  }
-  return principalId;
+  return typeof principalId === "string" && principalId.trim() ? principalId : undefined;
 }

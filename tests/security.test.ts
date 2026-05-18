@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   assertAllowedApiUrl,
+  isAllowedPortalTokenSource,
   getAllowedTokenKindForUrl,
   sanitizeErrorMessage,
   validateCapturedToken
@@ -12,7 +13,7 @@ import type { ActivationItem } from "../src/lib/types";
 const now = Date.parse("2026-05-18T12:00:00.000Z");
 
 describe("security allowlists and token validation", () => {
-  test("only allows Graph and Azure Management HTTPS API URLs", () => {
+  test("only allows Graph and Azure Management HTTPS API URLs plus Entra portal token sources", () => {
     expect(getAllowedTokenKindForUrl("https://graph.microsoft.com/v1.0/me")).toBe("graph");
     expect(getAllowedTokenKindForUrl("https://management.azure.com/subscriptions?api-version=2020-01-01")).toBe(
       "azureManagement"
@@ -22,9 +23,11 @@ describe("security allowlists and token validation", () => {
     expect(getAllowedTokenKindForUrl("https://evil.example/https://graph.microsoft.com/v1.0/me")).toBeUndefined();
 
     expect(() => assertAllowedApiUrl("https://evil.example/v1.0/me")).toThrow(/not allowed/i);
+    expect(isAllowedPortalTokenSource("https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade")).toBe(true);
+    expect(isAllowedPortalTokenSource("https://evil.example/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade")).toBe(false);
   });
 
-  test("rejects captured tokens with wrong audience, missing principal, invalid format, or expired claims", () => {
+  test("rejects captured tokens with wrong audience, invalid format, or expired claims", () => {
     const graphToken = makeToken({
       aud: "https://graph.microsoft.com",
       exp: Math.floor((now + 10 * 60_000) / 1000),
@@ -35,9 +38,7 @@ describe("security allowlists and token validation", () => {
     expect(validateCapturedToken(makeToken({ aud: "https://evil.example", exp: Math.floor((now + 60_000) / 1000), oid: "user-1" }), "graph", now)).toMatchObject({
       ok: false
     });
-    expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now + 60_000) / 1000) }), "graph", now)).toMatchObject({
-      ok: false
-    });
+    expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now + 60_000) / 1000) }), "graph", now)).toMatchObject({ ok: true });
     expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now - 60_000) / 1000), oid: "user-1" }), "graph", now)).toMatchObject({
       ok: false
     });
@@ -71,7 +72,14 @@ describe("security allowlists and token validation", () => {
 describe("runtime message validation", () => {
   test("rejects unsupported and malformed privileged messages", () => {
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
+    expect(validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["a.b.c"], source: "entra" })).toEqual({
+      action: "capturePortalTokens",
+      tokens: ["a.b.c"],
+      source: "entra"
+    });
     expect(() => validateQuickPimMessage({ action: "manualSetToken", token: "abc" })).toThrow(/unsupported/i);
+    expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
+    expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: "not-array" })).toThrow(/items/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(
       /justification/i
