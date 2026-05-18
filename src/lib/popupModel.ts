@@ -25,11 +25,11 @@ export function tokenStatusText(label: string, status: TokenStatusEntry | undefi
   }
 
   if (status.isExpired) {
-    return `${label} token expired. Refresh in portal.`;
+    return `${label} expired. Refresh in portal.`;
   }
 
   const age = status.tokenAge ?? 0;
-  return `${label} token active, captured ${age} min ago`;
+  return `${label} ready (${age} min ago)`;
 }
 
 export function formatLoadMessages(messages: string[]): string[] {
@@ -90,8 +90,12 @@ function formatLoadMessage(message: string): string {
   const missingScopes = extractMissingPermissionScopes(messageText) || extractMissingPermissionScopes(trimmed);
   const errorCode = typeof parsed?.errorCode === "string" ? parsed.errorCode : undefined;
 
+  if (isTokenExpiryMessage(messageText)) {
+    return "Captured token expired. Refresh in portal.";
+  }
+
   if (missingScopes || errorCode === "PermissionScopeNotGranted" || trimmed.includes("PermissionScopeNotGranted")) {
-    return `Microsoft Graph permission missing: ${missingScopes || "required scope"}.`;
+    return formatPermissionMessage(missingScopes);
   }
 
   if (parsed && messageText !== trimmed) {
@@ -99,6 +103,18 @@ function formatLoadMessage(message: string): string {
   }
 
   return trimmed;
+}
+
+function isTokenExpiryMessage(message: string): boolean {
+  return /access token expiry UTC time/i.test(message) || /token (has )?expired/i.test(message);
+}
+
+function formatPermissionMessage(missingScopes: string | undefined): string {
+  if (missingScopes?.includes("AzureADGroup")) {
+    return "PIM Groups permissions missing. Add Graph PIM group read/write scopes in Entra consent.";
+  }
+
+  return `Microsoft Graph permission missing: ${missingScopes || "required scope"}.`;
 }
 
 function parseJsonMessage(message: string): Record<string, unknown> | undefined {

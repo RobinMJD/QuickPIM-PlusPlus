@@ -95,7 +95,7 @@ button {
   max-width: 100%;
   padding: 5px 8px;
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   line-height: 1.25;
   text-align: left;
@@ -434,7 +434,7 @@ button {
   bottom: 0;
   width: 520px;
   padding: 12px;
-  background: rgba(255, 255, 255, 0.96);
+  background: #ffffff;
   border-top: 1px solid #e5e7eb;
   box-shadow: 0 -10px 24px rgba(15, 23, 42, 0.1);
 }
@@ -450,10 +450,10 @@ button {
   margin: 12px 12px 0;
   padding: 10px;
   border-radius: 6px;
-  background: #eff6ff;
-  color: #1d4ed8;
+  background: #f1f5f9;
+  color: #334155;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
   overflow-wrap: anywhere;
   white-space: pre-line;
 }

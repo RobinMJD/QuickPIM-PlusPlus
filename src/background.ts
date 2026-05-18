@@ -1,24 +1,24 @@
 import {
+  buildDirectoryRoleDefinitionNameMap,
   buildActivationRequest,
   normalizeAzureRole,
   normalizeDirectoryRole,
   normalizePimGroup,
   parseIsoDurationMs
 } from "./lib/pim";
+import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
 import type {
   ActivationItem,
   ActivationResponse,
   AzureRoleApi,
+  DirectoryRoleDefinitionApi,
   DirectoryRoleApi,
   GroupInfo,
   PimGroupApi,
   TicketInfo,
   TokenKind,
-  TokenStatus,
-  TokenStatusEntry
+  TokenStatus
 } from "./lib/types";
-
-const TOKEN_MAX_AGE_MINUTES = 45;
 
 type QuickPimMessage =
   | { action: "getTokenStatus" }
@@ -159,20 +159,6 @@ async function getTokenStatus(): Promise<TokenStatus> {
   };
 }
 
-function makeTokenStatus(token?: string, timestamp?: number, source?: string): TokenStatusEntry {
-  if (!token || !timestamp) {
-    return { hasToken: false };
-  }
-
-  const tokenAge = Math.round((Date.now() - timestamp) / 60000);
-  return {
-    hasToken: true,
-    tokenAge,
-    isExpired: tokenAge > TOKEN_MAX_AGE_MINUTES,
-    source
-  };
-}
-
 async function getActivationItems(): Promise<{ items: ActivationItem[]; errors: string[] }> {
   const tokens = await getStoredTokens();
   const errors: string[] = [];
@@ -232,11 +218,11 @@ async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> 
 }
 
 async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<string, string>> {
-  const roles = await fetchAllPages<{ id?: string; displayName?: string }>(
+  const roles = await fetchAllPages<DirectoryRoleDefinitionApi>(
     "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions",
     graphToken
   );
-  return Object.fromEntries(roles.filter((role) => role.id && role.displayName).map((role) => [role.id!, role.displayName!]));
+  return buildDirectoryRoleDefinitionNameMap(roles);
 }
 
 async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promise<Record<string, string>> {
@@ -249,10 +235,15 @@ async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promis
 }
 
 function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Record<string, string>): DirectoryRoleApi {
-  const roleDefinitionId = role.roleDefinitionId || role.roleDefinition?.id || role.id || "";
+  const roleDefinitionId = role.roleDefinitionId || role.roleDefinition?.id || role.roleDefinition?.templateId || role.id || "";
   return {
     ...role,
-    roleName: role.roleName || definitions[roleDefinitionId]
+    roleName:
+      role.roleName ||
+      role.roleDefinition?.displayName ||
+      definitions[roleDefinitionId] ||
+      definitions[role.roleDefinition?.id || ""] ||
+      definitions[role.roleDefinition?.templateId || ""]
   };
 }
 
@@ -534,13 +525,6 @@ function dedupeItems(items: ActivationItem[]): ActivationItem[] {
   return [...new Map(items.map((item) => [item.id, item])).values()];
 }
 
-function assertFreshToken(token: string, tokenKind: TokenKind): void {
-  const decoded = decodeToken(token);
-  if (!decoded) {
-    throw new Error(tokenKind === "graph" ? "Graph token is invalid." : "Azure Management token is invalid.");
-  }
-}
-
 function requirePrincipalId(token: string): string {
   const decoded = decodeToken(token);
   const principalId = decoded?.oid;
@@ -548,18 +532,4 @@ function requirePrincipalId(token: string): string {
     throw new Error("Could not determine the signed-in principal from the captured token.");
   }
   return principalId;
-}
-
-function decodeToken(token: string): Record<string, any> | null {
-  try {
-    const payload = token.split(".")[1];
-    if (!payload) {
-      return null;
-    }
-    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    return JSON.parse(atob(padded));
-  } catch {
-    return null;
-  }
 }

@@ -3,6 +3,7 @@ import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
   formatCacheAge,
+  getDataWithCache,
   isCacheEntryFresh
 } from "../src/lib/cache";
 import {
@@ -13,7 +14,8 @@ import {
   getPortalUrlForTab,
   tokenStatusText
 } from "../src/lib/popupModel";
-import { normalizeDirectoryRole } from "../src/lib/pim";
+import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole } from "../src/lib/pim";
+import { makeTokenStatus } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
 
 const directoryRole: ActivationItem = {
@@ -60,14 +62,57 @@ describe("popup cache helpers", () => {
     expect(formatCacheAge(Date.parse("2026-05-18T12:09:20.000Z"), now)).toBe("less than 1 min ago");
     expect(formatCacheAge(Date.parse("2026-05-18T12:02:00.000Z"), now)).toBe("8 min ago");
   });
+
+  test("does not replay stale errors when serving fresh cached data", async () => {
+    const now = Date.parse("2026-05-18T12:10:00.000Z");
+    const cached = {
+      items: [directoryRole],
+      errors: ["The access token expiry UTC time '5/18/2026 2:22:14 PM' is earlier than current UTC time."],
+      fetchedAt: now - 60_000
+    };
+
+    const result = await getDataWithCache(
+      "eligible",
+      { eligible: cached },
+      DEFAULT_ELIGIBLE_CACHE_TTL_MS,
+      false,
+      async () => {
+        throw new Error("Should not fetch while cache is fresh");
+      },
+      now
+    );
+
+    expect(result.fromCache).toBe(true);
+    expect(result.entry.errors).toEqual([]);
+  });
 });
 
 describe("popup model helpers", () => {
   test("shows readable token status instead of raw minute badges", () => {
-    expect(tokenStatusText("Microsoft Graph", { hasToken: true, tokenAge: 1, isExpired: false })).toBe(
-      "Microsoft Graph token active, captured 1 min ago"
+    expect(tokenStatusText("Graph", { hasToken: true, tokenAge: 1, isExpired: false })).toBe("Graph ready (1 min ago)");
+    expect(tokenStatusText("Azure", { hasToken: false })).toBe("Azure token missing");
+  });
+
+  test("uses JWT expiry instead of capture age for token status", () => {
+    const now = Date.parse("2026-05-18T14:23:42.000Z");
+    const capturedAt = now - 4 * 60_000;
+    const expiredToken = makeToken({ exp: Math.floor((now - 60_000) / 1000), oid: "user-1" });
+    const freshToken = makeToken({ exp: Math.floor((now + 10 * 60_000) / 1000), oid: "user-1" });
+
+    expect(makeTokenStatus(expiredToken, capturedAt, "portal", now)).toMatchObject({
+      hasToken: true,
+      tokenAge: 4,
+      isExpired: true
+    });
+    expect(makeTokenStatus(freshToken, capturedAt, "portal", now)).toMatchObject({
+      hasToken: true,
+      tokenAge: 4,
+      isExpired: false,
+      expiresInMinutes: 10
+    });
+    expect(tokenStatusText("Graph", makeTokenStatus(expiredToken, capturedAt, "portal", now))).toBe(
+      "Graph expired. Refresh in portal."
     );
-    expect(tokenStatusText("Azure Management", { hasToken: false })).toBe("Azure Management token missing");
   });
 
   test("maps role tabs to matching Entra portal pages", () => {
@@ -99,9 +144,17 @@ describe("popup model helpers", () => {
     ]);
 
     expect(warning).toEqual([
-      "Microsoft Graph permission missing: PrivilegedAssignmentSchedule.Read.AzureADGroup, PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup.",
+      "PIM Groups permissions missing. Add Graph PIM group read/write scopes in Entra consent.",
       "Using cached data from 2 min ago."
     ]);
+  });
+
+  test("formats token expiry API errors into a short action", () => {
+    expect(
+      formatLoadMessages([
+        "The access token expiry UTC time '5/18/2026 2:22:14 PM' is earlier than current UTC time '5/18/2026 2:23:42 PM'."
+      ])
+    ).toEqual(["Captured token expired. Refresh in portal."]);
   });
 
   test("uses expanded directory role names before falling back to role definition ids", () => {
@@ -116,9 +169,29 @@ describe("popup model helpers", () => {
     ).toBe("Agent ID Administrator");
   });
 
+  test("maps directory role definitions by template id as well as definition id", () => {
+    expect(
+      buildDirectoryRoleDefinitionNameMap([
+        {
+          id: "definition-id",
+          templateId: "968ca2cf-d644-4258-8311-65ba3a692b96",
+          displayName: "Agent ID Administrator"
+        }
+      ])
+    ).toMatchObject({
+      "definition-id": "Agent ID Administrator",
+      "968ca2cf-d644-4258-8311-65ba3a692b96": "Agent ID Administrator"
+    });
+  });
+
   test("uses duration labels instead of localized fractional numeric text", () => {
     expect(getDurationOptions()[0]).toEqual({ value: 0.5, label: "30 minutes" });
     expect(getDurationOptions().find((option) => option.value === 1)?.label).toBe("1 hour");
     expect(getDurationOptions().find((option) => option.value === 2)?.label).toBe("2 hours");
   });
 });
+
+function makeToken(payload: Record<string, unknown>): string {
+  const encodedPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return `header.${encodedPayload}.signature`;
+}

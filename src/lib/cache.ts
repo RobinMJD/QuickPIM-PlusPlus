@@ -42,3 +42,38 @@ export async function saveDataCache(cache: QuickPimDataCache): Promise<void> {
 export async function clearDataCache(): Promise<void> {
   await chrome.storage.local.remove(DATA_CACHE_KEY);
 }
+
+export async function getDataWithCache(
+  key: keyof QuickPimDataCache,
+  cache: QuickPimDataCache,
+  ttlMs: number,
+  force: boolean,
+  fetcher: () => Promise<{ items: CachedActivationEntry["items"]; errors: string[] }>,
+  now = Date.now()
+): Promise<{ entry: CachedActivationEntry; fromCache: boolean; cache: QuickPimDataCache }> {
+  const cached = cache[key];
+  if (!force && isCacheEntryFresh(cached, ttlMs, now)) {
+    return { entry: { ...cached, errors: [] }, fromCache: true, cache };
+  }
+
+  try {
+    const fresh = await fetcher();
+    const entry: CachedActivationEntry = {
+      ...fresh,
+      fetchedAt: now
+    };
+    return { entry, fromCache: false, cache: { ...cache, [key]: entry } };
+  } catch (error) {
+    if (cached) {
+      return {
+        entry: {
+          ...cached,
+          errors: [error instanceof Error ? error.message : String(error)]
+        },
+        fromCache: true,
+        cache
+      };
+    }
+    throw error;
+  }
+}

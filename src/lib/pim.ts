@@ -3,6 +3,7 @@ import type {
   ActivationRequest,
   AzureRoleApi,
   AzureRoleItem,
+  DirectoryRoleDefinitionApi,
   DirectoryRoleApi,
   DirectoryRoleItem,
   GroupInfo,
@@ -13,6 +14,23 @@ import type {
 
 export function durationHoursToIso(durationHours: number): string {
   return `PT${Math.round(durationHours * 60)}M`;
+}
+
+export function buildDirectoryRoleDefinitionNameMap(
+  definitions: DirectoryRoleDefinitionApi[]
+): Record<string, string> {
+  const entries = definitions.flatMap((definition) => {
+    const displayName = definition.displayName;
+    if (!displayName) {
+      return [];
+    }
+
+    return [definition.id, definition.templateId]
+      .filter((id): id is string => Boolean(id))
+      .map((id) => [id, displayName] as const);
+  });
+
+  return Object.fromEntries(entries);
 }
 
 export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleItem {

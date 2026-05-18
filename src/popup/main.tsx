@@ -5,7 +5,7 @@ import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
   formatCacheAge,
-  isCacheEntryFresh,
+  getDataWithCache,
   loadDataCache,
   saveDataCache
 } from "../lib/cache";
@@ -35,8 +35,6 @@ import {
 import type {
   ActivationItem,
   ActivationResponse,
-  CachedActivationEntry,
-  QuickPimDataCache,
   QuickPimBundle,
   QuickPimSettings,
   SortMode,
@@ -252,8 +250,8 @@ function PopupApp() {
           </div>
         </div>
         <div className="status-stack">
-          <TokenPill label="Graph API" status={tokenStatus?.graph} />
-          <TokenPill label="Azure API" status={tokenStatus?.azureManagement} />
+          <TokenPill label="Graph" status={tokenStatus?.graph} />
+          <TokenPill label="Azure" status={tokenStatus?.azureManagement} />
         </div>
       </header>
 
@@ -551,40 +549,6 @@ async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {
     throw new Error(response?.error || "QuickPIM background request failed.");
   }
   return response.data as T;
-}
-
-async function getDataWithCache(
-  key: keyof QuickPimDataCache,
-  cache: QuickPimDataCache,
-  ttlMs: number,
-  force: boolean,
-  fetcher: () => Promise<{ items: ActivationItem[]; errors: string[] }>
-): Promise<{ entry: CachedActivationEntry; fromCache: boolean; cache: QuickPimDataCache }> {
-  const cached = cache[key];
-  if (!force && isCacheEntryFresh(cached, ttlMs)) {
-    return { entry: cached, fromCache: true, cache };
-  }
-
-  try {
-    const fresh = await fetcher();
-    const entry: CachedActivationEntry = {
-      ...fresh,
-      fetchedAt: Date.now()
-    };
-    return { entry, fromCache: false, cache: { ...cache, [key]: entry } };
-  } catch (error) {
-    if (cached) {
-      return {
-        entry: {
-          ...cached,
-          errors: [...cached.errors, error instanceof Error ? error.message : String(error)]
-        },
-        fromCache: true,
-        cache
-      };
-    }
-    throw error;
-  }
 }
 
 createRoot(document.getElementById("root")!).render(<PopupApp />);

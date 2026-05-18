@@ -102,6 +102,8 @@ export interface QuickPimSettings {
 export interface TokenStatusEntry {
   hasToken: boolean;
   tokenAge?: number;
+  expiresAt?: string;
+  expiresInMinutes?: number;
   isExpired?: boolean;
   source?: string;
 }
@@ -151,6 +153,12 @@ export interface DirectoryRoleApi {
     displayName?: string;
     templateId?: string;
   };
+}
+
+export interface DirectoryRoleDefinitionApi {
+  id?: string;
+  templateId?: string;
+  displayName?: string;
 }
 
 export interface AzureRoleApi {
