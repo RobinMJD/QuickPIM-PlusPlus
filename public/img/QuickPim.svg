@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="QuickPIM logo">
+  <defs>
+    <linearGradient id="quickpim-bg" x1="16" y1="10" x2="114" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.48" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="quickpim-bolt" x1="50" y1="40" x2="82" y2="91" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#0891b2"/>
+    </linearGradient>
+    <filter id="quickpim-shadow" x="16" y="12" width="96" height="112" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#020617" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#quickpim-bg)"/>
+  <path d="M15 91C40 76 76 77 113 39v74H15z" fill="#22d3ee" opacity="0.16"/>
+  <path d="M64 18l34 13v28c0 24-13 42-34 53-21-11-34-29-34-53V31z" fill="#f8fafc" filter="url(#quickpim-shadow)"/>
+  <path d="M64 30l23 9v20c0 17-8 30-23 39-15-9-23-22-23-39V39z" fill="#dbeafe"/>
+  <path d="M68 37L51 69h13l-7 24 26-37H69z" fill="url(#quickpim-bolt)"/>
+</svg>
