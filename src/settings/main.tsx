@@ -1,0 +1,1433 @@
+import { useEffect, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
+import "../styles.css";
+import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets } from "../lib/access";
+import { DEFAULT_ELIGIBLE_CACHE_TTL_MS, formatCacheAge, getDataWithCache, loadDataCache, saveDataCache } from "../lib/cache";
+import { DEFAULT_DURATION_OPTIONS, coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
+import {
+  DEFAULT_SETTINGS,
+  SETTINGS_KEY,
+  createBundleId,
+  getDisplayName,
+  getScopeLabel,
+  loadSettings,
+  mergeSettings,
+  saveSettings
+} from "../lib/settings";
+import {
+  applyReferenceDataToItems,
+  clearReferenceData,
+  learnReferenceDataFromItems,
+  loadReferenceData,
+  saveReferenceData
+} from "../lib/referenceData";
+import { getGenericJustificationWarning } from "../lib/justifications";
+import type { AccessDiagnostic, AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+
+type SettingsTab = "home" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data" | "about";
+
+const ORIGINAL_AUTHOR = "Daniel Bradley";
+const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
+const REPOSITORY_URL = "https://github.com/RobinMJD/QuickPIM";
+const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM";
+const CHANGELOG_CACHE_KEY = "quickPimChangelog.v1";
+const CHANGELOG_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
+
+const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
+  { title: "Overview", tabs: ["home"] },
+  { title: "Setup", tabs: ["access"] },
+  { title: "Configuration", tabs: ["aliases", "justifications", "bundles", "preferences"] },
+  { title: "Maintenance", tabs: ["data", "about"] }
+];
+
+interface ChangelogItem {
+  title: string;
+  description: string;
+  url: string;
+  date?: string;
+}
+
+interface ChangelogCache {
+  fetchedAt: number;
+  items: ChangelogItem[];
+}
+
+interface MessageResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+function SettingsApp() {
+  const [tab, setTab] = useState<SettingsTab>(() => tabFromHash());
+  const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
+  const [items, setItems] = useState<ActivationItem[]>([]);
+  const [tokenStatus, setTokenStatus] = useState<TokenStatus | null>(null);
+  const [dataCache, setDataCache] = useState<QuickPimDataCache>({});
+  const [referenceData, setReferenceData] = useState<ReferenceDataCache | undefined>();
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [exportText, setExportText] = useState("");
+  const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
+  const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  useEffect(() => {
+    const storageChangeEvent = chrome.storage?.onChanged;
+    if (!storageChangeEvent) {
+      return;
+    }
+    function handleStorageChange(changes: Record<string, chrome.storage.StorageChange>, areaName: string) {
+      if (areaName !== "local" || !changes[SETTINGS_KEY]) {
+        return;
+      }
+      const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
+      setSettings(merged);
+      setExportText(JSON.stringify(merged, null, 2));
+    }
+    storageChangeEvent.addListener(handleStorageChange);
+    return () => storageChangeEvent.removeListener(handleStorageChange);
+  }, []);
+
+  useEffect(() => {
+    document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
+  }, [settings.preferences.darkMode]);
+
+  useEffect(() => {
+    function handleHashChange() {
+      setTab(tabFromHash());
+    }
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  async function refresh(options: { showProgress?: boolean } = {}) {
+    if (options.showProgress) {
+      setIsRefreshingEligible(true);
+      setMessage("Refreshing eligible items...");
+    }
+    setError("");
+    try {
+      const [loadedSettings, loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
+        loadSettings(),
+        sendMessage<TokenStatus>({ action: "getTokenStatus" }),
+        loadDataCache(),
+        loadReferenceData()
+      ]);
+      const tokenCacheKey = buildTokenCacheKey(loadedTokens);
+      const eligible = await getDataWithCache(
+        "eligible",
+        loadedCache,
+        DEFAULT_ELIGIBLE_CACHE_TTL_MS,
+        Boolean(options.showProgress),
+        () => sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
+        Date.now(),
+        tokenCacheKey
+      );
+      const cachedActive = loadedCache.active?.cacheKey === tokenCacheKey ? loadedCache.active : undefined;
+      const nextCache: QuickPimDataCache = {
+        ...(eligible.cache.eligible ? { eligible: eligible.cache.eligible } : {}),
+        ...(cachedActive ? { active: cachedActive } : {})
+      };
+      if (!eligible.fromCache || loadedCache.active !== cachedActive) {
+        await saveDataCache(nextCache);
+      }
+      const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, eligible.entry.items);
+      await saveReferenceData(nextReferenceData);
+      setSettings(loadedSettings);
+      setItems(applyDisplayData(eligible.entry.items, loadedSettings, nextReferenceData));
+      setTokenStatus(loadedTokens);
+      setDataCache(nextCache);
+      setReferenceData(nextReferenceData);
+      setExportText(JSON.stringify(loadedSettings, null, 2));
+      if (options.showProgress) {
+        setMessage(
+          eligible.fromCache
+            ? `Using cached eligible items from ${formatCacheAge(eligible.entry.fetchedAt)}.`
+            : "Eligible items refreshed."
+        );
+      }
+    } catch (loadError) {
+      if (options.showProgress) {
+        setMessage("");
+      }
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      if (options.showProgress) {
+        setIsRefreshingEligible(false);
+      }
+    }
+  }
+
+  async function forceRefreshAccessData(tokens?: TokenStatus) {
+    setIsRefreshingAccess(true);
+    setError("");
+    setMessage("Refreshing access data...");
+    try {
+      const latestTokens = tokens ?? await sendMessage<TokenStatus>({ action: "getTokenStatus" });
+      const tokenCacheKey = buildTokenCacheKey(latestTokens);
+      const [eligible, active] = await Promise.all([
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActiveItems" })
+      ]);
+      const fetchedAt = Date.now();
+      const nextCache: QuickPimDataCache = {
+        eligible: { ...eligible, fetchedAt, cacheKey: tokenCacheKey },
+        active: { ...active, fetchedAt, cacheKey: tokenCacheKey }
+      };
+      await saveDataCache(nextCache);
+      const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [
+        ...eligible.items,
+        ...active.items
+      ]);
+      await saveReferenceData(nextReferenceData);
+      setTokenStatus(latestTokens);
+      setDataCache(nextCache);
+      setReferenceData(nextReferenceData);
+      setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
+      const limitedAreas = buildAccessCapabilityItems(latestTokens, nextCache).filter((item) => item.status !== "ready").length;
+      setMessage(
+        limitedAreas
+          ? `Access data refreshed. ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
+          : "Access data refreshed."
+      );
+    } catch (refreshError) {
+      setMessage("");
+      setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+    } finally {
+      setIsRefreshingAccess(false);
+    }
+  }
+
+  async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
+    const merged = mergeSettings(next);
+    await saveSettings(merged);
+    setSettings(merged);
+    setExportText(JSON.stringify(merged, null, 2));
+    setMessage(successMessage);
+  }
+
+  async function clearCapturedTokens() {
+    await sendMessage<boolean>({ action: "clearToken" });
+    setTokenStatus({
+      graph: { hasToken: false },
+      azureManagement: { hasToken: false }
+    });
+    setMessage("Captured tokens cleared.");
+  }
+
+  async function clearLearnedReferences() {
+    await clearReferenceData();
+    setReferenceData(undefined);
+    setMessage("Learned names cleared.");
+  }
+
+  function selectTab(nextTab: SettingsTab) {
+    setTab(nextTab);
+    if (window.location.hash !== `#${nextTab}`) {
+      window.history.replaceState(null, "", `#${nextTab}`);
+    }
+  }
+
+  return (
+    <main className="settings-shell">
+      <header className="settings-header">
+        <div className="brand">
+          <img src="/img/QuickPim48.png" alt="" />
+          <div>
+            <h1>QuickPIM++ Settings</h1>
+            <p>Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.</p>
+          </div>
+        </div>
+        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible}>
+          {isRefreshingEligible ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Refreshing eligible items...</span>
+            </span>
+          ) : (
+            "Refresh eligible items"
+          )}
+        </button>
+      </header>
+
+      <section className="settings-content">
+        {error ? <p className="message error">{error}</p> : null}
+        {message ? <p className={message === "Settings saved." ? "message success" : "message"}>{message}</p> : null}
+        <div className="settings-layout">
+          <nav className="settings-nav" aria-label="Settings sections">
+            {NAV_SECTIONS.map((section) => (
+              <div className="settings-nav-group" key={section.title}>
+                <p className="settings-nav-heading">{section.title}</p>
+                {section.tabs.map((item) => (
+                  <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>
+                    <SettingsNavIcon tab={item} />
+                    <span>{tabLabel(item)}</span>
+                  </button>
+                ))}
+              </div>
+            ))}
+          </nav>
+          <div>
+            {tab === "home" ? <HomePanel /> : null}
+            {tab === "about" ? <AboutPanel tokenStatus={tokenStatus} onClearTokens={() => void clearCapturedTokens()} /> : null}
+            {tab === "access" ? (
+              <AccessSetupPanel
+                settings={settings}
+                tokenStatus={tokenStatus}
+                dataCache={dataCache}
+                isRefreshingAccess={isRefreshingAccess}
+                onSave={persist}
+                onRefreshAccessData={forceRefreshAccessData}
+                onClearReferenceData={clearLearnedReferences}
+              />
+            ) : null}
+            {tab === "aliases" ? <AliasesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
+            {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
+            {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
+            {tab === "preferences" ? <PreferencesPanel settings={settings} onSave={persist} /> : null}
+            {tab === "data" ? (
+              <DataPanel
+                settings={settings}
+                exportText={exportText}
+                setExportText={setExportText}
+                onSave={persist}
+                onClearMessage={() => setMessage("")}
+              />
+            ) : null}
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function HomePanel() {
+  const [changelog, setChangelog] = useState<ChangelogItem[]>([]);
+  const [isLoadingChangelog, setIsLoadingChangelog] = useState(true);
+  const [changelogError, setChangelogError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setIsLoadingChangelog(true);
+      setChangelogError("");
+      try {
+        const items = await loadGithubChangelog();
+        if (!cancelled) {
+          setChangelog(items);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setChangelogError(error instanceof Error ? error.message : "GitHub changelog could not be loaded.");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingChangelog(false);
+        }
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section className="home-stack">
+      <div className="panel home-hero">
+        <div>
+          <h2>QuickPIM++ is a local-first activation console</h2>
+          <p className="muted">
+            Use one compact popup to activate eligible Microsoft Entra roles, PIM groups, and Azure roles with saved reasons,
+            bundles, aliases, favorites, and local learned names.
+          </p>
+        </div>
+        <div className="home-feature-grid">
+          <div>
+            <strong>Daily activation</strong>
+            <span>Select roles, continue, then review duration and justification only when needed.</span>
+          </div>
+          <div>
+            <strong>Local setup</strong>
+            <span>Settings stay in this browser profile and portal tokens are captured from Microsoft pages.</span>
+          </div>
+          <div>
+            <strong>Cleaner management</strong>
+            <span>Manage aliases, justifications, bundles, popup defaults, access setup, and import/export in one place.</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title-row">
+          <div>
+            <h2>Changelog</h2>
+            <p className="muted">Loaded from the QuickPIM++ GitHub repository.</p>
+          </div>
+          <a className="btn" href={`${REPOSITORY_URL}/releases`} target="_blank" rel="noreferrer">
+            Open GitHub
+          </a>
+        </div>
+        {isLoadingChangelog ? (
+          <section className="loading-panel settings-local-loading" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span>Loading changelog from GitHub...</span>
+          </section>
+        ) : null}
+        {changelogError ? (
+          <p className="message error settings-inline-message">
+            Could not load the GitHub changelog. Open GitHub to review the latest changes.
+          </p>
+        ) : null}
+        {!isLoadingChangelog && !changelogError ? (
+          <div className="changelog-list">
+            {changelog.map((item) => (
+              <a className="changelog-item" href={item.url} target="_blank" rel="noreferrer" key={`${item.title}-${item.url}`}>
+                <span>
+                  <strong>{item.title}</strong>
+                  {item.date ? <small>{new Date(item.date).toLocaleDateString()}</small> : null}
+                </span>
+                <p>{item.description}</p>
+              </a>
+            ))}
+            {!changelog.length ? <p className="muted">No GitHub releases or commits were returned.</p> : null}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
+  const pathByTab: Record<SettingsTab, string[]> = {
+    home: ["M3 11.5 12 4l9 7.5", "M5 10.5V20h14v-9.5", "M9 20v-6h6v6"],
+    access: ["M12 3l7 3v5c0 4.5-2.8 8.1-7 10-4.2-1.9-7-5.5-7-10V6l7-3z", "M9.5 12.5l1.8 1.8 3.8-4.4"],
+    aliases: ["M4 7h16", "M7 4v6", "M17 4v6", "M6 14h7", "M6 18h11"],
+    justifications: ["M6 4h9l3 3v13H6z", "M14 4v4h4", "M9 12h6", "M9 16h6"],
+    bundles: ["M5 7h14v5H5z", "M7 12v5h10v-5", "M9 7V5h6v2"],
+    preferences: ["M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", "M12 2v3", "M12 19v3", "M4.9 4.9 7 7", "M17 17l2.1 2.1", "M2 12h3", "M19 12h3"],
+    data: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
+    about: ["M12 17v-5", "M12 8h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"]
+  };
+  return (
+    <span className="settings-nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        {pathByTab[tab].map((path) => (
+          <path d={path} key={path} />
+        ))}
+      </svg>
+    </span>
+  );
+}
+
+function AboutPanel({
+  tokenStatus,
+  onClearTokens
+}: {
+  tokenStatus: TokenStatus | null;
+  onClearTokens: () => void;
+}) {
+  const manifest = chrome.runtime.getManifest();
+  return (
+    <section className="panel about-panel">
+      <div>
+        <h2>{manifest.name} {manifest.version}</h2>
+        <p className="muted">Quick activation for Microsoft Entra roles, Azure roles, and PIM groups.</p>
+      </div>
+      <div className="about-grid">
+        <div>
+          <strong>
+            Original author:{" "}
+            <a href={ORIGINAL_REPOSITORY_URL} target="_blank" rel="noreferrer">
+              {ORIGINAL_AUTHOR}
+            </a>
+          </strong>
+          <p className="muted">
+            v2 continues the original QuickPIM project as QuickPIM++ with the React rewrite, PIM groups, Azure roles,
+            role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!
+          </p>
+        </div>
+        <div>
+          <strong>Privacy</strong>
+          <p className="muted">Tokens and settings stay in this browser profile. QuickPIM++ only calls Microsoft Graph and Azure Management APIs.</p>
+        </div>
+        <div>
+          <strong>Repository</strong>
+          <p className="muted">
+            <a href={REPOSITORY_URL} target="_blank" rel="noreferrer">
+              {REPOSITORY_URL}
+            </a>
+          </p>
+        </div>
+        <div>
+          <strong>Captured tokens</strong>
+          <p className="muted">
+            Graph: {tokenStatus?.graph.hasToken ? "captured" : "missing"} / Azure:{" "}
+            {tokenStatus?.azureManagement.hasToken ? "captured" : "missing"}
+          </p>
+          <button className="btn danger settings-inline-action" onClick={onClearTokens}>
+            Clear captured tokens
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AccessSetupPanel({
+  settings,
+  tokenStatus,
+  dataCache,
+  isRefreshingAccess,
+  onSave,
+  onRefreshAccessData,
+  onClearReferenceData
+}: {
+  settings: QuickPimSettings;
+  tokenStatus: TokenStatus | null;
+  dataCache: QuickPimDataCache;
+  isRefreshingAccess: boolean;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onRefreshAccessData: (tokens?: TokenStatus) => Promise<void>;
+  onClearReferenceData: () => Promise<void>;
+}) {
+  const [isRunningSetup, setIsRunningSetup] = useState(false);
+  const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache), [dataCache, tokenStatus]);
+  const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
+  const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
+
+  async function setIgnored(ignored: boolean) {
+    await onSave(
+      {
+        ...settings,
+        preferences: {
+          ...settings.preferences,
+          permissionWarningIgnored: ignored,
+          permissionWarningIgnoredAt: ignored ? new Date().toISOString() : undefined
+        }
+      },
+      ignored ? "Permission warning ignored." : "Permission warning enabled."
+    );
+  }
+
+  async function runPortalSetup() {
+    const targets = setupTargets;
+    const urls = getPortalUrlsForTargets(targets);
+    for (const url of urls) {
+      if (chrome.tabs?.create) {
+        void chrome.tabs.create({ url });
+      } else {
+        window.open(url, "_blank", "noopener");
+      }
+    }
+
+    setIsRunningSetup(true);
+    try {
+      const latestTokens = await waitForPortalTokens(targets);
+      await onRefreshAccessData(latestTokens);
+    } finally {
+      setIsRunningSetup(false);
+    }
+  }
+
+  async function waitForPortalTokens(targets: AccessSetupTarget[]): Promise<TokenStatus> {
+    let latestTokens = tokenStatus || await sendMessage<TokenStatus>({ action: "getTokenStatus" });
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      latestTokens = await sendMessage<TokenStatus>({ action: "getTokenStatus" });
+      if (targets.every((target) => hasRequiredPortalToken(target, latestTokens))) {
+        return latestTokens;
+      }
+      await delay(3000);
+    }
+    return latestTokens;
+  }
+
+  return (
+    <section className="panel permissions-panel">
+      <div className="panel-title-row">
+        <div>
+          <h2>Access Setup</h2>
+          <p className="muted">
+            {setupTargets.length
+              ? `${setupTargets.length} area(s) need a portal refresh or are limited by the captured portal token.`
+              : "QuickPIM++ can use the currently captured portal tokens for all feature areas."}
+          </p>
+        </div>
+        <button className={`btn ${warningIgnored ? "" : "subtle"}`} onClick={() => void setIgnored(!warningIgnored)}>
+          {warningIgnored ? "Show access warning" : "Ignore access warning"}
+        </button>
+      </div>
+
+      <div className="button-row settings-action-lead">
+        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRefreshingAccess || !setupTargets.length}>
+          {isRunningSetup ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Checking portal access...</span>
+            </span>
+          ) : (
+            "Open missing portal pages"
+          )}
+        </button>
+        <button className="btn" onClick={() => void onRefreshAccessData()} disabled={isRunningSetup || isRefreshingAccess}>
+          {isRefreshingAccess ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Rechecking access...</span>
+            </span>
+          ) : (
+            "Recheck now"
+          )}
+        </button>
+        <button className="btn danger" onClick={() => void onClearReferenceData()}>
+          Clear learned names
+        </button>
+      </div>
+      {isRunningSetup ? (
+        <section className="loading-panel" aria-live="polite">
+          <span className="spinner large" aria-hidden="true" />
+          <span>Waiting for Microsoft portal token capture...</span>
+        </section>
+      ) : null}
+      {isRefreshingAccess ? (
+        <section className="loading-panel" aria-live="polite">
+          <span className="spinner large" aria-hidden="true" />
+          <span>Refreshing access data...</span>
+        </section>
+      ) : null}
+      <p className="muted">
+        QuickPIM++ only uses tokens captured from Microsoft portal pages. If a page asks you to sign in or load PIM data, complete that
+        step in the opened tab, then return here.
+      </p>
+
+      <div className="permission-list">
+        {accessStatus.map((item) => (
+          <AccessStatusRow item={item} key={item.target} />
+        ))}
+      </div>
+
+      <div className="panel">
+        <h3>Quick Tutorial</h3>
+        <ol className="tutorial-list">
+          <li>Use Open missing portal pages to open the Microsoft pages that normally request the needed Graph or Azure tokens.</li>
+          <li>Let the portal pages finish loading. Switch to them if sign-in, tenant selection, or page consent is required.</li>
+          <li>Return to QuickPIM++ and use Recheck now if the automatic refresh has not picked up the new portal token yet.</li>
+          <li>QuickPIM++ keeps learned role, group, subscription, and scope names locally so old friendly names can still be displayed later.</li>
+        </ol>
+      </div>
+    </section>
+  );
+}
+
+function AccessStatusRow({ item }: { item: ReturnType<typeof buildAccessCapabilityItems>[number] }) {
+  return (
+    <article className={`permission-row ${item.status === "ready" ? "ok" : "missing"}`}>
+      <div className="permission-row-header">
+        <span className={`permission-state ${item.status === "ready" ? "ok" : "missing"}`}>{statusLabel(item.status)}</span>
+        <div>
+          <h3>{item.label}</h3>
+          <p>{item.target === "azureRole" ? "Azure Management portal token" : "Microsoft Graph portal token"}</p>
+        </div>
+      </div>
+      <div className="permission-detail-grid">
+        <div>
+          <strong>Status</strong>
+          <p>{item.detail}</p>
+        </div>
+        <div>
+          <strong>{item.status === "ready" ? "Last success" : "What is limited"}</strong>
+          <p>{item.status === "ready" ? item.lastSuccessAt || "Token is available." : item.lastError || "Open the matching portal page to refresh access."}</p>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[number]["status"]): string {
+  if (status === "ready") return "Ready";
+  if (status === "limited") return "Limited";
+  return "Needs portal refresh";
+}
+
+function hasRequiredPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus): boolean {
+  return target === "azureRole"
+    ? Boolean(tokenStatus.azureManagement.hasToken && !tokenStatus.azureManagement.isExpired)
+    : Boolean(tokenStatus.graph.hasToken && !tokenStatus.graph.isExpired);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function AliasesPanel({
+  settings,
+  items,
+  referenceData,
+  onSave
+}: {
+  settings: QuickPimSettings;
+  items: ActivationItem[];
+  referenceData?: ReferenceDataCache;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+}) {
+  const [itemId, setItemId] = useState("");
+  const [alias, setAlias] = useState("");
+  const selectedItem = items.find((item) => item.id === itemId);
+
+  async function saveAlias() {
+    if (!selectedItem || !alias.trim()) return;
+    await onSave({
+      ...settings,
+      aliasesByItemId: {
+        ...settings.aliasesByItemId,
+        [selectedItem.id]: alias.trim()
+      }
+    });
+    setAlias("");
+  }
+
+  async function removeAlias(id: string) {
+    const aliasesByItemId = { ...settings.aliasesByItemId };
+    delete aliasesByItemId[id];
+    await onSave({ ...settings, aliasesByItemId });
+  }
+
+  return (
+    <section className="panel">
+      <h2>Custom Role Names</h2>
+      <div className="form-grid">
+        <div className="field">
+          <label>Role or group</label>
+          <select className="select" value={itemId} onChange={(event) => setItemId(event.target.value)}>
+            <option value="">Choose an eligible item</option>
+            {items.map((item) => (
+              <option value={item.id} key={item.id}>
+                {getDisplayName(item, settings, referenceData)} / {getScopeLabel(item, referenceData)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Alias</label>
+          <input className="input" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Display name" />
+        </div>
+      </div>
+      <div className="button-row settings-form-actions">
+        <button className="btn primary" onClick={() => void saveAlias()} disabled={!itemId || !alias.trim()}>
+          Save alias
+        </button>
+      </div>
+      <div className="panel">
+        <h3>Saved aliases</h3>
+        {Object.entries(settings.aliasesByItemId).length ? (
+          Object.entries(settings.aliasesByItemId).map(([id, value]) => (
+            <div className="alias-row" key={id}>
+              <div>
+                <strong>{value}</strong>
+                <p className="muted">{items.find((item) => item.id === id)?.sourceName || id}</p>
+              </div>
+              <button className="btn danger" onClick={() => void removeAlias(id)}>
+                Remove
+              </button>
+            </div>
+          ))
+        ) : (
+          <p className="muted">No aliases saved yet.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function JustificationsPanel({
+  settings,
+  onSave
+}: {
+  settings: QuickPimSettings;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+}) {
+  const [value, setValue] = useState("");
+  const [validationWarning, setValidationWarning] = useState("");
+
+  async function add() {
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    const genericJustificationWarning = getGenericJustificationWarning(trimmed);
+    if (genericJustificationWarning) {
+      setValidationWarning(genericJustificationWarning);
+      return;
+    }
+    setValidationWarning("");
+    const exists = settings.savedJustifications.some((item) => item.toLowerCase() === trimmed.toLowerCase());
+    await onSave({
+      ...settings,
+      savedJustifications: exists ? settings.savedJustifications : [trimmed, ...settings.savedJustifications]
+    });
+    setValue("");
+  }
+
+  async function removeSaved(target: string) {
+    await onSave({
+      ...settings,
+      savedJustifications: settings.savedJustifications.filter((item) => item !== target)
+    });
+  }
+
+  return (
+    <section className="panel">
+      <h2>Justifications</h2>
+      <div className="form-row">
+        <input
+          className="input"
+          value={value}
+          onChange={(event) => {
+            setValue(event.target.value);
+            if (validationWarning) setValidationWarning("");
+          }}
+          placeholder="Reusable justification"
+        />
+        <button className="btn primary" onClick={() => void add()} disabled={!value.trim()}>
+          Add
+        </button>
+      </div>
+      {validationWarning ? <p className="field-warning settings-field-gap">{validationWarning}</p> : null}
+      <div className="two-column settings-section-gap">
+        <div className="panel">
+          <h3>Saved</h3>
+          {settings.savedJustifications.map((item) => (
+            <div className="settings-row" key={item}>
+              <span>{item}</span>
+              <button className="btn danger" onClick={() => void removeSaved(item)}>
+                Remove
+              </button>
+            </div>
+          ))}
+          {!settings.savedJustifications.length ? <p className="muted">No saved justifications.</p> : null}
+        </div>
+        <div className="panel">
+          <h3>Recent</h3>
+          {settings.recentJustifications.map((item) => (
+            <div className="settings-row" key={item}>
+              <span>{item}</span>
+            </div>
+          ))}
+          <button className="btn danger" onClick={() => void onSave({ ...settings, recentJustifications: [] }, "Recent history cleared.")}>
+            Clear recent
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function BundlesPanel({
+  settings,
+  items,
+  referenceData,
+  onSave
+}: {
+  settings: QuickPimSettings;
+  items: ActivationItem[];
+  referenceData?: ReferenceDataCache;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
+  const [durationHours, setDurationHours] = useState(settings.preferences.defaultDurationHours);
+  const [justification, setJustification] = useState("");
+  const [editingBundleId, setEditingBundleId] = useState<string | undefined>();
+  const [draftMode, setDraftMode] = useState<"create" | "edit" | "duplicate">("create");
+  const [draftSourceName, setDraftSourceName] = useState("");
+  const [validationWarning, setValidationWarning] = useState("");
+  const sortedItems = useMemo(
+    () => [...items].sort((a, b) => getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData))),
+    [items, referenceData, settings]
+  );
+  const selectedItems = useMemo(
+    () => items.filter((item) => selectedItemIds.has(item.id)),
+    [items, selectedItemIds]
+  );
+  const durationOptions = useMemo(() => getDurationOptions(selectedItems), [selectedItems]);
+
+  useEffect(() => {
+    if (durationOptions.length) {
+      setDurationHours((current) => coerceDurationForItems(current, selectedItems));
+    }
+  }, [durationOptions, selectedItems]);
+
+  async function saveBundle() {
+    if (!name.trim() || !selectedItemIds.size) return;
+    const genericJustificationWarning = getGenericJustificationWarning(justification);
+    if (genericJustificationWarning) {
+      setValidationWarning(genericJustificationWarning);
+      return;
+    }
+    setValidationWarning("");
+    const effectiveDuration = coerceDurationForItems(durationHours, selectedItems);
+    const bundle: QuickPimBundle = {
+      id: editingBundleId || createBundleId(name),
+      name: name.trim(),
+      itemIds: [...selectedItemIds],
+      defaultDurationHours: effectiveDuration,
+      defaultJustification: justification.trim() || undefined
+    };
+    const bundles = editingBundleId
+      ? settings.bundles.map((item) => (item.id === editingBundleId ? bundle : item))
+      : [bundle, ...settings.bundles.filter((item) => item.id !== bundle.id)];
+    await onSave({ ...settings, bundles });
+    resetDraft();
+  }
+
+  async function removeBundle(bundleId: string) {
+    await onSave({ ...settings, bundles: settings.bundles.filter((bundle) => bundle.id !== bundleId) });
+    if (editingBundleId === bundleId) {
+      resetDraft();
+    }
+  }
+
+  function toggle(itemId: string) {
+    setSelectedItemIds((current) => {
+      const next = new Set(current);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  }
+
+  function editBundle(bundle: QuickPimBundle) {
+    loadBundleDraft(bundle, bundle.name);
+    setEditingBundleId(bundle.id);
+    setDraftMode("edit");
+    setDraftSourceName(bundle.name);
+  }
+
+  function duplicateBundle(bundle: QuickPimBundle) {
+    loadBundleDraft(bundle, getDuplicateBundleName(bundle.name, settings.bundles.map((item) => item.name)));
+    setEditingBundleId(undefined);
+    setDraftMode("duplicate");
+    setDraftSourceName(bundle.name);
+  }
+
+  function loadBundleDraft(bundle: QuickPimBundle, nextName: string) {
+    setName(nextName);
+    setSelectedItemIds(new Set(bundle.itemIds));
+    setDurationHours(bundle.defaultDurationHours || settings.preferences.defaultDurationHours);
+    setJustification(bundle.defaultJustification || "");
+  }
+
+  function resetDraft() {
+    setName("");
+    setSelectedItemIds(new Set());
+    setDurationHours(settings.preferences.defaultDurationHours);
+    setJustification("");
+    setEditingBundleId(undefined);
+    setDraftMode("create");
+    setDraftSourceName("");
+    setValidationWarning("");
+  }
+
+  return (
+    <section className="panel">
+      <h2>Role Bundles</h2>
+      {draftMode === "edit" ? <p className="muted">Editing {draftSourceName}</p> : null}
+      {draftMode === "duplicate" ? <p className="muted">Duplicating {draftSourceName}</p> : null}
+      <div className="form-grid">
+        <div className="field">
+          <label>Name</label>
+          <input className="input" value={name} onChange={(event) => setName(event.target.value)} placeholder="Daily operations" />
+        </div>
+        <div className="field">
+          <label>Duration</label>
+          <select
+            className="select"
+            value={String(durationOptions.some((option) => option.value === durationHours) ? durationHours : durationOptions[0]?.value || durationHours)}
+            onChange={(event) => setDurationHours(Number(event.target.value))}
+            disabled={!durationOptions.length}
+            aria-label="Bundle duration"
+          >
+            {durationOptions.length ? (
+              durationOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))
+            ) : (
+              <option value={durationHours}>Select roles first</option>
+            )}
+          </select>
+        </div>
+      </div>
+      <div className="field settings-field-gap">
+        <label>Justification</label>
+        <textarea
+          className="textarea justification-textarea"
+          rows={2}
+          value={justification}
+          onChange={(event) => {
+            setJustification(event.target.value);
+            if (validationWarning) setValidationWarning("");
+          }}
+          placeholder="Optional default"
+          aria-label="Bundle default justification"
+        />
+      </div>
+      {validationWarning ? <p className="message error settings-inline-message">{validationWarning}</p> : null}
+      <div className="checkbox-grid settings-section-gap">
+        {sortedItems.map((item) => (
+          <label className="checkbox-option" key={item.id}>
+            <input type="checkbox" checked={selectedItemIds.has(item.id)} onChange={() => toggle(item.id)} />
+            <span>
+              <strong>{getDisplayName(item, settings, referenceData)}</strong>
+              <br />
+              <span className="muted">{getScopeLabel(item, referenceData)}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="button-row settings-form-actions">
+        <button className="btn primary" onClick={() => void saveBundle()} disabled={!name.trim() || !selectedItemIds.size}>
+          {draftMode === "edit" ? "Save changes" : "Save bundle"}
+        </button>
+        {draftMode !== "create" ? (
+          <button className="btn" onClick={resetDraft}>
+            Cancel
+          </button>
+        ) : null}
+      </div>
+      <div className="panel">
+        <h3>Saved bundles</h3>
+        {settings.bundles.map((bundle) => (
+          <div className="alias-row" key={bundle.id}>
+            <div>
+              <strong>{bundle.name}</strong>
+              <p className="muted">
+                {bundle.itemIds.length} item(s)
+                {bundle.defaultJustification ? ` / ${bundle.defaultJustification}` : ""}
+              </p>
+            </div>
+            <div className="button-row nowrap">
+              <button className="btn" onClick={() => editBundle(bundle)}>
+                Edit
+              </button>
+              <button className="btn" onClick={() => duplicateBundle(bundle)}>
+                Duplicate
+              </button>
+              <button className="btn danger" onClick={() => void removeBundle(bundle.id)}>
+                Remove
+              </button>
+            </div>
+          </div>
+        ))}
+        {!settings.bundles.length ? <p className="muted">No bundles saved yet.</p> : null}
+      </div>
+    </section>
+  );
+}
+
+function PreferencesPanel({
+  settings,
+  onSave
+}: {
+  settings: QuickPimSettings;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+}) {
+  const [defaultDurationHours, setDefaultDurationHours] = useState(settings.preferences.defaultDurationHours);
+  const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
+  const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
+  const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
+  const [hiddenPopupTabs, setHiddenPopupTabs] = useState<Set<PopupTab>>(new Set(settings.preferences.hiddenPopupTabs));
+
+  useEffect(() => {
+    setDefaultDurationHours(settings.preferences.defaultDurationHours);
+    setDefaultSort(settings.preferences.defaultSort);
+    setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
+    setDarkMode(settings.preferences.darkMode);
+    setHiddenPopupTabs(new Set(settings.preferences.hiddenPopupTabs));
+  }, [
+    settings.preferences.darkMode,
+    settings.preferences.defaultDurationHours,
+    settings.preferences.defaultSort,
+    settings.preferences.hiddenPopupTabs,
+    settings.preferences.recentJustificationLimit
+  ]);
+
+  async function save() {
+    await onSave({
+      ...settings,
+      preferences: {
+        ...settings.preferences,
+        defaultDurationHours,
+        defaultSort,
+        recentJustificationLimit,
+        darkMode,
+        hiddenPopupTabs: [...hiddenPopupTabs]
+      }
+    });
+  }
+
+  function toggleHiddenPopupTab(tab: PopupTab, hidden: boolean) {
+    setHiddenPopupTabs((current) => {
+      const next = new Set(current);
+      if (hidden) {
+        next.add(tab);
+      } else {
+        next.delete(tab);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <section className="panel">
+      <h2>Preferences</h2>
+      <div className="preference-section">
+        <h3>Popup defaults</h3>
+        <p className="muted">These values are preselected when the popup opens. Role policies can still cap duration choices.</p>
+        <div className="form-grid three settings-section-gap">
+          <div className="field">
+            <label>Default activation duration</label>
+            <select
+              className="select"
+              value={String(defaultDurationHours)}
+              onChange={(event) => setDefaultDurationHours(Number(event.target.value))}
+              aria-label="Default activation duration"
+            >
+              {DEFAULT_DURATION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="muted">Preselected in the popup when selected roles allow it.</p>
+          </div>
+          <div className="field">
+            <label>Default sort order</label>
+            <select className="select" value={defaultSort} onChange={(event) => setDefaultSort(event.target.value as SortMode)}>
+              <option value="name">Name</option>
+              <option value="lastUsed">Last use</option>
+              <option value="activationCount">Activation count</option>
+              <option value="type">Type</option>
+              <option value="scope">Scope</option>
+            </select>
+            <p className="muted">Initial sort used in role tabs.</p>
+          </div>
+          <div className="field">
+            <label>Recent justification history limit</label>
+            <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
+            <p className="muted">How many recent reasons the picker keeps.</p>
+          </div>
+        </div>
+      </div>
+      <div className="preference-section">
+        <h3>Appearance</h3>
+        <label className="checkbox-option preference-toggle">
+          <input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} aria-label="Dark mode" />
+          <span>
+            <strong>Dark mode</strong>
+            <br />
+            <span className="muted">Use dark surfaces in the popup and settings.</span>
+          </span>
+        </label>
+      </div>
+      <div className="preference-section">
+        <h3>Popup tabs</h3>
+        <p className="muted">Hide tabs you do not use. Empty role-type tabs are also hidden automatically.</p>
+        <div className="checkbox-grid compact settings-section-gap">
+          {(["directoryRole", "pimGroup", "azureRole", "bundles"] as PopupTab[]).map((popupTab) => (
+            <label className="checkbox-option" key={popupTab}>
+              <input
+                type="checkbox"
+                checked={hiddenPopupTabs.has(popupTab)}
+                onChange={(event) => toggleHiddenPopupTab(popupTab, event.target.checked)}
+                aria-label={`Hide ${popupTabLabel(popupTab)} tab`}
+              />
+              <span>Hide {popupTabLabel(popupTab)} tab</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <div className="button-row settings-form-actions">
+        <button className="btn primary" onClick={() => void save()}>
+          Save preferences
+        </button>
+      </div>
+      <div className="panel">
+        <h3>Usage counters</h3>
+        {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
+          <div className="settings-row" key={id}>
+            <span>
+              {id}
+              <br />
+              <span className="muted">
+                {stats.activationCount} activation(s)
+                {stats.lastUsedAt ? ` / ${new Date(stats.lastUsedAt).toLocaleString()}` : ""}
+              </span>
+            </span>
+          </div>
+        ))}
+        <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [] }, "Usage data reset.")}>
+          Reset usage data
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function DataPanel({
+  settings,
+  exportText,
+  setExportText,
+  onSave,
+  onClearMessage
+}: {
+  settings: QuickPimSettings;
+  exportText: string;
+  setExportText: (value: string) => void;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onClearMessage: () => void;
+}) {
+  async function importSettings() {
+    onClearMessage();
+    const parsed = JSON.parse(exportText) as Partial<QuickPimSettings>;
+    await onSave(mergeSettings(parsed), "Settings imported.");
+  }
+
+  return (
+    <section className="panel">
+      <h2>Import / Export</h2>
+      <p className="muted">Settings are stored locally in Chrome storage under {SETTINGS_KEY}.</p>
+      <textarea className="textarea code-box" value={exportText} onChange={(event) => setExportText(event.target.value)} />
+      <div className="button-row settings-form-actions">
+        <button className="btn" onClick={() => setExportText(JSON.stringify(settings, null, 2))}>
+          Refresh export
+        </button>
+        <button className="btn primary" onClick={() => void importSettings()}>
+          Import JSON
+        </button>
+        <button className="btn danger" onClick={() => void onSave(DEFAULT_SETTINGS, "Settings reset.")}>
+          Reset all settings
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function tabLabel(tab: SettingsTab): string {
+  const labels: Record<SettingsTab, string> = {
+    home: "Home",
+    access: "Access Setup",
+    aliases: "Aliases",
+    justifications: "Justifications",
+    bundles: "Bundles",
+    preferences: "Preferences",
+    data: "Import / Export",
+    about: "About"
+  };
+  return labels[tab];
+}
+
+function tabFromHash(): SettingsTab {
+  const value = window.location.hash.replace("#", "");
+  if (value === "permissions") {
+    return "access";
+  }
+  if (["home", "about", "access", "aliases", "justifications", "bundles", "preferences", "data"].includes(value)) {
+    return value as SettingsTab;
+  }
+  return "home";
+}
+
+function applyDisplayData(
+  items: ActivationItem[],
+  settings: QuickPimSettings,
+  referenceData: ReferenceDataCache
+): ActivationItem[] {
+  return applyReferenceDataToItems(items, referenceData).map((item) => ({
+    ...item,
+    displayName: getDisplayName(item, settings, referenceData),
+    scopeLabel: getScopeLabel(item, referenceData)
+  }));
+}
+
+function getDuplicateBundleName(name: string, existingNames: string[]): string {
+  const baseName = `${name} copy`;
+  const existing = new Set(existingNames.map((item) => item.trim().toLowerCase()));
+  if (!existing.has(baseName.toLowerCase())) {
+    return baseName;
+  }
+
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${baseName} ${index}`;
+    if (!existing.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+
+  return `${baseName} ${Date.now()}`;
+}
+
+async function loadGithubChangelog(now = Date.now()): Promise<ChangelogItem[]> {
+  const cached = await loadCachedChangelog(now);
+  if (cached) {
+    return cached;
+  }
+
+  const releases = await fetchGithubJson(`${GITHUB_API_BASE}/releases?per_page=5`);
+  if (Array.isArray(releases) && releases.length) {
+    const items = releases
+      .filter((item): item is Record<string, unknown> => item && typeof item === "object")
+      .slice(0, 5)
+      .map((release) => ({
+        title: sanitizeChangelogText(release.name || release.tag_name || "Release", 100) || "Release",
+        description: getSummaryText(release.body) || "Release notes are available on GitHub.",
+        url: sanitizeGithubUrl(release.html_url),
+        date: sanitizeChangelogDate(release.published_at)
+      }));
+    await saveChangelogCache(items, now);
+    return items;
+  }
+
+  const commits = await fetchGithubJson(`${GITHUB_API_BASE}/commits?per_page=5`);
+  const items = Array.isArray(commits)
+    ? commits
+      .filter((item): item is Record<string, unknown> => item && typeof item === "object")
+      .slice(0, 5)
+      .map((item) => {
+        const commit = item.commit && typeof item.commit === "object" ? item.commit as Record<string, unknown> : {};
+        return {
+          title: getSummaryText(commit.message) || sanitizeChangelogText(item.sha, 7) || "Commit",
+          description: "Latest repository commit.",
+          url: sanitizeGithubUrl(item.html_url),
+          date: getCommitDate(commit)
+        };
+      })
+    : [];
+  await saveChangelogCache(items, now);
+  return items;
+}
+
+async function fetchGithubJson(url: string): Promise<unknown> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), CHANGELOG_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`GitHub returned ${response.status}`);
+    }
+    return await response.json();
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function getSummaryText(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.slice(0, 180) || "";
+}
+
+function getCommitDate(commit: Record<string, unknown>): string | undefined {
+  const author = commit.author && typeof commit.author === "object" ? commit.author as Record<string, unknown> : undefined;
+  return sanitizeChangelogDate(author?.date);
+}
+
+async function loadCachedChangelog(now: number): Promise<ChangelogItem[] | undefined> {
+  const result = await chrome.storage.local.get(CHANGELOG_CACHE_KEY);
+  const cache = coerceChangelogCache(result[CHANGELOG_CACHE_KEY]);
+  if (!cache || now - cache.fetchedAt > CHANGELOG_CACHE_TTL_MS) {
+    return undefined;
+  }
+  return cache.items;
+}
+
+async function saveChangelogCache(items: ChangelogItem[], fetchedAt: number): Promise<void> {
+  await chrome.storage.local.set({
+    [CHANGELOG_CACHE_KEY]: {
+      fetchedAt,
+      items: coerceChangelogItems(items)
+    }
+  });
+}
+
+function coerceChangelogCache(value: unknown): ChangelogCache | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const fetchedAt = Number(record.fetchedAt);
+  const items = coerceChangelogItems(record.items);
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || !items.length) {
+    return undefined;
+  }
+  return { fetchedAt, items };
+}
+
+function coerceChangelogItems(value: unknown): ChangelogItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, 5)
+    .flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return [];
+      }
+      const record = item as Record<string, unknown>;
+      const title = sanitizeChangelogText(record.title, 100);
+      if (!title) {
+        return [];
+      }
+      return [{
+        title,
+        description: sanitizeChangelogText(record.description, 180) || "Release notes are available on GitHub.",
+        url: sanitizeGithubUrl(record.url),
+        date: sanitizeChangelogDate(record.date)
+      }];
+    });
+}
+
+function sanitizeChangelogText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, maxLength) : "";
+}
+
+function sanitizeGithubUrl(value: unknown): string {
+  if (typeof value !== "string") {
+    return REPOSITORY_URL;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.hostname === "github.com" && parsed.pathname.startsWith("/RobinMJD/QuickPIM")
+      ? parsed.toString()
+      : REPOSITORY_URL;
+  } catch {
+    return REPOSITORY_URL;
+  }
+}
+
+function sanitizeChangelogDate(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return Number.isFinite(new Date(value).getTime()) ? value : undefined;
+}
+
+async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {
+  const response = (await chrome.runtime.sendMessage(message)) as MessageResponse<T>;
+  if (!response?.success) {
+    throw new Error(response?.error || "QuickPIM++ background request failed.");
+  }
+  return response.data as T;
+}
+
+createRoot(document.getElementById("root")!).render(<SettingsApp />);

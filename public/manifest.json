@@ -1,0 +1,45 @@
+{
+  "name": "QuickPIM++",
+  "version": "2.0.0",
+  "description": "Quickly view, select, group, and activate Microsoft Entra, Azure, and PIM group roles.",
+  "manifest_version": 3,
+  "permissions": ["storage", "webRequest"],
+  "host_permissions": [
+    "https://graph.microsoft.com/*",
+    "https://management.azure.com/*",
+    "https://entra.microsoft.com/*",
+    "https://api.github.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' https://graph.microsoft.com https://management.azure.com https://api.github.com"
+  },
+  "icons": {
+    "16": "img/QuickPim16.png",
+    "48": "img/QuickPim48.png",
+    "128": "img/QuickPim128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "img/QuickPim16.png",
+      "48": "img/QuickPim48.png",
+      "128": "img/QuickPim128.png"
+    }
+  },
+  "options_ui": {
+    "page": "settings.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://entra.microsoft.com/*"],
+      "js": ["portalTokenCollector.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}
