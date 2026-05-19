@@ -344,7 +344,8 @@ describe("settings helpers", () => {
         defaultDurationHours: 99,
         defaultSort: "invalid" as any,
         recentJustificationLimit: 99,
-        darkMode: true
+        darkMode: true,
+        hiddenPopupTabs: ["azureRole", "bundles", "unknown" as any, "azureRole"]
       }
     });
 
@@ -364,7 +365,8 @@ describe("settings helpers", () => {
       defaultDurationHours: 24,
       defaultSort: "name",
       recentJustificationLimit: 20,
-      darkMode: true
+      darkMode: true,
+      hiddenPopupTabs: ["azureRole", "bundles"]
     });
   });
 });

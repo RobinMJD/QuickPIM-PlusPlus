@@ -853,6 +853,10 @@ button {
   background: #f8fafc;
 }
 
+.checkbox-grid.compact {
+  max-height: none;
+}
+
 .checkbox-option {
   display: flex;
   gap: 8px;

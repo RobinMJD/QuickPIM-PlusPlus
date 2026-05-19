@@ -1,7 +1,5 @@
-import type { ActivationItem, TokenStatusEntry } from "./types";
-
-export type RoleTab = "directoryRole" | "pimGroup" | "azureRole";
-export type PopupTab = RoleTab | "bundles";
+import type { ActivationItem, PopupTab, RoleTab, TokenStatusEntry } from "./types";
+export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
   directoryRole:

@@ -104,6 +104,22 @@ function PopupApp() {
     [activeItems, eligibleItems]
   );
   const itemsById = useMemo(() => new Map(displayItems.map((item) => [item.id, item])), [displayItems]);
+  const hiddenPopupTabs = useMemo(() => new Set(settings.preferences.hiddenPopupTabs || []), [settings.preferences.hiddenPopupTabs]);
+  const itemTypesWithData = useMemo(() => new Set(displayItems.map((item) => item.type)), [displayItems]);
+  const roleTabs = useMemo<RoleTab[]>(
+    () =>
+      (["directoryRole", "pimGroup", "azureRole"] as RoleTab[]).filter(
+        (roleTab) => !hiddenPopupTabs.has(roleTab) && (isLoading || itemTypesWithData.has(roleTab))
+      ),
+    [hiddenPopupTabs, isLoading, itemTypesWithData]
+  );
+  const visibleTabs = useMemo<PopupTab[]>(() => {
+    const tabs: PopupTab[] = [...roleTabs];
+    if (!hiddenPopupTabs.has("bundles")) {
+      tabs.push("bundles");
+    }
+    return tabs;
+  }, [hiddenPopupTabs, roleTabs]);
   const favoriteIds = useMemo(() => new Set(settings.favoriteItemIds || []), [settings.favoriteItemIds]);
   const selectedItems = useMemo(
     () => getActivatableItems([...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item))),
@@ -129,6 +145,12 @@ function PopupApp() {
       return next.size === current.size ? current : next;
     });
   }, [itemsById]);
+
+  useEffect(() => {
+    if (visibleTabs.length && !visibleTabs.includes(tab)) {
+      setTab(visibleTabs[0]);
+    }
+  }, [tab, visibleTabs]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -302,7 +324,7 @@ function PopupApp() {
     }
   }
 
-  function openSettingsSection(section: "access" | "bundles") {
+  function openSettingsSection(section: "access" | "bundles" | "preferences") {
     const url = chrome.runtime.getURL(`settings.html#${section}`);
     if (chrome.tabs?.create) {
       void chrome.tabs.create({ url });
@@ -324,9 +346,10 @@ function PopupApp() {
     setSettings(updated);
   }
 
-  const roleTabs: RoleTab[] = ["directoryRole", "pimGroup", "azureRole"];
-  const portalUrl = getPortalUrlForTab(tab);
-  const portalLabel = roleTabs.includes(tab as RoleTab) ? tabLabel(tab as RoleTab) : "Microsoft Entra";
+  const activeTabIsVisible = visibleTabs.includes(tab);
+  const currentRoleTab = activeTabIsVisible && roleTabs.includes(tab as RoleTab) ? tab as RoleTab : undefined;
+  const portalUrl = activeTabIsVisible ? getPortalUrlForTab(tab) : undefined;
+  const portalLabel = currentRoleTab ? tabLabel(currentRoleTab) : "Microsoft Entra";
 
   return (
     <main className="app-shell">
@@ -363,22 +386,21 @@ function PopupApp() {
         />
       ) : null}
 
-      <nav className="tab-bar">
-        {roleTabs.map((roleTab) => (
-          <button className={`tab-button ${tab === roleTab ? "active" : ""}`} onClick={() => setTab(roleTab)} key={roleTab}>
-            {tabLabel(roleTab)}
-          </button>
-        ))}
-        <button className={`tab-button ${tab === "bundles" ? "active" : ""}`} onClick={() => setTab("bundles")}>
-          Bundles
-        </button>
-      </nav>
+      {visibleTabs.length ? (
+        <nav className="tab-bar">
+          {visibleTabs.map((visibleTab) => (
+            <button className={`tab-button ${tab === visibleTab ? "active" : ""}`} onClick={() => setTab(visibleTab)} key={visibleTab}>
+              {tabLabel(visibleTab)}
+            </button>
+          ))}
+        </nav>
+      ) : null}
 
       {error ? <p className="message error">{error}</p> : null}
       {message ? <p className="message">{message}</p> : null}
       {isLoading ? <LoadingState /> : null}
 
-      {roleTabs.includes(tab as RoleTab) ? (
+      {currentRoleTab ? (
         <>
           <section className="toolbar">
             <div className="control-with-icon filter-field">
@@ -432,7 +454,7 @@ function PopupApp() {
         </>
       ) : null}
 
-      {tab === "bundles" ? (
+      {activeTabIsVisible && tab === "bundles" ? (
         <section className="content item-list">
           {settings.bundles.length ? (
             settings.bundles.map((bundle) => {
@@ -460,6 +482,15 @@ function PopupApp() {
           )}
           <button className="btn" onClick={() => openSettingsSection("bundles")}>
             Open settings
+          </button>
+        </section>
+      ) : null}
+
+      {!isLoading && !visibleTabs.length ? (
+        <section className="content item-list empty-state">
+          <p>No popup tabs are visible. Change hidden tab preferences in Settings or refresh data.</p>
+          <button className="btn" onClick={() => openSettingsSection("preferences")}>
+            Settings
           </button>
         </section>
       ) : null}

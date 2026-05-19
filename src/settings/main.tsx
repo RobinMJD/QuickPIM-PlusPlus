@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets } from "../lib/access";
 import { DEFAULT_ELIGIBLE_CACHE_TTL_MS, formatCacheAge, getDataWithCache, loadDataCache, saveDataCache } from "../lib/cache";
-import { coerceDurationForItems, getDurationOptions } from "../lib/popupModel";
+import { coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -22,7 +22,7 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
-import type { AccessSetupTarget, ActivationItem, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import type { AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "about" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data";
 
@@ -838,16 +838,19 @@ function PreferencesPanel({
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
+  const [hiddenPopupTabs, setHiddenPopupTabs] = useState<Set<PopupTab>>(new Set(settings.preferences.hiddenPopupTabs));
 
   useEffect(() => {
     setDefaultDurationHours(settings.preferences.defaultDurationHours);
     setDefaultSort(settings.preferences.defaultSort);
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
     setDarkMode(settings.preferences.darkMode);
+    setHiddenPopupTabs(new Set(settings.preferences.hiddenPopupTabs));
   }, [
     settings.preferences.darkMode,
     settings.preferences.defaultDurationHours,
     settings.preferences.defaultSort,
+    settings.preferences.hiddenPopupTabs,
     settings.preferences.recentJustificationLimit
   ]);
 
@@ -859,8 +862,21 @@ function PreferencesPanel({
         defaultDurationHours,
         defaultSort,
         recentJustificationLimit,
-        darkMode
+        darkMode,
+        hiddenPopupTabs: [...hiddenPopupTabs]
       }
+    });
+  }
+
+  function toggleHiddenPopupTab(tab: PopupTab, hidden: boolean) {
+    setHiddenPopupTabs((current) => {
+      const next = new Set(current);
+      if (hidden) {
+        next.add(tab);
+      } else {
+        next.delete(tab);
+      }
+      return next;
     });
   }
 
@@ -894,6 +910,22 @@ function PreferencesPanel({
             <span className="muted">Use dark surfaces in the popup and settings.</span>
           </span>
         </label>
+      </div>
+      <div className="field settings-section-gap">
+        <label>Hidden popup tabs</label>
+        <div className="checkbox-grid compact">
+          {(["directoryRole", "pimGroup", "azureRole", "bundles"] as PopupTab[]).map((popupTab) => (
+            <label className="checkbox-option" key={popupTab}>
+              <input
+                type="checkbox"
+                checked={hiddenPopupTabs.has(popupTab)}
+                onChange={(event) => toggleHiddenPopupTab(popupTab, event.target.checked)}
+                aria-label={`Hide ${popupTabLabel(popupTab)} tab`}
+              />
+              <span>Hide {popupTabLabel(popupTab)} tab</span>
+            </label>
+          ))}
+        </div>
       </div>
       <div className="button-row settings-form-actions">
         <button className="btn primary" onClick={() => void save()}>

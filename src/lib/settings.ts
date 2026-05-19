@@ -5,7 +5,8 @@ import type {
   QuickPimBundle,
   ReferenceDataCache,
   QuickPimSettings,
-  SortMode
+  SortMode,
+  PopupTab
 } from "./types";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
 
@@ -37,6 +38,7 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     defaultSort: "name",
     recentJustificationLimit: 8,
     darkMode: false,
+    hiddenPopupTabs: [],
     permissionWarningIgnored: false
   }
 };
@@ -289,9 +291,25 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     darkMode: preferences.darkMode === true,
+    hiddenPopupTabs: sanitizePopupTabs(preferences.hiddenPopupTabs),
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,
     ...(ignoredAt ? { permissionWarningIgnoredAt: ignoredAt } : {})
   };
+}
+
+function sanitizePopupTabs(value: unknown): PopupTab[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<PopupTab>();
+  const result: PopupTab[] = [];
+  for (const item of value) {
+    if (!isPopupTab(item) || seen.has(item)) continue;
+    seen.add(item);
+    result.push(item);
+  }
+  return result;
 }
 
 function sanitizeBundles(value: unknown): QuickPimBundle[] {
@@ -401,6 +419,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isSortMode(value: unknown): value is SortMode {
   return value === "name" || value === "lastUsed" || value === "activationCount" || value === "type" || value === "scope";
+}
+
+function isPopupTab(value: unknown): value is PopupTab {
+  return value === "directoryRole" || value === "pimGroup" || value === "azureRole" || value === "bundles";
 }
 
 function isActivationItemType(value: unknown): value is ActivationItem["type"] {

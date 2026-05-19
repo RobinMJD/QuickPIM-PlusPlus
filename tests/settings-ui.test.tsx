@@ -689,4 +689,54 @@ describe("settings dark mode", () => {
       expect(document.body.classList.contains("dark-mode")).toBe(true);
     });
   });
+
+  test("saves hidden popup tab preferences", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#preferences");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationItems") {
+            return { success: true, data: { items: [], errors: [] } };
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Hidden popup tabs"));
+
+    document.querySelector<HTMLInputElement>('input[aria-label="Hide Azure Roles tab"]')?.click();
+    clickButton("Save preferences");
+
+    await waitFor(() => {
+      expect(storageData[SETTINGS_KEY]).toMatchObject({
+        preferences: expect.objectContaining({ hiddenPopupTabs: ["azureRole"] })
+      });
+    });
+  });
 });

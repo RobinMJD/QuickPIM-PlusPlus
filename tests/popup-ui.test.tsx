@@ -163,6 +163,17 @@ describe("popup compact controls", () => {
 
   test("renders filter and sort icons next to their toolbar fields", async () => {
     document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: DEFAULT_SETTINGS,
       [DATA_CACHE_KEY]: {
@@ -170,7 +181,7 @@ describe("popup compact controls", () => {
           fetchedAt: Date.now(),
           cacheKey: "graph:missing|azure:missing",
           errors: [],
-          items: []
+          items: [eligibleItem]
         },
         active: {
           fetchedAt: Date.now(),
@@ -212,9 +223,236 @@ describe("popup compact controls", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.querySelector(".filter-field .field-icon")).toBeTruthy();
     expect(document.querySelector(".sort-field .field-icon")).toBeTruthy();
+  });
+
+  test("hides empty role tabs while keeping populated role tabs visible", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const azureItem: ActivationItem = {
+      id: "azureRole:reader:/subscriptions/sub-1",
+      type: "azureRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Production",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      scope: "/subscriptions/sub-1"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [azureItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    const tabLabels = [...document.querySelectorAll(".tab-button")].map((button) => button.textContent?.trim());
+    expect(tabLabels).toEqual(["Azure Roles", "Bundles"]);
+  });
+
+  test("hides popup tabs disabled in preferences", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const items: ActivationItem[] = [
+      {
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        sourceName: "Reader",
+        displayName: "Reader",
+        principalId: "principal-1",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/"
+      },
+      {
+        id: "azureRole:owner:/subscriptions/sub-1",
+        type: "azureRole",
+        sourceName: "Owner",
+        displayName: "Owner",
+        principalId: "principal-1",
+        scopeLabel: "Production",
+        status: "eligible",
+        roleDefinitionId: "owner",
+        scope: "/subscriptions/sub-1"
+      }
+    ];
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          hiddenPopupTabs: ["azureRole"]
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    const tabLabels = [...document.querySelectorAll(".tab-button")].map((button) => button.textContent?.trim());
+    expect(tabLabels).toEqual(["Entra Roles", "Bundles"]);
+  });
+
+  test("does not force a hidden tab back into view when all popup tabs are hidden", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          hiddenPopupTabs: ["directoryRole", "pimGroup", "azureRole", "bundles"]
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [
+            {
+              id: "directoryRole:reader:/",
+              type: "directoryRole",
+              sourceName: "Reader",
+              displayName: "Reader",
+              principalId: "principal-1",
+              scopeLabel: "Tenant",
+              status: "eligible",
+              roleDefinitionId: "reader",
+              directoryScopeId: "/"
+            }
+          ]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("No popup tabs are visible"));
+    expect(document.querySelectorAll(".tab-button")).toHaveLength(0);
   });
 
   test("opens the Bundles settings section from the Bundles tab", async () => {
