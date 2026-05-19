@@ -8,16 +8,6 @@ Current version: **v2.0.1**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
-## Screenshots
-
-![QuickPIM++ popup activation overview](docs/images/screenshot-01-popup-overview-1280x800.png)
-
-![QuickPIM++ Access Setup showing enabled feature access checks](docs/images/screenshot-02-access-setup-1280x800.png)
-
-![QuickPIM++ Preferences showing enabled features](docs/images/screenshot-03-enabled-features-1280x800.png)
-
-![QuickPIM++ Chrome Web Store promo artwork](docs/images/marquee-promo-1400x560.png)
-
 ## Why QuickPIM++ Exists
 
 Microsoft PIM is useful, but the portal flow can be slow when you frequently need short-lived access across several Entra roles, Azure scopes, or PIM groups. QuickPIM++ keeps the security model of just-in-time activation while reducing the repeated portal navigation needed for daily work.
@@ -86,6 +76,8 @@ Settings are organized around setup, configuration, and local data:
 - **Import / Export** - move local configuration between browser profiles.
 - **About** - version, attribution, repository links, and local privacy note.
 
+![QuickPIM++ Preferences showing enabled feature areas](docs/images/screenshot-03-enabled-features-1280x800.png)
+
 ## Access Setup
 
 QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Access Setup** and choose **Open missing portal pages**.
@@ -97,6 +89,8 @@ The guided setup opens only the Microsoft portal pages needed for enabled featur
 - Azure roles
 
 If the opened portal page asks you to sign in, refresh, or load PIM data, complete that step in the portal tab and return to QuickPIM++. The extension then rechecks captured portal access and refreshes eligible data.
+
+![QuickPIM++ Access Setup showing feature-specific access checks](docs/images/screenshot-02-access-setup-1280x800.png)
 
 ## Privacy And Security Model
 
