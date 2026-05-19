@@ -23,6 +23,7 @@ export interface BaseActivationItem {
   principalId: string;
   scopeLabel: string;
   status: ActivationStatus;
+  activeUntil?: string;
   activationRequirements?: {
     justification?: boolean;
     ticket?: boolean;
@@ -266,6 +267,15 @@ export interface PimGroupApi {
   principalId?: string;
   accessId?: "member" | "owner";
   memberType?: string;
+  endDateTime?: string;
+  scheduleInfo?: {
+    startDateTime?: string;
+    expiration?: {
+      type?: string;
+      duration?: string;
+      endDateTime?: string;
+    };
+  };
 }
 
 export interface GroupInfo {

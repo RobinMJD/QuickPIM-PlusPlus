@@ -13,6 +13,9 @@ import {
   coerceDurationForItems,
   getDurationOptions,
   getPortalUrlForTab,
+  getActivatableItems,
+  getActiveStatusTitle,
+  mergeEligibleWithActive,
   tokenStatusText
 } from "../src/lib/popupModel";
 import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole } from "../src/lib/pim";
@@ -145,7 +148,41 @@ describe("popup model helpers", () => {
     expect(getPortalUrlForTab("directoryRole")).toBe(ENTRA_PORTAL_URLS.directoryRole);
     expect(getPortalUrlForTab("pimGroup")).toBe(ENTRA_PORTAL_URLS.pimGroup);
     expect(getPortalUrlForTab("azureRole")).toBe(ENTRA_PORTAL_URLS.azureRole);
-    expect(getPortalUrlForTab("active")).toBeUndefined();
+  });
+
+  test("overlays active state only onto matching eligible items", () => {
+    const activeDirectoryRole: ActivationItem = {
+      ...directoryRole,
+      status: "active",
+      activeUntil: "2026-05-18T14:00:00.000Z"
+    };
+    const activeOnlyRole: ActivationItem = {
+      ...azureRole,
+      status: "active",
+      activeUntil: "2026-05-18T15:00:00.000Z"
+    };
+
+    expect(mergeEligibleWithActive([directoryRole], [activeDirectoryRole, activeOnlyRole])).toEqual([
+      {
+        ...directoryRole,
+        status: "active",
+        activeUntil: "2026-05-18T14:00:00.000Z"
+      }
+    ]);
+  });
+
+  test("filters active items out of activatable selections", () => {
+    expect(getActivatableItems([directoryRole, { ...azureRole, status: "active" }])).toEqual([directoryRole]);
+  });
+
+  test("formats active status hover text when an end time is known", () => {
+    expect(
+      getActiveStatusTitle(
+        { ...directoryRole, status: "active", activeUntil: "2026-05-18T14:00:00.000Z" },
+        Date.parse("2026-05-18T12:30:00.000Z")
+      )
+    ).toBe("Active until 2026-05-18 14:00 (about 1 hour 30 minutes remaining)");
+    expect(getActiveStatusTitle({ ...directoryRole, status: "active" })).toBeUndefined();
   });
 
   test("only requests activation metadata fields required by selected items", () => {
@@ -241,6 +278,28 @@ describe("popup model helpers", () => {
     expect(getDurationOptions([cappedDirectoryRole, cappedAzureRole]).map((option) => option.value)).toEqual([0.5, 1, 2, 4]);
     expect(coerceDurationForItems(8, [cappedDirectoryRole, cappedAzureRole])).toBe(4);
     expect(coerceDurationForItems(1, [cappedDirectoryRole, cappedAzureRole])).toBe(1);
+  });
+
+  test("duration choices ignore already active selected items", () => {
+    const activeCappedRole: ActivationItem = {
+      ...directoryRole,
+      status: "active",
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 1
+      }
+    };
+    const eligibleCappedRole: ActivationItem = {
+      ...azureRole,
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 4
+      }
+    };
+
+    expect(getDurationOptions([activeCappedRole, eligibleCappedRole]).map((option) => option.value)).toEqual([0.5, 1, 2, 4]);
   });
 
   test("includes exact nonstandard maximum duration as a selectable value", () => {

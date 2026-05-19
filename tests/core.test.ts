@@ -11,8 +11,10 @@ import {
 } from "../src/lib/settings";
 import {
   buildActivationRequest,
+  buildRolePolicyRequirementMap,
   extractActivationRequirementsFromPolicyRules,
   durationHoursToIso,
+  getActiveUntilFromScheduleInfo,
   normalizeAzureRole,
   normalizeDirectoryRole,
   normalizePimGroup
@@ -235,6 +237,16 @@ describe("settings helpers", () => {
     });
   });
 
+  test("bundle expansion skips already active items", () => {
+    const bundle: QuickPimBundle = {
+      id: "bundle-1",
+      name: "Daily ops",
+      itemIds: ["directoryRole:reader:/", "pimGroup:group-1:member"]
+    };
+
+    expect(expandBundle(bundle, [{ ...items[0], status: "active" }, items[1]]).items).toEqual([items[1]]);
+  });
+
   test("records activation usage and history entries", () => {
     const now = "2026-05-18T12:00:00.000Z";
     const updated = recordActivations(baseSettings, items, now);
@@ -297,6 +309,63 @@ describe("settings helpers", () => {
 });
 
 describe("activation request builders", () => {
+  test("computes active end time from schedule info", () => {
+    expect(
+      getActiveUntilFromScheduleInfo({
+        startDateTime: "2026-05-18T12:00:00.000Z",
+        expiration: {
+          duration: "PT2H"
+        }
+      })
+    ).toBe("2026-05-18T14:00:00.000Z");
+    expect(
+      getActiveUntilFromScheduleInfo({
+        expiration: {
+          endDateTime: "2026-05-18T15:00:00.000Z"
+        }
+      })
+    ).toBe("2026-05-18T15:00:00.000Z");
+  });
+
+  test("maps policy requirements by full id, leaf id, and member owner aliases", () => {
+    const requirements = buildRolePolicyRequirementMap([
+      {
+        roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/contributor",
+        policy: {
+          rules: [
+            {
+              id: "Expiration_EndUser_Assignment",
+              maximumDuration: "PT4H",
+              target: { caller: "EndUser", level: "Assignment" }
+            }
+          ]
+        }
+      },
+      {
+        id: "group-member-policy",
+        properties: {
+          roleDefinitionId: "member",
+          policy: {
+            rules: [
+              {
+                id: "Expiration_EndUser_Assignment",
+                maximumDuration: "PT2H",
+                target: { caller: "EndUser", level: "Assignment" }
+              }
+            ]
+          }
+        }
+      }
+    ]);
+
+    expect(requirements["/subscriptions/sub-1/providers/microsoft.authorization/roledefinitions/contributor"]).toMatchObject({
+      maxDurationHours: 4
+    });
+    expect(requirements.contributor).toMatchObject({ maxDurationHours: 4 });
+    expect(requirements.member).toMatchObject({ maxDurationHours: 2 });
+    expect(requirements["group-member-policy"]).toMatchObject({ maxDurationHours: 2 });
+  });
+
   test("converts fractional hours to ISO-8601 minute durations", () => {
     expect(durationHoursToIso(1.5)).toBe("PT90M");
   });

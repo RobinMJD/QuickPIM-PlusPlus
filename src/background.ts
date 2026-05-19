@@ -1,12 +1,13 @@
 import {
   applyActivationRequirements,
+  buildRolePolicyRequirementMap,
   buildDirectoryRoleDefinitionNameMap,
   buildActivationRequest,
-  extractActivationRequirementsFromPolicyRules,
+  getActiveUntilFromScheduleInfo,
+  getRoleDefinitionLookupKeys,
   normalizeAzureRole,
   normalizeDirectoryRole,
-  normalizePimGroup,
-  parseIsoDurationMs
+  normalizePimGroup
 } from "./lib/pim";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
 import { mapWithConcurrency } from "./lib/concurrency";
@@ -651,7 +652,10 @@ async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: 
       return item;
     }
 
-    const requirements = requirementsByScope[item.scope]?.[item.roleDefinitionId.toLowerCase()];
+    const scopeRequirements = requirementsByScope[item.scope] || {};
+    const requirements = getRoleDefinitionLookupKeys(item.roleDefinitionId)
+      .map((key) => scopeRequirements[key])
+      .find(Boolean);
     return applyActivationRequirements(item, requirements);
   });
 }
@@ -679,15 +683,14 @@ async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationIt
   return roles
     .filter((role) => role.action === "selfActivate" && ["Provisioned", "Granted"].includes(role.status || ""))
     .map((role) => {
-      const startDateTime = role.scheduleInfo?.startDateTime;
-      const duration = role.scheduleInfo?.expiration?.duration;
-      const endTime = startDateTime && duration ? new Date(startDateTime).getTime() + parseIsoDurationMs(duration) : 0;
-      return { role, endTime };
+      const activeUntil = getActiveUntilFromScheduleInfo(role.scheduleInfo);
+      return { role, activeUntil };
     })
-    .filter(({ endTime }) => !endTime || endTime > now)
-    .map(({ role }) => ({
+    .filter(({ activeUntil }) => !activeUntil || new Date(activeUntil).getTime() > now)
+    .map(({ role, activeUntil }) => ({
       ...normalizeDirectoryRole(withDirectoryRoleScopeName(withDirectoryRoleDefinitionName(role, definitions), scopeNames)),
-      status: "active" as const
+      status: "active" as const,
+      ...(activeUntil ? { activeUntil } : {})
     }));
 }
 
@@ -711,7 +714,8 @@ async function getActiveAzureRoles(azureManagementToken: string): Promise<Activa
             subscriptionId: subscription.subscriptionId,
             subscriptionName: subscription.displayName
           }),
-          status: "active" as const
+          status: "active" as const,
+          ...(role.properties?.endDateTime ? { activeUntil: new Date(role.properties.endDateTime).toISOString() } : {})
         }));
     })
   );
@@ -773,7 +777,18 @@ async function getActivePimGroups(graphToken: string): Promise<ActivationItem[]>
     graphToken,
     [...new Set(schedules.map((schedule) => schedule.groupId).filter(Boolean) as string[])]
   );
-  return schedules.map((schedule) => ({ ...normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]), status: "active" }));
+  const now = Date.now();
+  return schedules
+    .map((schedule) => {
+      const activeUntil = schedule.endDateTime || getActiveUntilFromScheduleInfo(schedule.scheduleInfo);
+      return { schedule, activeUntil };
+    })
+    .filter(({ activeUntil }) => !activeUntil || new Date(activeUntil).getTime() > now)
+    .map(({ schedule, activeUntil }) => ({
+      ...normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]),
+      status: "active" as const,
+      ...(activeUntil ? { activeUntil: new Date(activeUntil).toISOString() } : {})
+    }));
 }
 
 async function activateItems(
@@ -886,35 +901,6 @@ async function safeJson(response: Response): Promise<any> {
 
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
   return [...new Map(items.map((item) => [item.id, item])).values()];
-}
-
-function buildRolePolicyRequirementMap(
-  assignments: RoleManagementPolicyAssignmentApi[]
-): Record<string, Partial<ActivationRequirements>> {
-  const entries = assignments.flatMap((assignment) => {
-    const roleDefinitionId = getPolicyAssignmentRoleDefinitionId(assignment);
-    const rules = getPolicyAssignmentRules(assignment);
-    if (!roleDefinitionId || !rules.length) {
-      return [];
-    }
-    return [[roleDefinitionId.toLowerCase(), extractActivationRequirementsFromPolicyRules(rules)] as const];
-  });
-  return Object.fromEntries(entries);
-}
-
-function getPolicyAssignmentRoleDefinitionId(assignment: RoleManagementPolicyAssignmentApi): string {
-  return assignment.roleDefinitionId || assignment.properties?.roleDefinitionId || "";
-}
-
-function getPolicyAssignmentRules(assignment: RoleManagementPolicyAssignmentApi) {
-  return (
-    assignment.policy?.rules ||
-    assignment.policy?.effectiveRules ||
-    assignment.properties?.effectiveRules ||
-    assignment.properties?.policy?.rules ||
-    assignment.properties?.policy?.effectiveRules ||
-    []
-  );
 }
 
 async function getPrincipalId(token: string): Promise<string> {

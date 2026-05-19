@@ -20,7 +20,10 @@ import {
   coerceDurationForItems,
   formatLoadMessages,
   getActivationRequirements,
+  getActivatableItems,
+  getActiveStatusTitle,
   getDurationOptions,
+  mergeEligibleWithActive,
   getPortalUrlForTab,
   tabLabel,
   tokenStatusText,
@@ -93,9 +96,13 @@ function PopupApp() {
     setDurationHours(settings.preferences.defaultDurationHours);
   }, [settings.preferences.defaultDurationHours, settings.preferences.defaultSort]);
 
-  const itemsById = useMemo(() => new Map(eligibleItems.map((item) => [item.id, item])), [eligibleItems]);
+  const displayItems = useMemo(
+    () => mergeEligibleWithActive(eligibleItems, activeItems),
+    [activeItems, eligibleItems]
+  );
+  const itemsById = useMemo(() => new Map(displayItems.map((item) => [item.id, item])), [displayItems]);
   const selectedItems = useMemo(
-    () => [...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item)),
+    () => getActivatableItems([...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item))),
     [itemsById, selectedIds]
   );
   const requirements = useMemo(() => getActivationRequirements(selectedItems), [selectedItems]);
@@ -112,16 +119,23 @@ function PopupApp() {
     }
   }, [durationOptions, selectedItems]);
 
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => itemsById.get(id)?.status === "eligible"));
+      return next.size === current.size ? current : next;
+    });
+  }, [itemsById]);
+
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
-    const filtered = eligibleItems.filter((item) => {
+    const filtered = displayItems.filter((item) => {
       const matchesType = item.type === tab;
       const name = getDisplayName(item, settings, referenceData).toLowerCase();
       const scope = getScopeLabel(item, referenceData).toLowerCase();
       return matchesType && (!term || name.includes(term) || scope.includes(term));
     });
     return sortItems(filtered, settings, sortMode, referenceData);
-  }, [eligibleItems, referenceData, search, settings, sortMode, tab]);
+  }, [displayItems, referenceData, search, settings, sortMode, tab]);
 
   async function refresh(options: { force: boolean }) {
     setIsLoading(true);
@@ -185,6 +199,9 @@ function PopupApp() {
 
   function toggleSelected(itemId: string) {
     setSelectedIds((current) => {
+      if (itemsById.get(itemId)?.status !== "eligible") {
+        return current;
+      }
       const next = new Set(current);
       if (next.has(itemId)) {
         next.delete(itemId);
@@ -196,18 +213,20 @@ function PopupApp() {
   }
 
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
+    const activatableItems = getActivatableItems(items);
+    if (!activatableItems.length) {
+      setError(items.length ? "All selected items are already active." : "Select at least one role or group.");
+      return;
+    }
+
     const effectiveJustification = bundle?.defaultJustification || justification;
-    const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, items);
+    const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, activatableItems);
     const effectiveTicketInfo: TicketInfo = {
       ticketSystem: bundle?.defaultTicketSystem || ticketSystem || undefined,
       ticketNumber: bundle?.defaultTicketNumber || ticketNumber || undefined
     };
 
-    if (!items.length) {
-      setError("Select at least one role or group.");
-      return;
-    }
-    if (getActivationRequirements(items).needsJustification && !effectiveJustification.trim()) {
+    if (getActivationRequirements(activatableItems).needsJustification && !effectiveJustification.trim()) {
       setError("Enter a justification or choose a saved one.");
       return;
     }
@@ -218,14 +237,14 @@ function PopupApp() {
     try {
       const response = await sendMessage<ActivationResponse>({
         action: "activateItems",
-        items,
+        items: activatableItems,
         durationHours: effectiveDuration,
         justification: effectiveJustification,
         ticketInfo: effectiveTicketInfo
       });
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => items.find((item) => item.id === result.itemId))
+        .map((result) => activatableItems.find((item) => item.id === result.itemId))
         .filter((item): item is ActivationItem => Boolean(item));
 
       let updatedSettings = addRecentJustification(settings, effectiveJustification);
@@ -252,7 +271,7 @@ function PopupApp() {
   }
 
   function useBundleDefaults(bundle: QuickPimBundle) {
-    const expansion = expandBundle(bundle, eligibleItems);
+    const expansion = expandBundle(bundle, displayItems);
     setSelectedIds(new Set(expansion.items.map((item) => item.id)));
     if (expansion.durationHours) setDurationHours(expansion.durationHours);
     if (expansion.justification) setJustification(expansion.justification);
@@ -310,7 +329,7 @@ function PopupApp() {
                   Loading access state
                 </span>
               ) : (
-                `${eligibleItems.length} eligible items`
+                `${displayItems.length} eligible items`
               )}
             </p>
           </div>
@@ -336,9 +355,6 @@ function PopupApp() {
             {tabLabel(roleTab)}
           </button>
         ))}
-        <button className={`tab-button ${tab === "active" ? "active" : ""}`} onClick={() => setTab("active")}>
-          Active
-        </button>
         <button className={`tab-button ${tab === "bundles" ? "active" : ""}`} onClick={() => setTab("bundles")}>
           Bundles
         </button>
@@ -397,17 +413,11 @@ function PopupApp() {
         </>
       ) : null}
 
-      {tab === "active" ? (
-        <section className="content">
-          <RoleList items={sortItems(activeItems, settings, "name", referenceData)} settings={settings} referenceData={referenceData} selectedIds={new Set()} readonly />
-        </section>
-      ) : null}
-
       {tab === "bundles" ? (
         <section className="content item-list">
           {settings.bundles.length ? (
             settings.bundles.map((bundle) => {
-              const expansion = expandBundle(bundle, eligibleItems);
+              const expansion = expandBundle(bundle, displayItems);
               return (
                 <div className="bundle-card" key={bundle.id}>
                   <h3>{bundle.name}</h3>
@@ -499,32 +509,40 @@ function RoleList({
   readonly?: boolean;
 }) {
   if (!items.length) {
-    return <EmptyState text={readonly ? "No active roles or groups found." : "No eligible roles or groups found."} />;
+    return <EmptyState text="No eligible roles or groups found." />;
   }
 
   return (
     <div className="item-list">
       {items.map((item) => {
         const usage = getUsage(item, settings);
-        const selected = selectedIds.has(item.id);
+        const isSelectable = !readonly && item.status === "eligible";
+        const selected = isSelectable && selectedIds.has(item.id);
+        const activeTitle = getActiveStatusTitle(item);
         const body = (
           <>
             <div>
               <p className="role-title">{getDisplayName(item, settings, referenceData)}</p>
               <div className="role-meta">
                 <span className={`badge ${item.type}`}>{typeLabel(item.type)}</span>
-                <span>{getScopeLabel(item, referenceData)}</span>
-                <span>{usage.activationCount} activations</span>
+                <span className="scope-label">{getScopeLabel(item, referenceData)}</span>
                 {usage.lastUsedAt ? <span>last {new Date(usage.lastUsedAt).toLocaleDateString()}</span> : null}
               </div>
             </div>
-            <span className="badge">{item.status}</span>
+            <div className="role-status-stack">
+              <span className="activation-count" title={`${usage.activationCount} activation${usage.activationCount === 1 ? "" : "s"}`}>
+                {usage.activationCount}
+              </span>
+              <span className={`badge status-badge ${item.status}`} title={activeTitle}>
+                {item.status}
+              </span>
+            </div>
           </>
         );
 
-        if (readonly) {
+        if (!isSelectable) {
           return (
-            <div className="role-row readonly" key={item.id}>
+            <div className={`role-row readonly ${item.status === "active" ? "active-row" : ""}`} key={item.id}>
               {body}
             </div>
           );

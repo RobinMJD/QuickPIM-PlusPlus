@@ -9,6 +9,7 @@ import type {
   GroupInfo,
   PimGroupApi,
   PimGroupItem,
+  RoleManagementPolicyAssignmentApi,
   RoleManagementPolicyRuleApi,
   TicketInfo
 } from "./types";
@@ -64,6 +65,51 @@ export function extractActivationRequirementsFromPolicyRules(
   }
 
   return requirements;
+}
+
+export function buildRolePolicyRequirementMap(
+  assignments: RoleManagementPolicyAssignmentApi[]
+): Record<string, Partial<NonNullable<ActivationItem["activationRequirements"]>>> {
+  const entries = assignments.flatMap((assignment) => {
+    const rules = getPolicyAssignmentRules(assignment);
+    if (!rules.length) {
+      return [];
+    }
+    const requirements = extractActivationRequirementsFromPolicyRules(rules);
+    return getPolicyAssignmentKeys(assignment).map((key) => [key, requirements] as const);
+  });
+  return Object.fromEntries(entries);
+}
+
+export function getRoleDefinitionLookupKeys(roleDefinitionId: string | undefined): string[] {
+  if (!roleDefinitionId) {
+    return [];
+  }
+  const lower = roleDefinitionId.toLowerCase();
+  const leaf = lower.split("/").filter(Boolean).at(-1);
+  return [...new Set([lower, leaf].filter((key): key is string => Boolean(key)))];
+}
+
+export function getActiveUntilFromScheduleInfo(scheduleInfo: unknown): string | undefined {
+  if (!isRecord(scheduleInfo)) {
+    return undefined;
+  }
+  const expiration = isRecord(scheduleInfo.expiration) ? scheduleInfo.expiration : {};
+  const endDateTime = typeof expiration.endDateTime === "string" ? expiration.endDateTime : undefined;
+  if (endDateTime && Number.isFinite(new Date(endDateTime).getTime())) {
+    return new Date(endDateTime).toISOString();
+  }
+  const startDateTime = typeof scheduleInfo.startDateTime === "string" ? scheduleInfo.startDateTime : undefined;
+  const duration = typeof expiration.duration === "string" ? expiration.duration : undefined;
+  if (!startDateTime || !duration) {
+    return undefined;
+  }
+  const startMs = new Date(startDateTime).getTime();
+  const durationMs = parseIsoDurationMs(duration);
+  if (!Number.isFinite(startMs) || durationMs <= 0) {
+    return undefined;
+  }
+  return new Date(startMs + durationMs).toISOString();
 }
 
 export function applyActivationRequirements<T extends ActivationItem>(
@@ -298,6 +344,29 @@ function addTicketInfo(target: Record<string, unknown>, ticketInfo: TicketInfo) 
       ticketNumber: ticketInfo.ticketNumber || "N/A"
     };
   }
+}
+
+function getPolicyAssignmentKeys(assignment: RoleManagementPolicyAssignmentApi): string[] {
+  return [
+    ...getRoleDefinitionLookupKeys(assignment.roleDefinitionId),
+    ...getRoleDefinitionLookupKeys(assignment.properties?.roleDefinitionId),
+    ...getRoleDefinitionLookupKeys(assignment.id)
+  ];
+}
+
+function getPolicyAssignmentRules(assignment: RoleManagementPolicyAssignmentApi): RoleManagementPolicyRuleApi[] {
+  return (
+    assignment.policy?.rules ||
+    assignment.policy?.effectiveRules ||
+    assignment.properties?.effectiveRules ||
+    assignment.properties?.policy?.rules ||
+    assignment.properties?.policy?.effectiveRules ||
+    []
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 function validateActivationInput(

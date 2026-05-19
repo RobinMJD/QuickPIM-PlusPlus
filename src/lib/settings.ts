@@ -189,7 +189,7 @@ export function createActivationHistoryEntries(
 export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): BundleExpansion {
   const bundleItems = bundle.itemIds
     .map((itemId) => items.find((item) => item.id === itemId))
-    .filter((item): item is ActivationItem => Boolean(item));
+    .filter((item): item is ActivationItem => Boolean(item && item.status === "eligible"));
   const ticketInfo: TicketInfo = {};
 
   if (bundle.defaultTicketSystem) {

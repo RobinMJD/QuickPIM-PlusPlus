@@ -1,7 +1,7 @@
 import type { ActivationItem, TokenStatusEntry } from "./types";
 
 export type RoleTab = "directoryRole" | "pimGroup" | "azureRole";
-export type PopupTab = RoleTab | "active" | "bundles";
+export type PopupTab = RoleTab | "bundles";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
   directoryRole:
@@ -53,11 +53,12 @@ export function formatLoadMessages(messages: string[]): string[] {
 }
 
 export function getDurationOptions(items: ActivationItem[]): Array<{ value: number; label: string }> {
-  if (!items.length) {
+  const activatableItems = getActivatableItems(items);
+  if (!activatableItems.length) {
     return [];
   }
 
-  const maxDurationHours = getSelectedMaxDurationHours(items);
+  const maxDurationHours = getSelectedMaxDurationHours(activatableItems);
   const values = maxDurationHours ? [...BASE_DURATION_VALUES, maxDurationHours] : BASE_DURATION_VALUES;
   return [...new Set(values)]
     .filter((value) => !maxDurationHours || value <= maxDurationHours)
@@ -100,9 +101,10 @@ export function tokenStatusTone(status: TokenStatusEntry | undefined): "ok" | "w
 }
 
 export function getActivationRequirements(items: ActivationItem[]) {
+  const activatableItems = getActivatableItems(items);
   return {
-    needsJustification: items.some((item) => item.activationRequirements?.justification !== false),
-    needsTicket: items.some((item) => item.activationRequirements?.ticket === true)
+    needsJustification: activatableItems.some((item) => item.activationRequirements?.justification !== false),
+    needsTicket: activatableItems.some((item) => item.activationRequirements?.ticket === true)
   };
 }
 
@@ -111,10 +113,50 @@ export function tabLabel(tab: PopupTab): string {
     directoryRole: "Entra Roles",
     pimGroup: "PIM Groups",
     azureRole: "Azure Roles",
-    active: "Active",
     bundles: "Bundles"
   };
   return labels[tab];
+}
+
+export function mergeEligibleWithActive(eligibleItems: ActivationItem[], activeItems: ActivationItem[]): ActivationItem[] {
+  const activeById = new Map(activeItems.map((item) => [item.id, item]));
+  return eligibleItems.map((item) => {
+    const activeItem = activeById.get(item.id);
+    return activeItem ? { ...item, status: "active", activeUntil: activeItem.activeUntil || item.activeUntil } : item;
+  });
+}
+
+export function getActivatableItems(items: ActivationItem[]): ActivationItem[] {
+  return items.filter((item) => item.status === "eligible");
+}
+
+export function getActiveStatusTitle(item: ActivationItem, now = Date.now()): string | undefined {
+  if (item.status !== "active" || !item.activeUntil) {
+    return undefined;
+  }
+  const activeUntilMs = new Date(item.activeUntil).getTime();
+  if (!Number.isFinite(activeUntilMs)) {
+    return undefined;
+  }
+  const activeUntil = item.activeUntil.replace("T", " ").slice(0, 16);
+  const remaining = formatRemainingTime(activeUntilMs - now);
+  return remaining ? `Active until ${activeUntil} (${remaining} remaining)` : `Active until ${activeUntil}`;
+}
+
+function formatRemainingTime(remainingMs: number): string {
+  const totalMinutes = Math.max(0, Math.ceil(remainingMs / 60000));
+  if (totalMinutes <= 0) {
+    return "less than 1 minute";
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (!hours) {
+    return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+  if (!minutes) {
+    return `about ${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  return `about ${hours} hour${hours === 1 ? "" : "s"} ${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
 function formatLoadMessage(message: string): string {
