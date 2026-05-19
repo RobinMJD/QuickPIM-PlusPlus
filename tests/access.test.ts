@@ -27,6 +27,28 @@ const freshTokensWithoutVisibleScopes: TokenStatus = {
   }
 };
 
+const freshTokensWithPimGroupReadOnlyScope: TokenStatus = {
+  graph: {
+    hasToken: true,
+    isExpired: false,
+    tokenAge: 1,
+    grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
+  },
+  graphTargets: {
+    pimGroup: {
+      hasToken: true,
+      isExpired: false,
+      tokenAge: 1,
+      grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
+    }
+  },
+  azureManagement: {
+    hasToken: true,
+    isExpired: false,
+    tokenAge: 1
+  }
+};
+
 describe("portal-driven access setup", () => {
   test("selects only portal targets that need setup", () => {
     const items = buildAccessCapabilityItems(missingTokens, {});
@@ -61,6 +83,44 @@ describe("portal-driven access setup", () => {
       status: "ready",
       detail: "Last API check succeeded."
     });
+  });
+
+  test("does not mark PIM groups ready when activation write scope is missing", () => {
+    const cache: QuickPimDataCache = {
+      eligible: {
+        items: [
+          {
+            id: "pimGroup:group-1:member",
+            type: "pimGroup",
+            sourceName: "Ops Group",
+            displayName: "Ops Group",
+            principalId: "user-1",
+            groupId: "group-1",
+            accessId: "member",
+            scopeLabel: "Group",
+            status: "eligible"
+          }
+        ],
+        errors: [],
+        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+        diagnostics: [
+          {
+            target: "pimGroup",
+            success: true,
+            checkedAt: "2026-05-18T12:00:00.000Z"
+          }
+        ]
+      }
+    };
+
+    const status = buildAccessCapabilityItems(freshTokensWithPimGroupReadOnlyScope, cache);
+
+    expect(status.find((item) => item.target === "pimGroup")).toMatchObject({
+      status: "limited",
+      detail: "Captured Graph token can read PIM Groups, but it is missing the write scope required for activation.",
+      lastError: expect.stringContaining("PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup")
+    });
+    expect(getAccessSetupTargets(status)).toContain("pimGroup");
   });
 
   test("uses loaded cached items as a ready signal when old caches have no diagnostics", () => {
@@ -187,5 +247,40 @@ describe("portal-driven access setup", () => {
     });
 
     expect(second).toBe(first);
+  });
+
+  test("includes target-specific Graph tokens in cache keys", () => {
+    const first = buildTokenCacheKey({
+      graph: {
+        hasToken: true,
+        grantedScopes: ["RoleEligibilitySchedule.Read.Directory"]
+      },
+      graphTargets: {
+        pimGroup: {
+          hasToken: true,
+          grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
+        }
+      },
+      azureManagement: {
+        hasToken: true
+      }
+    });
+    const second = buildTokenCacheKey({
+      graph: {
+        hasToken: true,
+        grantedScopes: ["RoleEligibilitySchedule.Read.Directory"]
+      },
+      graphTargets: {
+        pimGroup: {
+          hasToken: true,
+          grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+        }
+      },
+      azureManagement: {
+        hasToken: true
+      }
+    });
+
+    expect(second).not.toBe(first);
   });
 });

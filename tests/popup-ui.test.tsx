@@ -1081,15 +1081,15 @@ describe("popup compact controls", () => {
   test("shows activation errors without waiting forever", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
-      id: "directoryRole:reader:/",
-      type: "directoryRole",
-      sourceName: "Reader",
-      displayName: "Reader",
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Cybersec PIM Group",
+      displayName: "Cybersec PIM Group",
       principalId: "principal-1",
-      scopeLabel: "Tenant",
+      scopeLabel: "Member",
       status: "eligible",
-      roleDefinitionId: "reader",
-      directoryScopeId: "/",
+      groupId: "group-1",
+      accessId: "member",
       activationRequirements: {
         justification: false,
         ticket: false
@@ -1117,12 +1117,16 @@ describe("popup compact controls", () => {
       runtime: {
         sendMessage: vi.fn((message: { action: string }) => {
           if (message.action === "activateItems") {
+            const permissionError = JSON.stringify({
+              errorCode: "PermissionScopeNotGranted",
+              message: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup."
+            });
             return Promise.resolve({
               success: true,
               data: {
                 success: false,
-                results: [{ itemId: eligibleItem.id, itemName: "Reader", success: false, error: "Policy requires approval" }],
-                errors: [{ itemId: eligibleItem.id, itemName: "Reader", success: false, error: "Policy requires approval" }]
+                results: [{ itemId: eligibleItem.id, itemName: "Cybersec PIM Group", success: false, error: permissionError }],
+                errors: [{ itemId: eligibleItem.id, itemName: "Cybersec PIM Group", success: false, error: permissionError }]
               }
             });
           }
@@ -1154,7 +1158,7 @@ describe("popup compact controls", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    await waitFor(() => expect(document.body.textContent).toContain("Cybersec PIM Group"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     await waitFor(() => expect(document.body.textContent).toContain("Continue"));
     clickButton("Continue");
@@ -1162,7 +1166,8 @@ describe("popup compact controls", () => {
     clickButton("Activate 1 selected");
 
     await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
-    expect(document.body.textContent).toContain("Reader: Policy requires approval");
+    expect(document.body.textContent).toContain("Cybersec PIM Group: PIM Groups access is limited in the captured portal token.");
+    expect(document.body.textContent).not.toContain("PermissionScopeNotGranted");
   });
 
   test("toggles favorite rows with a star button and keeps favorites first", async () => {

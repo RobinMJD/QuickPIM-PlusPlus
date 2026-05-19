@@ -1,4 +1,9 @@
 import { ENTRA_GRAPH_BOOTSTRAP_URLS, ENTRA_PORTAL_URLS } from "./popupModel";
+import {
+  getMatchedGraphActivationScope,
+  getRequiredGraphActivationScopes,
+  type GraphTokenTarget
+} from "./graphTokenCapabilities";
 import type {
   AccessCapabilityStatus,
   AccessDiagnostic,
@@ -23,7 +28,7 @@ const TARGET_LABELS: Record<AccessSetupTarget, string> = {
   azureRole: "Azure Roles"
 };
 
-const TARGET_REQUIRED_SCOPES: Record<AccessSetupTarget, string[]> = {
+const TARGET_READ_SCOPES: Record<AccessSetupTarget, string[]> = {
   directoryRole: [
     "RoleEligibilitySchedule.Read.Directory",
     "RoleEligibilitySchedule.ReadWrite.Directory",
@@ -70,10 +75,28 @@ export function getPortalUrlsForTargets(targets: AccessSetupTarget[]): string[] 
 }
 
 export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined): string {
-  return [
-    buildTokenCachePart("graph", tokenStatus?.graph),
-    buildTokenCachePart("azure", tokenStatus?.azureManagement)
-  ].join("|");
+  const parts = [buildTokenCachePart("graph", tokenStatus?.graph)];
+  if (tokenStatus?.graphTargets) {
+    parts.push(
+      buildTokenCachePart("graphDirectory", tokenStatus.graphTargets.directoryRole),
+      buildTokenCachePart("graphPimGroup", tokenStatus.graphTargets.pimGroup)
+    );
+  }
+  parts.push(buildTokenCachePart("azure", tokenStatus?.azureManagement));
+  return parts.join("|");
+}
+
+export function hasRequiredPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus): boolean {
+  const token = getTokenStatusForTarget(target, tokenStatus);
+  if (!token?.hasToken || token.isExpired) {
+    return false;
+  }
+
+  if (target === "azureRole") {
+    return true;
+  }
+
+  return !hasKnownScopes(token) || Boolean(getMatchedGraphActivationScope(target, new Set(token.grantedScopes || [])));
 }
 
 function buildTokenCachePart(label: string, token: TokenStatusEntry | undefined): string {
@@ -103,6 +126,17 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "needsPortalRefresh",
       detail: token?.isExpired ? "Captured token expired. Open the portal to refresh it." : "Open the portal so QuickPIM++ can capture a token."
+    };
+  }
+
+  const missingActivationScopeDetail = getMissingActivationScopeDetail(target, token);
+  if (missingActivationScopeDetail) {
+    return {
+      target,
+      label: TARGET_LABELS[target],
+      status: "limited",
+      detail: missingActivationScopeDetail.detail,
+      lastError: missingActivationScopeDetail.lastError
     };
   }
 
@@ -145,7 +179,7 @@ function buildAccessCapabilityItem(
   }
 
   const grantedScopes = new Set(token.grantedScopes || []);
-  const matchedScope = TARGET_REQUIRED_SCOPES[target].find((scope) => grantedScopes.has(scope));
+  const matchedScope = TARGET_READ_SCOPES[target].find((scope) => grantedScopes.has(scope));
   if (matchedScope) {
     return {
       target,
@@ -167,7 +201,35 @@ function getTokenStatusForTarget(
   target: AccessSetupTarget,
   tokenStatus: TokenStatus | null | undefined
 ): TokenStatusEntry | undefined {
-  return target === "azureRole" ? tokenStatus?.azureManagement : tokenStatus?.graph;
+  if (target === "azureRole") {
+    return tokenStatus?.azureManagement;
+  }
+  return tokenStatus?.graphTargets?.[target] || tokenStatus?.graph;
+}
+
+function getMissingActivationScopeDetail(
+  target: AccessSetupTarget,
+  token: TokenStatusEntry
+): { detail: string; lastError: string } | undefined {
+  if (target === "azureRole" || !hasKnownScopes(token)) {
+    return undefined;
+  }
+
+  const graphTarget = target as GraphTokenTarget;
+  const grantedScopes = new Set(token.grantedScopes || []);
+  if (getMatchedGraphActivationScope(graphTarget, grantedScopes)) {
+    return undefined;
+  }
+
+  const requiredScopes = getRequiredGraphActivationScopes(graphTarget).join(" or ");
+  return {
+    detail: `Captured Graph token can read ${TARGET_LABELS[target]}, but it is missing the write scope required for activation.`,
+    lastError: `Missing activation scope: ${requiredScopes}. Open Access Setup and reload the matching Microsoft portal page.`
+  };
+}
+
+function hasKnownScopes(token: TokenStatusEntry): boolean {
+  return Boolean(token.grantedScopes?.length);
 }
 
 function collectDiagnostics(cache: QuickPimDataCache | undefined): AccessDiagnostic[] {

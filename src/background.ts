@@ -11,9 +11,11 @@ import {
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
 import { mapWithConcurrency } from "./lib/concurrency";
 import {
+  getRequiredGraphActivationScopes,
   getGraphTokenOverallScore,
   getGraphTokenTargetScore,
   getGraphTokenTargets,
+  hasGraphActivationScope,
   type GraphTokenTarget
 } from "./lib/graphTokenCapabilities";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
@@ -369,6 +371,10 @@ async function getTokenStatus(): Promise<TokenStatus> {
   const tokens = await getStoredTokens();
   const graphStatusToken = selectGraphTokenForStatus(tokens);
   const graphValidation = graphStatusToken?.token ? validateCapturedToken(graphStatusToken.token, "graph") : undefined;
+  const directoryRoleStatusToken = selectGraphTokenForTargetStatus(tokens, "directoryRole");
+  const pimGroupStatusToken = selectGraphTokenForTargetStatus(tokens, "pimGroup");
+  const directoryRoleValidation = directoryRoleStatusToken?.token ? validateCapturedToken(directoryRoleStatusToken.token, "graph") : undefined;
+  const pimGroupValidation = pimGroupStatusToken?.token ? validateCapturedToken(pimGroupStatusToken.token, "graph") : undefined;
   const azureValidation = tokens.azureManagementToken
     ? validateCapturedToken(tokens.azureManagementToken, "azureManagement")
     : undefined;
@@ -382,6 +388,14 @@ async function getTokenStatus(): Promise<TokenStatus> {
 
   return {
     graph: graphValidation?.ok ? makeTokenStatus(graphStatusToken?.token, graphStatusToken?.timestamp, graphStatusToken?.source) : { hasToken: false },
+    graphTargets: {
+      directoryRole: directoryRoleValidation?.ok
+        ? makeTokenStatus(directoryRoleStatusToken?.token, directoryRoleStatusToken?.timestamp, directoryRoleStatusToken?.source)
+        : { hasToken: false },
+      pimGroup: pimGroupValidation?.ok
+        ? makeTokenStatus(pimGroupStatusToken?.token, pimGroupStatusToken?.timestamp, pimGroupStatusToken?.source)
+        : { hasToken: false }
+    },
     azureManagement: azureValidation?.ok
       ? makeTokenStatus(
           tokens.azureManagementToken,
@@ -390,6 +404,24 @@ async function getTokenStatus(): Promise<TokenStatus> {
         )
       : { hasToken: false }
   };
+}
+
+function selectGraphTokenForTargetStatus(tokens: StoredTokens, target: GraphTokenTarget): { token?: string; timestamp?: number; source?: string } | undefined {
+  if (target === "directoryRole" && tokens.graphDirectoryRoleToken) {
+    return {
+      token: tokens.graphDirectoryRoleToken,
+      timestamp: tokens.graphDirectoryRoleTokenTimestamp,
+      source: tokens.graphDirectoryRoleTokenSource
+    };
+  }
+  if (target === "pimGroup" && tokens.graphPimGroupToken) {
+    return {
+      token: tokens.graphPimGroupToken,
+      timestamp: tokens.graphPimGroupTokenTimestamp,
+      source: tokens.graphPimGroupTokenSource
+    };
+  }
+  return { token: tokens.graphToken, timestamp: tokens.tokenTimestamp, source: tokens.tokenSource };
 }
 
 function selectGraphTokenForStatus(tokens: StoredTokens): { token?: string; timestamp?: number; source?: string } | undefined {
@@ -997,6 +1029,7 @@ async function activateItems(
         if (!token) {
           throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
         }
+        assertTokenCanActivate(item, token, request.tokenKind);
 
         const response = await fetch(request.endpoint, {
           method: request.method,
@@ -1036,6 +1069,22 @@ async function activateItems(
     results,
     errors
   };
+}
+
+function assertTokenCanActivate(item: ActivationItem, token: string, tokenKind: TokenKind): void {
+  if (tokenKind !== "graph" || item.type === "azureRole") {
+    return;
+  }
+
+  const target: GraphTokenTarget = item.type === "pimGroup" ? "pimGroup" : "directoryRole";
+  const decoded = decodeToken(token);
+  if (!decoded || hasGraphActivationScope(decoded, target)) {
+    return;
+  }
+
+  const label = target === "pimGroup" ? "PIM group" : "Entra role";
+  const requiredScopes = getRequiredGraphActivationScopes(target).join(" or ");
+  throw new Error(`${label} activation needs a captured Graph token with ${requiredScopes}. Run Access Setup and reload the matching Microsoft portal page.`);
 }
 
 function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, tokenKind: TokenKind): string | undefined {

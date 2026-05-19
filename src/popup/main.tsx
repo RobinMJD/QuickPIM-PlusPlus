@@ -368,7 +368,7 @@ function PopupApp() {
       setSelectedIds(new Set());
       setActivationProgress(ACTIVATION_STEPS[2]);
       if (response.errors.length) {
-        setError(response.errors.map((item) => `${item.itemName}: ${item.error}`).join(" "));
+        setError(response.errors.map(formatActivationError).join(" "));
       }
       if (successItems.length) {
         await refresh({ force: true, showLoading: false, suppressMessage: true });
@@ -380,6 +380,12 @@ function PopupApp() {
       setActivationProgress(null);
       setIsActivating(false);
     }
+  }
+
+  function formatActivationError(item: ActivationResponse["errors"][number]): string {
+    const error = item.error || "Activation failed.";
+    const formatted = formatLoadMessages([error])[0] || error;
+    return `${item.itemName}: ${formatted}`;
   }
 
   async function saveCurrentJustification() {

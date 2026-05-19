@@ -23,6 +23,9 @@ const PIM_GROUP_SCOPES = [
 
 export const GRAPH_TOKEN_TARGETS: GraphTokenTarget[] = ["directoryRole", "pimGroup"];
 
+const DIRECTORY_ROLE_ACTIVATION_SCOPES = ["RoleAssignmentSchedule.ReadWrite.Directory", "RoleManagement.ReadWrite.Directory"];
+const PIM_GROUP_ACTIVATION_SCOPES = ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup", "PrivilegedAccess.ReadWrite.AzureADGroup"];
+
 export function getGrantedTokenScopes(decoded: Record<string, unknown>): Set<string> {
   const scopes = typeof decoded.scp === "string" ? decoded.scp.split(/\s+/).filter(Boolean) : [];
   const roles = Array.isArray(decoded.roles) ? decoded.roles.filter((role): role is string => typeof role === "string") : [];
@@ -41,6 +44,10 @@ export function getGraphTokenTargetScore(
 ): number {
   const targetScopes = target === "directoryRole" ? DIRECTORY_ROLE_SCOPES : PIM_GROUP_SCOPES;
   const exactMatches = targetScopes.filter((scope) => scopes.has(scope)).length;
+  const activationMatches = getRequiredGraphActivationScopes(target).filter((scope) => scopes.has(scope)).length;
+  if (activationMatches) {
+    return 200 + activationMatches * 10 + exactMatches;
+  }
   if (exactMatches) {
     return 100 + exactMatches;
   }
@@ -54,6 +61,18 @@ export function getGraphTokenTargetScore(
   }
 
   return 0;
+}
+
+export function getRequiredGraphActivationScopes(target: GraphTokenTarget): string[] {
+  return target === "directoryRole" ? DIRECTORY_ROLE_ACTIVATION_SCOPES : PIM_GROUP_ACTIVATION_SCOPES;
+}
+
+export function getMatchedGraphActivationScope(target: GraphTokenTarget, scopes: Set<string>): string | undefined {
+  return getRequiredGraphActivationScopes(target).find((scope) => scopes.has(scope));
+}
+
+export function hasGraphActivationScope(decoded: Record<string, unknown>, target: GraphTokenTarget): boolean {
+  return Boolean(getMatchedGraphActivationScope(target, getGrantedTokenScopes(decoded)));
 }
 
 export function getGraphTokenOverallScore(decoded: Record<string, unknown>): number {

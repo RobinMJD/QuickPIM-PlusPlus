@@ -150,6 +150,7 @@ export interface TokenStatusEntry {
 
 export interface TokenStatus {
   graph: TokenStatusEntry;
+  graphTargets?: Partial<Record<Exclude<AccessSetupTarget, "azureRole">, TokenStatusEntry>>;
   azureManagement: TokenStatusEntry;
 }
 

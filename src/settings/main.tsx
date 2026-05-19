@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
-import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets } from "../lib/access";
+import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
 import { DEFAULT_ELIGIBLE_CACHE_TTL_MS, formatCacheAge, getDataWithCache, loadDataCache, saveDataCache } from "../lib/cache";
 import { DEFAULT_DURATION_OPTIONS, coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
 import {
@@ -682,12 +682,6 @@ function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[numbe
   if (status === "ready") return "Ready";
   if (status === "limited") return "Limited";
   return "Needs portal refresh";
-}
-
-function hasRequiredPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus): boolean {
-  return target === "azureRole"
-    ? Boolean(tokenStatus.azureManagement.hasToken && !tokenStatus.azureManagement.isExpired)
-    : Boolean(tokenStatus.graph.hasToken && !tokenStatus.graph.isExpired);
 }
 
 function delay(ms: number): Promise<void> {

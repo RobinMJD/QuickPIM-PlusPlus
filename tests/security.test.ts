@@ -9,7 +9,8 @@ import {
 import {
   getGraphTokenOverallScore,
   getGraphTokenTargetScore,
-  getGraphTokenTargets
+  getGraphTokenTargets,
+  hasGraphActivationScope
 } from "../src/lib/graphTokenCapabilities";
 import { validateQuickPimMessage } from "../src/lib/messages";
 import { buildActivationRequest } from "../src/lib/pim";
@@ -90,6 +91,21 @@ describe("Graph token capability detection", () => {
     expect(getGraphTokenTargetScore(pimGroupToken, "pimGroup")).toBeGreaterThan(0);
     expect(getGraphTokenTargetScore(pimGroupToken, "directoryRole")).toBe(0);
     expect(getGraphTokenOverallScore(pimGroupToken)).toBeGreaterThan(0);
+  });
+
+  test("scores activation-capable PIM group tokens above read-only tokens", () => {
+    const readOnlyToken = {
+      scp: "PrivilegedEligibilitySchedule.Read.AzureADGroup PrivilegedAssignmentSchedule.Read.AzureADGroup RoleManagementPolicy.Read.AzureADGroup",
+      exp: Math.floor((now + 10 * 60_000) / 1000)
+    };
+    const activationToken = {
+      scp: "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup",
+      exp: Math.floor((now + 10 * 60_000) / 1000)
+    };
+
+    expect(hasGraphActivationScope(readOnlyToken, "pimGroup")).toBe(false);
+    expect(hasGraphActivationScope(activationToken, "pimGroup")).toBe(true);
+    expect(getGraphTokenTargetScore(activationToken, "pimGroup")).toBeGreaterThan(getGraphTokenTargetScore(readOnlyToken, "pimGroup"));
   });
 });
 
