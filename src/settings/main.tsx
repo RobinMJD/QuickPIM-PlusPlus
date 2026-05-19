@@ -22,6 +22,10 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
+import {
+  GENERIC_JUSTIFICATION_WARNING,
+  getGenericJustificationWarning
+} from "../lib/justifications";
 import type { AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "about" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data";
@@ -578,10 +582,17 @@ function JustificationsPanel({
   onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
 }) {
   const [value, setValue] = useState("");
+  const [validationWarning, setValidationWarning] = useState("");
 
   async function add() {
     const trimmed = value.trim();
     if (!trimmed) return;
+    const genericJustificationWarning = getGenericJustificationWarning(trimmed);
+    if (genericJustificationWarning) {
+      setValidationWarning(genericJustificationWarning);
+      return;
+    }
+    setValidationWarning("");
     const exists = settings.savedJustifications.some((item) => item.toLowerCase() === trimmed.toLowerCase());
     await onSave({
       ...settings,
@@ -601,11 +612,20 @@ function JustificationsPanel({
     <section className="panel">
       <h2>Justifications</h2>
       <div className="form-row">
-        <input className="input" value={value} onChange={(event) => setValue(event.target.value)} placeholder="Reusable justification" />
+        <input
+          className="input"
+          value={value}
+          onChange={(event) => {
+            setValue(event.target.value);
+            if (validationWarning) setValidationWarning("");
+          }}
+          placeholder="Reusable justification"
+        />
         <button className="btn primary" onClick={() => void add()} disabled={!value.trim()}>
           Add
         </button>
       </div>
+      <p className="field-warning settings-field-gap">{validationWarning || GENERIC_JUSTIFICATION_WARNING}</p>
       <div className="two-column settings-section-gap">
         <div className="panel">
           <h3>Saved</h3>
@@ -653,6 +673,7 @@ function BundlesPanel({
   const [editingBundleId, setEditingBundleId] = useState<string | undefined>();
   const [draftMode, setDraftMode] = useState<"create" | "edit" | "duplicate">("create");
   const [draftSourceName, setDraftSourceName] = useState("");
+  const [validationWarning, setValidationWarning] = useState("");
   const sortedItems = useMemo(
     () => [...items].sort((a, b) => getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData))),
     [items, referenceData, settings]
@@ -671,6 +692,12 @@ function BundlesPanel({
 
   async function saveBundle() {
     if (!name.trim() || !selectedItemIds.size) return;
+    const genericJustificationWarning = getGenericJustificationWarning(justification);
+    if (genericJustificationWarning) {
+      setValidationWarning(genericJustificationWarning);
+      return;
+    }
+    setValidationWarning("");
     const effectiveDuration = coerceDurationForItems(durationHours, selectedItems);
     const bundle: QuickPimBundle = {
       id: editingBundleId || createBundleId(name),
@@ -731,6 +758,7 @@ function BundlesPanel({
     setEditingBundleId(undefined);
     setDraftMode("create");
     setDraftSourceName("");
+    setValidationWarning("");
   }
 
   return (
@@ -770,11 +798,16 @@ function BundlesPanel({
           className="textarea justification-textarea"
           rows={2}
           value={justification}
-          onChange={(event) => setJustification(event.target.value)}
+          onChange={(event) => {
+            setJustification(event.target.value);
+            if (validationWarning) setValidationWarning("");
+          }}
           placeholder="Optional default"
           aria-label="Bundle default justification"
         />
+        <p className="field-warning">{GENERIC_JUSTIFICATION_WARNING}</p>
       </div>
+      {validationWarning ? <p className="message error settings-inline-message">{validationWarning}</p> : null}
       <div className="checkbox-grid settings-section-gap">
         {sortedItems.map((item) => (
           <label className="checkbox-option" key={item.id}>

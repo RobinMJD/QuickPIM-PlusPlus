@@ -430,6 +430,63 @@ describe("settings Access Setup page", () => {
   });
 });
 
+describe("settings justification guardrails", () => {
+  test("blocks generic saved justifications", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#justifications");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: { items: [], errors: [] } };
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Justifications"));
+
+    setFieldValue(document.querySelector<HTMLInputElement>('input[placeholder="Reusable justification"]')!, "needed");
+    clickButton("Add");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Justifications are requested for audit and approval"));
+    expect(storageData[SETTINGS_KEY]).toMatchObject({
+      savedJustifications: []
+    });
+  });
+});
+
 describe("settings Bundles page", () => {
   const bundleItems = [
     {
@@ -522,6 +579,64 @@ describe("settings Bundles page", () => {
       const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Bundle duration"]');
       expect(duration).toBeTruthy();
       expect([...duration!.options].map((option) => option.textContent)).toEqual(["30 minutes", "1 hour", "2 hours"]);
+    });
+  });
+
+  test("blocks generic bundle default justifications", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#bundles");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: bundleItems
+        }
+      }
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Role Bundles"));
+
+    setFieldValue(document.querySelector<HTMLInputElement>('input[placeholder="Daily operations"]')!, "Daily operations");
+    setFieldValue(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]')!, "Admin");
+    const readerOption = [...document.querySelectorAll("label.checkbox-option")].find((item) => item.textContent?.includes("Reader"));
+    readerOption?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    clickButton("Save bundle");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Generic answers such as BAU, Admin, or needed are blocked."));
+    expect(storageData[SETTINGS_KEY]).toMatchObject({
+      bundles: []
     });
   });
 

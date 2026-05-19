@@ -616,6 +616,30 @@ button {
   font-weight: 900;
 }
 
+.practice-warning {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid #fed7aa;
+  border-radius: 8px;
+  background: #fff7ed;
+  color: #9a3412;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.field-warning {
+  margin: 0;
+  color: #9a3412;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.settings-inline-message {
+  margin: 8px 0 0;
+}
+
 .activation-bar {
   position: fixed;
   left: 0;
@@ -1016,6 +1040,16 @@ body.dark-mode .permission-banner {
   background: #422006;
   border-color: #92400e;
   color: #fed7aa;
+}
+
+body.dark-mode .practice-warning {
+  background: #422006;
+  border-color: #92400e;
+  color: #fed7aa;
+}
+
+body.dark-mode .field-warning {
+  color: #fdba74;
 }
 
 body.dark-mode .message.error,

@@ -103,6 +103,7 @@ describe("activation request validation", () => {
   test("rejects invalid activation duration, oversized strings, and unsafe Azure scopes", () => {
     expect(() => buildActivationRequest(directoryRole, 25, "Need access")).toThrow(/duration/i);
     expect(() => buildActivationRequest(directoryRole, 1, "x".repeat(1025))).toThrow(/justification/i);
+    expect(() => buildActivationRequest(directoryRole, 1, "BAU")).toThrow(/generic/i);
     expect(() =>
       buildActivationRequest(
         {

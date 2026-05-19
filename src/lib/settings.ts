@@ -9,6 +9,7 @@ import type {
   PopupTab
 } from "./types";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
+import { isGenericJustification } from "./justifications";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
 const MAX_HISTORY_ENTRIES = 50;
@@ -51,8 +52,8 @@ export function mergeSettings(input: Partial<QuickPimSettings> | undefined): Qui
     favoriteItemIds: sanitizeFavoriteItemIds(source.favoriteItemIds),
     usageStatsByItemId: sanitizeUsageStats(source.usageStatsByItemId),
     preferences: sanitizePreferences(source.preferences),
-    savedJustifications: sanitizeStringList(source.savedJustifications, MAX_SAVED_JUSTIFICATIONS, MAX_JUSTIFICATION_LENGTH),
-    recentJustifications: sanitizeStringList(source.recentJustifications, 20, MAX_JUSTIFICATION_LENGTH),
+    savedJustifications: sanitizeJustificationList(source.savedJustifications, MAX_SAVED_JUSTIFICATIONS),
+    recentJustifications: sanitizeJustificationList(source.recentJustifications, 20),
     bundles: sanitizeBundles(source.bundles),
     activationHistory: sanitizeActivationHistory(source.activationHistory),
     version: 1
@@ -124,7 +125,7 @@ export function sortItems(
 
 export function addRecentJustification(settings: QuickPimSettings, justification: string): QuickPimSettings {
   const trimmed = justification.trim();
-  if (!trimmed) {
+  if (!trimmed || isGenericJustification(trimmed)) {
     return settings;
   }
 
@@ -142,7 +143,7 @@ export function addRecentJustification(settings: QuickPimSettings, justification
 
 export function addSavedJustification(settings: QuickPimSettings, justification: string): QuickPimSettings {
   const trimmed = justification.trim();
-  if (!trimmed) {
+  if (!trimmed || isGenericJustification(trimmed)) {
     return settings;
   }
 
@@ -327,16 +328,21 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
     }
     const id = sanitizeString(bundle.id, MAX_ITEM_ID_LENGTH) || createBundleId(name);
     const itemIds = sanitizeStringList(bundle.itemIds, MAX_BUNDLE_ITEMS, MAX_ITEM_ID_LENGTH);
+    const defaultJustification = sanitizeString(bundle.defaultJustification, MAX_JUSTIFICATION_LENGTH);
     return [
       {
         id,
         name,
         itemIds,
         defaultDurationHours: clampNumber(bundle.defaultDurationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
-        defaultJustification: sanitizeString(bundle.defaultJustification, MAX_JUSTIFICATION_LENGTH)
+        defaultJustification: defaultJustification && !isGenericJustification(defaultJustification) ? defaultJustification : undefined
       }
     ];
   });
+}
+
+function sanitizeJustificationList(value: unknown, limit: number): string[] {
+  return sanitizeStringList(value, limit, MAX_JUSTIFICATION_LENGTH).filter((item) => !isGenericJustification(item));
 }
 
 function sanitizeActivationHistory(value: unknown): ActivationHistoryEntry[] {

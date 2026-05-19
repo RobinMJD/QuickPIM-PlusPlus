@@ -50,6 +50,10 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
+import {
+  GENERIC_JUSTIFICATION_WARNING,
+  getGenericJustificationWarning
+} from "../lib/justifications";
 import type {
   ActivationItem,
   ActivationResponse,
@@ -146,6 +150,10 @@ function PopupApp() {
   const selectedItems = useMemo(
     () => getActivatableItems([...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item))),
     [itemsById, selectedIds]
+  );
+  const selectedDirectoryRoleCount = useMemo(
+    () => selectedItems.filter((item) => item.type === "directoryRole").length,
+    [selectedItems]
   );
   const requirements = useMemo(() => getActivationRequirements(selectedItems), [selectedItems]);
   const durationOptions = useMemo(() => getDurationOptions(selectedItems), [selectedItems]);
@@ -291,16 +299,24 @@ function PopupApp() {
       return;
     }
 
-    const effectiveJustification = bundle?.defaultJustification || justification;
+    const activationRequirements = getActivationRequirements(activatableItems);
+    const effectiveJustification = activationRequirements.needsJustification ? bundle?.defaultJustification || justification : "";
     const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, activatableItems);
     const effectiveTicketInfo: TicketInfo = {
       ticketSystem: ticketSystem || undefined,
       ticketNumber: ticketNumber || undefined
     };
 
-    if (getActivationRequirements(activatableItems).needsJustification && !effectiveJustification.trim()) {
-      setError("Enter a justification or choose a saved one.");
-      return;
+    if (activationRequirements.needsJustification) {
+      if (!effectiveJustification.trim()) {
+        setError("Enter a justification or choose a saved one.");
+        return;
+      }
+      const genericJustificationWarning = getGenericJustificationWarning(effectiveJustification);
+      if (genericJustificationWarning) {
+        setError(genericJustificationWarning);
+        return;
+      }
     }
 
     setIsActivating(true);
@@ -343,6 +359,11 @@ function PopupApp() {
   }
 
   async function saveCurrentJustification() {
+    const genericJustificationWarning = getGenericJustificationWarning(justification);
+    if (genericJustificationWarning) {
+      setError(genericJustificationWarning);
+      return;
+    }
     const updated = addSavedJustification(settings, justification);
     await saveSettings(updated);
     setSettings(updated);
@@ -491,6 +512,7 @@ function PopupApp() {
             requirements={requirements}
             durationOptions={durationOptions}
             selectedCount={selectedItems.length}
+            selectedDirectoryRoleCount={selectedDirectoryRoleCount}
             isActivating={isActivating}
             onActivate={() => void activate(selectedItems)}
             onSaveJustification={() => void saveCurrentJustification()}
@@ -701,6 +723,7 @@ function ActivationBar(props: {
   requirements: ReturnType<typeof getActivationRequirements>;
   durationOptions: Array<{ value: number; label: string }>;
   selectedCount: number;
+  selectedDirectoryRoleCount: number;
   isActivating: boolean;
   onActivate: () => void;
   onSaveJustification: () => void;
@@ -713,6 +736,14 @@ function ActivationBar(props: {
     : props.durationOptions[0]?.value;
   return (
     <section className="activation-bar">
+      {hasSelection && props.selectedDirectoryRoleCount > 4 ? (
+        <div className="practice-warning" role="status">
+          <strong>Select only what you need.</strong>
+          <span>
+            PIM works best when roles are activated only for a specific need. Selecting many Entra roles by default reduces the value of just-in-time access.
+          </span>
+        </div>
+      ) : null}
       {hasSelection && props.durationOptions.length ? (
         <div className="field">
           <label>Activation time</label>
@@ -742,6 +773,7 @@ function ActivationBar(props: {
             onChange={(event) => props.setJustification(event.target.value)}
             placeholder="Why do you need this activation?"
           />
+          <p className="field-warning">{GENERIC_JUSTIFICATION_WARNING}</p>
         </div>
       ) : null}
       {hasSelection && props.requirements.needsJustification && justificationOptions.length ? (

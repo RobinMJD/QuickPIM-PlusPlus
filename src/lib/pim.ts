@@ -14,6 +14,7 @@ import type {
   TicketInfo
 } from "./types";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./apiUrls";
+import { getGenericJustificationWarning } from "./justifications";
 
 const MAX_DURATION_HOURS = 24;
 const MAX_JUSTIFICATION_LENGTH = 1024;
@@ -405,6 +406,10 @@ function validateActivationInput(
 
   if (typeof justification !== "string" || justification.length > MAX_JUSTIFICATION_LENGTH) {
     throw new Error(`Activation justification must be ${MAX_JUSTIFICATION_LENGTH} characters or fewer.`);
+  }
+  const genericJustificationWarning = getGenericJustificationWarning(justification);
+  if (genericJustificationWarning) {
+    throw new Error(`Generic activation justification is not allowed. ${genericJustificationWarning}`);
   }
 
   if ((ticketInfo.ticketSystem?.length || 0) > MAX_TICKET_FIELD_LENGTH || (ticketInfo.ticketNumber?.length || 0) > MAX_TICKET_FIELD_LENGTH) {

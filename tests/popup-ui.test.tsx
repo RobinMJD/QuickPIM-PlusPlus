@@ -48,6 +48,13 @@ function clickButton(label: string): HTMLButtonElement {
   return button;
 }
 
+function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  setter?.call(field, value);
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 describe("popup loading UI", () => {
   test("shows only one loading access message while data is loading", async () => {
     document.body.innerHTML = '<div id="root"></div>';
@@ -1032,6 +1039,158 @@ describe("popup compact controls", () => {
     const readerRow = rows.find((row) => row.textContent?.includes("Global Reader"));
     expect(adminRow?.querySelector(".crown-icon")).toBeTruthy();
     expect(readerRow?.querySelector(".crown-icon")).toBeFalsy();
+  });
+});
+
+describe("popup activation guardrails", () => {
+  test("warns when selecting more than four Entra roles", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const items: ActivationItem[] = Array.from({ length: 5 }, (_, index) => ({
+      id: `directoryRole:role-${index + 1}:/`,
+      type: "directoryRole",
+      sourceName: `Role ${index + 1}`,
+      displayName: `Role ${index + 1}`,
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: `role-${index + 1}`,
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: false,
+        ticket: false
+      }
+    }));
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Role 5"));
+    document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((checkbox) => checkbox.click());
+
+    await waitFor(() => expect(document.body.textContent).toContain("PIM works best when roles are activated only for a specific need"));
+    expect(document.body.textContent).toContain("Selecting many Entra roles by default reduces the value of just-in-time access.");
+  });
+
+  test("blocks generic justification text before sending activation", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: true,
+        ticket: false
+      }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: false },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      if (message.action === "activateItems") {
+        return Promise.resolve({ success: true, data: { success: true, results: [], errors: [] } });
+      }
+      return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        sendMessage
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
+    setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "BAU");
+    clickButton("Activate 1 selected");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Justifications are requested for audit and approval"));
+    expect(document.body.textContent).toContain("Generic answers such as BAU, Admin, or needed are blocked.");
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "activateItems" }));
   });
 });
 
