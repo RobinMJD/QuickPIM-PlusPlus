@@ -10,13 +10,13 @@ Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](ht
 
 ## Screenshots
 
-![QuickPIM++ popup with eligible roles and activation controls](docs/images/quickpim-popup.png)
+![QuickPIM++ popup activation overview](docs/images/screenshot-01-popup-overview-1280x800.png)
 
-![QuickPIM++ Access Setup showing enabled feature access checks](docs/images/quickpim-access-setup.png)
+![QuickPIM++ Access Setup showing enabled feature access checks](docs/images/screenshot-02-access-setup-1280x800.png)
 
-![QuickPIM++ Preferences showing enabled features](docs/images/quickpim-enabled-features.png)
+![QuickPIM++ Preferences showing enabled features](docs/images/screenshot-03-enabled-features-1280x800.png)
 
-![QuickPIM++ role bundle management](docs/images/quickpim-bundles.png)
+![QuickPIM++ Chrome Web Store promo artwork](docs/images/marquee-promo-1400x560.png)
 
 ## Why QuickPIM++ Exists
 

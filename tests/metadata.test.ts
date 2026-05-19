@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { APP_NAME, APP_VERSION } from "../src/lib/appMetadata";
 
@@ -64,5 +64,15 @@ describe("versioning and extension manifest", () => {
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");
     expect(license).toContain("Daniel Bradley and QuickPIM++ contributors");
+  });
+
+  test("references existing README images", () => {
+    const readme = readFileSync(resolve("README.md"), "utf8");
+    const imagePaths = [...readme.matchAll(/!\[[^\]]+\]\((docs\/images\/[^)]+)\)/g)].map((match) => match[1]);
+
+    expect(imagePaths.length).toBeGreaterThan(0);
+    for (const imagePath of imagePaths) {
+      expect(existsSync(resolve(imagePath))).toBe(true);
+    }
   });
 });
