@@ -37,6 +37,15 @@ async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promi
   throw new Error("Timed out waiting for assertion.");
 }
 
+function clickButton(label: string): HTMLButtonElement {
+  const button = [...document.querySelectorAll("button")].find((item) => item.textContent?.trim() === label);
+  if (!button) {
+    throw new Error(`Button not found: ${label}`);
+  }
+  button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  return button;
+}
+
 describe("popup loading UI", () => {
   test("shows only one loading access message while data is loading", async () => {
     document.body.innerHTML = '<div id="root"></div>';
@@ -204,6 +213,69 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
     expect(document.querySelector(".filter-field .field-icon")).toBeTruthy();
     expect(document.querySelector(".sort-field .field-icon")).toBeTruthy();
+  });
+
+  test("opens the Bundles settings section from the Bundles tab", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+    const openedUrls: string[] = [];
+
+    const chromeMock = {
+      runtime: {
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        openOptionsPage: vi.fn(),
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn(({ url }: { url: string }) => openedUrls.push(url))
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    clickButton("Bundles");
+    await waitFor(() => expect(document.body.textContent).toContain("Create role bundles from Settings."));
+    clickButton("Open settings");
+
+    expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#bundles"]);
+    expect(chromeMock.runtime.openOptionsPage).not.toHaveBeenCalled();
   });
 });
 

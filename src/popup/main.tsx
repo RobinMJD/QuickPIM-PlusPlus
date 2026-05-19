@@ -281,8 +281,8 @@ function PopupApp() {
     }
   }
 
-  function openPermissionDetails() {
-    const url = chrome.runtime.getURL("settings.html#access");
+  function openSettingsSection(section: "access" | "bundles") {
+    const url = chrome.runtime.getURL(`settings.html#${section}`);
     if (chrome.tabs?.create) {
       void chrome.tabs.create({ url });
     } else {
@@ -336,8 +336,8 @@ function PopupApp() {
       {showPermissionWarning ? (
         <PermissionWarningBanner
           missingCount={accessSetupTargets.length}
-          onFix={openPermissionDetails}
-          onDetails={openPermissionDetails}
+          onFix={() => openSettingsSection("access")}
+          onDetails={() => openSettingsSection("access")}
           onIgnore={() => void ignorePermissionWarning()}
         />
       ) : null}
@@ -434,7 +434,7 @@ function PopupApp() {
           ) : (
             <EmptyState text="Create role bundles from Settings." />
           )}
-          <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
+          <button className="btn" onClick={() => openSettingsSection("bundles")}>
             Open settings
           </button>
         </section>
