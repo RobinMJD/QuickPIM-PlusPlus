@@ -134,6 +134,7 @@ export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleIte
   const directoryScopeId = role.directoryScopeId || "/";
   const roleName = role.roleDefinition?.displayName || role.roleName || role.roleDefinitionDisplayName || roleDefinitionId;
   const scopeName = role.directoryScopeDisplayName || role.directoryScope?.displayName;
+  const isPrivileged = role.isPrivileged ?? role.roleDefinition?.isPrivileged;
 
   return {
     id: `directoryRole:${roleDefinitionId}:${directoryScopeId}`,
@@ -145,6 +146,7 @@ export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleIte
     directoryScopeId,
     scopeLabel: directoryScopeId === "/" ? "Tenant" : scopeName || directoryScopeId,
     status: "eligible",
+    ...(typeof isPrivileged === "boolean" ? { isPrivileged } : {}),
     activationRequirements: {
       justification: true,
       ticket: false

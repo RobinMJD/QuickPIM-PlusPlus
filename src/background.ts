@@ -1,7 +1,6 @@
 import {
   applyActivationRequirements,
   buildRolePolicyRequirementMap,
-  buildDirectoryRoleDefinitionNameMap,
   buildActivationRequest,
   getActiveUntilFromScheduleInfo,
   getRoleDefinitionLookupKeys,
@@ -12,6 +11,7 @@ import {
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
 import { mapWithConcurrency } from "./lib/concurrency";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
+import { isPrivilegedAzureRoleDefinition } from "./lib/privilegedRoles";
 import {
   assertAllowedApiUrl,
   getAllowedTokenKindForUrl,
@@ -46,6 +46,21 @@ interface StoredTokens {
 }
 
 type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
+interface AzureRoleDefinitionResponse {
+  properties?: {
+    roleName?: string;
+    permissions?: Array<{
+      actions?: string[];
+      dataActions?: string[];
+    }>;
+  };
+}
+
+interface AzureRoleDefinitionInfo {
+  displayName: string;
+  isPrivileged?: boolean;
+}
+
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
 const TOKEN_KINDS: TokenKind[] = ["graph", "azureManagement"];
 
@@ -393,15 +408,20 @@ async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> 
   });
 }
 
-async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<string, string>> {
+interface DirectoryRoleDefinitionInfo {
+  displayName?: string;
+  isPrivileged?: boolean;
+}
+
+async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
   const roles = await fetchAllPages<DirectoryRoleDefinitionApi>(
     graphApiUrl("/v1.0/roleManagement/directory/roleDefinitions"),
     graphToken
   );
-  return buildDirectoryRoleDefinitionNameMap(roles);
+  return buildDirectoryRoleDefinitionInfoMap(roles);
 }
 
-async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promise<Record<string, string>> {
+async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
   try {
     return await getDirectoryRoleDefinitions(graphToken);
   } catch (error) {
@@ -432,16 +452,36 @@ async function getDirectoryRolePolicyRequirementsBestEffort(
   );
 }
 
-function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Record<string, string>): DirectoryRoleApi {
+function buildDirectoryRoleDefinitionInfoMap(roles: DirectoryRoleDefinitionApi[]): Record<string, DirectoryRoleDefinitionInfo> {
+  const result: Record<string, DirectoryRoleDefinitionInfo> = {};
+  for (const role of roles) {
+    const info: DirectoryRoleDefinitionInfo = {
+      ...(role.displayName ? { displayName: role.displayName } : {}),
+      ...(typeof role.isPrivileged === "boolean" ? { isPrivileged: role.isPrivileged } : {})
+    };
+    if (role.id) {
+      result[role.id] = info;
+    }
+    if (role.templateId) {
+      result[role.templateId] = info;
+    }
+  }
+  return result;
+}
+
+function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Record<string, DirectoryRoleDefinitionInfo>): DirectoryRoleApi {
   const roleDefinitionId = role.roleDefinitionId || role.roleDefinition?.id || role.roleDefinition?.templateId || role.id || "";
+  const definition =
+    definitions[roleDefinitionId] ||
+    definitions[role.roleDefinition?.id || ""] ||
+    definitions[role.roleDefinition?.templateId || ""];
   return {
     ...role,
     roleName:
       role.roleName ||
       role.roleDefinition?.displayName ||
-      definitions[roleDefinitionId] ||
-      definitions[role.roleDefinition?.id || ""] ||
-      definitions[role.roleDefinition?.templateId || ""]
+      definition?.displayName,
+    isPrivileged: role.isPrivileged ?? role.roleDefinition?.isPrivileged ?? definition?.isPrivileged
   };
 }
 
@@ -624,7 +664,7 @@ async function getAzureRoles(azureManagementToken: string): Promise<ActivationIt
 
   const items = roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []));
   const itemsWithPolicies = await applyAzureRolePolicyRequirements(items, azureManagementToken);
-  return applyAzureRoleDefinitionNames(itemsWithPolicies, azureManagementToken);
+  return applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken);
 }
 
 async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
@@ -720,39 +760,44 @@ async function getActiveAzureRoles(azureManagementToken: string): Promise<Activa
     })
   );
 
-  return applyAzureRoleDefinitionNames(
+  return applyAzureRoleDefinitionMetadata(
     roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])),
     azureManagementToken
   );
 }
 
-async function applyAzureRoleDefinitionNames(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
+async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
   const azureItems = items.filter((item): item is Extract<ActivationItem, { type: "azureRole" }> => item.type === "azureRole");
-  const unresolvedDefinitionIds = [
-    ...new Set(
-      azureItems
-        .filter((item) => item.displayName === item.roleDefinitionId.split("/").at(-1))
-        .map((item) => item.roleDefinitionId)
-    )
-  ];
+  const definitionIds = [...new Set(azureItems.map((item) => item.roleDefinitionId))];
 
-  if (!unresolvedDefinitionIds.length) {
+  if (!definitionIds.length) {
     return items;
   }
 
-  const definitions = Object.fromEntries(
+  const definitions: Record<string, AzureRoleDefinitionInfo> = Object.fromEntries(
     await mapWithConcurrency(
-      unresolvedDefinitionIds,
+      definitionIds,
       6,
       async (roleDefinitionId) => {
         try {
-          const definition = await fetchJson<{ properties?: { roleName?: string } }>(
+          const definition = await fetchJson<AzureRoleDefinitionResponse>(
             azureManagementUrl(`${roleDefinitionId}?api-version=2022-04-01`),
             token
           );
-          return [roleDefinitionId, definition.properties?.roleName || roleDefinitionId.split("/").at(-1) || roleDefinitionId] as const;
+          return [
+            roleDefinitionId,
+            {
+              displayName: definition.properties?.roleName || roleDefinitionId.split("/").at(-1) || roleDefinitionId,
+              isPrivileged: isPrivilegedAzureRoleDefinition(definition)
+            }
+          ] as const;
         } catch {
-          return [roleDefinitionId, roleDefinitionId.split("/").at(-1) || roleDefinitionId] as const;
+          return [
+            roleDefinitionId,
+            {
+              displayName: roleDefinitionId.split("/").at(-1) || roleDefinitionId
+            }
+          ] as const;
         }
       }
     )
@@ -762,8 +807,16 @@ async function applyAzureRoleDefinitionNames(items: ActivationItem[], token: str
     if (item.type !== "azureRole") {
       return item;
     }
-    const displayName = definitions[item.roleDefinitionId];
-    return displayName ? { ...item, sourceName: displayName, displayName } : item;
+    const definition = definitions[item.roleDefinitionId];
+    if (!definition) {
+      return item;
+    }
+    const displayName = item.displayName === item.roleDefinitionId.split("/").at(-1) ? definition.displayName : item.displayName;
+    return {
+      ...item,
+      ...(displayName ? { sourceName: displayName, displayName } : {}),
+      ...(typeof definition.isPrivileged === "boolean" ? { isPrivileged: definition.isPrivileged } : {})
+    };
   });
 }
 

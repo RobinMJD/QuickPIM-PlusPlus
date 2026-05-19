@@ -373,10 +373,24 @@ button {
 }
 
 .role-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   margin: 0;
   color: #0f172a;
   font-weight: 700;
   font-size: 13px;
+}
+
+.crown-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: #b45309;
+  fill: #fbbf24;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linejoin: round;
 }
 
 .role-meta {

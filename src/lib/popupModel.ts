@@ -128,6 +128,10 @@ export function getActivatableItems(items: ActivationItem[]): ActivationItem[] {
   return items.filter((item) => item.status === "eligible");
 }
 
+export function isHighPrivilegeItem(item: ActivationItem): boolean {
+  return item.isPrivileged === true;
+}
+
 export function getActiveStatusTitle(item: ActivationItem, now = Date.now()): string | undefined {
   if (item.status !== "active" || !item.activeUntil) {
     return undefined;

@@ -26,6 +26,7 @@ export interface BaseActivationItem {
   scopeLabel: string;
   status: ActivationStatus;
   activeUntil?: string;
+  isPrivileged?: boolean;
   activationRequirements?: {
     justification?: boolean;
     ticket?: boolean;
@@ -193,13 +194,16 @@ export interface DirectoryRoleApi {
     id?: string;
     displayName?: string;
     templateId?: string;
+    isPrivileged?: boolean;
   };
+  isPrivileged?: boolean;
 }
 
 export interface DirectoryRoleDefinitionApi {
   id?: string;
   templateId?: string;
   displayName?: string;
+  isPrivileged?: boolean;
 }
 
 export interface RoleManagementPolicyRuleApi {

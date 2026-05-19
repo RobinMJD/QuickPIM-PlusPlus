@@ -22,6 +22,7 @@ import {
   getActivatableItems,
   getActiveStatusTitle,
   getDurationOptions,
+  isHighPrivilegeItem,
   mergeEligibleWithActive,
   getPortalUrlForTab,
   tabLabel,
@@ -613,7 +614,10 @@ function RoleList({
               <StarIcon filled={isFavorite} />
             </button>
             <div>
-              <p className="role-title">{displayName}</p>
+              <p className="role-title">
+                <span>{displayName}</span>
+                {isHighPrivilegeItem(item) ? <CrownIcon /> : null}
+              </p>
               <div className="role-meta">
                 <span className={`badge ${item.type}`}>{typeLabel(item.type)}</span>
                 <span className="scope-label">{getScopeLabel(item, referenceData)}</span>
@@ -788,6 +792,15 @@ function StarIcon({ filled }: { filled: boolean }) {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="star-icon">
       <path d="m12 3.7 2.5 5.1 5.6.8-4 3.9.9 5.5-5-2.6-5 2.6.9-5.5-4-3.9 5.6-.8L12 3.7Z" fill={filled ? "currentColor" : "none"} />
+    </svg>
+  );
+}
+
+function CrownIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="crown-icon">
+      <path d="m3 7 5 4 4-7 4 7 5-4-2 12H5L3 7Z" />
+      <path d="M5 19h14" />
     </svg>
   );
 }

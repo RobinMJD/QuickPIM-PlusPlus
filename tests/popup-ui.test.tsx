@@ -683,6 +683,90 @@ describe("popup compact controls", () => {
     });
     expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remove Zebra Role from favorites"]')).toBeTruthy();
   });
+
+  test("shows a crown icon after high privilege role names only", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const items: ActivationItem[] = [
+      {
+        id: "directoryRole:global-admin:/",
+        type: "directoryRole",
+        sourceName: "Global Administrator",
+        displayName: "Global Administrator",
+        principalId: "principal-1",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        isPrivileged: true,
+        roleDefinitionId: "global-admin",
+        directoryScopeId: "/"
+      },
+      {
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        sourceName: "Global Reader",
+        displayName: "Global Reader",
+        principalId: "principal-1",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/"
+      }
+    ];
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Global Administrator"));
+    const rows = [...document.querySelectorAll(".role-row")];
+    const adminRow = rows.find((row) => row.textContent?.includes("Global Administrator"));
+    const readerRow = rows.find((row) => row.textContent?.includes("Global Reader"));
+    expect(adminRow?.querySelector(".crown-icon")).toBeTruthy();
+    expect(readerRow?.querySelector(".crown-icon")).toBeFalsy();
+  });
 });
 
 describe("popup role row styling", () => {

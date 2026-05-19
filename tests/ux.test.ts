@@ -16,10 +16,12 @@ import {
   getPortalUrlForTab,
   getActivatableItems,
   getActiveStatusTitle,
+  isHighPrivilegeItem,
   mergeEligibleWithActive,
   tokenStatusText
 } from "../src/lib/popupModel";
 import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole } from "../src/lib/pim";
+import { isPrivilegedAzureRoleDefinition } from "../src/lib/privilegedRoles";
 import { makeTokenStatus } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
 
@@ -210,6 +212,38 @@ describe("popup model helpers", () => {
 
   test("filters active items out of activatable selections", () => {
     expect(getActivatableItems([directoryRole, { ...azureRole, status: "active" }])).toEqual([directoryRole]);
+  });
+
+  test("identifies high privilege rows from Microsoft-provided role metadata", () => {
+    expect(isHighPrivilegeItem({ ...directoryRole, displayName: "Global Administrator", isPrivileged: true })).toBe(true);
+    expect(isHighPrivilegeItem({ ...directoryRole, displayName: "Global Administrator" })).toBe(false);
+    expect(isHighPrivilegeItem({ ...azureRole, displayName: "Owner", isPrivileged: true })).toBe(true);
+    expect(isHighPrivilegeItem({ ...azureRole, displayName: "Reader" })).toBe(false);
+  });
+
+  test("uses Microsoft Azure privileged administrator role-definition actions", () => {
+    expect(
+      isPrivilegedAzureRoleDefinition({
+        properties: {
+          permissions: [
+            {
+              actions: ["Microsoft.Authorization/roleAssignments/write"]
+            }
+          ]
+        }
+      })
+    ).toBe(true);
+    expect(
+      isPrivilegedAzureRoleDefinition({
+        properties: {
+          permissions: [
+            {
+              actions: ["Microsoft.Resources/subscriptions/resourceGroups/read"]
+            }
+          ]
+        }
+      })
+    ).toBe(false);
   });
 
   test("formats active status hover text when an end time is known", () => {
