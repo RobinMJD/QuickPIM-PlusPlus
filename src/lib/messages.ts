@@ -1,4 +1,4 @@
-import type { ActivationItem, TicketInfo, TokenKind } from "./types";
+import type { ActivationItem, TicketInfo } from "./types";
 
 export type QuickPimMessage =
   | { action: "getTokenStatus" }

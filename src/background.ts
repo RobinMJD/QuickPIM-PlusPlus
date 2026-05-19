@@ -88,7 +88,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     .then((data) => sendResponse({ success: true, data }))
     .catch((error: unknown) => {
       const message = sanitizeErrorMessage(error);
-      console.error("QuickPIM++ background error:", message);
       sendResponse({ success: false, error: message });
     });
   return true;
@@ -201,7 +200,7 @@ async function storeCapturedToken(tokenKind: TokenKind, token: string, source: s
   return true;
 }
 
-function shouldKeepCurrentToken(current: Record<string, any>, incoming: Record<string, any>, tokenKind: TokenKind): boolean {
+function shouldKeepCurrentToken(current: Record<string, unknown>, incoming: Record<string, unknown>, tokenKind: TokenKind): boolean {
   const currentScore = getTokenCaptureScore(current, tokenKind);
   const incomingScore = getTokenCaptureScore(incoming, tokenKind);
   if (currentScore > incomingScore) {
@@ -212,7 +211,7 @@ function shouldKeepCurrentToken(current: Record<string, any>, incoming: Record<s
   return currentScore === incomingScore && currentExpiry >= incomingExpiry;
 }
 
-function getTokenCaptureScore(decoded: Record<string, any>, tokenKind: TokenKind): number {
+function getTokenCaptureScore(decoded: Record<string, unknown>, tokenKind: TokenKind): number {
   if (tokenKind === "azureManagement") {
     return 1;
   }
@@ -237,7 +236,7 @@ function getTokenCaptureScore(decoded: Record<string, any>, tokenKind: TokenKind
   return 1;
 }
 
-function getGrantedTokenScopes(decoded: Record<string, any>): Set<string> {
+function getGrantedTokenScopes(decoded: Record<string, unknown>): Set<string> {
   const scopes = typeof decoded.scp === "string" ? decoded.scp.split(/\s+/).filter(Boolean) : [];
   const roles = Array.isArray(decoded.roles) ? decoded.roles.filter((role): role is string => typeof role === "string") : [];
   return new Set([...scopes, ...roles]);
@@ -424,8 +423,7 @@ async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<s
 async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
   try {
     return await getDirectoryRoleDefinitions(graphToken);
-  } catch (error) {
-    console.warn("QuickPIM++ could not resolve directory role definitions:", error);
+  } catch {
     return {};
   }
 }
@@ -710,7 +708,7 @@ async function getSubscriptions(token: string): Promise<Array<{ subscriptionId: 
 
 async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
-  const roles = await fetchAllPages<DirectoryRoleApi & { action?: string; status?: string; scheduleInfo?: any }>(
+  const roles = await fetchAllPages<DirectoryRoleApi>(
     graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
     graphToken
   );
@@ -884,7 +882,7 @@ async function activateItems(
 
         if (!response.ok) {
           const errorData = await safeJson(response);
-          throw new Error(sanitizeErrorMessage(errorData?.error?.message || `${response.status} ${response.statusText}`));
+          throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData) || `${response.status} ${response.statusText}`));
         }
 
         const data = await safeJson(response);
@@ -892,7 +890,7 @@ async function activateItems(
           itemId: item.id,
           itemName: item.displayName,
           success: true,
-          requestId: data?.id || data?.name
+          requestId: getResponseIdentifier(data)
         };
       } catch (error) {
         return {
@@ -938,13 +936,13 @@ async function fetchJson<T>(url: string, token: string): Promise<T> {
 
   if (!response.ok) {
     const errorData = await safeJson(response);
-    throw new Error(sanitizeErrorMessage(errorData?.error?.message || `${response.status} ${response.statusText}`));
+    throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData) || `${response.status} ${response.statusText}`));
   }
 
   return (await response.json()) as T;
 }
 
-async function safeJson(response: Response): Promise<any> {
+async function safeJson(response: Response): Promise<unknown> {
   try {
     return await response.json();
   } catch {
@@ -954,6 +952,26 @@ async function safeJson(response: Response): Promise<any> {
 
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
   return [...new Map(items.map((item) => [item.id, item])).values()];
+}
+
+function getApiErrorMessage(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const error = (payload as Record<string, unknown>).error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) {
+    return undefined;
+  }
+  const message = (error as Record<string, unknown>).message;
+  return typeof message === "string" ? message : undefined;
+}
+
+function getResponseIdentifier(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return undefined;
+  }
+  const record = payload as Record<string, unknown>;
+  return typeof record.id === "string" ? record.id : typeof record.name === "string" ? record.name : undefined;
 }
 
 async function getPrincipalId(token: string): Promise<string> {

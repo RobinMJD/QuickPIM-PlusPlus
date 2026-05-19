@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets } from "../lib/access";
@@ -9,7 +9,6 @@ import {
   SETTINGS_KEY,
   createBundleId,
   getDisplayName,
-  getUsage,
   getScopeLabel,
   loadSettings,
   mergeSettings,
@@ -23,7 +22,7 @@ import {
   saveReferenceData
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
-import type { AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import type { AccessDiagnostic, AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "home" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data" | "about";
 
@@ -31,6 +30,9 @@ const ORIGINAL_AUTHOR = "Daniel Bradley";
 const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
 const REPOSITORY_URL = "https://github.com/RobinMJD/QuickPIM";
 const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM";
+const CHANGELOG_CACHE_KEY = "quickPimChangelog.v1";
+const CHANGELOG_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 
 const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Overview", tabs: ["home"] },
@@ -44,6 +46,11 @@ interface ChangelogItem {
   description: string;
   url: string;
   date?: string;
+}
+
+interface ChangelogCache {
+  fetchedAt: number;
+  items: ChangelogItem[];
 }
 
 interface MessageResponse<T> {
@@ -117,7 +124,7 @@ function SettingsApp() {
         loadedCache,
         DEFAULT_ELIGIBLE_CACHE_TTL_MS,
         Boolean(options.showProgress),
-        () => sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActivationItems" }),
+        () => sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
         Date.now(),
         tokenCacheKey
       );
@@ -164,8 +171,8 @@ function SettingsApp() {
       const latestTokens = tokens ?? await sendMessage<TokenStatus>({ action: "getTokenStatus" });
       const tokenCacheKey = buildTokenCacheKey(latestTokens);
       const [eligible, active] = await Promise.all([
-        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActivationItems" }),
-        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
+        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActiveItems" })
       ]);
       const fetchedAt = Date.now();
       const nextCache: QuickPimDataCache = {
@@ -1265,43 +1272,58 @@ function getDuplicateBundleName(name: string, existingNames: string[]): string {
   return `${baseName} ${Date.now()}`;
 }
 
-async function loadGithubChangelog(): Promise<ChangelogItem[]> {
+async function loadGithubChangelog(now = Date.now()): Promise<ChangelogItem[]> {
+  const cached = await loadCachedChangelog(now);
+  if (cached) {
+    return cached;
+  }
+
   const releases = await fetchGithubJson(`${GITHUB_API_BASE}/releases?per_page=5`);
   if (Array.isArray(releases) && releases.length) {
-    return releases
+    const items = releases
       .filter((item): item is Record<string, unknown> => item && typeof item === "object")
       .slice(0, 5)
       .map((release) => ({
-        title: String(release.name || release.tag_name || "Release"),
+        title: sanitizeChangelogText(release.name || release.tag_name || "Release", 100) || "Release",
         description: getSummaryText(release.body) || "Release notes are available on GitHub.",
-        url: String(release.html_url || REPOSITORY_URL),
-        date: typeof release.published_at === "string" ? release.published_at : undefined
+        url: sanitizeGithubUrl(release.html_url),
+        date: sanitizeChangelogDate(release.published_at)
       }));
+    await saveChangelogCache(items, now);
+    return items;
   }
 
   const commits = await fetchGithubJson(`${GITHUB_API_BASE}/commits?per_page=5`);
-  return Array.isArray(commits)
+  const items = Array.isArray(commits)
     ? commits
       .filter((item): item is Record<string, unknown> => item && typeof item === "object")
       .slice(0, 5)
       .map((item) => {
         const commit = item.commit && typeof item.commit === "object" ? item.commit as Record<string, unknown> : {};
         return {
-          title: getSummaryText(commit.message) || String(item.sha || "Commit").slice(0, 7),
+          title: getSummaryText(commit.message) || sanitizeChangelogText(item.sha, 7) || "Commit",
           description: "Latest repository commit.",
-          url: String(item.html_url || REPOSITORY_URL),
+          url: sanitizeGithubUrl(item.html_url),
           date: getCommitDate(commit)
         };
       })
     : [];
+  await saveChangelogCache(items, now);
+  return items;
 }
 
 async function fetchGithubJson(url: string): Promise<unknown> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`GitHub returned ${response.status}`);
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), CHANGELOG_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`GitHub returned ${response.status}`);
+    }
+    return await response.json();
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-  return await response.json();
 }
 
 function getSummaryText(value: unknown): string {
@@ -1317,7 +1339,87 @@ function getSummaryText(value: unknown): string {
 
 function getCommitDate(commit: Record<string, unknown>): string | undefined {
   const author = commit.author && typeof commit.author === "object" ? commit.author as Record<string, unknown> : undefined;
-  return typeof author?.date === "string" ? author.date : undefined;
+  return sanitizeChangelogDate(author?.date);
+}
+
+async function loadCachedChangelog(now: number): Promise<ChangelogItem[] | undefined> {
+  const result = await chrome.storage.local.get(CHANGELOG_CACHE_KEY);
+  const cache = coerceChangelogCache(result[CHANGELOG_CACHE_KEY]);
+  if (!cache || now - cache.fetchedAt > CHANGELOG_CACHE_TTL_MS) {
+    return undefined;
+  }
+  return cache.items;
+}
+
+async function saveChangelogCache(items: ChangelogItem[], fetchedAt: number): Promise<void> {
+  await chrome.storage.local.set({
+    [CHANGELOG_CACHE_KEY]: {
+      fetchedAt,
+      items: coerceChangelogItems(items)
+    }
+  });
+}
+
+function coerceChangelogCache(value: unknown): ChangelogCache | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const fetchedAt = Number(record.fetchedAt);
+  const items = coerceChangelogItems(record.items);
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || !items.length) {
+    return undefined;
+  }
+  return { fetchedAt, items };
+}
+
+function coerceChangelogItems(value: unknown): ChangelogItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, 5)
+    .flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return [];
+      }
+      const record = item as Record<string, unknown>;
+      const title = sanitizeChangelogText(record.title, 100);
+      if (!title) {
+        return [];
+      }
+      return [{
+        title,
+        description: sanitizeChangelogText(record.description, 180) || "Release notes are available on GitHub.",
+        url: sanitizeGithubUrl(record.url),
+        date: sanitizeChangelogDate(record.date)
+      }];
+    });
+}
+
+function sanitizeChangelogText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, maxLength) : "";
+}
+
+function sanitizeGithubUrl(value: unknown): string {
+  if (typeof value !== "string") {
+    return REPOSITORY_URL;
+  }
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:" && parsed.hostname === "github.com" && parsed.pathname.startsWith("/RobinMJD/QuickPIM")
+      ? parsed.toString()
+      : REPOSITORY_URL;
+  } catch {
+    return REPOSITORY_URL;
+  }
+}
+
+function sanitizeChangelogDate(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return Number.isFinite(new Date(value).getTime()) ? value : undefined;
 }
 
 async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {

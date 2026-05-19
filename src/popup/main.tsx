@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import {
@@ -52,6 +52,7 @@ import {
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
 import type {
+  AccessDiagnostic,
   ActivationItem,
   ActivationResponse,
   QuickPimBundle,
@@ -217,9 +218,9 @@ function PopupApp() {
         now,
         tokenCacheKey,
         fetchEligible: () =>
-          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActivationItems" }),
+          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
         fetchActive: () =>
-          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
+          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActiveItems" })
       });
 
       if (!eligible.fromCache || !active.fromCache) {

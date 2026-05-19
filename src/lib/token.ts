@@ -44,7 +44,7 @@ export function assertFreshToken(token: string, tokenKind: TokenKind, now = Date
   }
 }
 
-export function decodeToken(token: string): Record<string, any> | null {
+export function decodeToken(token: string): Record<string, unknown> | null {
   try {
     const payload = token.split(".")[1];
     if (!payload) {
@@ -52,23 +52,24 @@ export function decodeToken(token: string): Record<string, any> | null {
     }
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    return JSON.parse(atob(padded));
+    const decoded = JSON.parse(atob(padded));
+    return decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded as Record<string, unknown> : null;
   } catch {
     return null;
   }
 }
 
-function isDecodedTokenExpired(decoded: Record<string, any>, now: number): boolean {
+function isDecodedTokenExpired(decoded: Record<string, unknown>, now: number): boolean {
   const expiresAtMs = getTokenExpiryMs(decoded);
   return expiresAtMs !== undefined && expiresAtMs <= now;
 }
 
-function getTokenExpiryMs(decoded: Record<string, any> | null): number | undefined {
+function getTokenExpiryMs(decoded: Record<string, unknown> | null): number | undefined {
   const exp = Number(decoded?.exp);
   return Number.isFinite(exp) && exp > 0 ? exp * 1000 : undefined;
 }
 
-function getGrantedScopes(decoded: Record<string, any> | null): string[] {
+function getGrantedScopes(decoded: Record<string, unknown> | null): string[] {
   const delegatedScopes =
     typeof decoded?.scp === "string"
       ? decoded.scp.split(/\s+/).filter(Boolean)

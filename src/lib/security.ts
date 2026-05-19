@@ -20,7 +20,7 @@ const AZURE_MANAGEMENT_AUDIENCES = new Set([
 ]);
 
 export type TokenValidationResult =
-  | { ok: true; decoded: Record<string, any> }
+  | { ok: true; decoded: Record<string, unknown> }
   | { ok: false; reason: string };
 
 export function getAllowedTokenKindForUrl(url: string): TokenKind | undefined {

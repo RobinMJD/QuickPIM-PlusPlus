@@ -184,6 +184,9 @@ export interface DirectoryRoleApi {
   principalId?: string;
   directoryScopeId?: string;
   roleName?: string;
+  action?: string;
+  status?: string;
+  scheduleInfo?: unknown;
   directoryScopeDisplayName?: string;
   directoryScope?: {
     id?: string;

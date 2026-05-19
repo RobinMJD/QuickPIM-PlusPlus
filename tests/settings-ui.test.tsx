@@ -124,7 +124,65 @@ describe("settings Home page", () => {
     ]);
     expect(navButtons.at(-1)).toBe("About");
     expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(8);
-    expect(fetchMock).toHaveBeenCalledWith("https://api.github.com/repos/RobinMJD/QuickPIM/releases?per_page=5");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.github.com/repos/RobinMJD/QuickPIM/releases?per_page=5");
+  });
+
+  test("uses cached GitHub changelog data without fetching again", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#home");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      "quickPimChangelog.v1": {
+        fetchedAt: Date.now(),
+        items: [
+          {
+            title: "Cached v2.0.0",
+            description: "Cached release notes.",
+            url: "https://github.com/RobinMJD/QuickPIM/releases/tag/v2.0.0",
+            date: "2026-05-18T10:00:00.000Z"
+          }
+        ]
+      }
+    };
+    const fetchMock = vi.fn(async () => {
+      throw new Error("Fresh changelog fetch should not run for a valid cache.");
+    });
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationItems") {
+            return { success: true, data: { items: [], errors: [] } };
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Cached v2.0.0"));
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
