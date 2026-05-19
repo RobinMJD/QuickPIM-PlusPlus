@@ -4,7 +4,6 @@ import "../styles.css";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
-  formatCacheAge,
   getActivationDataWithCache,
   loadDataCache,
   saveDataCache
@@ -180,12 +179,7 @@ function PopupApp() {
       setAccessCapabilities(nextAccessCapabilities);
       setEligibleItems(applyDisplayData(eligible.entry.items, loadedSettings, nextReferenceData));
       setActiveItems(applyDisplayData(active.entry.items, loadedSettings, nextReferenceData));
-      const cacheMessage =
-        eligible.fromCache && active.fromCache
-          ? `Using cached data from ${formatCacheAge(Math.min(eligible.entry.fetchedAt, active.entry.fetchedAt))}.`
-          : options.force
-            ? "Forced refresh completed."
-            : "";
+      const cacheMessage = options.force ? "Forced refresh completed." : "";
       setMessage(formatLoadMessages([...loadErrors, cacheMessage].filter(Boolean)).join("\n"));
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
@@ -311,6 +305,7 @@ function PopupApp() {
 
   const roleTabs: RoleTab[] = ["directoryRole", "pimGroup", "azureRole"];
   const portalUrl = getPortalUrlForTab(tab);
+  const portalLabel = roleTabs.includes(tab as RoleTab) ? tabLabel(tab as RoleTab) : "Microsoft Entra";
 
   return (
     <main className="app-shell">
@@ -327,6 +322,14 @@ function PopupApp() {
         <div className="status-stack">
           <TokenPill label="Graph" status={tokenStatus?.graph} />
           <TokenPill label="Azure" status={tokenStatus?.azureManagement} />
+          <div className="header-actions" aria-label="Popup actions">
+            <button className="btn icon-btn" onClick={() => void refresh({ force: true })} disabled={isLoading} title="Force refresh all data" aria-label="Force refresh all data">
+              <RefreshIcon />
+            </button>
+            <button className="btn icon-btn" onClick={openPortalForCurrentTab} disabled={!portalUrl} title={`Open ${portalLabel} in Microsoft Entra`} aria-label={`Open ${portalLabel} in Microsoft Entra`}>
+              <LinkIcon />
+            </button>
+          </div>
         </div>
       </header>
 
@@ -358,15 +361,7 @@ function PopupApp() {
         <>
           <section className="toolbar">
             <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or scope" />
-            <button className="btn icon-btn" onClick={() => void refresh({ force: true })} disabled={isLoading} title="Force refresh all data" aria-label="Force refresh all data">
-              <RefreshIcon />
-            </button>
-            <button className="btn icon-btn" onClick={openPortalForCurrentTab} disabled={!portalUrl} title={`Open ${tabLabel(tab)} in Microsoft Entra`} aria-label={`Open ${tabLabel(tab)} in Microsoft Entra`}>
-              <LinkIcon />
-            </button>
-          </section>
-          <section className="filter-row">
-            <select className="select" value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)}>
+            <select className="select" value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort roles">
               <option value="name">Name</option>
               <option value="lastUsed">Last use</option>
               <option value="activationCount">Activation count</option>
