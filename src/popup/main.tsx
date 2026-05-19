@@ -74,13 +74,6 @@ interface LoadingProgress {
   label: string;
 }
 
-const LOADING_STEPS: LoadingProgress[] = [
-  { current: 1, total: 4, label: "Preparing local settings" },
-  { current: 2, total: 4, label: "Checking portal tokens" },
-  { current: 3, total: 4, label: "Loading eligible and active data" },
-  { current: 4, total: 4, label: "Preparing the role list" }
-];
-
 const ACTIVATION_STEPS: LoadingProgress[] = [
   { current: 1, total: 3, label: "Sending activation request" },
   { current: 2, total: 3, label: "Saving activation result" },
@@ -106,7 +99,6 @@ function PopupApp() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
-  const [loadingProgress, setLoadingProgress] = useState<LoadingProgress>(LOADING_STEPS[0]);
   const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
   const [isActivating, setIsActivating] = useState(false);
 
@@ -201,7 +193,6 @@ function PopupApp() {
     const showLoading = options.showLoading !== false;
     if (showLoading) {
       setIsLoading(true);
-      setLoadingProgress(LOADING_STEPS[0]);
     }
     if (!options.suppressMessage) {
       setError("");
@@ -214,12 +205,10 @@ function PopupApp() {
       ]);
       const tokenPromise = sendMessage<TokenStatus>({ action: "getTokenStatus" });
       const [loadedSettings, currentCache, loadedReferenceData] = await localDataPromise;
-      setLoadingProgress(LOADING_STEPS[1]);
       const loadedTokens = await tokenPromise;
 
       const now = Date.now();
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
-      setLoadingProgress(LOADING_STEPS[2]);
       const { eligible, active, cache: nextCache } = await getActivationDataWithCache({
         cache: currentCache,
         eligibleTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
@@ -233,7 +222,6 @@ function PopupApp() {
           sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
       });
 
-      setLoadingProgress(LOADING_STEPS[3]);
       if (!eligible.fromCache || !active.fromCache) {
         await saveDataCache(nextCache);
       }
@@ -467,7 +455,7 @@ function PopupApp() {
 
       {error ? <p className="message error">{error}</p> : null}
       {message ? <p className="message">{message}</p> : null}
-      {isLoading ? <LoadingState progress={loadingProgress} /> : null}
+      {isLoading ? <LoadingState /> : null}
       {activationProgress ? <ActivationProgressPanel progress={activationProgress} /> : null}
 
       {currentRoleTab ? (
@@ -607,13 +595,11 @@ function TokenPill({ label, status }: { label: string; status?: TokenStatus["gra
   return <span className={`token-pill ${tokenStatusTone(status)}`}>{tokenStatusText(label, status)}</span>;
 }
 
-function LoadingState({ progress }: { progress: LoadingProgress }) {
+function LoadingState() {
   return (
     <section className="loading-panel" aria-live="polite">
       <span className="spinner large" aria-hidden="true" />
-      <span>
-        Loading access data (step {progress.current}/{progress.total}): {progress.label}
-      </span>
+      <span>Loading access data (this can take up to 15 seconds)</span>
     </section>
   );
 }

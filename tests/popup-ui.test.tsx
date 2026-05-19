@@ -103,8 +103,8 @@ describe("popup loading UI", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(document.body.textContent?.match(/Loading access/g) || []).toHaveLength(1);
-    expect(document.body.textContent).toContain("Loading access data (step");
-    expect(document.body.textContent).toContain("Loading eligible and active data");
+    expect(document.body.textContent).toContain("Loading access data (this can take up to 15 seconds)");
+    expect(document.body.textContent).not.toContain("Loading access data (step");
 
     eligible.resolve({ success: true, data: { items: [], errors: [] } });
     active.resolve({ success: true, data: { items: [], errors: [] } });
