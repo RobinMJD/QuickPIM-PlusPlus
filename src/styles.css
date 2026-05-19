@@ -383,8 +383,9 @@ button {
 .role-status-stack {
   display: grid;
   gap: 4px;
-  justify-items: center;
+  justify-items: end;
   min-width: 58px;
+  text-align: right;
 }
 
 .activation-count {

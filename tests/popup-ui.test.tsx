@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 
 afterEach(() => {
@@ -65,5 +67,15 @@ describe("popup loading UI", () => {
 
     eligible.resolve({ success: true, data: { items: [], errors: [] } });
     active.resolve({ success: true, data: { items: [], errors: [] } });
+  });
+});
+
+describe("popup role row styling", () => {
+  test("right-aligns activation count and status badge in the status column", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const statusStackRule = css.match(/\.role-status-stack\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(statusStackRule).toContain("justify-items: end;");
+    expect(statusStackRule).toContain("text-align: right;");
   });
 });
