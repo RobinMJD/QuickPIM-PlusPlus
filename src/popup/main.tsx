@@ -35,8 +35,11 @@ import {
   DEFAULT_SETTINGS,
   addRecentJustification,
   addSavedJustification,
+  buildFeatureCacheKey,
   expandBundle,
+  getAutoEnabledFeatures,
   getDisplayName,
+  getEnabledRoleFeatures,
   getScopeLabel,
   getUsage,
   loadSettings,
@@ -56,6 +59,7 @@ import type {
   ActivationItem,
   ActivationResponse,
   QuickPimBundle,
+  QuickPimFeature,
   ReferenceDataCache,
   QuickPimSettings,
   SortMode,
@@ -121,22 +125,22 @@ function PopupApp() {
     [activeItems, eligibleItems]
   );
   const itemsById = useMemo(() => new Map(displayItems.map((item) => [item.id, item])), [displayItems]);
-  const hiddenPopupTabs = useMemo(() => new Set(settings.preferences.hiddenPopupTabs || []), [settings.preferences.hiddenPopupTabs]);
+  const enabledFeatures = useMemo(() => new Set<QuickPimFeature>(settings.preferences.enabledFeatures || []), [settings.preferences.enabledFeatures]);
   const itemTypesWithData = useMemo(() => new Set(displayItems.map((item) => item.type)), [displayItems]);
   const roleTabs = useMemo<RoleTab[]>(
     () =>
       (["directoryRole", "pimGroup", "azureRole"] as RoleTab[]).filter(
-        (roleTab) => !hiddenPopupTabs.has(roleTab) && (isLoading || itemTypesWithData.has(roleTab))
+        (roleTab) => enabledFeatures.has(roleTab) && (isLoading || itemTypesWithData.has(roleTab))
       ),
-    [hiddenPopupTabs, isLoading, itemTypesWithData]
+    [enabledFeatures, isLoading, itemTypesWithData]
   );
   const visibleTabs = useMemo<PopupTab[]>(() => {
     const tabs: PopupTab[] = [...roleTabs];
-    if (!hiddenPopupTabs.has("bundles")) {
+    if (enabledFeatures.has("bundles")) {
       tabs.push("bundles");
     }
     return tabs;
-  }, [hiddenPopupTabs, roleTabs]);
+  }, [enabledFeatures, roleTabs]);
   const favoriteIds = useMemo(() => new Set(settings.favoriteItemIds || []), [settings.favoriteItemIds]);
   const selectedItems = useMemo(
     () => getActivatableItems([...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item))),
@@ -210,18 +214,45 @@ function PopupApp() {
 
       const now = Date.now();
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
+      const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
+      const featureCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
+      const fetchEnabledItems = (action: "getActivationItems" | "getActiveItems") =>
+        enabledRoleFeatures.length
+          ? sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({
+              action,
+              targets: enabledRoleFeatures
+            })
+          : Promise.resolve({ items: [], errors: [], diagnostics: [] });
       const { eligible, active, cache: nextCache } = await getActivationDataWithCache({
         cache: currentCache,
         eligibleTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
         activeTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS,
         force: options.force,
         now,
-        tokenCacheKey,
-        fetchEligible: () =>
-          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
-        fetchActive: () =>
-          sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActiveItems" })
+        tokenCacheKey: featureCacheKey,
+        fetchEligible: () => fetchEnabledItems("getActivationItems"),
+        fetchActive: () => fetchEnabledItems("getActiveItems")
       });
+
+      let nextSettings = loadedSettings;
+      if (
+        !loadedSettings.preferences.autoEnabledFeaturesInitialized &&
+        (!eligible.fromCache || !active.fromCache) &&
+        eligible.entry.items.length > 0
+      ) {
+        nextSettings = {
+          ...loadedSettings,
+          preferences: {
+            ...loadedSettings.preferences,
+            enabledFeatures: getAutoEnabledFeatures(
+              eligible.entry.items,
+              loadedSettings.preferences.enabledFeatures?.includes("bundles") !== false
+            ),
+            autoEnabledFeaturesInitialized: true
+          }
+        };
+        await saveSettings(nextSettings);
+      }
 
       if (!eligible.fromCache || !active.fromCache) {
         await saveDataCache(nextCache);
@@ -229,18 +260,18 @@ function PopupApp() {
       const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, [...eligible.entry.items, ...active.entry.items]);
       await saveReferenceData(nextReferenceData);
 
-      const nextAccessCapabilities = buildAccessCapabilityItems(loadedTokens, nextCache);
+      const nextAccessCapabilities = buildAccessCapabilityItems(loadedTokens, nextCache, getEnabledRoleFeatures(nextSettings));
       const loadErrors = filterLoadErrorsForAccessState(
         [...(eligible.entry.errors || []), ...(active.entry.errors || [])],
         nextAccessCapabilities
       );
 
-      setSettings(loadedSettings);
+      setSettings(nextSettings);
       setTokenStatus(loadedTokens);
       setReferenceData(nextReferenceData);
       setAccessCapabilities(nextAccessCapabilities);
-      setEligibleItems(applyDisplayData(eligible.entry.items, loadedSettings, nextReferenceData));
-      setActiveItems(applyDisplayData(active.entry.items, loadedSettings, nextReferenceData));
+      setEligibleItems(applyDisplayData(eligible.entry.items, nextSettings, nextReferenceData));
+      setActiveItems(applyDisplayData(active.entry.items, nextSettings, nextReferenceData));
       const cacheMessage = options.force ? "Forced refresh completed." : "";
       if (!options.suppressMessage) {
         setMessage(formatLoadMessages([...loadErrors, cacheMessage].filter(Boolean)).join("\n"));
@@ -550,7 +581,7 @@ function PopupApp() {
 
       {!isLoading && !visibleTabs.length ? (
         <section className="content item-list empty-state">
-          <p>No popup tabs are visible. Change hidden tab preferences in Settings or refresh data.</p>
+          <p>No enabled features have data yet. Enable features in Settings or refresh data.</p>
           <button className="btn" onClick={() => openSettingsSection("preferences")}>
             Settings
           </button>

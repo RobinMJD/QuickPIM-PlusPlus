@@ -4,9 +4,19 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.0.0**
+Current version: **v2.0.1**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
+
+## Screenshots
+
+![QuickPIM++ popup with eligible roles and activation controls](docs/images/quickpim-popup.png)
+
+![QuickPIM++ Access Setup showing enabled feature access checks](docs/images/quickpim-access-setup.png)
+
+![QuickPIM++ Preferences showing enabled features](docs/images/quickpim-enabled-features.png)
+
+![QuickPIM++ role bundle management](docs/images/quickpim-bundles.png)
 
 ## Why QuickPIM++ Exists
 
@@ -27,7 +37,7 @@ The extension does not create a separate OAuth app registration and does not ask
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
-- Hide unused popup tabs and automatically omit empty role-type tabs.
+- Enable only the feature areas you use, skip disabled feature fetches, and automatically omit empty role-type tabs.
 - Use dark mode from settings.
 - Import and export local settings as JSON.
 - View a GitHub-backed changelog from the settings home page.
@@ -72,7 +82,7 @@ Settings are organized around setup, configuration, and local data:
 - **Aliases** - local display-name overrides for roles, groups, and scopes.
 - **Justifications** - saved justification templates and recent history controls.
 - **Bundles** - create, edit, duplicate, and remove role/group bundles.
-- **Preferences** - activation defaults, recent-history limits, dark mode, and tab visibility.
+- **Preferences** - activation defaults, recent-history limits, dark mode, and enabled feature areas.
 - **Import / Export** - move local configuration between browser profiles.
 - **About** - version, attribution, repository links, and local privacy note.
 
@@ -80,7 +90,7 @@ Settings are organized around setup, configuration, and local data:
 
 QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Access Setup** and choose **Open missing portal pages**.
 
-The guided setup opens only the Microsoft portal pages needed for the missing areas:
+The guided setup opens only the Microsoft portal pages needed for enabled feature areas that are missing or limited:
 
 - Entra roles
 - PIM groups
@@ -95,6 +105,7 @@ QuickPIM++ is local-first:
 - Tokens are stored only in the local browser profile.
 - Settings, aliases, learned names, favorites, bundles, and justification history are local Chrome storage data.
 - The extension only calls Microsoft Graph and Azure Management for PIM operations.
+- Disabled role features are skipped during refreshes and Access Setup checks.
 - The settings home page calls the public GitHub API only to show repository changelog entries.
 - Runtime messages, imported settings, activation inputs, JWTs, and API URLs are validated before privileged background actions run.
 - API errors shown in the UI are sanitized so token-like values and oversized raw messages are not surfaced.
@@ -161,7 +172,7 @@ After building and loading `dist/`, verify:
 - Access Setup opens only the portal pages needed for missing or limited feature areas.
 - Eligible Entra roles, Azure roles, and PIM groups render with friendly names.
 - Admin unit, device, subscription, and inherited Azure scope names display when available.
-- Search, sort, favorites, hidden tabs, and dark mode persist after reopening.
+- Search, sort, favorites, enabled features, and dark mode persist after reopening.
 - A single role or group activation submits successfully with the required duration and justification.
 - Already-active eligible items show as `active`, cannot be selected, and show remaining time when available.
 - Bundles activate only eligible inactive entries and skip already-active entries.
@@ -185,6 +196,15 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.0.1
+
+- Adds enabled feature preferences that control popup visibility, refresh scope, and Access Setup requirements.
+- Optimizes eligible and active data loading so disabled role features are not fetched.
+- Auto-enables only feature areas that return eligible items after the first successful data load.
+- Refreshes the QuickPIM++ PNG logo assets from the SVG source.
+- Adds README screenshots and refreshed Chrome Web Store assets for the v2.0.1 release.
+- Updates the privacy policy to describe enabled feature behavior.
 
 ### v2.0.0
 

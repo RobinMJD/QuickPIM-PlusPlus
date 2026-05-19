@@ -3,10 +3,10 @@ import type {
   ActivationItem,
   BundleExpansion,
   QuickPimBundle,
+  QuickPimFeature,
   ReferenceDataCache,
   QuickPimSettings,
-  SortMode,
-  PopupTab
+  SortMode
 } from "./types";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
 import { isGenericJustification } from "./justifications";
@@ -24,6 +24,8 @@ const MAX_BUNDLE_ITEMS = 100;
 const MAX_BUNDLE_NAME_LENGTH = 80;
 const MIN_DURATION_HOURS = 0.5;
 const MAX_DURATION_HOURS = 24;
+export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "pimGroup", "azureRole"];
+export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 
 export const DEFAULT_SETTINGS: QuickPimSettings = {
   version: 1,
@@ -39,7 +41,8 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     defaultSort: "name",
     recentJustificationLimit: 8,
     darkMode: false,
-    hiddenPopupTabs: [],
+    enabledFeatures: ALL_FEATURES,
+    autoEnabledFeaturesInitialized: false,
     permissionWarningIgnored: false
   }
 };
@@ -292,21 +295,52 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     darkMode: preferences.darkMode === true,
-    hiddenPopupTabs: sanitizePopupTabs(preferences.hiddenPopupTabs),
+    enabledFeatures: sanitizeEnabledFeatures(preferences.enabledFeatures, preferences.hiddenPopupTabs),
+    autoEnabledFeaturesInitialized: preferences.autoEnabledFeaturesInitialized === true,
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,
     ...(ignoredAt ? { permissionWarningIgnoredAt: ignoredAt } : {})
   };
 }
 
-function sanitizePopupTabs(value: unknown): PopupTab[] {
+export function getEnabledRoleFeatures(settings: QuickPimSettings): Array<ActivationItem["type"]> {
+  const enabled = new Set(settings.preferences.enabledFeatures || ALL_FEATURES);
+  return ROLE_FEATURES.filter((feature): feature is ActivationItem["type"] => enabled.has(feature));
+}
+
+export function buildFeatureCacheKey(tokenCacheKey: string, enabledRoleFeatures: Array<ActivationItem["type"]>): string {
+  const enabled = new Set(enabledRoleFeatures);
+  const allRoleFeaturesEnabled = ROLE_FEATURES.every((feature) => enabled.has(feature)) && enabled.size === ROLE_FEATURES.length;
+  return allRoleFeaturesEnabled ? tokenCacheKey : `${tokenCacheKey}|features:${enabledRoleFeatures.join(",") || "none"}`;
+}
+
+export function getAutoEnabledFeatures(items: ActivationItem[], preserveBundles = true): QuickPimFeature[] {
+  const itemTypes = new Set(items.filter((item) => item.status === "eligible").map((item) => item.type));
+  const enabled: QuickPimFeature[] = ROLE_FEATURES.filter((feature) => itemTypes.has(feature));
+  if (preserveBundles) {
+    enabled.push("bundles");
+  }
+  return enabled.length ? enabled : preserveBundles ? ["bundles"] : [];
+}
+
+function sanitizeEnabledFeatures(value: unknown, legacyHiddenPopupTabs: unknown): QuickPimFeature[] {
+  if (!Array.isArray(value)) {
+    const hidden = new Set(sanitizeFeatureList(legacyHiddenPopupTabs));
+    return ALL_FEATURES.filter((feature) => !hidden.has(feature));
+  }
+
+  const enabled = sanitizeFeatureList(value);
+  return enabled.length ? enabled : [];
+}
+
+function sanitizeFeatureList(value: unknown): QuickPimFeature[] {
   if (!Array.isArray(value)) {
     return [];
   }
 
-  const seen = new Set<PopupTab>();
-  const result: PopupTab[] = [];
+  const seen = new Set<QuickPimFeature>();
+  const result: QuickPimFeature[] = [];
   for (const item of value) {
-    if (!isPopupTab(item) || seen.has(item)) continue;
+    if (!isQuickPimFeature(item) || seen.has(item)) continue;
     seen.add(item);
     result.push(item);
   }
@@ -427,7 +461,7 @@ function isSortMode(value: unknown): value is SortMode {
   return value === "name" || value === "lastUsed" || value === "activationCount" || value === "type" || value === "scope";
 }
 
-function isPopupTab(value: unknown): value is PopupTab {
+function isQuickPimFeature(value: unknown): value is QuickPimFeature {
   return value === "directoryRole" || value === "pimGroup" || value === "azureRole" || value === "bundles";
 }
 

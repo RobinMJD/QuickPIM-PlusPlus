@@ -14,11 +14,11 @@ describe("versioning and extension manifest", () => {
     expect(packageLockJson.packages[""].name).toBe("quickpim-plusplus");
   });
 
-  test("keeps package, lockfile, and manifest versions in sync at v2.0.0", () => {
-    expect(packageJson.version).toBe("2.0.0");
-    expect(packageLockJson.packages[""].version).toBe("2.0.0");
-    expect(packageLockJson.version).toBe("2.0.0");
-    expect(manifest.version).toBe("2.0.0");
+  test("keeps package, lockfile, and manifest versions in sync at v2.0.1", () => {
+    expect(packageJson.version).toBe("2.0.1");
+    expect(packageLockJson.packages[""].version).toBe("2.0.1");
+    expect(packageLockJson.version).toBe("2.0.1");
+    expect(manifest.version).toBe("2.0.1");
   });
 
   test("uses only required host permissions and an explicit extension CSP", () => {
@@ -58,7 +58,7 @@ describe("versioning and extension manifest", () => {
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
     expect(readme).toContain("Original author: Daniel Bradley");
-    expect(readme).toContain("v2.0.0");
+    expect(readme).toContain("v2.0.1");
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");

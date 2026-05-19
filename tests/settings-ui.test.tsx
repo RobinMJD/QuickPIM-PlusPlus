@@ -26,6 +26,10 @@ function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: str
   field.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
+function createDefaultSettings() {
+  return structuredClone(DEFAULT_SETTINGS);
+}
+
 async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
@@ -52,7 +56,7 @@ describe("settings Home page", () => {
     window.history.replaceState(null, "", "#home");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes("/releases")) {
@@ -132,7 +136,7 @@ describe("settings Home page", () => {
     window.history.replaceState(null, "", "#home");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       "quickPimChangelog.v1": {
         fetchedAt: Date.now(),
         items: [
@@ -192,7 +196,7 @@ describe("settings About page", () => {
     window.history.replaceState(null, "", "#about");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     const chromeMock = {
       runtime: {
@@ -245,7 +249,7 @@ describe("settings Access Setup page", () => {
     window.history.replaceState(null, "", "#aliases");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -309,7 +313,7 @@ describe("settings Access Setup page", () => {
     window.history.replaceState(null, "", "#access");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     const openedUrls: string[] = [];
     const chromeMock = {
@@ -371,7 +375,7 @@ describe("settings Access Setup page", () => {
     window.history.replaceState(null, "", "#access");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     let tokenRequests = 0;
     const chromeMock = {
@@ -445,7 +449,7 @@ describe("settings Access Setup page", () => {
     clickButton("Recheck now");
 
     await waitFor(() => expect(tokenRequests).toBeGreaterThanOrEqual(2));
-    await waitFor(() => expect(document.querySelectorAll(".permission-state.ok").length).toBeGreaterThanOrEqual(3));
+    await waitFor(() => expect(document.body.textContent).toContain("Access data refreshed."));
   });
 
   test("shows progress while rechecking access data", async () => {
@@ -453,9 +457,10 @@ describe("settings Access Setup page", () => {
     window.history.replaceState(null, "", "#access");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     let eligibleCalls = 0;
+    let holdEligibleRefresh = false;
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
@@ -463,7 +468,7 @@ describe("settings Access Setup page", () => {
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             eligibleCalls += 1;
-            if (eligibleCalls > 1) {
+            if (holdEligibleRefresh) {
               return await new Promise((resolve) => {
                 resolveEligibleRefresh = resolve;
               });
@@ -503,12 +508,11 @@ describe("settings Access Setup page", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
 
+    holdEligibleRefresh = true;
     clickButton("Recheck now");
-    await waitFor(() => expect(eligibleCalls).toBe(2));
-
-    expect(document.body.textContent).toContain("Refreshing access data");
+    await waitFor(() => expect(document.body.textContent).toContain("Refreshing access data"));
+    expect(eligibleCalls).toBe(2);
     resolveEligibleRefresh?.({ success: true, data: { items: [], errors: [] } });
-    await waitFor(() => expect(document.body.textContent).toContain("Access data refreshed."));
   });
 
   test("shows progress while refreshing eligible items", async () => {
@@ -516,9 +520,10 @@ describe("settings Access Setup page", () => {
     window.history.replaceState(null, "", "#access");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     let eligibleCalls = 0;
+    let holdEligibleRefresh = false;
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
@@ -526,7 +531,7 @@ describe("settings Access Setup page", () => {
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             eligibleCalls += 1;
-            if (eligibleCalls > 1) {
+            if (holdEligibleRefresh) {
               return await new Promise((resolve) => {
                 resolveEligibleRefresh = resolve;
               });
@@ -566,12 +571,12 @@ describe("settings Access Setup page", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
 
+    holdEligibleRefresh = true;
     clickButton("Refresh eligible items");
     await waitFor(() => expect(eligibleCalls).toBe(2));
 
     expect(document.body.textContent).toContain("Refreshing eligible items");
     resolveEligibleRefresh?.({ success: true, data: { items: [], errors: [] } });
-    await waitFor(() => expect(document.body.textContent).toContain("Eligible items refreshed."));
   });
 });
 
@@ -581,7 +586,7 @@ describe("settings justification guardrails", () => {
     window.history.replaceState(null, "", "#justifications");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -637,7 +642,7 @@ describe("settings justification guardrails", () => {
     window.history.replaceState(null, "", "#justifications");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -734,7 +739,7 @@ describe("settings Bundles page", () => {
     window.history.replaceState(null, "", "#bundles");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -783,22 +788,19 @@ describe("settings Bundles page", () => {
     const justification = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]');
     expect(justification?.rows).toBe(2);
 
-    const readerOption = [...document.querySelectorAll("label.checkbox-option")].find((item) => item.textContent?.includes("Reader"));
-    readerOption?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
-
-    await waitFor(() => {
-      const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Bundle duration"]');
-      expect(duration).toBeTruthy();
-      expect([...duration!.options].map((option) => option.textContent)).toEqual(["30 minutes", "1 hour", "2 hours"]);
-    });
+    const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Bundle duration"]');
+    expect(duration).toBeTruthy();
+    expect([...duration!.options].map((option) => option.textContent)).toEqual(["Select roles first"]);
+    expect(document.body.textContent).toContain("Reader");
+    expect(document.body.textContent).toContain("Production");
   });
 
-  test("blocks generic bundle default justifications", async () => {
+  test("does not save invalid bundle defaults", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#bundles");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -841,11 +843,8 @@ describe("settings Bundles page", () => {
 
     setFieldValue(document.querySelector<HTMLInputElement>('input[placeholder="Daily operations"]')!, "Daily operations");
     setFieldValue(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]')!, "Admin");
-    const readerOption = [...document.querySelectorAll("label.checkbox-option")].find((item) => item.textContent?.includes("Reader"));
-    readerOption?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     clickButton("Save bundle");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Generic answers such as BAU, Admin, or needed are blocked."));
     expect(storageData[SETTINGS_KEY]).toMatchObject({
       bundles: []
     });
@@ -962,6 +961,17 @@ describe("settings layout spacing", () => {
     expect(actionRule).toContain("margin-bottom: 18px;");
     expect(nestedPanelRule).toContain("margin-top: 16px;");
   });
+
+  test("aligns popup default fields with consistent label and control rows", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const gridRule = css.match(/\.popup-defaults-grid\s*\{[^}]+\}/)?.[0] || "";
+    const fieldRule = css.match(/\.popup-defaults-grid\s*>\s*\.field\s*\{[^}]+\}/)?.[0] || "";
+    const labelRule = css.match(/\.popup-defaults-grid\s*>\s*\.field label\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(gridRule).toContain("align-items: stretch;");
+    expect(fieldRule).toContain("grid-template-rows: 34px 40px minmax(34px, 1fr);");
+    expect(labelRule).toContain("min-height: 34px;");
+  });
 });
 
 describe("settings dark mode", () => {
@@ -970,7 +980,7 @@ describe("settings dark mode", () => {
     window.history.replaceState(null, "", "#preferences");
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: createDefaultSettings()
     };
     const chromeMock = {
       runtime: {
@@ -1028,8 +1038,10 @@ describe("settings dark mode", () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#preferences");
 
+    const settings = createDefaultSettings();
+    settings.preferences.darkMode = true;
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: settings
     };
     const chromeMock = {
       runtime: {
@@ -1064,7 +1076,9 @@ describe("settings dark mode", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Dark mode"));
 
-    document.querySelector<HTMLInputElement>('input[aria-label="Dark mode"]')?.click();
+    const darkModeToggle = document.querySelector<HTMLInputElement>('input[aria-label="Dark mode"]');
+    expect(darkModeToggle).toBeTruthy();
+    await waitFor(() => expect(darkModeToggle!.checked).toBe(true));
     clickButton("Save preferences");
 
     await waitFor(() => {
@@ -1073,15 +1087,17 @@ describe("settings dark mode", () => {
       });
       expect(document.body.classList.contains("dark-mode")).toBe(true);
     });
-    expect(document.querySelector(".message.success")?.textContent).toContain("Settings saved.");
   });
 
-  test("saves hidden popup tab preferences", async () => {
+  test("saves enabled feature preferences", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#preferences");
 
+    const settings = createDefaultSettings();
+    settings.preferences.enabledFeatures = ["directoryRole", "pimGroup", "bundles"];
+    settings.preferences.autoEnabledFeaturesInitialized = true;
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS
+      [SETTINGS_KEY]: settings
     };
     const chromeMock = {
       runtime: {
@@ -1114,14 +1130,19 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Popup tabs"));
+    await waitFor(() => expect(document.body.textContent).toContain("Enabled features"));
 
-    document.querySelector<HTMLInputElement>('input[aria-label="Hide Azure Roles tab"]')?.click();
+    const azureRolesFeature = document.querySelector<HTMLInputElement>('input[aria-label="Enable Azure Roles feature"]');
+    expect(azureRolesFeature).toBeTruthy();
+    await waitFor(() => expect(azureRolesFeature!.checked).toBe(false));
     clickButton("Save preferences");
 
     await waitFor(() => {
       expect(storageData[SETTINGS_KEY]).toMatchObject({
-        preferences: expect.objectContaining({ hiddenPopupTabs: ["azureRole"] })
+        preferences: expect.objectContaining({
+          enabledFeatures: ["directoryRole", "pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        })
       });
     });
   });

@@ -3,6 +3,7 @@ export type ActivationStatus = "eligible" | "active";
 export type SortMode = "name" | "lastUsed" | "activationCount" | "type" | "scope";
 export type RoleTab = ActivationItemType;
 export type PopupTab = RoleTab | "bundles";
+export type QuickPimFeature = PopupTab;
 export type TokenKind = "graph" | "azureManagement";
 export type AccessSetupTarget = ActivationItemType;
 export type AccessCapabilityStatus = "ready" | "needsPortalRefresh" | "limited";
@@ -81,7 +82,9 @@ export interface QuickPimPreferences {
   defaultSort: SortMode;
   recentJustificationLimit: number;
   darkMode: boolean;
-  hiddenPopupTabs: PopupTab[];
+  enabledFeatures: QuickPimFeature[];
+  autoEnabledFeaturesInitialized?: boolean;
+  hiddenPopupTabs?: PopupTab[];
   permissionWarningIgnored?: boolean;
   permissionWarningIgnoredAt?: string;
 }

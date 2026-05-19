@@ -1,4 +1,7 @@
 node_modules/
 dist/
+release/
+preview/
 .tools/
 .DS_Store
+/AI_HANDOVER.md

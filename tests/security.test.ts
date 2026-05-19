@@ -6,6 +6,11 @@ import {
   sanitizeErrorMessage,
   validateCapturedToken
 } from "../src/lib/security";
+import {
+  getGraphTokenOverallScore,
+  getGraphTokenTargetScore,
+  getGraphTokenTargets
+} from "../src/lib/graphTokenCapabilities";
 import { validateQuickPimMessage } from "../src/lib/messages";
 import { buildActivationRequest } from "../src/lib/pim";
 import type { ActivationItem } from "../src/lib/types";
@@ -66,6 +71,25 @@ describe("security allowlists and token validation", () => {
     expect(message).not.toContain(token);
     expect(message).toContain("[redacted token]");
     expect(message.length).toBeLessThanOrEqual(260);
+  });
+});
+
+describe("Graph token capability detection", () => {
+  test("detects PIM group Graph tokens independently from Entra role tokens", () => {
+    const directoryRoleToken = {
+      scp: "RoleEligibilitySchedule.Read.Directory RoleManagement.Read.Directory",
+      exp: Math.floor((now + 10 * 60_000) / 1000)
+    };
+    const pimGroupToken = {
+      scp: "PrivilegedEligibilitySchedule.Read.AzureADGroup PrivilegedAssignmentSchedule.Read.AzureADGroup",
+      exp: Math.floor((now + 10 * 60_000) / 1000)
+    };
+
+    expect(getGraphTokenTargets(directoryRoleToken)).toEqual(["directoryRole"]);
+    expect(getGraphTokenTargets(pimGroupToken)).toEqual(["pimGroup"]);
+    expect(getGraphTokenTargetScore(pimGroupToken, "pimGroup")).toBeGreaterThan(0);
+    expect(getGraphTokenTargetScore(pimGroupToken, "directoryRole")).toBe(0);
+    expect(getGraphTokenOverallScore(pimGroupToken)).toBeGreaterThan(0);
   });
 });
 

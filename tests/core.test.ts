@@ -345,7 +345,7 @@ describe("settings helpers", () => {
         defaultSort: "invalid" as any,
         recentJustificationLimit: 99,
         darkMode: true,
-        hiddenPopupTabs: ["azureRole", "bundles", "unknown" as any, "azureRole"]
+        enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
     });
 
@@ -366,7 +366,7 @@ describe("settings helpers", () => {
       defaultSort: "name",
       recentJustificationLimit: 20,
       darkMode: true,
-      hiddenPopupTabs: ["azureRole", "bundles"]
+      enabledFeatures: ["directoryRole", "pimGroup"]
     });
   });
 });

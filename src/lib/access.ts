@@ -42,11 +42,12 @@ const TARGET_REQUIRED_SCOPES: Record<AccessSetupTarget, string[]> = {
 
 export function buildAccessCapabilityItems(
   tokenStatus: TokenStatus | null | undefined,
-  cache: QuickPimDataCache | undefined
+  cache: QuickPimDataCache | undefined,
+  targets: AccessSetupTarget[] = ["directoryRole", "pimGroup", "azureRole"]
 ): AccessCapabilityItem[] {
   const diagnostics = collectDiagnostics(cache);
   const loadedTargets = collectLoadedTargets(cache);
-  return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[]).map((target) =>
+  return targets.map((target) =>
     buildAccessCapabilityItem(target, tokenStatus, diagnostics.filter((item) => item.target === target), loadedTargets.has(target))
   );
 }

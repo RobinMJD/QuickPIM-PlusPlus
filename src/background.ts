@@ -10,6 +10,12 @@ import {
 } from "./lib/pim";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
 import { mapWithConcurrency } from "./lib/concurrency";
+import {
+  getGraphTokenOverallScore,
+  getGraphTokenTargetScore,
+  getGraphTokenTargets,
+  type GraphTokenTarget
+} from "./lib/graphTokenCapabilities";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
 import { isPrivilegedAzureRoleDefinition } from "./lib/privilegedRoles";
 import {
@@ -40,6 +46,12 @@ interface StoredTokens {
   graphToken?: string;
   tokenTimestamp?: number;
   tokenSource?: string;
+  graphDirectoryRoleToken?: string;
+  graphDirectoryRoleTokenTimestamp?: number;
+  graphDirectoryRoleTokenSource?: string;
+  graphPimGroupToken?: string;
+  graphPimGroupTokenTimestamp?: number;
+  graphPimGroupTokenSource?: string;
   azureManagementToken?: string;
   azureManagementTokenTimestamp?: number;
   azureManagementTokenSource?: string;
@@ -101,9 +113,9 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       await clearTokens();
       return true;
     case "getActivationItems":
-      return getActivationItems();
+      return getActivationItems(message.targets);
     case "getActiveItems":
-      return getActiveItems();
+      return getActiveItems(message.targets);
     case "capturePortalTokens":
       return capturePortalTokens(message.tokens, message.source, sender);
     case "activateItems":
@@ -174,22 +186,17 @@ async function storeCapturedToken(tokenKind: TokenKind, token: string, source: s
     return false;
   }
 
+  if (tokenKind === "graph") {
+    return storeCapturedGraphToken(token, source, timestamp, validation.decoded);
+  }
+
   const tokens = await getStoredTokens();
-  const currentToken = tokenKind === "graph" ? tokens.graphToken : tokens.azureManagementToken;
+  const currentToken = tokens.azureManagementToken;
   if (currentToken) {
     const currentValidation = validateCapturedToken(currentToken, tokenKind, timestamp);
     if (currentValidation.ok && shouldKeepCurrentToken(currentValidation.decoded, validation.decoded, tokenKind)) {
       return false;
     }
-  }
-
-  if (tokenKind === "graph") {
-    await chrome.storage.local.set({
-      graphToken: token,
-      tokenTimestamp: timestamp,
-      tokenSource: source
-    });
-    return true;
   }
 
   await chrome.storage.local.set({
@@ -198,6 +205,89 @@ async function storeCapturedToken(tokenKind: TokenKind, token: string, source: s
     azureManagementTokenSource: source
   });
   return true;
+}
+
+async function storeCapturedGraphToken(
+  token: string,
+  source: string,
+  timestamp: number,
+  decoded: Record<string, unknown>
+): Promise<boolean> {
+  const tokens = await getStoredTokens();
+  const updates: Partial<StoredTokens> = {};
+
+  if (shouldStoreGenericGraphToken(tokens.graphToken, decoded, timestamp)) {
+    updates.graphToken = token;
+    updates.tokenTimestamp = timestamp;
+    updates.tokenSource = source;
+  }
+
+  for (const target of getGraphTokenTargets(decoded)) {
+    if (shouldStoreTargetGraphToken(tokens, target, decoded, timestamp)) {
+      Object.assign(updates, getGraphTokenStorageUpdate(target, token, source, timestamp));
+    }
+  }
+
+  if (!Object.keys(updates).length) {
+    return false;
+  }
+
+  await chrome.storage.local.set(updates);
+  return true;
+}
+
+function shouldStoreGenericGraphToken(currentToken: string | undefined, incoming: Record<string, unknown>, timestamp: number): boolean {
+  if (!currentToken) {
+    return true;
+  }
+  const currentValidation = validateCapturedToken(currentToken, "graph", timestamp);
+  return !currentValidation.ok || !shouldKeepCurrentToken(currentValidation.decoded, incoming, "graph");
+}
+
+function shouldStoreTargetGraphToken(
+  tokens: StoredTokens,
+  target: GraphTokenTarget,
+  incoming: Record<string, unknown>,
+  timestamp: number
+): boolean {
+  const currentToken = getStoredGraphTokenForTarget(tokens, target);
+  if (!currentToken) {
+    return true;
+  }
+
+  const currentValidation = validateCapturedToken(currentToken, "graph", timestamp);
+  if (!currentValidation.ok) {
+    return true;
+  }
+
+  const currentScore = getGraphTokenTargetScore(currentValidation.decoded, target);
+  const incomingScore = getGraphTokenTargetScore(incoming, target);
+  if (currentScore > incomingScore) {
+    return false;
+  }
+  const currentExpiry = Number(currentValidation.decoded.exp) || 0;
+  const incomingExpiry = Number(incoming.exp) || 0;
+  return incomingScore > currentScore || incomingExpiry >= currentExpiry;
+}
+
+function getGraphTokenStorageUpdate(
+  target: GraphTokenTarget,
+  token: string,
+  source: string,
+  timestamp: number
+): Partial<StoredTokens> {
+  if (target === "directoryRole") {
+    return {
+      graphDirectoryRoleToken: token,
+      graphDirectoryRoleTokenTimestamp: timestamp,
+      graphDirectoryRoleTokenSource: source
+    };
+  }
+  return {
+    graphPimGroupToken: token,
+    graphPimGroupTokenTimestamp: timestamp,
+    graphPimGroupTokenSource: source
+  };
 }
 
 function shouldKeepCurrentToken(current: Record<string, unknown>, incoming: Record<string, unknown>, tokenKind: TokenKind): boolean {
@@ -215,31 +305,7 @@ function getTokenCaptureScore(decoded: Record<string, unknown>, tokenKind: Token
   if (tokenKind === "azureManagement") {
     return 1;
   }
-
-  const scopes = getGrantedTokenScopes(decoded);
-  const privilegedScopes = [
-    "RoleEligibilitySchedule.Read.Directory",
-    "RoleEligibilitySchedule.ReadWrite.Directory",
-    "RoleManagement.Read.Directory",
-    "RoleManagement.ReadWrite.Directory",
-    "PrivilegedEligibilitySchedule.Read.AzureADGroup",
-    "PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup",
-    "PrivilegedAccess.Read.AzureADGroup",
-    "PrivilegedAccess.ReadWrite.AzureADGroup"
-  ];
-  if (privilegedScopes.some((scope) => scopes.has(scope))) {
-    return 20;
-  }
-  if ([...scopes].some((scope) => /^RoleManagement\.Read/i.test(scope) || /^Privileged/i.test(scope))) {
-    return 10;
-  }
-  return 1;
-}
-
-function getGrantedTokenScopes(decoded: Record<string, unknown>): Set<string> {
-  const scopes = typeof decoded.scp === "string" ? decoded.scp.split(/\s+/).filter(Boolean) : [];
-  const roles = Array.isArray(decoded.roles) ? decoded.roles.filter((role): role is string => typeof role === "string") : [];
-  return new Set([...scopes, ...roles]);
+  return getGraphTokenOverallScore(decoded) || 1;
 }
 
 async function getStoredTokens(): Promise<StoredTokens> {
@@ -247,6 +313,12 @@ async function getStoredTokens(): Promise<StoredTokens> {
     "graphToken",
     "tokenTimestamp",
     "tokenSource",
+    "graphDirectoryRoleToken",
+    "graphDirectoryRoleTokenTimestamp",
+    "graphDirectoryRoleTokenSource",
+    "graphPimGroupToken",
+    "graphPimGroupTokenTimestamp",
+    "graphPimGroupTokenSource",
     "azureManagementToken",
     "azureManagementTokenTimestamp",
     "azureManagementTokenSource"
@@ -258,6 +330,12 @@ async function clearTokens(): Promise<void> {
     "graphToken",
     "tokenTimestamp",
     "tokenSource",
+    "graphDirectoryRoleToken",
+    "graphDirectoryRoleTokenTimestamp",
+    "graphDirectoryRoleTokenSource",
+    "graphPimGroupToken",
+    "graphPimGroupTokenTimestamp",
+    "graphPimGroupTokenSource",
     "azureManagementToken",
     "azureManagementTokenTimestamp",
     "azureManagementTokenSource"
@@ -266,7 +344,17 @@ async function clearTokens(): Promise<void> {
 
 async function clearTokenKind(tokenKind: "graph" | "azureManagement"): Promise<void> {
   if (tokenKind === "graph") {
-    await chrome.storage.local.remove(["graphToken", "tokenTimestamp", "tokenSource"]);
+    await chrome.storage.local.remove([
+      "graphToken",
+      "tokenTimestamp",
+      "tokenSource",
+      "graphDirectoryRoleToken",
+      "graphDirectoryRoleTokenTimestamp",
+      "graphDirectoryRoleTokenSource",
+      "graphPimGroupToken",
+      "graphPimGroupTokenTimestamp",
+      "graphPimGroupTokenSource"
+    ]);
     return;
   }
 
@@ -279,7 +367,8 @@ async function clearTokenKind(tokenKind: "graph" | "azureManagement"): Promise<v
 
 async function getTokenStatus(): Promise<TokenStatus> {
   const tokens = await getStoredTokens();
-  const graphValidation = tokens.graphToken ? validateCapturedToken(tokens.graphToken, "graph") : undefined;
+  const graphStatusToken = selectGraphTokenForStatus(tokens);
+  const graphValidation = graphStatusToken?.token ? validateCapturedToken(graphStatusToken.token, "graph") : undefined;
   const azureValidation = tokens.azureManagementToken
     ? validateCapturedToken(tokens.azureManagementToken, "azureManagement")
     : undefined;
@@ -292,7 +381,7 @@ async function getTokenStatus(): Promise<TokenStatus> {
   }
 
   return {
-    graph: graphValidation?.ok ? makeTokenStatus(tokens.graphToken, tokens.tokenTimestamp, tokens.tokenSource) : { hasToken: false },
+    graph: graphValidation?.ok ? makeTokenStatus(graphStatusToken?.token, graphStatusToken?.timestamp, graphStatusToken?.source) : { hasToken: false },
     azureManagement: azureValidation?.ok
       ? makeTokenStatus(
           tokens.azureManagementToken,
@@ -303,13 +392,42 @@ async function getTokenStatus(): Promise<TokenStatus> {
   };
 }
 
-async function getActivationItems(): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
+function selectGraphTokenForStatus(tokens: StoredTokens): { token?: string; timestamp?: number; source?: string } | undefined {
+  const candidates = [
+    { token: tokens.graphToken, timestamp: tokens.tokenTimestamp, source: tokens.tokenSource },
+    {
+      token: tokens.graphDirectoryRoleToken,
+      timestamp: tokens.graphDirectoryRoleTokenTimestamp,
+      source: tokens.graphDirectoryRoleTokenSource
+    },
+    {
+      token: tokens.graphPimGroupToken,
+      timestamp: tokens.graphPimGroupTokenTimestamp,
+      source: tokens.graphPimGroupTokenSource
+    }
+  ];
+
+  return candidates
+    .filter((candidate) => Boolean(candidate.token))
+    .sort((a, b) => {
+      const aDecoded = decodeToken(a.token || "");
+      const bDecoded = decodeToken(b.token || "");
+      const scoreDelta = (bDecoded ? getTokenCaptureScore(bDecoded, "graph") : 0) - (aDecoded ? getTokenCaptureScore(aDecoded, "graph") : 0);
+      if (scoreDelta) {
+        return scoreDelta;
+      }
+      return (b.timestamp || 0) - (a.timestamp || 0);
+    })[0];
+}
+
+async function getActivationItems(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
   const tokens = await getStoredTokens();
-  const results = await Promise.all([
-    fetchItemGroup("directoryRole", "graph", tokens.graphToken, getDirectoryRoles),
-    fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getAzureRoles),
-    fetchItemGroup("pimGroup", "graph", tokens.graphToken, getPimGroups)
-  ]);
+  const fetchers: Record<AccessSetupTarget, () => Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }>> = {
+    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getDirectoryRoles),
+    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getAzureRoles),
+    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getPimGroups)
+  };
+  const results = await Promise.all(targets.map((target) => fetchers[target]()));
 
   return {
     items: dedupeItems(results.flatMap((result) => result.items)),
@@ -318,19 +436,28 @@ async function getActivationItems(): Promise<{ items: ActivationItem[]; errors: 
   };
 }
 
-async function getActiveItems(): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
+async function getActiveItems(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
   const tokens = await getStoredTokens();
-  const results = await Promise.all([
-    fetchItemGroup("directoryRole", "graph", tokens.graphToken, getActiveDirectoryRoles),
-    fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getActiveAzureRoles),
-    fetchItemGroup("pimGroup", "graph", tokens.graphToken, getActivePimGroups)
-  ]);
+  const fetchers: Record<AccessSetupTarget, () => Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }>> = {
+    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getActiveDirectoryRoles),
+    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getActiveAzureRoles),
+    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getActivePimGroups)
+  };
+  const results = await Promise.all(targets.map((target) => fetchers[target]()));
 
   return {
     items: dedupeItems(results.flatMap((result) => result.items)),
     errors: results.flatMap((result) => result.error ? [result.error] : []),
     diagnostics: results.map((result) => result.diagnostic)
   };
+}
+
+function getGraphTokenForTarget(tokens: StoredTokens, target: GraphTokenTarget): string | undefined {
+  return getStoredGraphTokenForTarget(tokens, target) || tokens.graphToken;
+}
+
+function getStoredGraphTokenForTarget(tokens: StoredTokens, target: GraphTokenTarget): string | undefined {
+  return target === "directoryRole" ? tokens.graphDirectoryRoleToken : tokens.graphPimGroupToken;
 }
 
 async function fetchItemGroup(
@@ -866,7 +993,7 @@ async function activateItems(
       try {
         const request = buildActivationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
         assertAllowedApiUrl(request.endpoint, request.tokenKind);
-        const token = request.tokenKind === "graph" ? tokens.graphToken : tokens.azureManagementToken;
+        const token = getTokenForActivation(tokens, item, request.tokenKind);
         if (!token) {
           throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
         }
@@ -909,6 +1036,16 @@ async function activateItems(
     results,
     errors
   };
+}
+
+function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, tokenKind: TokenKind): string | undefined {
+  if (tokenKind === "azureManagement") {
+    return tokens.azureManagementToken;
+  }
+  if (item.type === "pimGroup") {
+    return getGraphTokenForTarget(tokens, "pimGroup");
+  }
+  return getGraphTokenForTarget(tokens, "directoryRole");
 }
 
 async function fetchAllPages<T>(url: string, token: string): Promise<T[]> {

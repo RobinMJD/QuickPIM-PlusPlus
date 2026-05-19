@@ -1,10 +1,10 @@
-import type { ActivationItem, TicketInfo } from "./types";
+import type { AccessSetupTarget, ActivationItem, TicketInfo } from "./types";
 
 export type QuickPimMessage =
   | { action: "getTokenStatus" }
   | { action: "clearToken" }
-  | { action: "getActivationItems" }
-  | { action: "getActiveItems" }
+  | { action: "getActivationItems"; targets?: AccessSetupTarget[] }
+  | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
   | { action: "capturePortalTokens"; tokens: string[]; source?: string }
   | {
       action: "activateItems";
@@ -14,7 +14,8 @@ export type QuickPimMessage =
       ticketInfo?: TicketInfo;
     };
 
-const SIMPLE_ACTIONS = new Set(["getTokenStatus", "clearToken", "getActivationItems", "getActiveItems"]);
+const SIMPLE_ACTIONS = new Set(["getTokenStatus", "clearToken"]);
+const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems"]);
 const MAX_PORTAL_TOKENS = 20;
 const MAX_PORTAL_TOKEN_LENGTH = 8192;
 const MAX_PORTAL_SOURCE_LENGTH = 160;
@@ -26,6 +27,13 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
 
   if (SIMPLE_ACTIONS.has(message.action)) {
     return { action: message.action } as QuickPimMessage;
+  }
+
+  if (TARGETED_FETCH_ACTIONS.has(message.action)) {
+    return {
+      action: message.action,
+      targets: sanitizeTargets(message.targets)
+    } as QuickPimMessage;
   }
 
   if (message.action === "capturePortalTokens") {
@@ -83,6 +91,28 @@ export function isTrustedRuntimeSender(sender: chrome.runtime.MessageSender): bo
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function sanitizeTargets(value: unknown): AccessSetupTarget[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("Fetch targets must be an array.");
+  }
+
+  const seen = new Set<AccessSetupTarget>();
+  const targets: AccessSetupTarget[] = [];
+  for (const item of value) {
+    if (item !== "directoryRole" && item !== "pimGroup" && item !== "azureRole") {
+      throw new Error("Fetch target is unsupported.");
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      targets.push(item);
+    }
+  }
+  return targets;
 }
 
 function isJwtLike(value: string): boolean {

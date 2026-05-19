@@ -7,8 +7,10 @@ import { DEFAULT_DURATION_OPTIONS, coerceDurationForItems, getDurationOptions, t
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
+  buildFeatureCacheKey,
   createBundleId,
   getDisplayName,
+  getEnabledRoleFeatures,
   getScopeLabel,
   loadSettings,
   mergeSettings,
@@ -22,7 +24,7 @@ import {
   saveReferenceData
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
-import type { AccessDiagnostic, AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import type { AccessDiagnostic, AccessSetupTarget, ActivationItem, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "home" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data" | "about";
 
@@ -119,16 +121,25 @@ function SettingsApp() {
         loadReferenceData()
       ]);
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
+      const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
+      const featureCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
+      const fetchEligibleItems = () =>
+        enabledRoleFeatures.length
+          ? sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({
+              action: "getActivationItems",
+              targets: enabledRoleFeatures
+            })
+          : Promise.resolve({ items: [], errors: [], diagnostics: [] });
       const eligible = await getDataWithCache(
         "eligible",
         loadedCache,
         DEFAULT_ELIGIBLE_CACHE_TTL_MS,
         Boolean(options.showProgress),
-        () => sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
+        fetchEligibleItems,
         Date.now(),
-        tokenCacheKey
+        featureCacheKey
       );
-      const cachedActive = loadedCache.active?.cacheKey === tokenCacheKey ? loadedCache.active : undefined;
+      const cachedActive = loadedCache.active?.cacheKey === featureCacheKey ? loadedCache.active : undefined;
       const nextCache: QuickPimDataCache = {
         ...(eligible.cache.eligible ? { eligible: eligible.cache.eligible } : {}),
         ...(cachedActive ? { active: cachedActive } : {})
@@ -170,14 +181,26 @@ function SettingsApp() {
     try {
       const latestTokens = tokens ?? await sendMessage<TokenStatus>({ action: "getTokenStatus" });
       const tokenCacheKey = buildTokenCacheKey(latestTokens);
+      const enabledRoleFeatures = getEnabledRoleFeatures(settings);
+      const featureCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
       const [eligible, active] = await Promise.all([
-        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActivationItems" }),
-        sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({ action: "getActiveItems" })
+        enabledRoleFeatures.length
+          ? sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({
+              action: "getActivationItems",
+              targets: enabledRoleFeatures
+            })
+          : Promise.resolve({ items: [], errors: [], diagnostics: [] }),
+        enabledRoleFeatures.length
+          ? sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: AccessDiagnostic[] }>({
+              action: "getActiveItems",
+              targets: enabledRoleFeatures
+            })
+          : Promise.resolve({ items: [], errors: [], diagnostics: [] })
       ]);
       const fetchedAt = Date.now();
       const nextCache: QuickPimDataCache = {
-        eligible: { ...eligible, fetchedAt, cacheKey: tokenCacheKey },
-        active: { ...active, fetchedAt, cacheKey: tokenCacheKey }
+        eligible: { ...eligible, fetchedAt, cacheKey: featureCacheKey },
+        active: { ...active, fetchedAt, cacheKey: featureCacheKey }
       };
       await saveDataCache(nextCache);
       const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [
@@ -189,7 +212,7 @@ function SettingsApp() {
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
-      const limitedAreas = buildAccessCapabilityItems(latestTokens, nextCache).filter((item) => item.status !== "ready").length;
+      const limitedAreas = buildAccessCapabilityItems(latestTokens, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
       setMessage(
         limitedAreas
           ? `Access data refreshed. ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
@@ -497,7 +520,8 @@ function AccessSetupPanel({
   onClearReferenceData: () => Promise<void>;
 }) {
   const [isRunningSetup, setIsRunningSetup] = useState(false);
-  const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache), [dataCache, tokenStatus]);
+  const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
+  const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
   const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
 
@@ -556,7 +580,9 @@ function AccessSetupPanel({
           <p className="muted">
             {setupTargets.length
               ? `${setupTargets.length} area(s) need a portal refresh or are limited by the captured portal token.`
-              : "QuickPIM++ can use the currently captured portal tokens for all feature areas."}
+              : enabledRoleFeatures.length
+                ? "QuickPIM++ can use the currently captured portal tokens for all enabled feature areas."
+                : "No role features are enabled, so no portal access is required."}
           </p>
         </div>
         <button className={`btn ${warningIgnored ? "" : "subtle"}`} onClick={() => void setIgnored(!warningIgnored)}>
@@ -610,6 +636,7 @@ function AccessSetupPanel({
         {accessStatus.map((item) => (
           <AccessStatusRow item={item} key={item.target} />
         ))}
+        {!accessStatus.length ? <p className="muted">Enable Entra Roles, PIM Groups, or Azure Roles in Preferences to add access checks.</p> : null}
       </div>
 
       <div className="panel">
@@ -1041,19 +1068,19 @@ function PreferencesPanel({
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
-  const [hiddenPopupTabs, setHiddenPopupTabs] = useState<Set<PopupTab>>(new Set(settings.preferences.hiddenPopupTabs));
+  const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
 
   useEffect(() => {
     setDefaultDurationHours(settings.preferences.defaultDurationHours);
     setDefaultSort(settings.preferences.defaultSort);
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
     setDarkMode(settings.preferences.darkMode);
-    setHiddenPopupTabs(new Set(settings.preferences.hiddenPopupTabs));
+    setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
   }, [
     settings.preferences.darkMode,
     settings.preferences.defaultDurationHours,
     settings.preferences.defaultSort,
-    settings.preferences.hiddenPopupTabs,
+    settings.preferences.enabledFeatures,
     settings.preferences.recentJustificationLimit
   ]);
 
@@ -1066,18 +1093,19 @@ function PreferencesPanel({
         defaultSort,
         recentJustificationLimit,
         darkMode,
-        hiddenPopupTabs: [...hiddenPopupTabs]
+        enabledFeatures: [...enabledFeatures],
+        autoEnabledFeaturesInitialized: true
       }
     });
   }
 
-  function toggleHiddenPopupTab(tab: PopupTab, hidden: boolean) {
-    setHiddenPopupTabs((current) => {
+  function toggleFeature(feature: QuickPimFeature, enabled: boolean) {
+    setEnabledFeatures((current) => {
       const next = new Set(current);
-      if (hidden) {
-        next.add(tab);
+      if (enabled) {
+        next.add(feature);
       } else {
-        next.delete(tab);
+        next.delete(feature);
       }
       return next;
     });
@@ -1089,7 +1117,7 @@ function PreferencesPanel({
       <div className="preference-section">
         <h3>Popup defaults</h3>
         <p className="muted">These values are preselected when the popup opens. Role policies can still cap duration choices.</p>
-        <div className="form-grid three settings-section-gap">
+        <div className="form-grid three settings-section-gap popup-defaults-grid">
           <div className="field">
             <label>Default activation duration</label>
             <select
@@ -1136,18 +1164,18 @@ function PreferencesPanel({
         </label>
       </div>
       <div className="preference-section">
-        <h3>Popup tabs</h3>
-        <p className="muted">Hide tabs you do not use. Empty role-type tabs are also hidden automatically.</p>
+        <h3>Enabled features</h3>
+        <p className="muted">Only enabled role features are fetched, shown in the popup, and checked by Access Setup. Empty enabled role tabs are still hidden automatically.</p>
         <div className="checkbox-grid compact settings-section-gap">
-          {(["directoryRole", "pimGroup", "azureRole", "bundles"] as PopupTab[]).map((popupTab) => (
-            <label className="checkbox-option" key={popupTab}>
+          {(["directoryRole", "pimGroup", "azureRole", "bundles"] as QuickPimFeature[]).map((feature) => (
+            <label className="checkbox-option" key={feature}>
               <input
                 type="checkbox"
-                checked={hiddenPopupTabs.has(popupTab)}
-                onChange={(event) => toggleHiddenPopupTab(popupTab, event.target.checked)}
-                aria-label={`Hide ${popupTabLabel(popupTab)} tab`}
+                checked={enabledFeatures.has(feature)}
+                onChange={(event) => toggleFeature(feature, event.target.checked)}
+                aria-label={`Enable ${popupTabLabel(feature)} feature`}
               />
-              <span>Hide {popupTabLabel(popupTab)} tab</span>
+              <span>Enable {popupTabLabel(feature)}</span>
             </label>
           ))}
         </div>
