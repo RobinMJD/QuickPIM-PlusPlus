@@ -53,6 +53,10 @@ function SettingsApp() {
   }, []);
 
   useEffect(() => {
+    document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
+  }, [settings.preferences.darkMode]);
+
+  useEffect(() => {
     function handleHashChange() {
       setTab(tabFromHash());
     }
@@ -833,6 +837,19 @@ function PreferencesPanel({
   const [defaultDurationHours, setDefaultDurationHours] = useState(settings.preferences.defaultDurationHours);
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
+  const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
+
+  useEffect(() => {
+    setDefaultDurationHours(settings.preferences.defaultDurationHours);
+    setDefaultSort(settings.preferences.defaultSort);
+    setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
+    setDarkMode(settings.preferences.darkMode);
+  }, [
+    settings.preferences.darkMode,
+    settings.preferences.defaultDurationHours,
+    settings.preferences.defaultSort,
+    settings.preferences.recentJustificationLimit
+  ]);
 
   async function save() {
     await onSave({
@@ -841,7 +858,8 @@ function PreferencesPanel({
         ...settings.preferences,
         defaultDurationHours,
         defaultSort,
-        recentJustificationLimit
+        recentJustificationLimit,
+        darkMode
       }
     });
   }
@@ -868,6 +886,14 @@ function PreferencesPanel({
           <label>Recent justification count</label>
           <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
         </div>
+        <label className="checkbox-option preference-toggle">
+          <input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} aria-label="Dark mode" />
+          <span>
+            <strong>Dark mode</strong>
+            <br />
+            <span className="muted">Use dark surfaces in the popup and settings.</span>
+          </span>
+        </label>
       </div>
       <div className="button-row settings-form-actions">
         <button className="btn primary" onClick={() => void save()}>

@@ -77,6 +77,7 @@ export interface QuickPimPreferences {
   defaultDurationHours: number;
   defaultSort: SortMode;
   recentJustificationLimit: number;
+  darkMode: boolean;
   permissionWarningIgnored?: boolean;
   permissionWarningIgnoredAt?: string;
 }

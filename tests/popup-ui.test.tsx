@@ -8,6 +8,7 @@ import type { ActivationItem } from "../src/lib/types";
 afterEach(() => {
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
+  document.body.className = "";
 });
 
 function deferred<T>() {
@@ -471,5 +472,77 @@ describe("popup role row styling", () => {
 
     expect(iconRule).toContain("position: absolute;");
     expect(iconInputRule).toContain("padding-left: 34px;");
+  });
+
+  test("includes dark mode surface overrides", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const darkRule = css.match(/body\.dark-mode\s*\{[^}]+\}/)?.[0] || "";
+    const darkPanelRule = css.match(/body\.dark-mode\s+\.panel,\s*body\.dark-mode\s+\.role-row\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(darkRule).toContain("color-scheme: dark;");
+    expect(darkPanelRule).toContain("background: #1e293b;");
+  });
+});
+
+describe("popup dark mode", () => {
+  test("applies the saved dark mode preference on load", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          darkMode: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    expect(document.body.classList.contains("dark-mode")).toBe(true);
   });
 });

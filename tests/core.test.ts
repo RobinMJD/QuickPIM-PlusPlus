@@ -343,7 +343,8 @@ describe("settings helpers", () => {
       preferences: {
         defaultDurationHours: 99,
         defaultSort: "invalid" as any,
-        recentJustificationLimit: 99
+        recentJustificationLimit: 99,
+        darkMode: true
       }
     });
 
@@ -362,7 +363,8 @@ describe("settings helpers", () => {
     expect(imported.preferences).toMatchObject({
       defaultDurationHours: 24,
       defaultSort: "name",
-      recentJustificationLimit: 20
+      recentJustificationLimit: 20,
+      darkMode: true
     });
   });
 });

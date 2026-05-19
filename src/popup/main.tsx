@@ -95,6 +95,10 @@ function PopupApp() {
     setDurationHours(settings.preferences.defaultDurationHours);
   }, [settings.preferences.defaultDurationHours, settings.preferences.defaultSort]);
 
+  useEffect(() => {
+    document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
+  }, [settings.preferences.darkMode]);
+
   const displayItems = useMemo(
     () => mergeEligibleWithActive(eligibleItems, activeItems),
     [activeItems, eligibleItems]

@@ -881,6 +881,173 @@ button {
   white-space: pre;
 }
 
+body.dark-mode {
+  color-scheme: dark;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+body.dark-mode .app-shell,
+body.dark-mode .settings-shell {
+  background: #0f172a;
+}
+
+body.dark-mode .app-header,
+body.dark-mode .settings-header,
+body.dark-mode .tab-bar,
+body.dark-mode .activation-bar {
+  background: #111827;
+  border-color: #334155;
+}
+
+body.dark-mode .brand h1,
+body.dark-mode .panel h2,
+body.dark-mode .panel h3,
+body.dark-mode .role-title,
+body.dark-mode .about-grid strong,
+body.dark-mode .permission-row h3,
+body.dark-mode .btn,
+body.dark-mode .input,
+body.dark-mode .select,
+body.dark-mode .textarea {
+  color: #f8fafc;
+}
+
+body.dark-mode .brand p,
+body.dark-mode .muted,
+body.dark-mode .role-meta,
+body.dark-mode .field label,
+body.dark-mode .settings-nav button,
+body.dark-mode .empty-state,
+body.dark-mode .permission-row p,
+body.dark-mode .tutorial-list,
+body.dark-mode .field-icon {
+  color: #94a3b8;
+}
+
+body.dark-mode .panel,
+body.dark-mode .role-row {
+  background: #1e293b;
+  border-color: #334155;
+  box-shadow: none;
+}
+
+body.dark-mode .role-row.selected {
+  background: #172554;
+  border-color: #3b82f6;
+}
+
+body.dark-mode .role-row.active-row {
+  background: #10251b;
+}
+
+body.dark-mode .input,
+body.dark-mode .select,
+body.dark-mode .textarea,
+body.dark-mode .checkbox-option,
+body.dark-mode .bundle-card,
+body.dark-mode .permission-row {
+  background: #0f172a;
+  border-color: #334155;
+}
+
+body.dark-mode .settings-nav button.active,
+body.dark-mode .tab-button.active,
+body.dark-mode .about-grid > div,
+body.dark-mode .permission-detail-grid,
+body.dark-mode .permission-note,
+body.dark-mode .checkbox-grid,
+body.dark-mode .message,
+body.dark-mode .justification-chip,
+body.dark-mode .activation-count,
+body.dark-mode .status-badge.eligible,
+body.dark-mode .badge {
+  background: #334155;
+  color: #e2e8f0;
+}
+
+body.dark-mode .tab-button.active {
+  border-color: #334155;
+  border-bottom-color: #0f172a;
+}
+
+body.dark-mode .tab-button {
+  color: #94a3b8;
+}
+
+body.dark-mode .permission-banner {
+  background: #422006;
+  border-color: #92400e;
+  color: #fed7aa;
+}
+
+body.dark-mode .message.error,
+body.dark-mode .btn.danger,
+body.dark-mode .permission-state.missing {
+  background: #7f1d1d;
+  color: #fecaca;
+}
+
+body.dark-mode .loading-panel {
+  background: #172554;
+  border-color: #1d4ed8;
+  color: #bfdbfe;
+}
+
+body.dark-mode .alias-row,
+body.dark-mode .settings-row {
+  border-bottom-color: #334155;
+}
+
+body.dark-mode .badge.directoryRole {
+  background: #1e3a8a;
+  color: #bfdbfe;
+}
+
+body.dark-mode .badge.azureRole {
+  background: #164e63;
+  color: #a5f3fc;
+}
+
+body.dark-mode .badge.pimGroup {
+  background: #581c87;
+  color: #e9d5ff;
+}
+
+body.dark-mode .token-pill.ok,
+body.dark-mode .status-badge.active,
+body.dark-mode .permission-state.ok {
+  background: #14532d;
+  color: #bbf7d0;
+}
+
+body.dark-mode .token-pill.warn {
+  background: #7c2d12;
+  color: #fed7aa;
+}
+
+body.dark-mode .btn {
+  background: #334155;
+}
+
+body.dark-mode .btn:hover {
+  background: #475569;
+}
+
+body.dark-mode .btn.primary {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+body.dark-mode .btn.subtle,
+body.dark-mode .permission-doc-link {
+  color: #93c5fd;
+}
+
+body.dark-mode .favorite-button:hover {
+  background: #334155;
+}
+
 @media (max-width: 760px) {
   body.settings-page {
     min-width: 360px;

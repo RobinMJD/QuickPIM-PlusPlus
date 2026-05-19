@@ -36,6 +36,7 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     defaultDurationHours: 0.5,
     defaultSort: "name",
     recentJustificationLimit: 8,
+    darkMode: false,
     permissionWarningIgnored: false
   }
 };
@@ -287,6 +288,7 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
+    darkMode: preferences.darkMode === true,
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,
     ...(ignoredAt ? { permissionWarningIgnoredAt: ignoredAt } : {})
   };
