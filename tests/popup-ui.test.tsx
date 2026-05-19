@@ -593,12 +593,14 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("Unselect all");
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
 
-    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+    expect(document.body.textContent).not.toContain("Activation time");
     expect(document.body.textContent).toContain("Unselect all");
 
     clickButton("Unselect all");
 
-    await waitFor(() => expect(document.body.textContent).not.toContain("Activate 1 selected"));
+    await waitFor(() => expect(document.body.textContent).not.toContain("Continue"));
     expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(false);
   });
 
@@ -668,11 +670,12 @@ describe("popup compact controls", () => {
 
     document.querySelector<HTMLElement>(".role-title")?.click();
     await waitFor(() => expect(checkbox.checked).toBe(true));
-    expect(document.body.textContent).toContain("Activate 1 selected");
+    expect(document.body.textContent).toContain("Continue");
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
 
     row.click();
     await waitFor(() => expect(checkbox.checked).toBe(false));
-    expect(document.body.textContent).not.toContain("Activate 1 selected");
+    expect(document.body.textContent).not.toContain("Continue");
   });
 
   test("shows activation progress through request and refresh before final confirmation", async () => {
@@ -762,6 +765,11 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.body.textContent).not.toContain("Activation time");
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+    clickButton("Continue");
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     clickButton("Activate 1 selected");
 
     await waitFor(() => expect(document.body.textContent).toContain("Activation in progress (step 1/3): Sending activation request"));
@@ -851,6 +859,10 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
 
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.querySelector(".required-marker")).toBeFalsy();
+    expect(document.body.textContent).not.toContain("Justification");
+    clickButton("Continue");
     await waitFor(() => expect(document.querySelector(".required-marker")).toBeTruthy());
     expect(document.querySelector(".required-marker")?.textContent).toBe("*");
     expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
@@ -925,6 +937,9 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
 
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.querySelector(".justification-label-row")).toBeFalsy();
+    clickButton("Continue");
     await waitFor(() => expect(document.querySelector(".justification-label-row")).toBeTruthy());
     expect(document.body.textContent).not.toContain("Save justification");
 
@@ -1022,6 +1037,9 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    clickButton("Continue");
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     clickButton("Activate 1 selected");
 
     await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
@@ -1270,6 +1288,9 @@ describe("popup activation guardrails", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Role 5"));
     document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((checkbox) => checkbox.click());
 
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.body.textContent).not.toContain("PIM works best when roles are activated only for a specific need");
+    clickButton("Continue");
     await waitFor(() => expect(document.body.textContent).toContain("PIM works best when roles are activated only for a specific need"));
     expect(document.body.textContent).toContain("Selecting many Entra roles by default reduces the value of just-in-time access.");
   });
@@ -1344,6 +1365,9 @@ describe("popup activation guardrails", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeFalsy();
+    clickButton("Continue");
     await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
     setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "BAU");
     clickButton("Activate 1 selected");

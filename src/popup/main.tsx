@@ -105,6 +105,7 @@ function PopupApp() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress>(LOADING_STEPS[0]);
   const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
   const [isActivating, setIsActivating] = useState(false);
@@ -178,6 +179,12 @@ function PopupApp() {
       setTab(visibleTabs[0]);
     }
   }, [tab, visibleTabs]);
+
+  useEffect(() => {
+    if (!selectedItems.length) {
+      setIsActivationReviewOpen(false);
+    }
+  }, [selectedItems.length]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -510,7 +517,9 @@ function PopupApp() {
             durationOptions={durationOptions}
             selectedCount={selectedItems.length}
             selectedDirectoryRoleCount={selectedDirectoryRoleCount}
+            isReviewOpen={isActivationReviewOpen}
             isActivating={isActivating}
+            onContinue={() => setIsActivationReviewOpen(true)}
             onActivate={() => void activate(selectedItems)}
             onSaveJustification={() => void saveCurrentJustification()}
             onClearSelection={() => setSelectedIds(new Set())}
@@ -726,7 +735,9 @@ function ActivationBar(props: {
   durationOptions: Array<{ value: number; label: string }>;
   selectedCount: number;
   selectedDirectoryRoleCount: number;
+  isReviewOpen: boolean;
   isActivating: boolean;
+  onContinue: () => void;
   onActivate: () => void;
   onSaveJustification: () => void;
   onClearSelection: () => void;
@@ -738,7 +749,20 @@ function ActivationBar(props: {
     : props.durationOptions[0]?.value;
   return (
     <section className="activation-bar">
-      {hasSelection && props.selectedDirectoryRoleCount > 4 ? (
+      {hasSelection && !props.isReviewOpen ? (
+        <div className="button-row">
+          <button className="btn primary" onClick={props.onContinue} disabled={props.isActivating}>
+            Continue
+          </button>
+          <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
+            Unselect all
+          </button>
+          <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
+            Settings
+          </button>
+        </div>
+      ) : null}
+      {hasSelection && props.isReviewOpen && props.selectedDirectoryRoleCount > 4 ? (
         <div className="practice-warning" role="status">
           <strong>Select only what you need.</strong>
           <span>
@@ -746,7 +770,7 @@ function ActivationBar(props: {
           </span>
         </div>
       ) : null}
-      {hasSelection && props.durationOptions.length ? (
+      {hasSelection && props.isReviewOpen && props.durationOptions.length ? (
         <div className="field">
           <label>Activation time</label>
           <select
@@ -763,7 +787,7 @@ function ActivationBar(props: {
           </select>
         </div>
       ) : null}
-      {hasSelection && props.requirements.needsJustification ? (
+      {hasSelection && props.isReviewOpen && props.requirements.needsJustification ? (
         <div className="field" style={{ marginTop: 8 }}>
           <div className="justification-label-row">
             <label>
@@ -788,7 +812,7 @@ function ActivationBar(props: {
           />
         </div>
       ) : null}
-      {hasSelection && props.requirements.needsJustification && justificationOptions.length ? (
+      {hasSelection && props.isReviewOpen && props.requirements.needsJustification && justificationOptions.length ? (
         <div className="chip-row">
           {justificationOptions.slice(0, 4).map((item) => (
             <button className="justification-chip" key={item} onClick={() => props.setJustification(item)}>
@@ -797,27 +821,29 @@ function ActivationBar(props: {
           ))}
         </div>
       ) : null}
-      {hasSelection && props.requirements.needsTicket ? (
+      {hasSelection && props.isReviewOpen && props.requirements.needsTicket ? (
         <div className="activation-grid" style={{ marginTop: 8 }}>
           <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
           <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
         </div>
       ) : null}
-      <div className="button-row">
-        {hasSelection ? (
-          <button className="btn primary" onClick={props.onActivate} disabled={props.isActivating}>
-            {props.isActivating ? "Activating..." : `Activate ${props.selectedCount} selected`}
+      {props.isReviewOpen || !hasSelection ? (
+        <div className="button-row">
+          {hasSelection && props.isReviewOpen ? (
+            <button className="btn primary" onClick={props.onActivate} disabled={props.isActivating}>
+              {props.isActivating ? "Activating..." : `Activate ${props.selectedCount} selected`}
+            </button>
+          ) : null}
+          {hasSelection ? (
+            <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
+              Unselect all
+            </button>
+          ) : null}
+          <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
+            Settings
           </button>
-        ) : null}
-        {hasSelection ? (
-          <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
-            Unselect all
-          </button>
-        ) : null}
-        <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
-          Settings
-        </button>
-      </div>
+        </div>
+      ) : null}
     </section>
   );
 }
