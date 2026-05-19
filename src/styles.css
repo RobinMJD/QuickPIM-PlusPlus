@@ -364,6 +364,10 @@ button {
   background: #eff6ff;
 }
 
+.role-row.selectable {
+  cursor: pointer;
+}
+
 .role-row.readonly {
   grid-template-columns: 28px minmax(0, 1fr) auto;
 }

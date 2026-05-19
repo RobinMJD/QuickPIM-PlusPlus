@@ -602,6 +602,79 @@ describe("popup compact controls", () => {
     expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(false);
   });
 
+  test("toggles selection when clicking role text or blank row space", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    const checkbox = document.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    const row = document.querySelector<HTMLElement>(".role-row")!;
+
+    document.querySelector<HTMLElement>(".role-title")?.click();
+    await waitFor(() => expect(checkbox.checked).toBe(true));
+    expect(document.body.textContent).toContain("Activate 1 selected");
+
+    row.click();
+    await waitFor(() => expect(checkbox.checked).toBe(false));
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+  });
+
   test("shows activation progress through request and refresh before final confirmation", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {

@@ -700,8 +700,13 @@ function RoleList({
         }
 
         return (
-          <div className={`role-row ${selected ? "selected" : ""}`} key={item.id}>
-            <input type="checkbox" checked={selected} onChange={() => onToggle?.(item.id)} />
+          <div className={`role-row selectable ${selected ? "selected" : ""}`} key={item.id} onClick={() => onToggle?.(item.id)}>
+            <input
+              type="checkbox"
+              checked={selected}
+              onClick={(event) => event.stopPropagation()}
+              onChange={() => onToggle?.(item.id)}
+            />
             {body}
           </div>
         );
