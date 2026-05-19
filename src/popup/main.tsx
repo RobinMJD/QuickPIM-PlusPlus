@@ -80,6 +80,12 @@ const LOADING_STEPS: LoadingProgress[] = [
   { current: 4, total: 4, label: "Preparing the role list" }
 ];
 
+const ACTIVATION_STEPS: LoadingProgress[] = [
+  { current: 1, total: 3, label: "Sending activation request" },
+  { current: 2, total: 3, label: "Saving activation result" },
+  { current: 3, total: 3, label: "Refreshing activation status" }
+];
+
 function PopupApp() {
   const [tab, setTab] = useState<PopupTab>("directoryRole");
   const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
@@ -99,6 +105,7 @@ function PopupApp() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress>(LOADING_STEPS[0]);
+  const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
   const [isActivating, setIsActivating] = useState(false);
 
   useEffect(() => {
@@ -178,10 +185,15 @@ function PopupApp() {
     return sortItems(filtered, settings, sortMode, referenceData);
   }, [displayItems, referenceData, search, settings, sortMode, tab]);
 
-  async function refresh(options: { force: boolean }) {
-    setIsLoading(true);
-    setLoadingProgress(LOADING_STEPS[0]);
-    setError("");
+  async function refresh(options: { force: boolean; showLoading?: boolean; suppressMessage?: boolean }) {
+    const showLoading = options.showLoading !== false;
+    if (showLoading) {
+      setIsLoading(true);
+      setLoadingProgress(LOADING_STEPS[0]);
+    }
+    if (!options.suppressMessage) {
+      setError("");
+    }
     try {
       const localDataPromise = Promise.all([
         loadSettings(),
@@ -229,11 +241,15 @@ function PopupApp() {
       setEligibleItems(applyDisplayData(eligible.entry.items, loadedSettings, nextReferenceData));
       setActiveItems(applyDisplayData(active.entry.items, loadedSettings, nextReferenceData));
       const cacheMessage = options.force ? "Forced refresh completed." : "";
-      setMessage(formatLoadMessages([...loadErrors, cacheMessage].filter(Boolean)).join("\n"));
+      if (!options.suppressMessage) {
+        setMessage(formatLoadMessages([...loadErrors, cacheMessage].filter(Boolean)).join("\n"));
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
-      setIsLoading(false);
+      if (showLoading) {
+        setIsLoading(false);
+      }
     }
   }
 
@@ -288,6 +304,7 @@ function PopupApp() {
     }
 
     setIsActivating(true);
+    setActivationProgress(ACTIVATION_STEPS[0]);
     setError("");
     setMessage("");
     try {
@@ -298,6 +315,7 @@ function PopupApp() {
         justification: effectiveJustification,
         ticketInfo: effectiveTicketInfo
       });
+      setActivationProgress(ACTIVATION_STEPS[1]);
       const successItems = response.results
         .filter((result) => result.success)
         .map((result) => activatableItems.find((item) => item.id === result.itemId))
@@ -308,14 +326,18 @@ function PopupApp() {
       await saveSettings(updatedSettings);
       setSettings(updatedSettings);
       setSelectedIds(new Set());
-      setMessage(response.success ? `Activated ${successItems.length} item(s).` : `Activated ${successItems.length}; ${response.errors.length} failed.`);
+      setActivationProgress(ACTIVATION_STEPS[2]);
       if (response.errors.length) {
         setError(response.errors.map((item) => `${item.itemName}: ${item.error}`).join(" "));
       }
-      await refresh({ force: true });
+      if (successItems.length) {
+        await refresh({ force: true, showLoading: false, suppressMessage: true });
+      }
+      setMessage(formatActivationConfirmation(successItems.length, response.errors.length));
     } catch (activationError) {
       setError(activationError instanceof Error ? activationError.message : String(activationError));
     } finally {
+      setActivationProgress(null);
       setIsActivating(false);
     }
   }
@@ -421,6 +443,7 @@ function PopupApp() {
       {error ? <p className="message error">{error}</p> : null}
       {message ? <p className="message">{message}</p> : null}
       {isLoading ? <LoadingState progress={loadingProgress} /> : null}
+      {activationProgress ? <ActivationProgressPanel progress={activationProgress} /> : null}
 
       {currentRoleTab ? (
         <>
@@ -493,7 +516,7 @@ function PopupApp() {
                       Use defaults
                     </button>
                     <button className="btn primary" onClick={() => void activate(expansion.items, bundle)} disabled={!expansion.items.length || isActivating}>
-                      Activate bundle
+                      {isActivating ? "Activating..." : "Activate bundle"}
                     </button>
                   </div>
                 </div>
@@ -562,6 +585,17 @@ function LoadingState({ progress }: { progress: LoadingProgress }) {
       <span className="spinner large" aria-hidden="true" />
       <span>
         Loading access data (step {progress.current}/{progress.total}): {progress.label}
+      </span>
+    </section>
+  );
+}
+
+function ActivationProgressPanel({ progress }: { progress: LoadingProgress }) {
+  return (
+    <section className="activation-progress-panel" aria-live="polite">
+      <span className="spinner large" aria-hidden="true" />
+      <span>
+        Activation in progress (step {progress.current}/{progress.total}): {progress.label}
       </span>
     </section>
   );
@@ -731,7 +765,7 @@ function ActivationBar(props: {
         ) : null}
         {hasSelection ? (
           <button className="btn primary" onClick={props.onActivate} disabled={props.isActivating}>
-            Activate {props.selectedCount} selected
+            {props.isActivating ? "Activating..." : `Activate ${props.selectedCount} selected`}
           </button>
         ) : null}
         {hasSelection ? (
@@ -825,6 +859,17 @@ function typeLabel(type: ActivationItem["type"]) {
   if (type === "directoryRole") return "Entra";
   if (type === "azureRole") return "Azure";
   return "PIM group";
+}
+
+function formatActivationConfirmation(successCount: number, errorCount: number): string {
+  const itemLabel = (count: number) => `item${count === 1 ? "" : "s"}`;
+  if (successCount && !errorCount) {
+    return `Activation confirmed for ${successCount} ${itemLabel(successCount)}.`;
+  }
+  if (successCount && errorCount) {
+    return `Activation confirmed for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.`;
+  }
+  return `Activation failed for ${errorCount} ${itemLabel(errorCount)}.`;
 }
 
 async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {

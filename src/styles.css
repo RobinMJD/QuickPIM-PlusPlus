@@ -673,6 +673,20 @@ button {
   font-weight: 700;
 }
 
+.activation-progress-panel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px;
+  padding: 16px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .permissions-panel {
   display: grid;
   gap: 12px;
@@ -1006,7 +1020,8 @@ body.dark-mode .permission-state.missing {
   color: #fecaca;
 }
 
-body.dark-mode .loading-panel {
+body.dark-mode .loading-panel,
+body.dark-mode .activation-progress-panel {
   background: #172554;
   border-color: #1d4ed8;
   color: #bfdbfe;

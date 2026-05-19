@@ -595,6 +595,197 @@ describe("popup compact controls", () => {
     expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(false);
   });
 
+  test("shows activation progress through request and refresh before final confirmation", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: false,
+        ticket: false
+      }
+    };
+    const activation = deferred<{
+      success: true;
+      data: {
+        success: true;
+        results: Array<{ itemId: string; itemName: string; success: true }>;
+        errors: [];
+      };
+    }>();
+    const refreshedEligible = deferred<{ success: true; data: { items: ActivationItem[]; errors: [] } }>();
+    const refreshedActive = deferred<{ success: true; data: { items: ActivationItem[]; errors: [] } }>();
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "activateItems") {
+            return activation.promise;
+          }
+          if (message.action === "getActivationItems") {
+            return refreshedEligible.promise;
+          }
+          if (message.action === "getActiveItems") {
+            return refreshedActive.promise;
+          }
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: true });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    clickButton("Activate 1 selected");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation in progress (step 1/3): Sending activation request"));
+    activation.resolve({
+      success: true,
+      data: {
+        success: true,
+        results: [{ itemId: eligibleItem.id, itemName: "Reader", success: true }],
+        errors: []
+      }
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation in progress (step 3/3): Refreshing activation status"));
+    refreshedEligible.resolve({ success: true, data: { items: [], errors: [] } });
+    refreshedActive.resolve({ success: true, data: { items: [{ ...eligibleItem, status: "active" }], errors: [] } });
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation confirmed for 1 item."));
+    expect(document.body.textContent).not.toContain("Forced refresh completed.");
+  });
+
+  test("shows activation errors without waiting forever", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: false,
+        ticket: false
+      }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "activateItems") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                success: false,
+                results: [{ itemId: eligibleItem.id, itemName: "Reader", success: false, error: "Policy requires approval" }],
+                errors: [{ itemId: eligibleItem.id, itemName: "Reader", success: false, error: "Policy requires approval" }]
+              }
+            });
+          }
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    clickButton("Activate 1 selected");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
+    expect(document.body.textContent).toContain("Reader: Policy requires approval");
+  });
+
   test("toggles favorite rows with a star button and keeps favorites first", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const items: ActivationItem[] = [
