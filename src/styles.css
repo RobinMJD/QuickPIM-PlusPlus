@@ -317,6 +317,10 @@ button {
   margin-top: 12px;
 }
 
+.panel > .panel {
+  margin-top: 16px;
+}
+
 .panel h2,
 .panel h3 {
   margin: 0 0 10px;
@@ -549,6 +553,27 @@ button {
 
 .button-row.nowrap {
   flex-wrap: nowrap;
+}
+
+.settings-form-actions {
+  margin-top: 8px;
+  margin-bottom: 18px;
+}
+
+.settings-action-lead {
+  margin-bottom: 12px;
+}
+
+.settings-inline-action {
+  margin-top: 8px;
+}
+
+.settings-field-gap {
+  margin-top: 10px;
+}
+
+.settings-section-gap {
+  margin-top: 12px;
 }
 
 .form-grid {
@@ -812,6 +837,10 @@ button {
   border-bottom: 0;
 }
 
+.alias-row .button-row {
+  justify-content: flex-end;
+}
+
 .checkbox-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
@@ -869,5 +898,14 @@ button {
 
   .settings-content {
     padding: 16px;
+  }
+
+  .alias-row {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .alias-row .button-row {
+    justify-content: flex-start;
   }
 }

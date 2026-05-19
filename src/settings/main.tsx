@@ -291,7 +291,7 @@ function AboutPanel({
             Graph: {tokenStatus?.graph.hasToken ? "captured" : "missing"} / Azure:{" "}
             {tokenStatus?.azureManagement.hasToken ? "captured" : "missing"}
           </p>
-          <button className="btn danger" onClick={onClearTokens} style={{ marginTop: 8 }}>
+          <button className="btn danger settings-inline-action" onClick={onClearTokens}>
             Clear captured tokens
           </button>
         </div>
@@ -385,7 +385,7 @@ function AccessSetupPanel({
         </button>
       </div>
 
-      <div className="button-row" style={{ marginBottom: 12 }}>
+      <div className="button-row settings-action-lead">
         <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRefreshingAccess || !setupTargets.length}>
           {isRunningSetup ? (
             <span className="loading-inline">
@@ -539,7 +539,7 @@ function AliasesPanel({
           <input className="input" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Display name" />
         </div>
       </div>
-      <div className="button-row" style={{ marginTop: 10 }}>
+      <div className="button-row settings-form-actions">
         <button className="btn primary" onClick={() => void saveAlias()} disabled={!itemId || !alias.trim()}>
           Save alias
         </button>
@@ -602,7 +602,7 @@ function JustificationsPanel({
           Add
         </button>
       </div>
-      <div className="two-column" style={{ marginTop: 12 }}>
+      <div className="two-column settings-section-gap">
         <div className="panel">
           <h3>Saved</h3>
           {settings.savedJustifications.map((item) => (
@@ -760,7 +760,7 @@ function BundlesPanel({
           </select>
         </div>
       </div>
-      <div className="field" style={{ marginTop: 10 }}>
+      <div className="field settings-field-gap">
         <label>Justification</label>
         <textarea
           className="textarea justification-textarea"
@@ -771,7 +771,7 @@ function BundlesPanel({
           aria-label="Bundle default justification"
         />
       </div>
-      <div className="checkbox-grid" style={{ marginTop: 12 }}>
+      <div className="checkbox-grid settings-section-gap">
         {sortedItems.map((item) => (
           <label className="checkbox-option" key={item.id}>
             <input type="checkbox" checked={selectedItemIds.has(item.id)} onChange={() => toggle(item.id)} />
@@ -783,7 +783,7 @@ function BundlesPanel({
           </label>
         ))}
       </div>
-      <div className="button-row" style={{ marginTop: 12 }}>
+      <div className="button-row settings-form-actions">
         <button className="btn primary" onClick={() => void saveBundle()} disabled={!name.trim() || !selectedItemIds.size}>
           {draftMode === "edit" ? "Save changes" : "Save bundle"}
         </button>
@@ -869,9 +869,11 @@ function PreferencesPanel({
           <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
         </div>
       </div>
-      <button className="btn primary" style={{ marginTop: 12 }} onClick={() => void save()}>
-        Save preferences
-      </button>
+      <div className="button-row settings-form-actions">
+        <button className="btn primary" onClick={() => void save()}>
+          Save preferences
+        </button>
+      </div>
       <div className="panel">
         <h3>Usage counters</h3>
         {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
@@ -918,7 +920,7 @@ function DataPanel({
       <h2>Import / Export</h2>
       <p className="muted">Settings are stored locally in Chrome storage under {SETTINGS_KEY}.</p>
       <textarea className="textarea code-box" value={exportText} onChange={(event) => setExportText(event.target.value)} />
-      <div className="button-row" style={{ marginTop: 10 }}>
+      <div className="button-row settings-form-actions">
         <button className="btn" onClick={() => setExportText(JSON.stringify(settings, null, 2))}>
           Refresh export
         </button>

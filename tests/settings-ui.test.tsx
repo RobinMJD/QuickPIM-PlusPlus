@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { DATA_CACHE_KEY } from "../src/lib/cache";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 
@@ -620,5 +622,17 @@ describe("settings Bundles page", () => {
         expect.objectContaining({ id: "bundle:daily-operations-copy", name: "Daily operations copy" })
       ])
     });
+  });
+});
+
+describe("settings layout spacing", () => {
+  test("keeps form action buttons closer to their form than the next saved-list panel", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const actionRule = css.match(/\.settings-form-actions\s*\{[^}]+\}/)?.[0] || "";
+    const nestedPanelRule = css.match(/\.panel\s*>\s*\.panel\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(actionRule).toContain("margin-top: 8px;");
+    expect(actionRule).toContain("margin-bottom: 18px;");
+    expect(nestedPanelRule).toContain("margin-top: 16px;");
   });
 });
