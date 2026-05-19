@@ -204,6 +204,40 @@ button {
   padding: 12px;
 }
 
+.control-with-icon {
+  position: relative;
+}
+
+.control-with-icon .input,
+.control-with-icon .select {
+  padding-left: 34px;
+}
+
+.field-icon {
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  z-index: 1;
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  color: #64748b;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.field-icon-svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .input,
 .select,
 .textarea {

@@ -360,14 +360,24 @@ function PopupApp() {
       {roleTabs.includes(tab as RoleTab) ? (
         <>
           <section className="toolbar">
-            <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or scope" />
-            <select className="select" value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort roles">
-              <option value="name">Name</option>
-              <option value="lastUsed">Last use</option>
-              <option value="activationCount">Activation count</option>
-              <option value="type">Type</option>
-              <option value="scope">Scope</option>
-            </select>
+            <div className="control-with-icon filter-field">
+              <span className="field-icon" aria-hidden="true">
+                <FilterIcon />
+              </span>
+              <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or scope" aria-label="Filter roles" />
+            </div>
+            <div className="control-with-icon sort-field">
+              <span className="field-icon" aria-hidden="true">
+                <SortIcon />
+              </span>
+              <select className="select" value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort roles">
+                <option value="name">Name</option>
+                <option value="lastUsed">Last use</option>
+                <option value="activationCount">Activation count</option>
+                <option value="type">Type</option>
+                <option value="scope">Scope</option>
+              </select>
+            </div>
           </section>
           <section className="content">
             <RoleList
@@ -647,6 +657,27 @@ function LinkIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
       <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
       <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1" />
+    </svg>
+  );
+}
+
+function FilterIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="field-icon-svg">
+      <path d="M4 5h16" />
+      <path d="M7 12h10" />
+      <path d="M10 19h4" />
+    </svg>
+  );
+}
+
+function SortIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="field-icon-svg">
+      <path d="M7 4v16" />
+      <path d="M4 7l3-3 3 3" />
+      <path d="M17 20V4" />
+      <path d="M14 17l3 3 3-3" />
     </svg>
   );
 }
