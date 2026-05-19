@@ -46,6 +46,88 @@ async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promi
   throw new Error("Timed out waiting for assertion.");
 }
 
+describe("settings Home page", () => {
+  test("opens on a home dashboard with grouped icon navigation and a GitHub changelog", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#home");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS
+    };
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/releases")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              tag_name: "v2.0.0",
+              name: "QuickPIM++ v2.0.0",
+              body: "React rewrite, bundles, PIM groups, and cleaner settings.",
+              html_url: "https://github.com/RobinMJD/QuickPIM/releases/tag/v2.0.0",
+              published_at: "2026-05-18T10:00:00.000Z"
+            }
+          ]
+        };
+      }
+      return { ok: true, json: async () => [] };
+    });
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationItems") {
+            return { success: true, data: { items: [], errors: [] } };
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ is a local-first activation console"));
+    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ v2.0.0"));
+    expect(document.body.textContent).toContain("Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.");
+    expect(document.body.textContent).toContain("Setup");
+    expect(document.body.textContent).toContain("Configuration");
+    expect(document.body.textContent).toContain("Maintenance");
+
+    const navButtons = [...document.querySelectorAll(".settings-nav button")].map((button) => button.textContent?.trim());
+    expect(navButtons).toEqual([
+      "Home",
+      "Access Setup",
+      "Aliases",
+      "Justifications",
+      "Bundles",
+      "Preferences",
+      "Import / Export",
+      "About"
+    ]);
+    expect(navButtons.at(-1)).toBe("About");
+    expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(8);
+    expect(fetchMock).toHaveBeenCalledWith("https://api.github.com/repos/RobinMJD/QuickPIM/releases?per_page=5");
+  });
+});
+
 describe("settings About page", () => {
   test("renders v2 version, original author credit, and local privacy note", async () => {
     document.body.innerHTML = '<div id="root"></div>';
@@ -825,6 +907,65 @@ describe("settings layout spacing", () => {
 });
 
 describe("settings dark mode", () => {
+  test("clarifies popup defaults and uses labeled activation duration options", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#preferences");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationItems") {
+            return { success: true, data: { items: [], errors: [] } };
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
+
+    expect(document.body.textContent).toContain("Default activation duration");
+    expect(document.body.textContent).toContain("Preselected in the popup when selected roles allow it.");
+    expect(document.body.textContent).toContain("Default sort order");
+    expect(document.body.textContent).toContain("Recent justification history limit");
+    expect(document.body.textContent).not.toContain("Default duration");
+
+    const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Default activation duration"]');
+    expect(duration).toBeTruthy();
+    expect([...duration!.options].map((option) => option.textContent)).toEqual([
+      "30 minutes",
+      "1 hour",
+      "2 hours",
+      "4 hours",
+      "8 hours",
+      "12 hours",
+      "24 hours"
+    ]);
+  });
+
   test("saves the dark mode preference and applies it to settings", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#preferences");
@@ -915,7 +1056,7 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Hidden popup tabs"));
+    await waitFor(() => expect(document.body.textContent).toContain("Popup tabs"));
 
     document.querySelector<HTMLInputElement>('input[aria-label="Hide Azure Roles tab"]')?.click();
     clickButton("Save preferences");

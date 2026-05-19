@@ -79,6 +79,11 @@ export function coerceDurationForItems(durationHours: number, items: ActivationI
 
 const BASE_DURATION_VALUES = [0.5, 1, 2, 4, 8, 12, 24];
 
+export const DEFAULT_DURATION_OPTIONS = BASE_DURATION_VALUES.map((value) => ({
+  value,
+  label: formatDurationLabel(value)
+}));
+
 function getSelectedMaxDurationHours(items: ActivationItem[]): number | undefined {
   const maximums = items
     .map((item) => item.activationRequirements?.maxDurationHours)

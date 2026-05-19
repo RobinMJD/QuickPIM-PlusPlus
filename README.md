@@ -11,16 +11,17 @@ Original author: Daniel Bradley. QuickPIM++ continues the original QuickPIM proj
 - Activate eligible Entra roles, Azure roles, and PIM groups.
 - Resolve friendly role and group names, with custom local aliases when an API still returns an opaque ID.
 - Save reusable justifications and quickly reuse recent justifications.
-- Create bundles of roles and groups with optional default duration, justification, and ticket metadata.
+- Create bundles of roles and groups with optional default duration and justification.
 - Sort and filter by name, type, scope, last use, and activation count.
 - Use Access Setup to open the right Microsoft portal pages when QuickPIM++ needs fresh portal tokens.
+- Use the settings home page for a quick overview and a GitHub-backed changelog.
 - Manage aliases, bundles, justifications, learned names, preferences, and JSON import/export from the settings page.
 
 ## How It Works
 
 QuickPIM++ watches browser requests to Microsoft Graph and Azure Management endpoints and stores the bearer tokens locally in Chrome storage. When the guided Access Setup opens Microsoft Entra pages, QuickPIM++ also reads validated access-token candidates from that Entra page's local MSAL cache, including browser storage and IndexedDB, because some portal views no longer make direct Graph requests that extensions can observe. Those tokens are then used from the extension background worker to read eligible PIM assignments and submit self-activation requests.
 
-Tokens and settings remain in the local browser profile. QuickPIM++ does not send data to any service other than Microsoft Graph and Azure Management APIs.
+Tokens and settings remain in the local browser profile. QuickPIM++ uses Microsoft Graph and Azure Management APIs for PIM data and activation, and fetches public release metadata from the QuickPIM GitHub repository for the settings changelog without sending local extension data.
 
 ## Development
 
@@ -82,7 +83,7 @@ After building, load `dist/` and verify:
 
 - Adds visible versioning and original author attribution.
 - Adds portal-driven Access Setup and local learned-name fallbacks.
-- Narrows extension host permissions to Microsoft Graph, Azure Management, and Microsoft Entra portal pages used for token capture.
+- Narrows extension host permissions to Microsoft Graph, Azure Management, Microsoft Entra portal pages used for token capture, and GitHub's public API for the settings changelog.
 - Adds stricter token, runtime message, activation payload, and settings import validation.
 - Adds a settings About page with token-clearing controls and local privacy notes.
 - Documents the security review in `SECURITY_REVIEW.md`.

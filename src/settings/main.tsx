@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTokenCacheKey, getAccessSetupTargets, getPortalUrlsForTargets } from "../lib/access";
 import { DEFAULT_ELIGIBLE_CACHE_TTL_MS, formatCacheAge, getDataWithCache, loadDataCache, saveDataCache } from "../lib/cache";
-import { coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
+import { DEFAULT_DURATION_OPTIONS, coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -25,11 +25,26 @@ import {
 import { getGenericJustificationWarning } from "../lib/justifications";
 import type { AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
-type SettingsTab = "about" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data";
+type SettingsTab = "home" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data" | "about";
 
 const ORIGINAL_AUTHOR = "Daniel Bradley";
 const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
 const REPOSITORY_URL = "https://github.com/RobinMJD/QuickPIM";
+const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM";
+
+const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
+  { title: "Overview", tabs: ["home"] },
+  { title: "Setup", tabs: ["access"] },
+  { title: "Configuration", tabs: ["aliases", "justifications", "bundles", "preferences"] },
+  { title: "Maintenance", tabs: ["data", "about"] }
+];
+
+interface ChangelogItem {
+  title: string;
+  description: string;
+  url: string;
+  date?: string;
+}
 
 interface MessageResponse<T> {
   success: boolean;
@@ -218,7 +233,7 @@ function SettingsApp() {
           <img src="/img/QuickPim48.png" alt="" />
           <div>
             <h1>QuickPIM++ Settings</h1>
-            <p>Aliases, saved reasons, bundles, and local preferences.</p>
+            <p>Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.</p>
           </div>
         </div>
         <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible}>
@@ -237,14 +252,21 @@ function SettingsApp() {
         {error ? <p className="message error">{error}</p> : null}
         {message ? <p className={message === "Settings saved." ? "message success" : "message"}>{message}</p> : null}
         <div className="settings-layout">
-          <nav className="settings-nav">
-            {(["about", "access", "aliases", "justifications", "bundles", "preferences", "data"] as SettingsTab[]).map((item) => (
-              <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>
-                {tabLabel(item)}
-              </button>
+          <nav className="settings-nav" aria-label="Settings sections">
+            {NAV_SECTIONS.map((section) => (
+              <div className="settings-nav-group" key={section.title}>
+                <p className="settings-nav-heading">{section.title}</p>
+                {section.tabs.map((item) => (
+                  <button key={item} className={tab === item ? "active" : ""} onClick={() => selectTab(item)}>
+                    <SettingsNavIcon tab={item} />
+                    <span>{tabLabel(item)}</span>
+                  </button>
+                ))}
+              </div>
             ))}
           </nav>
           <div>
+            {tab === "home" ? <HomePanel /> : null}
             {tab === "about" ? <AboutPanel tokenStatus={tokenStatus} onClearTokens={() => void clearCapturedTokens()} /> : null}
             {tab === "access" ? (
               <AccessSetupPanel
@@ -274,6 +296,125 @@ function SettingsApp() {
         </div>
       </section>
     </main>
+  );
+}
+
+function HomePanel() {
+  const [changelog, setChangelog] = useState<ChangelogItem[]>([]);
+  const [isLoadingChangelog, setIsLoadingChangelog] = useState(true);
+  const [changelogError, setChangelogError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      setIsLoadingChangelog(true);
+      setChangelogError("");
+      try {
+        const items = await loadGithubChangelog();
+        if (!cancelled) {
+          setChangelog(items);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setChangelogError(error instanceof Error ? error.message : "GitHub changelog could not be loaded.");
+        }
+      } finally {
+        if (!cancelled) {
+          setIsLoadingChangelog(false);
+        }
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section className="home-stack">
+      <div className="panel home-hero">
+        <div>
+          <h2>QuickPIM++ is a local-first activation console</h2>
+          <p className="muted">
+            Use one compact popup to activate eligible Microsoft Entra roles, PIM groups, and Azure roles with saved reasons,
+            bundles, aliases, favorites, and local learned names.
+          </p>
+        </div>
+        <div className="home-feature-grid">
+          <div>
+            <strong>Daily activation</strong>
+            <span>Select roles, continue, then review duration and justification only when needed.</span>
+          </div>
+          <div>
+            <strong>Local setup</strong>
+            <span>Settings stay in this browser profile and portal tokens are captured from Microsoft pages.</span>
+          </div>
+          <div>
+            <strong>Cleaner management</strong>
+            <span>Manage aliases, justifications, bundles, popup defaults, access setup, and import/export in one place.</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title-row">
+          <div>
+            <h2>Changelog</h2>
+            <p className="muted">Loaded from the QuickPIM++ GitHub repository.</p>
+          </div>
+          <a className="btn" href={`${REPOSITORY_URL}/releases`} target="_blank" rel="noreferrer">
+            Open GitHub
+          </a>
+        </div>
+        {isLoadingChangelog ? (
+          <section className="loading-panel settings-local-loading" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span>Loading changelog from GitHub...</span>
+          </section>
+        ) : null}
+        {changelogError ? (
+          <p className="message error settings-inline-message">
+            Could not load the GitHub changelog. Open GitHub to review the latest changes.
+          </p>
+        ) : null}
+        {!isLoadingChangelog && !changelogError ? (
+          <div className="changelog-list">
+            {changelog.map((item) => (
+              <a className="changelog-item" href={item.url} target="_blank" rel="noreferrer" key={`${item.title}-${item.url}`}>
+                <span>
+                  <strong>{item.title}</strong>
+                  {item.date ? <small>{new Date(item.date).toLocaleDateString()}</small> : null}
+                </span>
+                <p>{item.description}</p>
+              </a>
+            ))}
+            {!changelog.length ? <p className="muted">No GitHub releases or commits were returned.</p> : null}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
+  const pathByTab: Record<SettingsTab, string[]> = {
+    home: ["M3 11.5 12 4l9 7.5", "M5 10.5V20h14v-9.5", "M9 20v-6h6v6"],
+    access: ["M12 3l7 3v5c0 4.5-2.8 8.1-7 10-4.2-1.9-7-5.5-7-10V6l7-3z", "M9.5 12.5l1.8 1.8 3.8-4.4"],
+    aliases: ["M4 7h16", "M7 4v6", "M17 4v6", "M6 14h7", "M6 18h11"],
+    justifications: ["M6 4h9l3 3v13H6z", "M14 4v4h4", "M9 12h6", "M9 16h6"],
+    bundles: ["M5 7h14v5H5z", "M7 12v5h10v-5", "M9 7V5h6v2"],
+    preferences: ["M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", "M12 2v3", "M12 19v3", "M4.9 4.9 7 7", "M17 17l2.1 2.1", "M2 12h3", "M19 12h3"],
+    data: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
+    about: ["M12 17v-5", "M12 8h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"]
+  };
+  return (
+    <span className="settings-nav-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24">
+        {pathByTab[tab].map((path) => (
+          <path d={path} key={path} />
+        ))}
+      </svg>
+    </span>
   );
 }
 
@@ -938,25 +1079,46 @@ function PreferencesPanel({
   return (
     <section className="panel">
       <h2>Preferences</h2>
-      <div className="form-grid three">
-        <div className="field">
-          <label>Default duration</label>
-          <input className="input" type="number" min="0.5" max="24" step="0.5" value={defaultDurationHours} onChange={(event) => setDefaultDurationHours(Number(event.target.value))} />
+      <div className="preference-section">
+        <h3>Popup defaults</h3>
+        <p className="muted">These values are preselected when the popup opens. Role policies can still cap duration choices.</p>
+        <div className="form-grid three settings-section-gap">
+          <div className="field">
+            <label>Default activation duration</label>
+            <select
+              className="select"
+              value={String(defaultDurationHours)}
+              onChange={(event) => setDefaultDurationHours(Number(event.target.value))}
+              aria-label="Default activation duration"
+            >
+              {DEFAULT_DURATION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="muted">Preselected in the popup when selected roles allow it.</p>
+          </div>
+          <div className="field">
+            <label>Default sort order</label>
+            <select className="select" value={defaultSort} onChange={(event) => setDefaultSort(event.target.value as SortMode)}>
+              <option value="name">Name</option>
+              <option value="lastUsed">Last use</option>
+              <option value="activationCount">Activation count</option>
+              <option value="type">Type</option>
+              <option value="scope">Scope</option>
+            </select>
+            <p className="muted">Initial sort used in role tabs.</p>
+          </div>
+          <div className="field">
+            <label>Recent justification history limit</label>
+            <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
+            <p className="muted">How many recent reasons the picker keeps.</p>
+          </div>
         </div>
-        <div className="field">
-          <label>Default sort</label>
-          <select className="select" value={defaultSort} onChange={(event) => setDefaultSort(event.target.value as SortMode)}>
-            <option value="name">Name</option>
-            <option value="lastUsed">Last use</option>
-            <option value="activationCount">Activation count</option>
-            <option value="type">Type</option>
-            <option value="scope">Scope</option>
-          </select>
-        </div>
-        <div className="field">
-          <label>Recent justification count</label>
-          <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
-        </div>
+      </div>
+      <div className="preference-section">
+        <h3>Appearance</h3>
         <label className="checkbox-option preference-toggle">
           <input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} aria-label="Dark mode" />
           <span>
@@ -966,9 +1128,10 @@ function PreferencesPanel({
           </span>
         </label>
       </div>
-      <div className="field settings-section-gap">
-        <label>Hidden popup tabs</label>
-        <div className="checkbox-grid compact">
+      <div className="preference-section">
+        <h3>Popup tabs</h3>
+        <p className="muted">Hide tabs you do not use. Empty role-type tabs are also hidden automatically.</p>
+        <div className="checkbox-grid compact settings-section-gap">
           {(["directoryRole", "pimGroup", "azureRole", "bundles"] as PopupTab[]).map((popupTab) => (
             <label className="checkbox-option" key={popupTab}>
               <input
@@ -1050,13 +1213,14 @@ function DataPanel({
 
 function tabLabel(tab: SettingsTab): string {
   const labels: Record<SettingsTab, string> = {
-    about: "About",
+    home: "Home",
     access: "Access Setup",
     aliases: "Aliases",
     justifications: "Justifications",
     bundles: "Bundles",
     preferences: "Preferences",
-    data: "Import / Export"
+    data: "Import / Export",
+    about: "About"
   };
   return labels[tab];
 }
@@ -1066,10 +1230,10 @@ function tabFromHash(): SettingsTab {
   if (value === "permissions") {
     return "access";
   }
-  if (["about", "access", "aliases", "justifications", "bundles", "preferences", "data"].includes(value)) {
+  if (["home", "about", "access", "aliases", "justifications", "bundles", "preferences", "data"].includes(value)) {
     return value as SettingsTab;
   }
-  return "aliases";
+  return "home";
 }
 
 function applyDisplayData(
@@ -1099,6 +1263,61 @@ function getDuplicateBundleName(name: string, existingNames: string[]): string {
   }
 
   return `${baseName} ${Date.now()}`;
+}
+
+async function loadGithubChangelog(): Promise<ChangelogItem[]> {
+  const releases = await fetchGithubJson(`${GITHUB_API_BASE}/releases?per_page=5`);
+  if (Array.isArray(releases) && releases.length) {
+    return releases
+      .filter((item): item is Record<string, unknown> => item && typeof item === "object")
+      .slice(0, 5)
+      .map((release) => ({
+        title: String(release.name || release.tag_name || "Release"),
+        description: getSummaryText(release.body) || "Release notes are available on GitHub.",
+        url: String(release.html_url || REPOSITORY_URL),
+        date: typeof release.published_at === "string" ? release.published_at : undefined
+      }));
+  }
+
+  const commits = await fetchGithubJson(`${GITHUB_API_BASE}/commits?per_page=5`);
+  return Array.isArray(commits)
+    ? commits
+      .filter((item): item is Record<string, unknown> => item && typeof item === "object")
+      .slice(0, 5)
+      .map((item) => {
+        const commit = item.commit && typeof item.commit === "object" ? item.commit as Record<string, unknown> : {};
+        return {
+          title: getSummaryText(commit.message) || String(item.sha || "Commit").slice(0, 7),
+          description: "Latest repository commit.",
+          url: String(item.html_url || REPOSITORY_URL),
+          date: getCommitDate(commit)
+        };
+      })
+    : [];
+}
+
+async function fetchGithubJson(url: string): Promise<unknown> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`GitHub returned ${response.status}`);
+  }
+  return await response.json();
+}
+
+function getSummaryText(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.slice(0, 180) || "";
+}
+
+function getCommitDate(commit: Record<string, unknown>): string | undefined {
+  const author = commit.author && typeof commit.author === "object" ? commit.author as Record<string, unknown> : undefined;
+  return typeof author?.date === "string" ? author.date : undefined;
 }
 
 async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {

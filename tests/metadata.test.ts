@@ -25,7 +25,8 @@ describe("versioning and extension manifest", () => {
     expect(manifest.host_permissions).toEqual([
       "https://graph.microsoft.com/*",
       "https://management.azure.com/*",
-      "https://entra.microsoft.com/*"
+      "https://entra.microsoft.com/*",
+      "https://api.github.com/*"
     ]);
     expect(manifest.content_scripts).toEqual([
       {
@@ -37,6 +38,8 @@ describe("versioning and extension manifest", () => {
     ]);
     expect(manifest.content_security_policy?.extension_pages).toContain("script-src 'self'");
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'none'");
+    expect(manifest.content_security_policy?.extension_pages).toContain("connect-src 'self'");
+    expect(manifest.content_security_policy?.extension_pages).toContain("https://api.github.com");
   });
 
   test("keeps build-only tooling out of production dependencies", () => {

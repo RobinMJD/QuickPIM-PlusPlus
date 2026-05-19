@@ -7,10 +7,11 @@
   "host_permissions": [
     "https://graph.microsoft.com/*",
     "https://management.azure.com/*",
-    "https://entra.microsoft.com/*"
+    "https://entra.microsoft.com/*",
+    "https://api.github.com/*"
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' https://graph.microsoft.com https://management.azure.com https://api.github.com"
   },
   "icons": {
     "16": "img/QuickPim16.png",
