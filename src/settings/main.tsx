@@ -55,6 +55,23 @@ function SettingsApp() {
   }, []);
 
   useEffect(() => {
+    const storageChangeEvent = chrome.storage?.onChanged;
+    if (!storageChangeEvent) {
+      return;
+    }
+    function handleStorageChange(changes: Record<string, chrome.storage.StorageChange>, areaName: string) {
+      if (areaName !== "local" || !changes[SETTINGS_KEY]) {
+        return;
+      }
+      const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
+      setSettings(merged);
+      setExportText(JSON.stringify(merged, null, 2));
+    }
+    storageChangeEvent.addListener(handleStorageChange);
+    return () => storageChangeEvent.removeListener(handleStorageChange);
+  }, []);
+
+  useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
   }, [settings.preferences.darkMode]);
 

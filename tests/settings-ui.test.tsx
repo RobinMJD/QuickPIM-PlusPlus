@@ -491,6 +491,70 @@ describe("settings justification guardrails", () => {
       savedJustifications: []
     });
   });
+
+  test("updates saved justifications when settings storage changes", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#justifications");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+    const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: { items: [], errors: [] } };
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        },
+        onChanged: {
+          addListener: vi.fn((listener: (changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void) => {
+            storageListeners.push(listener);
+          }),
+          removeListener: vi.fn()
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("No saved justifications."));
+
+    const nextSettings = {
+      ...DEFAULT_SETTINGS,
+      savedJustifications: ["Emergency patch approval"]
+    };
+    storageData[SETTINGS_KEY] = nextSettings;
+    expect(storageListeners).toHaveLength(1);
+    storageListeners[0]({ [SETTINGS_KEY]: { oldValue: DEFAULT_SETTINGS, newValue: nextSettings } }, "local");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Emergency patch approval"));
+  });
 });
 
 describe("settings Bundles page", () => {
