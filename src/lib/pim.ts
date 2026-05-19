@@ -164,10 +164,10 @@ export function normalizeAzureRole(role: AzureRoleApi): AzureRoleItem {
     leafName(roleDefinitionId) ||
     "Unknown Azure role";
   const subscriptionName = role.subscriptionName || role.subscriptionId || "Azure";
-  const scopeName = expandedScope?.displayName || extractScopeName(scope);
+  const scopeLabel = formatAzureScopeLabel(scope, expandedScope, subscriptionName);
 
   return {
-    id: `azureRole:${roleDefinitionId}:${scope}`,
+    id: `azureRole:${leafName(roleDefinitionId)}:${scope}`,
     type: "azureRole",
     sourceName: roleName,
     displayName: roleName,
@@ -177,7 +177,7 @@ export function normalizeAzureRole(role: AzureRoleApi): AzureRoleItem {
     subscriptionId: role.subscriptionId,
     subscriptionName: role.subscriptionName,
     roleEligibilityScheduleId: properties.roleEligibilityScheduleId,
-    scopeLabel: scopeName ? `${subscriptionName} / ${scopeName}` : subscriptionName,
+    scopeLabel,
     status: "eligible",
     activationRequirements: {
       justification: true,
@@ -321,6 +321,28 @@ export function extractScopeName(scope: string): string {
   return resource ? `${decodeURIComponent(resourceGroup)} / ${decodeURIComponent(resource)}` : decodeURIComponent(resourceGroup);
 }
 
+function formatAzureScopeLabel(
+  scope: string,
+  expandedScope: { displayName?: string; type?: string } | undefined,
+  subscriptionName: string
+): string {
+  const expandedDisplayName = typeof expandedScope?.displayName === "string" ? expandedScope.displayName : undefined;
+  if (isManagementGroupScope(scope, expandedScope?.type)) {
+    return expandedDisplayName || leafName(scope) || scope;
+  }
+
+  if (isSubscriptionScope(scope, expandedScope?.type)) {
+    return expandedDisplayName || subscriptionName || leafName(scope) || scope;
+  }
+
+  const scopeName = expandedDisplayName || extractScopeName(scope);
+  if (!scopeName) {
+    return subscriptionName || scope;
+  }
+
+  return scopeName === subscriptionName ? scopeName : `${subscriptionName} / ${scopeName}`;
+}
+
 export function parseIsoDurationMs(duration: string): number {
   const match = duration.match(/^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
   if (!match) {
@@ -420,7 +442,26 @@ function validateActivationInput(
 }
 
 function isSafeAzureScope(scope: string): boolean {
-  return /^\/subscriptions\/[^/?#\s]+(?:\/[^?#]*)?$/i.test(scope) && !scope.includes("..");
+  return (
+    (/^\/subscriptions\/[^/?#\s]+(?:\/[^?#]*)?$/i.test(scope) ||
+      /^\/providers\/Microsoft\.Management\/managementGroups\/[^/?#\s]+$/i.test(scope)) &&
+    !scope.includes("..")
+  );
+}
+
+function isManagementGroupScope(scope: string, type: string | undefined): boolean {
+  return (
+    normalizeAzureScopeType(type) === "managementgroup" ||
+    /^\/providers\/Microsoft\.Management\/managementGroups\//i.test(scope)
+  );
+}
+
+function isSubscriptionScope(scope: string, type: string | undefined): boolean {
+  return normalizeAzureScopeType(type) === "subscription" || /^\/subscriptions\/[^/]+$/i.test(scope);
+}
+
+function normalizeAzureScopeType(type: string | undefined): string {
+  return (type || "").replace(/\s+/g, "").toLowerCase();
 }
 
 function isEndUserAssignmentRule(rule: RoleManagementPolicyRuleApi): boolean {

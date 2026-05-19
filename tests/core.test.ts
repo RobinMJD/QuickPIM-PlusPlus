@@ -96,11 +96,40 @@ describe("PIM item normalization", () => {
     });
 
     expect(item).toMatchObject({
-      id: "azureRole:/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/contributor:/subscriptions/sub-1/resourceGroups/rg-app",
+      id: "azureRole:contributor:/subscriptions/sub-1/resourceGroups/rg-app",
       type: "azureRole",
       sourceName: "Contributor",
       scopeLabel: "Production / rg-app",
       roleEligibilityScheduleId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleEligibilitySchedules/schedule-1"
+    });
+  });
+
+  test("normalizes inherited Azure management group roles without subscription duplication", () => {
+    const item = normalizeAzureRole({
+      id: "/subscriptions/sub-1/providers/Microsoft.Authorization/RoleEligibilityScheduleInstances/elig-1",
+      name: "elig-1",
+      subscriptionId: "sub-1",
+      subscriptionName: "FR_HQ_AzDevOps_PRD01_SUB",
+      properties: {
+        principalId: "user-1",
+        roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+        roleEligibilityScheduleId: "/providers/Microsoft.Authorization/roleEligibilitySchedules/root-reader",
+        scope: "/providers/Microsoft.Management/managementGroups/tenant-root",
+        expandedProperties: {
+          roleDefinition: {
+            displayName: "Reader"
+          },
+          scope: {
+            displayName: "Tenant Root Group",
+            type: "managementgroup"
+          }
+        }
+      }
+    });
+
+    expect(item).toMatchObject({
+      id: "azureRole:acdd72a7-3385-48ef-bd42-f606fba81ae7:/providers/Microsoft.Management/managementGroups/tenant-root",
+      scopeLabel: "Tenant Root Group"
     });
   });
 
@@ -464,5 +493,30 @@ describe("activation request builders", () => {
         groupId: "group-1"
       }
     });
+  });
+
+  test("allows Azure management group scopes for activation payloads", () => {
+    const request = buildActivationRequest(
+      {
+        id: "azureRole:reader:/providers/Microsoft.Management/managementGroups/tenant-root",
+        type: "azureRole",
+        sourceName: "Reader",
+        displayName: "Reader",
+        principalId: "user-1",
+        roleDefinitionId: "/providers/Microsoft.Authorization/roleDefinitions/acdd72a7-3385-48ef-bd42-f606fba81ae7",
+        scope: "/providers/Microsoft.Management/managementGroups/tenant-root",
+        scopeLabel: "Tenant Root Group",
+        status: "eligible"
+      },
+      1,
+      "Admin task",
+      {},
+      "2026-05-18T12:00:00.000Z",
+      "request-1"
+    );
+
+    expect(request.endpoint).toBe(
+      "https://management.azure.com/providers/Microsoft.Management/managementGroups/tenant-root/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/request-1?api-version=2020-10-01"
+    );
   });
 });
