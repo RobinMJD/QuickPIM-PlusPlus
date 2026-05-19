@@ -66,6 +66,19 @@ interface MessageResponse<T> {
   error?: string;
 }
 
+interface LoadingProgress {
+  current: number;
+  total: number;
+  label: string;
+}
+
+const LOADING_STEPS: LoadingProgress[] = [
+  { current: 1, total: 4, label: "Preparing local settings" },
+  { current: 2, total: 4, label: "Checking portal tokens" },
+  { current: 3, total: 4, label: "Loading eligible and active data" },
+  { current: 4, total: 4, label: "Preparing the role list" }
+];
+
 function PopupApp() {
   const [tab, setTab] = useState<PopupTab>("directoryRole");
   const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
@@ -84,6 +97,7 @@ function PopupApp() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const [loadingProgress, setLoadingProgress] = useState<LoadingProgress>(LOADING_STEPS[0]);
   const [isActivating, setIsActivating] = useState(false);
 
   useEffect(() => {
@@ -165,16 +179,22 @@ function PopupApp() {
 
   async function refresh(options: { force: boolean }) {
     setIsLoading(true);
+    setLoadingProgress(LOADING_STEPS[0]);
     setError("");
     try {
-      const [loadedSettings, loadedTokens, currentCache, loadedReferenceData] = await Promise.all([
+      const localDataPromise = Promise.all([
         loadSettings(),
-        sendMessage<TokenStatus>({ action: "getTokenStatus" }),
         loadDataCache(),
         loadReferenceData()
       ]);
+      const tokenPromise = sendMessage<TokenStatus>({ action: "getTokenStatus" });
+      const [loadedSettings, currentCache, loadedReferenceData] = await localDataPromise;
+      setLoadingProgress(LOADING_STEPS[1]);
+      const loadedTokens = await tokenPromise;
+
       const now = Date.now();
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
+      setLoadingProgress(LOADING_STEPS[2]);
       const { eligible, active, cache: nextCache } = await getActivationDataWithCache({
         cache: currentCache,
         eligibleTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
@@ -188,6 +208,7 @@ function PopupApp() {
           sendMessage<{ items: ActivationItem[]; errors: string[]; diagnostics?: any[] }>({ action: "getActiveItems" })
       });
 
+      setLoadingProgress(LOADING_STEPS[3]);
       if (!eligible.fromCache || !active.fromCache) {
         await saveDataCache(nextCache);
       }
@@ -398,7 +419,7 @@ function PopupApp() {
 
       {error ? <p className="message error">{error}</p> : null}
       {message ? <p className="message">{message}</p> : null}
-      {isLoading ? <LoadingState /> : null}
+      {isLoading ? <LoadingState progress={loadingProgress} /> : null}
 
       {currentRoleTab ? (
         <>
@@ -534,11 +555,13 @@ function TokenPill({ label, status }: { label: string; status?: TokenStatus["gra
   return <span className={`token-pill ${tokenStatusTone(status)}`}>{tokenStatusText(label, status)}</span>;
 }
 
-function LoadingState() {
+function LoadingState({ progress }: { progress: LoadingProgress }) {
   return (
     <section className="loading-panel" aria-live="polite">
       <span className="spinner large" aria-hidden="true" />
-      <span>Loading access data</span>
+      <span>
+        Loading access data (step {progress.current}/{progress.total}): {progress.label}
+      </span>
     </section>
   );
 }
