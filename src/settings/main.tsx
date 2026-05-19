@@ -646,6 +646,9 @@ function BundlesPanel({
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
   const [durationHours, setDurationHours] = useState(settings.preferences.defaultDurationHours);
   const [justification, setJustification] = useState("");
+  const [editingBundleId, setEditingBundleId] = useState<string | undefined>();
+  const [draftMode, setDraftMode] = useState<"create" | "edit" | "duplicate">("create");
+  const [draftSourceName, setDraftSourceName] = useState("");
   const sortedItems = useMemo(
     () => [...items].sort((a, b) => getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData))),
     [items, referenceData, settings]
@@ -666,20 +669,24 @@ function BundlesPanel({
     if (!name.trim() || !selectedItemIds.size) return;
     const effectiveDuration = coerceDurationForItems(durationHours, selectedItems);
     const bundle: QuickPimBundle = {
-      id: createBundleId(name),
+      id: editingBundleId || createBundleId(name),
       name: name.trim(),
       itemIds: [...selectedItemIds],
       defaultDurationHours: effectiveDuration,
       defaultJustification: justification.trim() || undefined
     };
-    await onSave({ ...settings, bundles: [bundle, ...settings.bundles.filter((item) => item.id !== bundle.id)] });
-    setName("");
-    setSelectedItemIds(new Set());
-    setJustification("");
+    const bundles = editingBundleId
+      ? settings.bundles.map((item) => (item.id === editingBundleId ? bundle : item))
+      : [bundle, ...settings.bundles.filter((item) => item.id !== bundle.id)];
+    await onSave({ ...settings, bundles });
+    resetDraft();
   }
 
   async function removeBundle(bundleId: string) {
     await onSave({ ...settings, bundles: settings.bundles.filter((bundle) => bundle.id !== bundleId) });
+    if (editingBundleId === bundleId) {
+      resetDraft();
+    }
   }
 
   function toggle(itemId: string) {
@@ -691,9 +698,42 @@ function BundlesPanel({
     });
   }
 
+  function editBundle(bundle: QuickPimBundle) {
+    loadBundleDraft(bundle, bundle.name);
+    setEditingBundleId(bundle.id);
+    setDraftMode("edit");
+    setDraftSourceName(bundle.name);
+  }
+
+  function duplicateBundle(bundle: QuickPimBundle) {
+    loadBundleDraft(bundle, getDuplicateBundleName(bundle.name, settings.bundles.map((item) => item.name)));
+    setEditingBundleId(undefined);
+    setDraftMode("duplicate");
+    setDraftSourceName(bundle.name);
+  }
+
+  function loadBundleDraft(bundle: QuickPimBundle, nextName: string) {
+    setName(nextName);
+    setSelectedItemIds(new Set(bundle.itemIds));
+    setDurationHours(bundle.defaultDurationHours || settings.preferences.defaultDurationHours);
+    setJustification(bundle.defaultJustification || "");
+  }
+
+  function resetDraft() {
+    setName("");
+    setSelectedItemIds(new Set());
+    setDurationHours(settings.preferences.defaultDurationHours);
+    setJustification("");
+    setEditingBundleId(undefined);
+    setDraftMode("create");
+    setDraftSourceName("");
+  }
+
   return (
     <section className="panel">
       <h2>Role Bundles</h2>
+      {draftMode === "edit" ? <p className="muted">Editing {draftSourceName}</p> : null}
+      {draftMode === "duplicate" ? <p className="muted">Duplicating {draftSourceName}</p> : null}
       <div className="form-grid">
         <div className="field">
           <label>Name</label>
@@ -743,9 +783,16 @@ function BundlesPanel({
           </label>
         ))}
       </div>
-      <button className="btn primary" style={{ marginTop: 12 }} onClick={() => void saveBundle()} disabled={!name.trim() || !selectedItemIds.size}>
-        Save bundle
-      </button>
+      <div className="button-row" style={{ marginTop: 12 }}>
+        <button className="btn primary" onClick={() => void saveBundle()} disabled={!name.trim() || !selectedItemIds.size}>
+          {draftMode === "edit" ? "Save changes" : "Save bundle"}
+        </button>
+        {draftMode !== "create" ? (
+          <button className="btn" onClick={resetDraft}>
+            Cancel
+          </button>
+        ) : null}
+      </div>
       <div className="panel">
         <h3>Saved bundles</h3>
         {settings.bundles.map((bundle) => (
@@ -757,9 +804,17 @@ function BundlesPanel({
                 {bundle.defaultJustification ? ` / ${bundle.defaultJustification}` : ""}
               </p>
             </div>
-            <button className="btn danger" onClick={() => void removeBundle(bundle.id)}>
-              Remove
-            </button>
+            <div className="button-row nowrap">
+              <button className="btn" onClick={() => editBundle(bundle)}>
+                Edit
+              </button>
+              <button className="btn" onClick={() => duplicateBundle(bundle)}>
+                Duplicate
+              </button>
+              <button className="btn danger" onClick={() => void removeBundle(bundle.id)}>
+                Remove
+              </button>
+            </div>
           </div>
         ))}
         {!settings.bundles.length ? <p className="muted">No bundles saved yet.</p> : null}
@@ -912,6 +967,23 @@ function applyDisplayData(
     displayName: getDisplayName(item, settings, referenceData),
     scopeLabel: getScopeLabel(item, referenceData)
   }));
+}
+
+function getDuplicateBundleName(name: string, existingNames: string[]): string {
+  const baseName = `${name} copy`;
+  const existing = new Set(existingNames.map((item) => item.trim().toLowerCase()));
+  if (!existing.has(baseName.toLowerCase())) {
+    return baseName;
+  }
+
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${baseName} ${index}`;
+    if (!existing.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+
+  return `${baseName} ${Date.now()}`;
 }
 
 async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {

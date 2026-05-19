@@ -16,6 +16,13 @@ function clickButton(label: string): HTMLButtonElement {
   return button;
 }
 
+function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+  setter?.call(field, value);
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
@@ -421,6 +428,37 @@ describe("settings Access Setup page", () => {
 });
 
 describe("settings Bundles page", () => {
+  const bundleItems = [
+    {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "user-1",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      activationRequirements: {
+        maxDurationHours: 2
+      }
+    },
+    {
+      id: "azureRole:owner:/subscriptions/sub-1",
+      type: "azureRole",
+      sourceName: "Owner",
+      displayName: "Owner",
+      principalId: "user-1",
+      roleDefinitionId: "owner",
+      scope: "/subscriptions/sub-1",
+      scopeLabel: "Production",
+      status: "eligible",
+      activationRequirements: {
+        maxDurationHours: 4
+      }
+    }
+  ];
+
   test("uses two-line justification, hides ticket fields, and caps duration by selected items", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#bundles");
@@ -432,36 +470,7 @@ describe("settings Bundles page", () => {
           fetchedAt: Date.now(),
           cacheKey: "graph:missing|azure:missing",
           errors: [],
-          items: [
-            {
-              id: "directoryRole:reader:/",
-              type: "directoryRole",
-              sourceName: "Reader",
-              displayName: "Reader",
-              principalId: "user-1",
-              roleDefinitionId: "reader",
-              directoryScopeId: "/",
-              scopeLabel: "Tenant",
-              status: "eligible",
-              activationRequirements: {
-                maxDurationHours: 2
-              }
-            },
-            {
-              id: "azureRole:owner:/subscriptions/sub-1",
-              type: "azureRole",
-              sourceName: "Owner",
-              displayName: "Owner",
-              principalId: "user-1",
-              roleDefinitionId: "owner",
-              scope: "/subscriptions/sub-1",
-              scopeLabel: "Production",
-              status: "eligible",
-              activationRequirements: {
-                maxDurationHours: 4
-              }
-            }
-          ]
+          items: bundleItems
         }
       }
     };
@@ -510,6 +519,106 @@ describe("settings Bundles page", () => {
       const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Bundle duration"]');
       expect(duration).toBeTruthy();
       expect([...duration!.options].map((option) => option.textContent)).toEqual(["30 minutes", "1 hour", "2 hours"]);
+    });
+  });
+
+  test("edits and duplicates saved bundles from the bundle list", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#bundles");
+
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        bundles: [
+          {
+            id: "bundle:daily-ops",
+            name: "Daily ops",
+            itemIds: ["directoryRole:reader:/"],
+            defaultDurationHours: 2,
+            defaultJustification: "Daily work"
+          }
+        ]
+      },
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: bundleItems
+        }
+      }
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM", version: "2.0.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationItems") {
+            throw new Error("Settings should use cached eligible data.");
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Daily ops"));
+
+    clickButton("Edit");
+    await waitFor(() => expect(document.body.textContent).toContain("Editing Daily ops"));
+    const nameInput = document.querySelector<HTMLInputElement>('input[placeholder="Daily operations"]');
+    const justification = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]');
+    expect(nameInput?.value).toBe("Daily ops");
+    expect(justification?.value).toBe("Daily work");
+
+    setFieldValue(nameInput!, "Daily operations");
+    setFieldValue(justification!, "Daily support");
+    clickButton("Save changes");
+
+    await waitFor(() => {
+      expect(storageData[SETTINGS_KEY]).toMatchObject({
+        bundles: [
+          {
+            id: "bundle:daily-ops",
+            name: "Daily operations",
+            defaultJustification: "Daily support"
+          }
+        ]
+      });
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain("Daily operations1 item(s) / Daily supportEditDuplicateRemove"));
+    clickButton("Duplicate");
+    await waitFor(() => expect(document.body.textContent).toContain("Duplicating Daily operations"));
+    expect(nameInput?.value).toBe("Daily operations copy");
+    clickButton("Save bundle");
+
+    await waitFor(() => {
+      expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).bundles).toHaveLength(2);
+    });
+    expect(storageData[SETTINGS_KEY]).toMatchObject({
+      bundles: expect.arrayContaining([
+        expect.objectContaining({ id: "bundle:daily-ops", name: "Daily operations" }),
+        expect.objectContaining({ id: "bundle:daily-operations-copy", name: "Daily operations copy" })
+      ])
     });
   });
 });
