@@ -320,14 +320,7 @@ function PopupApp() {
           <div>
             <h1>QuickPIM</h1>
             <p>
-              {isLoading ? (
-                <span className="loading-inline">
-                  <span className="spinner" aria-hidden="true" />
-                  Loading access state
-                </span>
-              ) : (
-                `${displayItems.length} eligible items`
-              )}
+              {isLoading ? null : `${displayItems.length} eligible items`}
             </p>
           </div>
         </div>
