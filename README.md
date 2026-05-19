@@ -206,7 +206,7 @@ After building and loading `dist/`, verify:
 - Adds README screenshots and refreshed Chrome Web Store assets for the v2.0.1 release.
 - Updates the privacy policy to describe enabled feature behavior.
 
-### v2.0.0
+### Previous v2 release
 
 - Renames the app to QuickPIM++.
 - Rebuilds the popup and settings UI with React, TypeScript, and Vite.

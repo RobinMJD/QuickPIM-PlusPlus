@@ -32,7 +32,7 @@ const ORIGINAL_AUTHOR = "Daniel Bradley";
 const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
 const REPOSITORY_URL = "https://github.com/RobinMJD/QuickPIM";
 const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM";
-const CHANGELOG_CACHE_KEY = "quickPimChangelog.v1";
+const CHANGELOG_CACHE_KEY = "quickPimChangelog.v2";
 const CHANGELOG_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 
