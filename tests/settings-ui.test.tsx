@@ -476,6 +476,7 @@ describe("settings justification guardrails", () => {
     vi.resetModules();
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Justifications"));
+    expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
 
     setFieldValue(document.querySelector<HTMLInputElement>('input[placeholder="Reusable justification"]')!, "needed");
     clickButton("Add");
@@ -569,6 +570,7 @@ describe("settings Bundles page", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Role Bundles"));
 
     expect(document.body.textContent).not.toMatch(/Ticket system|Ticket number/i);
+    expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
     const justification = document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]');
     expect(justification?.rows).toBe(2);
 

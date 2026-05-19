@@ -50,10 +50,7 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
-import {
-  GENERIC_JUSTIFICATION_WARNING,
-  getGenericJustificationWarning
-} from "../lib/justifications";
+import { getGenericJustificationWarning } from "../lib/justifications";
 import type {
   ActivationItem,
   ActivationResponse,
@@ -789,7 +786,6 @@ function ActivationBar(props: {
             onChange={(event) => props.setJustification(event.target.value)}
             placeholder="Why do you need this activation?"
           />
-          <p className="field-warning">{GENERIC_JUSTIFICATION_WARNING}</p>
         </div>
       ) : null}
       {hasSelection && props.requirements.needsJustification && justificationOptions.length ? (

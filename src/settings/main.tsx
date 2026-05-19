@@ -22,10 +22,7 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
-import {
-  GENERIC_JUSTIFICATION_WARNING,
-  getGenericJustificationWarning
-} from "../lib/justifications";
+import { getGenericJustificationWarning } from "../lib/justifications";
 import type { AccessSetupTarget, ActivationItem, PopupTab, QuickPimBundle, QuickPimDataCache, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "about" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data";
@@ -625,7 +622,7 @@ function JustificationsPanel({
           Add
         </button>
       </div>
-      <p className="field-warning settings-field-gap">{validationWarning || GENERIC_JUSTIFICATION_WARNING}</p>
+      {validationWarning ? <p className="field-warning settings-field-gap">{validationWarning}</p> : null}
       <div className="two-column settings-section-gap">
         <div className="panel">
           <h3>Saved</h3>
@@ -805,7 +802,6 @@ function BundlesPanel({
           placeholder="Optional default"
           aria-label="Bundle default justification"
         />
-        <p className="field-warning">{GENERIC_JUSTIFICATION_WARNING}</p>
       </div>
       {validationWarning ? <p className="message error settings-inline-message">{validationWarning}</p> : null}
       <div className="checkbox-grid settings-section-gap">

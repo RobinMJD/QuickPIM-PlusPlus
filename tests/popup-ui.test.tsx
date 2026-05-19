@@ -853,6 +853,7 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.querySelector(".required-marker")).toBeTruthy());
     expect(document.querySelector(".required-marker")?.textContent).toBe("*");
+    expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     expect(css.match(/\.required-marker\s*\{[^}]+\}/)?.[0] || "").toContain("color: #dc2626;");
   });
