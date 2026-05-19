@@ -235,7 +235,7 @@ function SettingsApp() {
 
       <section className="settings-content">
         {error ? <p className="message error">{error}</p> : null}
-        {message ? <p className="message">{message}</p> : null}
+        {message ? <p className={message === "Settings saved." ? "message success" : "message"}>{message}</p> : null}
         <div className="settings-layout">
           <nav className="settings-nav">
             {(["about", "access", "aliases", "justifications", "bundles", "preferences", "data"] as SettingsTab[]).map((item) => (

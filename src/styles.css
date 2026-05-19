@@ -699,6 +699,13 @@ button {
   white-space: pre-line;
 }
 
+.message.success {
+  background: #dcfce7;
+  border: 1px solid #86efac;
+  color: #14532d;
+  font-weight: 700;
+}
+
 .message.error {
   background: #fee2e2;
   color: #991b1b;
@@ -1072,6 +1079,12 @@ body.dark-mode .practice-warning {
 
 body.dark-mode .field-warning {
   color: #fdba74;
+}
+
+body.dark-mode .message.success {
+  background: #14532d;
+  border-color: #22c55e;
+  color: #dcfce7;
 }
 
 body.dark-mode .message.error,

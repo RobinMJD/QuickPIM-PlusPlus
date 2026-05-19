@@ -874,6 +874,7 @@ describe("settings dark mode", () => {
       });
       expect(document.body.classList.contains("dark-mode")).toBe(true);
     });
+    expect(document.querySelector(".message.success")?.textContent).toContain("Settings saved.");
   });
 
   test("saves hidden popup tab preferences", async () => {
@@ -924,5 +925,19 @@ describe("settings dark mode", () => {
         preferences: expect.objectContaining({ hiddenPopupTabs: ["azureRole"] })
       });
     });
+  });
+});
+
+describe("settings message contrast", () => {
+  test("uses a dedicated high-contrast success style for saved settings messages", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const successRule = css.match(/\.message\.success\s*\{[^}]+\}/)?.[0] || "";
+    const darkSuccessRule = css.match(/body\.dark-mode\s+\.message\.success\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(successRule).toContain("background: #dcfce7;");
+    expect(successRule).toContain("color: #14532d;");
+    expect(successRule).toContain("border: 1px solid #86efac;");
+    expect(darkSuccessRule).toContain("background: #14532d;");
+    expect(darkSuccessRule).toContain("color: #dcfce7;");
   });
 });
