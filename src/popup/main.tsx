@@ -732,7 +732,9 @@ function ActivationBar(props: {
       ) : null}
       {hasSelection && props.requirements.needsJustification ? (
         <div className="field" style={{ marginTop: 8 }}>
-          <label>Justification</label>
+          <label>
+            Justification <span className="required-marker" aria-label="required">*</span>
+          </label>
           <textarea
             className="textarea justification-textarea"
             rows={2}

@@ -702,6 +702,81 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("Forced refresh completed.");
   });
 
+  test("marks required justification with a red asterisk", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: true,
+        ticket: false
+      }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+
+    await waitFor(() => expect(document.querySelector(".required-marker")).toBeTruthy());
+    expect(document.querySelector(".required-marker")?.textContent).toBe("*");
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    expect(css.match(/\.required-marker\s*\{[^}]+\}/)?.[0] || "").toContain("color: #dc2626;");
+  });
+
   test("shows activation errors without waiting forever", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
