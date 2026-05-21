@@ -6,6 +6,9 @@ import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import type { ActivationItem } from "../src/lib/types";
 
 afterEach(() => {
+  const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
+  cleanupWindow.__quickPimPopupUnmount?.();
+  cleanupWindow.__quickPimPopupUnmount = undefined;
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
   document.body.className = "";
@@ -1078,6 +1081,92 @@ describe("popup compact controls", () => {
     );
   });
 
+  test("keeps saved justifications behind a dedicated picker instead of mixing them with recent chips", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: true,
+        ticket: false
+      }
+    };
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      savedJustifications: ["Saved break fix", "Saved audit review"],
+      recentJustifications: ["Recent support", "Saved break fix", "Recent cleanup"]
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: settings,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    clickButton("Continue");
+
+    await waitFor(() => expect(document.querySelector(".justification-chip")).toBeTruthy());
+    const chips = [...document.querySelectorAll<HTMLButtonElement>(".justification-chip")].map((button) => button.textContent?.trim());
+    expect(chips).toEqual(["Recent support", "Recent cleanup"]);
+    expect(document.body.textContent).not.toContain("Saved audit review");
+
+    clickButton("Saved");
+    await waitFor(() => expect(document.body.textContent).toContain("Saved audit review"));
+    clickButton("Saved audit review");
+
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.value).toBe("Saved audit review"));
+    expect(document.querySelector(".saved-justification-menu")).toBeFalsy();
+  });
+
   test("shows activation errors without waiting forever", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
@@ -1600,6 +1689,6 @@ describe("popup dark mode", () => {
     await import("../src/popup/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
-    expect(document.body.classList.contains("dark-mode")).toBe(true);
+    await waitFor(() => expect(document.body.classList.contains("dark-mode")).toBe(true));
   });
 });

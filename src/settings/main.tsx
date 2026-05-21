@@ -802,6 +802,19 @@ function JustificationsPanel({
     });
   }
 
+  async function moveSaved(index: number, direction: -1 | 1) {
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= settings.savedJustifications.length) return;
+
+    const savedJustifications = [...settings.savedJustifications];
+    const [item] = savedJustifications.splice(index, 1);
+    savedJustifications.splice(targetIndex, 0, item);
+    await onSave({
+      ...settings,
+      savedJustifications
+    }, "Saved justifications reordered.");
+  }
+
   return (
     <section className="panel">
       <h2>Justifications</h2>
@@ -823,12 +836,32 @@ function JustificationsPanel({
       <div className="two-column settings-section-gap">
         <div className="panel">
           <h3>Saved</h3>
-          {settings.savedJustifications.map((item) => (
-            <div className="settings-row" key={item}>
+          {settings.savedJustifications.map((item, index) => (
+            <div className="settings-row saved-justification-row" key={item}>
               <span>{item}</span>
-              <button className="btn danger" onClick={() => void removeSaved(item)}>
-                Remove
-              </button>
+              <div className="button-row nowrap settings-row-actions">
+                <button
+                  className="btn icon-btn compact-icon-btn"
+                  onClick={() => void moveSaved(index, -1)}
+                  disabled={index === 0}
+                  title="Move up"
+                  aria-label={`Move ${item} up`}
+                >
+                  <MoveIcon direction="up" />
+                </button>
+                <button
+                  className="btn icon-btn compact-icon-btn"
+                  onClick={() => void moveSaved(index, 1)}
+                  disabled={index === settings.savedJustifications.length - 1}
+                  title="Move down"
+                  aria-label={`Move ${item} down`}
+                >
+                  <MoveIcon direction="down" />
+                </button>
+                <button className="btn danger" onClick={() => void removeSaved(item)}>
+                  Remove
+                </button>
+              </div>
             </div>
           ))}
           {!settings.savedJustifications.length ? <p className="muted">No saved justifications.</p> : null}
@@ -846,6 +879,19 @@ function JustificationsPanel({
         </div>
       </div>
     </section>
+  );
+}
+
+function MoveIcon({ direction }: { direction: "up" | "down" }) {
+  const arrowPath = direction === "up" ? "M12 5l-6 6" : "M12 19l-6-6";
+  const mirroredPath = direction === "up" ? "M12 5l6 6" : "M12 19l6-6";
+  const linePath = direction === "up" ? "M12 6v13" : "M12 18V5";
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
+      <path d={arrowPath} />
+      <path d={mirroredPath} />
+      <path d={linePath} />
+    </svg>
   );
 }
 
@@ -1485,4 +1531,19 @@ async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {
   return response.data as T;
 }
 
-createRoot(document.getElementById("root")!).render(<SettingsApp />);
+function isTestRuntime() {
+  return typeof process !== "undefined" && process.env.NODE_ENV === "test";
+}
+
+const rootElement = document.getElementById("root");
+if (rootElement) {
+  const testWindow = window as Window & { __quickPimSettingsUnmount?: () => void };
+  if (isTestRuntime()) {
+    testWindow.__quickPimSettingsUnmount?.();
+  }
+  const root = createRoot(rootElement);
+  root.render(<SettingsApp />);
+  if (isTestRuntime()) {
+    testWindow.__quickPimSettingsUnmount = () => root.unmount();
+  }
+}

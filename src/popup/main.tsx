@@ -766,11 +766,22 @@ function ActivationBar(props: {
   onSaveJustification: () => void;
   onClearSelection: () => void;
 }) {
-  const justificationOptions = [...props.settings.savedJustifications, ...props.settings.recentJustifications];
+  const [isSavedListOpen, setIsSavedListOpen] = useState(false);
   const hasSelection = props.selectedCount > 0;
+  const savedJustifications = props.settings.savedJustifications;
+  const savedLookup = new Set(savedJustifications.map((item) => item.toLowerCase()));
+  const recentJustifications = props.settings.recentJustifications.filter((item) => !savedLookup.has(item.toLowerCase()));
+  const showJustificationShortcuts = props.requirements.needsJustification && (recentJustifications.length > 0 || savedJustifications.length > 0);
   const selectedDuration = props.durationOptions.some((option) => option.value === props.durationHours)
     ? props.durationHours
     : props.durationOptions[0]?.value;
+
+  useEffect(() => {
+    if (!hasSelection || !props.isReviewOpen || !props.requirements.needsJustification || !savedJustifications.length) {
+      setIsSavedListOpen(false);
+    }
+  }, [hasSelection, props.isReviewOpen, props.requirements.needsJustification, savedJustifications.length]);
+
   return (
     <section className="activation-bar">
       {hasSelection && !props.isReviewOpen ? (
@@ -836,13 +847,43 @@ function ActivationBar(props: {
           />
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && props.requirements.needsJustification && justificationOptions.length ? (
-        <div className="chip-row">
-          {justificationOptions.slice(0, 4).map((item) => (
-            <button className="justification-chip" key={item} onClick={() => props.setJustification(item)}>
-              {item}
-            </button>
-          ))}
+      {hasSelection && props.isReviewOpen && showJustificationShortcuts ? (
+        <div className="justification-shortcuts">
+          <div className="chip-row justification-recent-row">
+            {recentJustifications.slice(0, 3).map((item) => (
+              <button className="justification-chip" key={`recent:${item}`} onClick={() => props.setJustification(item)}>
+                {item}
+              </button>
+            ))}
+            {savedJustifications.length ? (
+              <button
+                className="btn saved-justification-toggle"
+                type="button"
+                onClick={() => setIsSavedListOpen((value) => !value)}
+                aria-expanded={isSavedListOpen}
+                aria-controls="saved-justification-list"
+              >
+                Saved
+              </button>
+            ) : null}
+          </div>
+          {isSavedListOpen ? (
+            <div className="saved-justification-menu" id="saved-justification-list" aria-label="Saved justifications">
+              {savedJustifications.map((item) => (
+                <button
+                  className="saved-justification-option"
+                  type="button"
+                  key={`saved:${item}`}
+                  onClick={() => {
+                    props.setJustification(item);
+                    setIsSavedListOpen(false);
+                  }}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {hasSelection && props.isReviewOpen && props.requirements.needsTicket ? (
@@ -981,4 +1022,19 @@ async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {
   return response.data as T;
 }
 
-createRoot(document.getElementById("root")!).render(<PopupApp />);
+function isTestRuntime() {
+  return typeof process !== "undefined" && process.env.NODE_ENV === "test";
+}
+
+const rootElement = document.getElementById("root");
+if (rootElement) {
+  const testWindow = window as Window & { __quickPimPopupUnmount?: () => void };
+  if (isTestRuntime()) {
+    testWindow.__quickPimPopupUnmount?.();
+  }
+  const root = createRoot(rootElement);
+  root.render(<PopupApp />);
+  if (isTestRuntime()) {
+    testWindow.__quickPimPopupUnmount = () => root.unmount();
+  }
+}
