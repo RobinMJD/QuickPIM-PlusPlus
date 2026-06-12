@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.5.0**
+Current version: **v2.6.2**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -29,7 +29,7 @@ The extension does not create a separate OAuth app registration and does not ask
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
-- Hide activation counters by default, with a preference to show them when useful.
+- Hide activation counters and last enablement dates by default, with preferences to show them when useful.
 - Enable only the feature areas you use, skip disabled feature fetches, and automatically omit empty role-type tabs.
 - Use dark mode from settings.
 - Import and export local settings as JSON.
@@ -199,6 +199,22 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.6.2
+
+- Replaces the manual refresh completion text with a green check badge on the refresh button that fades out after four seconds.
+
+### v2.6.1
+
+- Hides active-only PIM groups that are not currently eligible because they cannot be enabled or disabled from the popup.
+- Replaces the static first-load message with the same progress bar and step copy used by refresh.
+
+### v2.6.0
+
+- Fixes long popup role and group names so they wrap inside rows without overlapping status badges.
+- Cleans up refresh progress copy to avoid duplicated wording.
+- Standardizes visible date-only labels to `yyyy-MM-dd`.
+- Hides popup last enablement dates by default and adds a preference to show them.
 
 ### v2.5.0
 

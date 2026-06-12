@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
+import { formatDateOnly } from "../lib/dateFormat";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
@@ -452,7 +453,7 @@ function HomePanel() {
               <a className="changelog-item" href={item.url} target="_blank" rel="noreferrer" key={`${item.title}-${item.url}`}>
                 <span>
                   <strong>{item.title}</strong>
-                  {item.date ? <small>{new Date(item.date).toLocaleDateString()}</small> : null}
+                  {formatDateOnly(item.date) ? <small>{formatDateOnly(item.date)}</small> : null}
                 </span>
                 <p>{item.description}</p>
               </a>
@@ -1193,6 +1194,7 @@ function PreferencesPanel({
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
   const [showActivationCounters, setShowActivationCounters] = useState(settings.preferences.showActivationCounters);
+  const [showLastEnablementDate, setShowLastEnablementDate] = useState(settings.preferences.showLastEnablementDate);
   const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
 
   useEffect(() => {
@@ -1201,6 +1203,7 @@ function PreferencesPanel({
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
     setDarkMode(settings.preferences.darkMode);
     setShowActivationCounters(settings.preferences.showActivationCounters);
+    setShowLastEnablementDate(settings.preferences.showLastEnablementDate);
     setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
   }, [
     settings.preferences.darkMode,
@@ -1208,7 +1211,8 @@ function PreferencesPanel({
     settings.preferences.defaultSort,
     settings.preferences.enabledFeatures,
     settings.preferences.recentJustificationLimit,
-    settings.preferences.showActivationCounters
+    settings.preferences.showActivationCounters,
+    settings.preferences.showLastEnablementDate
   ]);
 
   async function save() {
@@ -1221,6 +1225,7 @@ function PreferencesPanel({
         recentJustificationLimit,
         darkMode,
         showActivationCounters,
+        showLastEnablementDate,
         enabledFeatures: [...enabledFeatures],
         autoEnabledFeaturesInitialized: true
       }
@@ -1303,6 +1308,19 @@ function PreferencesPanel({
             <span className="muted">Display the compact usage number on each popup row.</span>
           </span>
         </label>
+        <label className="checkbox-option preference-toggle">
+          <input
+            type="checkbox"
+            checked={showLastEnablementDate}
+            onChange={(event) => setShowLastEnablementDate(event.target.checked)}
+            aria-label="Show last enablement date in popup"
+          />
+          <span>
+            <strong>Show last enablement date</strong>
+            <br />
+            <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
+          </span>
+        </label>
       </div>
       <div className="preference-section">
         <h3>Enabled features</h3>
@@ -1335,7 +1353,7 @@ function PreferencesPanel({
               <br />
               <span className="muted">
                 {stats.activationCount} activation(s)
-                {stats.lastUsedAt ? ` / ${new Date(stats.lastUsedAt).toLocaleString()}` : ""}
+                {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
               </span>
             </span>
           </div>

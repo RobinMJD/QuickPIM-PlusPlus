@@ -87,6 +87,7 @@ export interface QuickPimPreferences {
   recentJustificationLimit: number;
   darkMode: boolean;
   showActivationCounters: boolean;
+  showLastEnablementDate: boolean;
   enabledFeatures: QuickPimFeature[];
   autoEnabledFeaturesInitialized?: boolean;
   hiddenPopupTabs?: PopupTab[];

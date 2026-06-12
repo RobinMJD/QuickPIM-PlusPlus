@@ -334,8 +334,21 @@ describe("popup model helpers", () => {
       activeUntil: "2026-05-18T15:00:00.000Z",
       assignmentScheduleId: "schedule-1"
     };
+    const activeOnlyPimGroup: ActivationItem = {
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Privileged Group",
+      displayName: "Privileged Group",
+      principalId: "user-1",
+      groupId: "group-1",
+      accessId: "member",
+      scopeLabel: "Member",
+      status: "active",
+      activeUntil: "2026-05-18T15:00:00.000Z",
+      assignmentScheduleId: "group-schedule-1"
+    };
 
-    expect(mergeEligibleWithActive([directoryRole], [activeOnlyRole], { includeActiveOnly: true })).toEqual([
+    expect(mergeEligibleWithActive([directoryRole], [activeOnlyRole, activeOnlyPimGroup], { includeActiveOnly: true })).toEqual([
       directoryRole,
       activeOnlyRole
     ]);

@@ -42,6 +42,7 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     recentJustificationLimit: 8,
     darkMode: false,
     showActivationCounters: false,
+    showLastEnablementDate: false,
     enabledFeatures: ALL_FEATURES,
     autoEnabledFeaturesInitialized: false,
     permissionWarningIgnored: false
@@ -297,6 +298,7 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     darkMode: preferences.darkMode === true,
     showActivationCounters: preferences.showActivationCounters === true,
+    showLastEnablementDate: preferences.showLastEnablementDate === true,
     enabledFeatures: sanitizeEnabledFeatures(preferences.enabledFeatures, preferences.hiddenPopupTabs),
     autoEnabledFeaturesInitialized: preferences.autoEnabledFeaturesInitialized === true,
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,

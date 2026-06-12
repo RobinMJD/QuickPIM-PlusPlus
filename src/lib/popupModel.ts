@@ -163,7 +163,7 @@ export function mergeEligibleWithActive(
   }
 
   const mergedIds = new Set(merged.map((item) => item.id));
-  const activeOnlyItems = activeItems.filter((item) => !mergedIds.has(item.id));
+  const activeOnlyItems = activeItems.filter((item) => item.type !== "pimGroup" && !mergedIds.has(item.id));
   return [...merged, ...activeOnlyItems];
 }
 

@@ -107,8 +107,11 @@ describe("popup loading UI", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(document.body.textContent?.match(/Loading access/g) || []).toHaveLength(1);
-    expect(document.body.textContent).toContain("Loading access data (this can take up to 15 seconds)");
-    expect(document.body.textContent).not.toContain("Loading access data (step");
+    expect(document.body.textContent).toContain("Loading access data");
+    expect(document.body.textContent).toContain("Step");
+    expect(document.body.textContent).toContain("This can take up to 15 seconds");
+    expect(document.body.textContent).not.toContain("Loading access data (this can take up to 15 seconds)");
+    expect(document.querySelector(".progress-track")).toBeTruthy();
 
     eligible.resolve({ success: true, data: { items: [], errors: [] } });
     active.resolve({ success: true, data: { items: [], errors: [] } });
@@ -411,7 +414,10 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.body.textContent).not.toContain("Loading access data");
-    expect(document.body.textContent).toContain("Refreshing stale access data");
+    await waitFor(() => expect(document.body.textContent).toContain("Fetching latest data"));
+    const refreshText = document.querySelector(".refresh-progress-panel")?.textContent || "";
+    expect(refreshText).toContain("Refreshing access data");
+    expect(refreshText).not.toMatch(/Refreshing access data.*Refreshing .*access data/i);
     expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
 
     snapshot.resolve({
@@ -754,6 +760,8 @@ describe("popup compact controls", () => {
         targets: ["directoryRole"]
       }))
     );
+    await waitFor(() => expect(document.querySelector(".refresh-success-indicator")).toBeTruthy());
+    expect(document.body.textContent).not.toContain("Refresh completed.");
   });
 
   test("hides popup tabs for disabled features", async () => {
@@ -1621,6 +1629,12 @@ describe("popup compact controls", () => {
       assignmentScheduleId: "active-schedule-1",
       activeUntil: "2026-06-12T16:00:00.000Z"
     };
+    const activeEligibleItem: ActivationItem = {
+      ...activeItem,
+      status: "eligible",
+      assignmentScheduleId: undefined,
+      activeUntil: undefined
+    };
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: {
         ...DEFAULT_SETTINGS,
@@ -1636,7 +1650,7 @@ describe("popup compact controls", () => {
             fetchedAt: Date.now(),
             cacheKey: "graphPimGroup::",
             errors: [],
-            items: [eligibleItem]
+            items: [eligibleItem, activeEligibleItem]
           }
         },
         activeByTarget: {
@@ -1801,6 +1815,90 @@ describe("popup compact controls", () => {
     cleanupWindow.__quickPimPopupUnmount = undefined;
     vi.unstubAllGlobals();
     expect(await renderWithCounterPreference(true)).toBeTruthy();
+  });
+
+  test("hides last enablement dates by default and shows them as yyyy-MM-dd when enabled", async () => {
+    async function renderWithDatePreference(showLastEnablementDate: boolean) {
+      document.body.innerHTML = '<div id="root"></div>';
+      const eligibleItem: ActivationItem = {
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        sourceName: "Reader",
+        displayName: "Reader",
+        principalId: "principal-1",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/"
+      };
+      const storageData: Record<string, unknown> = {
+        [SETTINGS_KEY]: {
+          ...DEFAULT_SETTINGS,
+          preferences: {
+            ...DEFAULT_SETTINGS.preferences,
+            showLastEnablementDate
+          },
+          usageStatsByItemId: {
+            [eligibleItem.id]: {
+              activationCount: 2,
+              lastUsedAt: "2026-06-12T09:30:00.000Z"
+            }
+          }
+        },
+        [DATA_CACHE_KEY]: {
+          eligible: {
+            fetchedAt: Date.now(),
+            cacheKey: "graph:missing|azure:missing",
+            errors: [],
+            items: [eligibleItem]
+          },
+          active: {
+            fetchedAt: Date.now(),
+            cacheKey: "graph:missing|azure:missing",
+            errors: [],
+            items: []
+          }
+        }
+      };
+
+      vi.stubGlobal("chrome", {
+        runtime: {
+          sendMessage: vi.fn((message: { action: string }) => {
+            if (message.action === "getTokenStatus") {
+              return Promise.resolve({
+                success: true,
+                data: {
+                  graph: { hasToken: false },
+                  azureManagement: { hasToken: false }
+                }
+              });
+            }
+            return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+          })
+        },
+        storage: {
+          local: {
+            get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+            set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+            remove: vi.fn(async () => undefined)
+          }
+        },
+        tabs: { create: vi.fn() }
+      });
+      vi.resetModules();
+      await import("../src/popup/main");
+      await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+      return document.body.textContent || "";
+    }
+
+    expect(await renderWithDatePreference(false)).not.toContain("last enabled");
+    const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
+    cleanupWindow.__quickPimPopupUnmount?.();
+    cleanupWindow.__quickPimPopupUnmount = undefined;
+    vi.unstubAllGlobals();
+    const text = await renderWithDatePreference(true);
+    expect(text).toContain("last enabled 2026-06-12");
+    expect(text).not.toContain("6/12/2026");
   });
 
   test("shows matching portal actions for claims challenge activation errors", async () => {
@@ -2417,6 +2515,18 @@ describe("popup role row styling", () => {
     expect(statusStackRule).toContain("text-align: right;");
   });
 
+  test("bounds long role names so they wrap inside the row instead of overlapping status", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const rowRule = css.match(/\.role-row\s*\{[^}]+\}/)?.[0] || "";
+    const mainRule = css.match(/\.role-main\s*\{[^}]+\}/)?.[0] || "";
+    const titleTextRule = css.match(/\.role-title\s+span\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(rowRule).toContain("minmax(58px, auto)");
+    expect(mainRule).toContain("min-width: 0;");
+    expect(mainRule).toContain("overflow: hidden;");
+    expect(titleTextRule).toContain("overflow-wrap: anywhere;");
+  });
+
   test("keeps popup controls compact and separates activation buttons from fields", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const toolbarRule = css.match(/\.toolbar\s*\{[^}]+\}/)?.[0] || "";
@@ -2426,6 +2536,16 @@ describe("popup role row styling", () => {
     expect(headerActionsRule).toContain("justify-content: flex-end;");
     expect(toolbarRule).toContain("grid-template-columns: minmax(0, 1fr) 150px;");
     expect(activationButtonRule).toContain("margin-top: 0;");
+  });
+
+  test("positions the refresh success check over the refresh button and fades it out", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const refreshButtonRule = css.match(/\.refresh-button\s*\{[^}]+\}/)?.[0] || "";
+    const successRule = css.match(/\.refresh-success-indicator\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(refreshButtonRule).toContain("position: relative;");
+    expect(successRule).toContain("position: absolute;");
+    expect(successRule).toContain("animation: refreshSuccessFade 4s ease forwards;");
   });
 
   test("keeps activation review in flow with sticky bottom behavior instead of fixed overlap", () => {

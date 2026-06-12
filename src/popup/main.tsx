@@ -13,6 +13,7 @@ import {
   updateCacheFromTargetResults
 } from "../lib/cache";
 import { CLAIMS_CHALLENGE_MESSAGE } from "../lib/apiErrors";
+import { formatDateOnly } from "../lib/dateFormat";
 import {
   buildAccessCapabilityItems,
   buildTokenCacheKey,
@@ -173,6 +174,7 @@ function PopupApp() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshProgress, setRefreshProgress] = useState<LoadingProgress | null>(null);
+  const [refreshSuccessKey, setRefreshSuccessKey] = useState(0);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
@@ -182,6 +184,7 @@ function PopupApp() {
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
 
   useEffect(() => {
@@ -199,6 +202,12 @@ function PopupApp() {
   useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
   }, [settings.preferences.darkMode]);
+
+  useEffect(() => () => {
+    if (refreshSuccessTimer.current) {
+      clearTimeout(refreshSuccessTimer.current);
+    }
+  }, []);
 
   const displayItems = useMemo(
     () => mergeEligibleWithActive(eligibleItems, activeItems, { includeActiveOnly: true }),
@@ -431,9 +440,20 @@ function PopupApp() {
 
   async function refresh(options: { force: boolean; showLoading?: boolean; suppressMessage?: boolean; targets?: AccessSetupTarget[] }) {
     const showBlockingLoading = options.showLoading !== false;
+    const shouldShowProgress = !options.suppressMessage;
     if (!options.suppressMessage) {
       setError("");
       setActivationFailureNotice(null);
+      setRefreshSuccessKey(0);
+      if (refreshSuccessTimer.current) {
+        clearTimeout(refreshSuccessTimer.current);
+        refreshSuccessTimer.current = undefined;
+      }
+      setRefreshProgress({
+        current: 1,
+        total: REFRESH_TOTAL_STEPS,
+        label: showBlockingLoading ? "Reading local state" : "Checking local data"
+      });
     }
     try {
       const [
@@ -467,12 +487,11 @@ function PopupApp() {
       const cachedEligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey);
       const cachedActive = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), now, legacyCacheKey);
       const canShowCachedData = !options.force && cachedEligible.items.length > 0;
-      const shouldShowRefreshProgress = !options.suppressMessage && (!showBlockingLoading || canShowCachedData);
-      if (shouldShowRefreshProgress) {
+      if (shouldShowProgress) {
         setRefreshProgress({
-          current: 1,
+          current: 2,
           total: REFRESH_TOTAL_STEPS,
-          label: "Checking cached access data"
+          label: "Checking cache and tokens"
         });
       }
 
@@ -488,11 +507,11 @@ function PopupApp() {
       const staleTargets = refreshTargets.filter(
         (target) => options.force || !eligibleCache[target]?.isFresh || !activeCache[target]?.isFresh
       );
-      if (shouldShowRefreshProgress) {
+      if (shouldShowProgress) {
         setRefreshProgress({
-          current: 2,
+          current: 3,
           total: REFRESH_TOTAL_STEPS,
-          label: "Preparing refresh targets"
+          label: "Checking what needs refresh"
         });
       }
       if (!staleTargets.length) {
@@ -512,11 +531,11 @@ function PopupApp() {
         }
       }
 
-      if (shouldShowRefreshProgress) {
+      if (shouldShowProgress) {
         setRefreshProgress({
           current: 3,
           total: REFRESH_TOTAL_STEPS,
-          label: options.force ? "Refreshing access data" : "Refreshing stale access data"
+          label: "Fetching latest data"
         });
       }
       const snapshot = await fetchActivationSnapshot(staleTargets);
@@ -558,11 +577,11 @@ function PopupApp() {
       }
 
       await saveDataCache(nextCache);
-      if (shouldShowRefreshProgress) {
+      if (shouldShowProgress) {
         setRefreshProgress({
           current: 4,
           total: REFRESH_TOTAL_STEPS,
-          label: "Saving refreshed access data"
+          label: "Saving refreshed data"
         });
       }
       const nextTargetCacheKeys = buildTargetCacheKeys(loadedTokens, getEnabledRoleFeatures(nextSettings));
@@ -582,9 +601,15 @@ function PopupApp() {
       await applyLoadedActivationData(nextSettings, loadedTokens, nextCache, loadedReferenceData, nextEligible, nextActive);
       const nextAccessCapabilities = buildAccessCapabilityItems(loadedTokens, nextCache, getEnabledRoleFeatures(nextSettings));
       const loadErrors = filterLoadErrorsForAccessState([...(snapshot.eligible.errors || []), ...(snapshot.active.errors || [])], nextAccessCapabilities);
-      const refreshMessage = options.force ? "Refresh completed." : "";
       if (!options.suppressMessage) {
-        setMessage(formatLoadMessages([...loadErrors, refreshMessage].filter(Boolean)).join("\n"));
+        setMessage(formatLoadMessages(loadErrors).join("\n"));
+        if (options.force && !loadErrors.length) {
+          setRefreshSuccessKey(Date.now());
+          refreshSuccessTimer.current = setTimeout(() => {
+            setRefreshSuccessKey(0);
+            refreshSuccessTimer.current = undefined;
+          }, 4_000);
+        }
       }
     } catch (loadError) {
       setActivationFailureNotice(null);
@@ -893,13 +918,18 @@ function PopupApp() {
           <TokenPill label="Azure" status={tokenStatus?.azureManagement} />
           <div className="header-actions" aria-label="Popup actions">
             <button
-              className={`btn icon-btn ${isRefreshing ? "spinning" : ""}`}
+              className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""}`}
               onClick={() => void refresh({ force: true, showLoading: false, targets: manualRefreshTargets })}
               disabled={isLoading || isRefreshing}
               title={manualRefreshLabel}
               aria-label={manualRefreshLabel}
             >
               <RefreshIcon />
+              {refreshSuccessKey ? (
+                <span className="refresh-success-indicator" key={refreshSuccessKey} aria-label="Refresh completed">
+                  <CheckIcon />
+                </span>
+              ) : null}
             </button>
             <button className="btn icon-btn" onClick={openPortalForCurrentTab} disabled={!portalUrl} title={`Open ${portalLabel} in Microsoft Entra`} aria-label={`Open ${portalLabel} in Microsoft Entra`}>
               <LinkIcon />
@@ -937,8 +967,10 @@ function PopupApp() {
         <p className="message error">{error}</p>
       ) : null}
       {message ? <p className="message">{message}</p> : null}
-      {isLoading ? <LoadingState /> : null}
-      {refreshProgress ? <RefreshProgressPanel progress={refreshProgress} /> : null}
+      {isLoading ? (
+        refreshProgress ? <AccessProgressPanel title="Loading access data" progress={refreshProgress} helperText="This can take up to 15 seconds" /> : <LoadingState />
+      ) : null}
+      {!isLoading && refreshProgress ? <AccessProgressPanel title="Refreshing access data" progress={refreshProgress} /> : null}
       {activationProgress ? <ActivationProgressPanel progress={activationProgress} mode={requestMode || "activate"} /> : null}
 
       {currentRoleTab ? (
@@ -972,6 +1004,7 @@ function PopupApp() {
               favoriteIds={favoriteIds}
               requestMode={requestMode}
               showActivationCounters={settings.preferences.showActivationCounters}
+              showLastEnablementDate={settings.preferences.showLastEnablementDate}
               onToggle={toggleSelected}
               onToggleFavorite={(itemId) => void toggleFavorite(itemId)}
             />
@@ -1092,15 +1125,15 @@ function LoadingState() {
   );
 }
 
-function RefreshProgressPanel({ progress }: { progress: LoadingProgress }) {
+function AccessProgressPanel({ title, progress, helperText }: { title: string; progress: LoadingProgress; helperText?: string }) {
   return (
     <section className="activation-progress-panel refresh-progress-panel" aria-live="polite">
       <div className="progress-line">
-        <span>
-          Refreshing access data (step {progress.current}/{progress.total}): {progress.label}
-        </span>
-        <span className="progress-fraction">{progress.current}/{progress.total}</span>
+        <span>{title}</span>
+        <span className="progress-fraction">Step {progress.current}/{progress.total}</span>
       </div>
+      {helperText ? <p className="progress-helper">{helperText}</p> : null}
+      <p className="progress-detail">{progress.label}</p>
       <div className="progress-track" aria-hidden="true">
         <span style={{ width: `${Math.round((progress.current / progress.total) * 100)}%` }} />
       </div>
@@ -1166,6 +1199,7 @@ function RoleList({
   favoriteIds,
   requestMode,
   showActivationCounters,
+  showLastEnablementDate,
   onToggle,
   onToggleFavorite,
   readonly = false
@@ -1177,6 +1211,7 @@ function RoleList({
   favoriteIds: Set<string>;
   requestMode?: PopupRequestMode;
   showActivationCounters: boolean;
+  showLastEnablementDate: boolean;
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
   readonly?: boolean;
@@ -1196,6 +1231,7 @@ function RoleList({
         const displayName = getDisplayName(item, settings, referenceData);
         const isFavorite = favoriteIds.has(item.id);
         const statusTitle = getActivationStatusTitle(item);
+        const lastEnabledDate = showLastEnablementDate ? formatDateOnly(usage.lastUsedAt) : "";
         const body = (
           <>
             <button
@@ -1210,7 +1246,7 @@ function RoleList({
             >
               <StarIcon filled={isFavorite} />
             </button>
-            <div>
+            <div className="role-main">
               <p className="role-title">
                 <span>{displayName}</span>
                 {isHighPrivilegeItem(item) ? <CrownIcon /> : null}
@@ -1218,7 +1254,7 @@ function RoleList({
               <div className="role-meta">
                 <span className={`badge ${item.type}`}>{typeLabel(item.type)}</span>
                 <span className="scope-label">{getScopeLabel(item, referenceData)}</span>
-                {usage.lastUsedAt ? <span>last {new Date(usage.lastUsedAt).toLocaleDateString()}</span> : null}
+                {lastEnabledDate ? <span>last enabled {lastEnabledDate}</span> : null}
               </div>
             </div>
             <div className="role-status-stack">
@@ -1460,6 +1496,14 @@ function LinkIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
       <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
       <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="refresh-success-icon">
+      <path d="m5 12 4 4L19 6" />
     </svg>
   );
 }

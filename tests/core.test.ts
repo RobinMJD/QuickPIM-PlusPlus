@@ -368,6 +368,7 @@ describe("settings helpers", () => {
         recentJustificationLimit: 99,
         darkMode: true,
         showActivationCounters: true,
+        showLastEnablementDate: true,
         enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
     });
@@ -390,14 +391,18 @@ describe("settings helpers", () => {
       recentJustificationLimit: 20,
       darkMode: true,
       showActivationCounters: true,
+      showLastEnablementDate: true,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
   });
 
-  test("hides popup activation counters by default while allowing an explicit preference", () => {
+  test("hides popup row metadata by default while allowing explicit display preferences", () => {
     expect(DEFAULT_SETTINGS.preferences.showActivationCounters).toBe(false);
+    expect(DEFAULT_SETTINGS.preferences.showLastEnablementDate).toBe(false);
     expect(mergeSettings({ preferences: { showActivationCounters: true } as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(true);
+    expect(mergeSettings({ preferences: { showLastEnablementDate: true } as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(true);
     expect(mergeSettings({ preferences: { showActivationCounters: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(false);
+    expect(mergeSettings({ preferences: { showLastEnablementDate: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(false);
   });
 });
 
