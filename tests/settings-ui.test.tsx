@@ -29,6 +29,19 @@ function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: str
   field.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
+function setCheckboxValue(field: HTMLInputElement, checked: boolean) {
+  if (field.checked !== checked) {
+    field.click();
+  }
+  if (field.checked === checked) {
+    return;
+  }
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
+  setter?.call(field, checked);
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+  field.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 function createDefaultSettings() {
   return structuredClone(DEFAULT_SETTINGS);
 }
@@ -509,6 +522,25 @@ describe("settings Access Setup page", () => {
               }
             ]
           },
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: "graphPimGroup::",
+            errors: ["PermissionScopeNotGranted"],
+            items: [],
+            diagnostics: [
+              {
+                target: "pimGroup",
+                success: false,
+                checkedAt: "2026-06-12T10:01:00.000Z",
+                operation: "active",
+                endpointLabel: "PIM group active assignments",
+                failureKind: "missingCapability",
+                error: "PIM group access is limited."
+              }
+            ]
+          }
+        },
+        activeByTarget: {
           pimGroup: {
             fetchedAt: Date.now(),
             cacheKey: "graphPimGroup::",
@@ -1482,7 +1514,7 @@ describe("settings dark mode", () => {
 
     expect(document.body.textContent).not.toContain("Usage counters");
     expect(document.body.textContent).not.toContain("Background pre-refresh");
-    document.querySelector<HTMLInputElement>('input[aria-label="Show advanced settings"]')!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    setCheckboxValue(document.querySelector<HTMLInputElement>('input[aria-label="Show advanced settings"]')!, true);
     await waitFor(() => expect(document.body.textContent).toContain("Usage counters"));
     expect(document.body.textContent).toContain("Background pre-refresh");
   });
