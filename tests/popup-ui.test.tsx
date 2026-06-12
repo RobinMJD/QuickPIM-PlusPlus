@@ -1591,6 +1591,218 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("PermissionScopeNotGranted");
   });
 
+  test("selects active rows for deactivation and prevents mixing with activation selections", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Eligible Group",
+      displayName: "Eligible Group",
+      principalId: "principal-1",
+      scopeLabel: "Member",
+      status: "eligible",
+      groupId: "group-1",
+      accessId: "member",
+      activationRequirements: {
+        justification: false,
+        ticket: false
+      }
+    };
+    const activeItem: ActivationItem = {
+      id: "pimGroup:group-2:member",
+      type: "pimGroup",
+      sourceName: "Active Group",
+      displayName: "Active Group",
+      principalId: "principal-1",
+      scopeLabel: "Member",
+      status: "active",
+      groupId: "group-2",
+      accessId: "member",
+      assignmentScheduleId: "active-schedule-1",
+      activeUntil: "2026-06-12T16:00:00.000Z"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["pimGroup"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: "graphPimGroup::",
+            errors: [],
+            items: [eligibleItem]
+          }
+        },
+        activeByTarget: {
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: "graphPimGroup::",
+            errors: [],
+            items: [activeItem]
+          }
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "deactivateItems") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            success: true,
+            results: [{ itemId: activeItem.id, itemName: "Active Group", success: true }],
+            errors: []
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            eligible: { items: [eligibleItem], errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] }
+          }
+        });
+      }
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: true, capturedAt: 1 },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Active Group"));
+    const rows = [...document.querySelectorAll<HTMLElement>(".role-row")];
+    const eligibleRow = rows.find((row) => row.textContent?.includes("Eligible Group"))!;
+    const activeRow = rows.find((row) => row.textContent?.includes("Active Group"))!;
+    const eligibleCheckbox = eligibleRow.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    const activeCheckbox = activeRow.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+
+    activeCheckbox.click();
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(activeCheckbox.checked).toBe(true);
+    expect(eligibleCheckbox.disabled).toBe(true);
+    expect(document.body.textContent).not.toContain("Activation time");
+
+    clickButton("Continue");
+    await waitFor(() => expect(document.body.textContent).toContain("Disable 1 selected"));
+    expect(document.body.textContent).not.toContain("Activation time");
+    clickButton("Disable 1 selected");
+
+    await waitFor(() =>
+      expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        action: "deactivateItems",
+        items: [expect.objectContaining({ id: activeItem.id, status: "active" })]
+      }))
+    );
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "activateItems" }));
+  });
+
+  test("hides activation counters by default and shows them when enabled in preferences", async () => {
+    async function renderWithCounterPreference(showActivationCounters: boolean) {
+      document.body.innerHTML = '<div id="root"></div>';
+      const eligibleItem: ActivationItem = {
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        sourceName: "Reader",
+        displayName: "Reader",
+        principalId: "principal-1",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/"
+      };
+      const storageData: Record<string, unknown> = {
+        [SETTINGS_KEY]: {
+          ...DEFAULT_SETTINGS,
+          preferences: {
+            ...DEFAULT_SETTINGS.preferences,
+            showActivationCounters
+          },
+          usageStatsByItemId: {
+            [eligibleItem.id]: {
+              activationCount: 7
+            }
+          }
+        },
+        [DATA_CACHE_KEY]: {
+          eligible: {
+            fetchedAt: Date.now(),
+            cacheKey: "graph:missing|azure:missing",
+            errors: [],
+            items: [eligibleItem]
+          },
+          active: {
+            fetchedAt: Date.now(),
+            cacheKey: "graph:missing|azure:missing",
+            errors: [],
+            items: []
+          }
+        }
+      };
+
+      vi.stubGlobal("chrome", {
+        runtime: {
+          sendMessage: vi.fn((message: { action: string }) => {
+            if (message.action === "getTokenStatus") {
+              return Promise.resolve({
+                success: true,
+                data: {
+                  graph: { hasToken: false },
+                  azureManagement: { hasToken: false }
+                }
+              });
+            }
+            return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+          })
+        },
+        storage: {
+          local: {
+            get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+            set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+            remove: vi.fn(async () => undefined)
+          }
+        },
+        tabs: { create: vi.fn() }
+      });
+      vi.resetModules();
+      await import("../src/popup/main");
+      await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+      return document.querySelector(".activation-count");
+    }
+
+    expect(await renderWithCounterPreference(false)).toBeNull();
+    const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
+    cleanupWindow.__quickPimPopupUnmount?.();
+    cleanupWindow.__quickPimPopupUnmount = undefined;
+    vi.unstubAllGlobals();
+    expect(await renderWithCounterPreference(true)).toBeTruthy();
+  });
+
   test("shows matching portal actions for claims challenge activation errors", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {

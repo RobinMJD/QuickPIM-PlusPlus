@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.4.0**
+Current version: **v2.5.0**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -17,16 +17,19 @@ The extension does not create a separate OAuth app registration and does not ask
 ## Highlights
 
 - Activate eligible Microsoft Entra roles, Azure resource roles, and PIM-enabled groups.
+- Disable active Microsoft Entra roles, Azure resource roles, and PIM-enabled groups before expiry when Microsoft exposes the needed schedule identifiers.
 - See friendly role, group, subscription, admin unit, device, and scope names when Microsoft APIs expose them.
 - Keep learned display names locally so old friendly names still work when later token access is limited.
 - Override names with local aliases when Microsoft returns opaque IDs or when your organization uses clearer internal naming.
 - Mark roles and groups as favorites and keep them at the top of each tab.
 - Build activation bundles that can include Entra roles, PIM groups, and Azure roles.
 - Skip already-active bundle entries automatically to avoid duplicate activation failures.
+- Keep enable and disable selections separate so a popup request does one clear operation at a time.
 - Reuse saved justifications and recent justification history.
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
+- Hide activation counters by default, with a preference to show them when useful.
 - Enable only the feature areas you use, skip disabled feature fetches, and automatically omit empty role-type tabs.
 - Use dark mode from settings.
 - Import and export local settings as JSON.
@@ -36,15 +39,15 @@ The extension does not create a separate OAuth app registration and does not ask
 
 ### Microsoft Entra Roles
 
-QuickPIM++ reads eligible Entra role assignments from Microsoft Graph and can activate directory roles from the popup. It resolves directory role names, detects active eligible roles, displays active status in the relevant role tab, and can show scoped assignments such as tenant, administrative unit, or device scopes with friendly display names when available.
+QuickPIM++ reads eligible Entra role assignments from Microsoft Graph and can activate or disable directory roles from the popup. It resolves directory role names, detects active roles, displays active status in the relevant role tab, and can show scoped assignments such as tenant, administrative unit, or device scopes with friendly display names when available.
 
 ### PIM Groups
 
-QuickPIM++ supports PIM-enabled groups for both member and owner eligibilities. Group display names are learned and cached locally, and group activations use the Graph PIM group schedule request APIs.
+QuickPIM++ supports PIM-enabled groups for both member and owner eligibilities. Group display names are learned and cached locally, and group enable/disable requests use the Graph PIM group schedule request APIs.
 
 ### Azure Roles
 
-QuickPIM++ supports Azure resource PIM roles from Azure Management APIs. It resolves role definition names, subscription names, inherited scopes, and activation policies where the captured portal token allows it.
+QuickPIM++ supports Azure resource PIM roles from Azure Management APIs. It resolves role definition names, subscription names, inherited scopes, activation policies, and active assignments where the captured portal token allows it.
 
 ## Popup Experience
 
@@ -54,11 +57,13 @@ The popup is designed for daily activation:
 - Access warning banner only when a feature area is stale or limited.
 - Separate tabs for Entra Roles, PIM Groups, Azure Roles, and Bundles.
 - Search and sort controls with compact icons.
-- Refresh and portal-link actions in the top control area.
+- Refresh and portal-link actions in the top control area, with visible refresh progress.
 - Favorite stars on role rows.
 - Row click selection, plus checkbox selection.
-- Active eligible rows shown as `active`, but not selectable.
+- Active rows can be selected for early disable, while eligible rows are selected for activation.
+- Enable and disable selections are mutually exclusive until the selection is cleared.
 - Activation review step shown only after pressing `Continue`.
+- Disable review skips the duration picker and keeps a two-line optional justification field.
 - Duration options capped to what the selected roles or groups allow.
 - Justification, ticket system, and ticket number fields shown only when required by selected items.
 - Clear progress and completion/error feedback during activation.
@@ -82,7 +87,7 @@ Settings are organized around setup, configuration, and local data:
 
 QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Access Setup** and choose **Open missing portal pages**.
 
-The guided setup opens only the Microsoft portal pages needed for enabled feature areas that are missing or limited:
+The guided setup first scans any already-open Entra admin center tabs for fresh portal tokens. It then opens only the Microsoft portal pages still needed for enabled feature areas that are missing or limited:
 
 - Entra roles
 - PIM groups
@@ -100,6 +105,7 @@ QuickPIM++ is local-first:
 - Settings, aliases, learned names, favorites, bundles, and justification history are local Chrome storage data.
 - The extension only calls Microsoft Graph and Azure Management for PIM operations.
 - Disabled role features are skipped during refreshes and Access Setup checks.
+- Existing Entra admin center tabs are scanned before Access Setup opens more portal pages.
 - The settings home page calls the public GitHub API only to show repository changelog entries.
 - Runtime messages, imported settings, activation inputs, JWTs, and API URLs are validated before privileged background actions run.
 - API errors shown in the UI are sanitized so token-like values and oversized raw messages are not surfaced.
@@ -164,11 +170,14 @@ After building and loading `dist/`, verify:
 
 - Graph and Azure token statuses appear in the popup header.
 - Access Setup opens only the portal pages needed for missing or limited feature areas.
+- Refresh shows progress, and the popup refresh icon spins while data is being refreshed.
 - Eligible Entra roles, Azure roles, and PIM groups render with friendly names.
 - Admin unit, device, subscription, and inherited Azure scope names display when available.
 - Search, sort, favorites, enabled features, and dark mode persist after reopening.
 - A single role or group activation submits successfully with the required duration and justification.
-- Already-active eligible items show as `active`, cannot be selected, and show remaining time when available.
+- An active role or group can be selected and disabled before expiry when Microsoft exposes the active schedule identifiers.
+- Activation and deactivation selections cannot be mixed in one request.
+- Already-active items show as `active` and show remaining time when available.
 - Bundles activate only eligible inactive entries and skip already-active entries.
 - Saved justifications and recent justification history update in both popup and settings.
 - Import/export preserves aliases, justifications, bundles, favorites, preferences, and learned names.
@@ -190,6 +199,15 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.5.0
+
+- Adds early disable requests for active Entra roles, PIM groups, and Azure roles when Microsoft exposes the needed schedule identifiers.
+- Keeps activation and deactivation selections mutually exclusive in the popup.
+- Adds refresh progress and a spinning refresh icon while data is being refreshed.
+- Scans already-open Entra admin center tabs before opening Access Setup portal pages.
+- Opens only the still-needed portal pages after that scan.
+- Hides popup activation counters by default and adds a preference to show them.
 
 ### v2.4.0
 

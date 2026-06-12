@@ -130,7 +130,11 @@ export function tabLabel(tab: PopupTab): string {
   return labels[tab];
 }
 
-export function mergeEligibleWithActive(eligibleItems: ActivationItem[], activeItems: ActivationItem[]): ActivationItem[] {
+export function mergeEligibleWithActive(
+  eligibleItems: ActivationItem[],
+  activeItems: ActivationItem[],
+  options: { includeActiveOnly?: boolean } = {}
+): ActivationItem[] {
   const activeById = new Map<string, ActivationItem>();
   for (const item of activeItems) {
     const current = activeById.get(item.id);
@@ -138,7 +142,7 @@ export function mergeEligibleWithActive(eligibleItems: ActivationItem[], activeI
       activeById.set(item.id, item);
     }
   }
-  return eligibleItems.map((item) => {
+  const merged = eligibleItems.map((item) => {
     const activeItem = activeById.get(item.id);
     const activationRequirements = {
       ...item.activationRequirements,
@@ -153,10 +157,22 @@ export function mergeEligibleWithActive(eligibleItems: ActivationItem[], activeI
         }
       : item;
   });
+
+  if (!options.includeActiveOnly) {
+    return merged;
+  }
+
+  const mergedIds = new Set(merged.map((item) => item.id));
+  const activeOnlyItems = activeItems.filter((item) => !mergedIds.has(item.id));
+  return [...merged, ...activeOnlyItems];
 }
 
 export function getActivatableItems(items: ActivationItem[]): ActivationItem[] {
   return items.filter((item) => item.status === "eligible");
+}
+
+export function getDeactivatableItems(items: ActivationItem[]): ActivationItem[] {
+  return items.filter((item) => item.status === "active");
 }
 
 export function isHighPrivilegeItem(item: ActivationItem): boolean {

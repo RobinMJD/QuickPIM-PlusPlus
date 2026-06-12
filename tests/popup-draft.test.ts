@@ -16,7 +16,8 @@ describe("popup draft storage", () => {
         justification: " Need access ",
         ticketSystem: " ServiceNow ",
         ticketNumber: " INC-123 ",
-        isActivationReviewOpen: true
+        isActivationReviewOpen: true,
+        requestMode: "deactivate"
       },
       now
     );
@@ -30,7 +31,8 @@ describe("popup draft storage", () => {
       justification: "Need access",
       ticketSystem: "ServiceNow",
       ticketNumber: "INC-123",
-      isActivationReviewOpen: true
+      isActivationReviewOpen: true,
+      requestMode: "deactivate"
     });
   });
 
@@ -47,8 +49,22 @@ describe("popup draft storage", () => {
         justification: "",
         ticketSystem: "",
         ticketNumber: "",
-        isActivationReviewOpen: false
+        isActivationReviewOpen: false,
+        requestMode: "activate"
       })
     ).toBe(true);
+  });
+
+  test("drops invalid popup request modes", () => {
+    expect(
+      sanitizePopupDraft(
+        {
+          updatedAt: now,
+          selectedIds: ["role-1"],
+          requestMode: "delete"
+        },
+        now
+      )?.requestMode
+    ).toBeUndefined();
   });
 });

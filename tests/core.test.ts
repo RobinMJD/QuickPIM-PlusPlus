@@ -10,6 +10,7 @@ import {
   sortItems
 } from "../src/lib/settings";
 import {
+  buildDeactivationRequest,
   buildActivationRequest,
   buildRolePolicyRequirementMap,
   extractActivationRequirementsFromPolicyRules,
@@ -366,6 +367,7 @@ describe("settings helpers", () => {
         defaultSort: "invalid" as any,
         recentJustificationLimit: 99,
         darkMode: true,
+        showActivationCounters: true,
         enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
     });
@@ -387,8 +389,15 @@ describe("settings helpers", () => {
       defaultSort: "name",
       recentJustificationLimit: 20,
       darkMode: true,
+      showActivationCounters: true,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
+  });
+
+  test("hides popup activation counters by default while allowing an explicit preference", () => {
+    expect(DEFAULT_SETTINGS.preferences.showActivationCounters).toBe(false);
+    expect(mergeSettings({ preferences: { showActivationCounters: true } as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(true);
+    expect(mergeSettings({ preferences: { showActivationCounters: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(false);
   });
 });
 
@@ -548,6 +557,128 @@ describe("activation request builders", () => {
         groupId: "group-1"
       }
     });
+  });
+
+  test("builds directory, Azure, and PIM group deactivation payloads", () => {
+    const directoryRequest = buildDeactivationRequest(
+      {
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        sourceName: "Global Reader",
+        displayName: "Global Reader",
+        principalId: "user-1",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/",
+        scopeLabel: "Tenant",
+        status: "active",
+        assignmentScheduleId: "directory-schedule-1"
+      },
+      "No longer needed",
+      {},
+      "2026-06-12T10:00:00.000Z",
+      "request-1"
+    );
+
+    expect(directoryRequest).toMatchObject({
+      endpoint: "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests",
+      method: "POST",
+      tokenKind: "graph",
+      body: {
+        action: "selfDeactivate",
+        principalId: "user-1",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/",
+        targetScheduleId: "directory-schedule-1",
+        justification: "No longer needed {Activated using QuickPIM++}"
+      }
+    });
+
+    const azureRequest = buildDeactivationRequest(
+      {
+        id: "azureRole:owner:/subscriptions/sub-1",
+        type: "azureRole",
+        sourceName: "Owner",
+        displayName: "Owner",
+        principalId: "user-1",
+        roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/owner",
+        scope: "/subscriptions/sub-1",
+        scopeLabel: "Production",
+        status: "active",
+        assignmentScheduleId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentSchedules/schedule-1",
+        assignmentScheduleInstanceId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentScheduleInstances/instance-1"
+      },
+      "",
+      {},
+      "2026-06-12T10:00:00.000Z",
+      "request-2"
+    );
+
+    expect(azureRequest).toMatchObject({
+      endpoint: "https://management.azure.com/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/request-2?api-version=2020-10-01",
+      method: "PUT",
+      tokenKind: "azureManagement",
+      body: {
+        properties: {
+          requestType: "SelfDeactivate",
+          principalId: "user-1",
+          roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/owner",
+          targetRoleAssignmentScheduleId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentSchedules/schedule-1",
+          targetRoleAssignmentScheduleInstanceId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentScheduleInstances/instance-1"
+        }
+      }
+    });
+
+    const pimGroupRequest = buildDeactivationRequest(
+      {
+        id: "pimGroup:group-1:owner",
+        type: "pimGroup",
+        sourceName: "Privileged Group",
+        displayName: "Privileged Group",
+        principalId: "user-1",
+        groupId: "group-1",
+        accessId: "owner",
+        scopeLabel: "Owner",
+        status: "active",
+        assignmentScheduleId: "group-schedule-1"
+      },
+      "Switching context",
+      {},
+      "2026-06-12T10:00:00.000Z",
+      "request-3"
+    );
+
+    expect(pimGroupRequest).toMatchObject({
+      endpoint: "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests",
+      method: "POST",
+      tokenKind: "graph",
+      body: {
+        action: "selfDeactivate",
+        accessId: "owner",
+        principalId: "user-1",
+        groupId: "group-1",
+        targetScheduleId: "group-schedule-1",
+        justification: "Switching context {Activated using QuickPIM++}"
+      }
+    });
+  });
+
+  test("rejects deactivation requests without an active target schedule", () => {
+    const baseRole: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Global Reader",
+      displayName: "Global Reader",
+      principalId: "user-1",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      scopeLabel: "Tenant",
+      status: "eligible"
+    };
+
+    expect(() => buildDeactivationRequest(baseRole, "")).toThrow("Only active items can be deactivated.");
+    expect(() => buildDeactivationRequest({ ...baseRole, status: "active" }, "")).toThrow(
+      "Deactivation item is missing the active assignment schedule."
+    );
   });
 
   test("appends the QuickPIM++ marker only to outbound activation payload justifications", () => {

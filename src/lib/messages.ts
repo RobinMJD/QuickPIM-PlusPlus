@@ -13,6 +13,12 @@ export type QuickPimMessage =
       durationHours: number;
       justification: string;
       ticketInfo?: TicketInfo;
+    }
+  | {
+      action: "deactivateItems";
+      items: ActivationItem[];
+      justification?: string;
+      ticketInfo?: TicketInfo;
     };
 
 const SIMPLE_ACTIONS = new Set(["getTokenStatus", "clearToken"]);
@@ -57,12 +63,29 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     };
   }
 
-  if (message.action !== "activateItems") {
+  if (message.action !== "activateItems" && message.action !== "deactivateItems") {
     throw new Error("Unsupported QuickPIM++ message.");
   }
 
   if (!Array.isArray(message.items)) {
     throw new Error("Activation items must be an array.");
+  }
+
+  if (message.action === "deactivateItems") {
+    if (message.justification !== undefined && typeof message.justification !== "string") {
+      throw new Error("Deactivation justification must be text.");
+    }
+
+    if (message.ticketInfo !== undefined && !isRecord(message.ticketInfo)) {
+      throw new Error("Ticket information must be an object.");
+    }
+
+    return {
+      action: "deactivateItems",
+      items: message.items as ActivationItem[],
+      justification: typeof message.justification === "string" ? message.justification : undefined,
+      ticketInfo: message.ticketInfo as TicketInfo | undefined
+    };
   }
 
   if (!Number.isFinite(message.durationHours)) {

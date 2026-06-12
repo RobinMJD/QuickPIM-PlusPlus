@@ -28,6 +28,7 @@ import {
   getActivationRequirements,
   getActivationStatusTitle,
   getActivatableItems,
+  getDeactivatableItems,
   getDurationOptions,
   getRemainingSelectedIdsAfterActivationResults,
   isHighPrivilegeItem,
@@ -79,6 +80,7 @@ import type {
   QuickPimDataCache,
   ReferenceDataCache,
   QuickPimSettings,
+  PopupRequestMode,
   SortMode,
   TicketInfo,
   TokenStatus
@@ -106,6 +108,12 @@ const ACTIVATION_STEPS: LoadingProgress[] = [
   { current: 2, total: 3, label: "Saving activation result" },
   { current: 3, total: 3, label: "Refreshing activation status" }
 ];
+const DEACTIVATION_STEPS: LoadingProgress[] = [
+  { current: 1, total: 3, label: "Sending deactivation request" },
+  { current: 2, total: 3, label: "Saving deactivation result" },
+  { current: 3, total: 3, label: "Refreshing deactivation status" }
+];
+const REFRESH_TOTAL_STEPS = 4;
 
 function buildActivationFailureNotice(
   errors: ActivationResponse["errors"],
@@ -164,10 +172,12 @@ function PopupApp() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshProgress, setRefreshProgress] = useState<LoadingProgress | null>(null);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
   const [isActivating, setIsActivating] = useState(false);
+  const [requestMode, setRequestMode] = useState<PopupRequestMode | undefined>();
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
@@ -191,7 +201,7 @@ function PopupApp() {
   }, [settings.preferences.darkMode]);
 
   const displayItems = useMemo(
-    () => mergeEligibleWithActive(eligibleItems, activeItems),
+    () => mergeEligibleWithActive(eligibleItems, activeItems, { includeActiveOnly: true }),
     [activeItems, eligibleItems]
   );
   const activatableItemCount = useMemo(() => getActivatableItems(displayItems).length, [displayItems]);
@@ -214,15 +224,18 @@ function PopupApp() {
   }, [enabledFeatures, roleTabs]);
   const favoriteIds = useMemo(() => new Set(settings.favoriteItemIds || []), [settings.favoriteItemIds]);
   const selectedItems = useMemo(
-    () => getActivatableItems([...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item))),
-    [itemsById, selectedIds]
+    () => {
+      const items = [...selectedIds].map((id) => itemsById.get(id)).filter((item): item is ActivationItem => Boolean(item));
+      return requestMode === "deactivate" ? getDeactivatableItems(items) : getActivatableItems(items);
+    },
+    [itemsById, requestMode, selectedIds]
   );
   const selectedDirectoryRoleCount = useMemo(
-    () => selectedItems.filter((item) => item.type === "directoryRole").length,
-    [selectedItems]
+    () => requestMode === "activate" ? selectedItems.filter((item) => item.type === "directoryRole").length : 0,
+    [requestMode, selectedItems]
   );
-  const requirements = useMemo(() => getActivationRequirements(selectedItems), [selectedItems]);
-  const durationOptions = useMemo(() => getDurationOptions(selectedItems), [selectedItems]);
+  const requirements = useMemo(() => getActivationRequirements(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
+  const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
   const showPermissionWarning = useMemo(
     () => tokenStatus !== null && !settings.preferences.permissionWarningIgnored && accessSetupTargets.length > 0,
@@ -243,18 +256,28 @@ function PopupApp() {
       return;
     }
     setSelectedIds((current) => {
-      const next = new Set([...current].filter((id) => itemsById.get(id)?.status === "eligible"));
+      const mode = requestMode || getRequestModeForItem([...current].map((id) => itemsById.get(id)).find(Boolean));
+      const next = new Set(
+        [...current].filter((id) => {
+          const item = itemsById.get(id);
+          return mode ? getRequestModeForItem(item) === mode : Boolean(getRequestModeForItem(item));
+        })
+      );
       if (!next.size && current.size) {
         if (draftSaveTimer.current) {
           clearTimeout(draftSaveTimer.current);
           draftSaveTimer.current = undefined;
         }
         latestPopupDraft.current = undefined;
+        setRequestMode(undefined);
         void clearPopupDraft();
+      }
+      if (next.size && !requestMode && mode) {
+        setRequestMode(mode);
       }
       return next.size === current.size ? current : next;
     });
-  }, [hasActivationDataLoaded, itemsById]);
+  }, [hasActivationDataLoaded, itemsById, requestMode]);
 
   useEffect(() => {
     if (visibleTabs.length && !visibleTabs.includes(tab)) {
@@ -301,7 +324,8 @@ function PopupApp() {
     sortMode,
     tab,
     ticketNumber,
-    ticketSystem
+    ticketSystem,
+    requestMode
   ]);
 
   useEffect(() => {
@@ -350,6 +374,7 @@ function PopupApp() {
         setTicketSystem(draft.ticketSystem);
         setTicketNumber(draft.ticketNumber);
         setIsActivationReviewOpen(draft.isActivationReviewOpen);
+        setRequestMode(draft.requestMode);
         setHasRestoredPopupDraft(true);
       }
     } finally {
@@ -369,6 +394,7 @@ function PopupApp() {
       ticketSystem,
       ticketNumber,
       isActivationReviewOpen,
+      requestMode,
       ...overrides
     };
   }
@@ -398,6 +424,7 @@ function PopupApp() {
     setJustification("");
     setTicketSystem("");
     setTicketNumber("");
+    setRequestMode(undefined);
     latestPopupDraft.current = undefined;
     await clearPopupDraft();
   }
@@ -440,6 +467,14 @@ function PopupApp() {
       const cachedEligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey);
       const cachedActive = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), now, legacyCacheKey);
       const canShowCachedData = !options.force && cachedEligible.items.length > 0;
+      const shouldShowRefreshProgress = !options.suppressMessage && (!showBlockingLoading || canShowCachedData);
+      if (shouldShowRefreshProgress) {
+        setRefreshProgress({
+          current: 1,
+          total: REFRESH_TOTAL_STEPS,
+          label: "Checking cached access data"
+        });
+      }
 
       if (canShowCachedData) {
         await applyLoadedActivationData(loadedSettings, loadedTokens, currentCache, loadedReferenceData, cachedEligible, cachedActive);
@@ -453,6 +488,13 @@ function PopupApp() {
       const staleTargets = refreshTargets.filter(
         (target) => options.force || !eligibleCache[target]?.isFresh || !activeCache[target]?.isFresh
       );
+      if (shouldShowRefreshProgress) {
+        setRefreshProgress({
+          current: 2,
+          total: REFRESH_TOTAL_STEPS,
+          label: "Preparing refresh targets"
+        });
+      }
       if (!staleTargets.length) {
         if (!canShowCachedData) {
           await applyLoadedActivationData(loadedSettings, loadedTokens, currentCache, loadedReferenceData, cachedEligible, cachedActive);
@@ -466,10 +508,17 @@ function PopupApp() {
       if (canShowCachedData || !showBlockingLoading) {
         setIsRefreshing(true);
         if (!options.suppressMessage) {
-          setMessage(options.force ? "Refreshing access data..." : "Refreshing stale access data...");
+          setMessage("");
         }
       }
 
+      if (shouldShowRefreshProgress) {
+        setRefreshProgress({
+          current: 3,
+          total: REFRESH_TOTAL_STEPS,
+          label: options.force ? "Refreshing access data" : "Refreshing stale access data"
+        });
+      }
       const snapshot = await fetchActivationSnapshot(staleTargets);
       const fetchedAt = Date.now();
       let nextCache = updateCacheFromTargetResults(
@@ -509,6 +558,13 @@ function PopupApp() {
       }
 
       await saveDataCache(nextCache);
+      if (shouldShowRefreshProgress) {
+        setRefreshProgress({
+          current: 4,
+          total: REFRESH_TOTAL_STEPS,
+          label: "Saving refreshed access data"
+        });
+      }
       const nextTargetCacheKeys = buildTargetCacheKeys(loadedTokens, getEnabledRoleFeatures(nextSettings));
       const nextEligibleCache = getTargetEntriesFromCache(nextCache, "eligible", getEnabledRoleFeatures(nextSettings), nextTargetCacheKeys, {
         legacyCacheKey: buildFeatureCacheKey(tokenCacheKey, getEnabledRoleFeatures(nextSettings)),
@@ -536,6 +592,7 @@ function PopupApp() {
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
+      setRefreshProgress(null);
     }
   }
 
@@ -560,7 +617,9 @@ function PopupApp() {
 
   function toggleSelected(itemId: string) {
     setSelectedIds((current) => {
-      if (itemsById.get(itemId)?.status !== "eligible") {
+      const item = itemsById.get(itemId);
+      const itemMode = getRequestModeForItem(item);
+      if (!itemMode || (requestMode && requestMode !== itemMode)) {
         return current;
       }
       const next = new Set(current);
@@ -568,6 +627,12 @@ function PopupApp() {
         next.delete(itemId);
       } else {
         next.add(itemId);
+      }
+      if (!next.size) {
+        setRequestMode(undefined);
+        setIsActivationReviewOpen(false);
+      } else if (!requestMode) {
+        setRequestMode(itemMode);
       }
       return next;
     });
@@ -661,12 +726,79 @@ function PopupApp() {
         });
       }
       if (remainingSelectedIds.size) {
-        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true });
+        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "activate" });
       } else {
+        setRequestMode(undefined);
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
-      setMessage(formatActivationConfirmation(successItems.length, response.errors.length));
+      setMessage(formatRequestConfirmation("activation", successItems.length, response.errors.length));
+    } catch (activationError) {
+      setActivationFailureNotice(null);
+      setError(activationError instanceof Error ? activationError.message : String(activationError));
+    } finally {
+      setActivationProgress(null);
+      setIsActivating(false);
+    }
+  }
+
+  async function deactivate(items: ActivationItem[]) {
+    const deactivatableItems = getDeactivatableItems(items);
+    if (!deactivatableItems.length) {
+      setActivationFailureNotice(null);
+      setError(items.length ? "No selected items are currently active." : "Select at least one active role or group.");
+      return;
+    }
+
+    setIsActivating(true);
+    setActivationProgress(DEACTIVATION_STEPS[0]);
+    scrollPopupToTop();
+    setError("");
+    setActivationFailureNotice(null);
+    setMessage("");
+    try {
+      const response = await sendMessage<ActivationResponse>({
+        action: "deactivateItems",
+        items: deactivatableItems,
+        justification,
+        ticketInfo: {}
+      });
+      setActivationProgress(DEACTIVATION_STEPS[1]);
+      const successItems = response.results
+        .filter((result) => result.success)
+        .map((result) => deactivatableItems.find((item) => item.id === result.itemId))
+        .filter((item): item is ActivationItem => Boolean(item));
+
+      if (justification.trim()) {
+        const updatedSettings = addRecentJustification(settings, justification);
+        await saveSettings(updatedSettings);
+        setSettings(updatedSettings);
+      }
+
+      const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
+      setSelectedIds(remainingSelectedIds);
+      setActivationProgress(DEACTIVATION_STEPS[2]);
+      if (response.errors.length) {
+        setActivationFailureNotice(buildActivationFailureNotice(response.errors, deactivatableItems));
+      } else {
+        setActivationFailureNotice(null);
+      }
+      if (successItems.length) {
+        await refresh({
+          force: true,
+          showLoading: false,
+          suppressMessage: true,
+          targets: [...new Set(successItems.map((item) => item.type))]
+        });
+      }
+      if (remainingSelectedIds.size) {
+        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "deactivate" });
+      } else {
+        setRequestMode(undefined);
+        latestPopupDraft.current = undefined;
+        await clearPopupDraft();
+      }
+      setMessage(formatRequestConfirmation("deactivation", successItems.length, response.errors.length));
     } catch (activationError) {
       setActivationFailureNotice(null);
       setError(activationError instanceof Error ? activationError.message : String(activationError));
@@ -690,6 +822,7 @@ function PopupApp() {
 
   function useBundleDefaults(bundle: QuickPimBundle) {
     const expansion = expandBundle(bundle, displayItems);
+    setRequestMode(expansion.items.length ? "activate" : undefined);
     setSelectedIds(new Set(expansion.items.map((item) => item.id)));
     if (expansion.durationHours) setDurationHours(expansion.durationHours);
     if (expansion.justification) setJustification(expansion.justification);
@@ -760,7 +893,7 @@ function PopupApp() {
           <TokenPill label="Azure" status={tokenStatus?.azureManagement} />
           <div className="header-actions" aria-label="Popup actions">
             <button
-              className="btn icon-btn"
+              className={`btn icon-btn ${isRefreshing ? "spinning" : ""}`}
               onClick={() => void refresh({ force: true, showLoading: false, targets: manualRefreshTargets })}
               disabled={isLoading || isRefreshing}
               title={manualRefreshLabel}
@@ -805,7 +938,8 @@ function PopupApp() {
       ) : null}
       {message ? <p className="message">{message}</p> : null}
       {isLoading ? <LoadingState /> : null}
-      {activationProgress ? <ActivationProgressPanel progress={activationProgress} /> : null}
+      {refreshProgress ? <RefreshProgressPanel progress={refreshProgress} /> : null}
+      {activationProgress ? <ActivationProgressPanel progress={activationProgress} mode={requestMode || "activate"} /> : null}
 
       {currentRoleTab ? (
         <>
@@ -836,6 +970,8 @@ function PopupApp() {
               referenceData={referenceData}
               selectedIds={selectedIds}
               favoriteIds={favoriteIds}
+              requestMode={requestMode}
+              showActivationCounters={settings.preferences.showActivationCounters}
               onToggle={toggleSelected}
               onToggleFavorite={(itemId) => void toggleFavorite(itemId)}
             />
@@ -854,10 +990,12 @@ function PopupApp() {
             durationOptions={durationOptions}
             selectedCount={selectedItems.length}
             selectedDirectoryRoleCount={selectedDirectoryRoleCount}
+            requestMode={requestMode}
             isReviewOpen={isActivationReviewOpen}
             isActivating={isActivating}
             onContinue={() => setIsActivationReviewOpen(true)}
             onActivate={() => void activate(selectedItems)}
+            onDeactivate={() => void deactivate(selectedItems)}
             onSaveJustification={() => void saveCurrentJustification()}
             onClearSelection={() => void clearSelectionAndDraft()}
             onOpenSettings={() => void openSettingsSection("preferences")}
@@ -954,12 +1092,29 @@ function LoadingState() {
   );
 }
 
-function ActivationProgressPanel({ progress }: { progress: LoadingProgress }) {
+function RefreshProgressPanel({ progress }: { progress: LoadingProgress }) {
+  return (
+    <section className="activation-progress-panel refresh-progress-panel" aria-live="polite">
+      <div className="progress-line">
+        <span>
+          Refreshing access data (step {progress.current}/{progress.total}): {progress.label}
+        </span>
+        <span className="progress-fraction">{progress.current}/{progress.total}</span>
+      </div>
+      <div className="progress-track" aria-hidden="true">
+        <span style={{ width: `${Math.round((progress.current / progress.total) * 100)}%` }} />
+      </div>
+    </section>
+  );
+}
+
+function ActivationProgressPanel({ progress, mode }: { progress: LoadingProgress; mode: PopupRequestMode }) {
+  const label = mode === "deactivate" ? "Deactivation" : "Activation";
   return (
     <section className="activation-progress-panel" aria-live="polite">
       <span className="spinner large" aria-hidden="true" />
       <span>
-        Activation in progress (step {progress.current}/{progress.total}): {progress.label}
+        {label} in progress (step {progress.current}/{progress.total}): {progress.label}
       </span>
     </section>
   );
@@ -1009,6 +1164,8 @@ function RoleList({
   referenceData,
   selectedIds,
   favoriteIds,
+  requestMode,
+  showActivationCounters,
   onToggle,
   onToggleFavorite,
   readonly = false
@@ -1018,6 +1175,8 @@ function RoleList({
   referenceData?: ReferenceDataCache;
   selectedIds: Set<string>;
   favoriteIds: Set<string>;
+  requestMode?: PopupRequestMode;
+  showActivationCounters: boolean;
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
   readonly?: boolean;
@@ -1030,7 +1189,9 @@ function RoleList({
     <div className="item-list">
       {items.map((item) => {
         const usage = getUsage(item, settings);
-        const isSelectable = !readonly && item.status === "eligible";
+        const itemMode = getRequestModeForItem(item);
+        const isActionable = !readonly && Boolean(itemMode);
+        const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
         const selected = isSelectable && selectedIds.has(item.id);
         const displayName = getDisplayName(item, settings, referenceData);
         const isFavorite = favoriteIds.has(item.id);
@@ -1061,9 +1222,11 @@ function RoleList({
               </div>
             </div>
             <div className="role-status-stack">
-              <span className="activation-count" title={`${usage.activationCount} activation${usage.activationCount === 1 ? "" : "s"}`}>
-                {usage.activationCount}
-              </span>
+              {showActivationCounters ? (
+                <span className="activation-count" title={`${usage.activationCount} activation${usage.activationCount === 1 ? "" : "s"}`}>
+                  {usage.activationCount}
+                </span>
+              ) : null}
               <span className={`badge status-badge ${item.status}`} title={statusTitle}>
                 {formatActivationStatusLabel(item.status)}
               </span>
@@ -1071,7 +1234,7 @@ function RoleList({
           </>
         );
 
-        if (!isSelectable) {
+        if (!isActionable) {
           return (
             <div className={`role-row readonly ${item.status === "active" ? "active-row" : item.status === "pendingApproval" ? "pending-row" : ""}`} key={item.id}>
               {body}
@@ -1080,10 +1243,20 @@ function RoleList({
         }
 
         return (
-          <div className={`role-row selectable ${selected ? "selected" : ""}`} key={item.id} onClick={() => onToggle?.(item.id)}>
+          <div
+            className={`role-row selectable ${selected ? "selected" : ""} ${!isSelectable ? "disabled" : ""} ${item.status === "active" ? "active-row" : ""}`}
+            key={item.id}
+            onClick={() => {
+              if (isSelectable) {
+                onToggle?.(item.id);
+              }
+            }}
+            title={!isSelectable && requestMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined}
+          >
             <input
               type="checkbox"
               checked={selected}
+              disabled={!isSelectable}
               onClick={(event) => event.stopPropagation()}
               onChange={() => onToggle?.(item.id)}
             />
@@ -1109,29 +1282,34 @@ function ActivationBar(props: {
   durationOptions: Array<{ value: number; label: string }>;
   selectedCount: number;
   selectedDirectoryRoleCount: number;
+  requestMode?: PopupRequestMode;
   isReviewOpen: boolean;
   isActivating: boolean;
   onContinue: () => void;
   onActivate: () => void;
+  onDeactivate: () => void;
   onSaveJustification: () => void;
   onClearSelection: () => void;
   onOpenSettings: () => void;
 }) {
   const [isSavedListOpen, setIsSavedListOpen] = useState(false);
   const hasSelection = props.selectedCount > 0;
+  const isDeactivateMode = props.requestMode === "deactivate";
+  const isActivateMode = props.requestMode !== "deactivate";
   const savedJustifications = props.settings.savedJustifications;
   const savedLookup = new Set(savedJustifications.map((item) => item.toLowerCase()));
   const recentJustifications = props.settings.recentJustifications.filter((item) => !savedLookup.has(item.toLowerCase()));
-  const showJustificationShortcuts = props.requirements.needsJustification && (recentJustifications.length > 0 || savedJustifications.length > 0);
+  const showJustificationField = isDeactivateMode || props.requirements.needsJustification;
+  const showJustificationShortcuts = showJustificationField && (recentJustifications.length > 0 || savedJustifications.length > 0);
   const selectedDuration = props.durationOptions.some((option) => option.value === props.durationHours)
     ? props.durationHours
     : props.durationOptions[0]?.value;
 
   useEffect(() => {
-    if (!hasSelection || !props.isReviewOpen || !props.requirements.needsJustification || !savedJustifications.length) {
+    if (!hasSelection || !props.isReviewOpen || !showJustificationField || !savedJustifications.length) {
       setIsSavedListOpen(false);
     }
-  }, [hasSelection, props.isReviewOpen, props.requirements.needsJustification, savedJustifications.length]);
+  }, [hasSelection, props.isReviewOpen, showJustificationField, savedJustifications.length]);
 
   return (
     <section className="activation-bar">
@@ -1148,7 +1326,7 @@ function ActivationBar(props: {
           </button>
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && props.selectedDirectoryRoleCount > 4 ? (
+      {hasSelection && props.isReviewOpen && isActivateMode && props.selectedDirectoryRoleCount > 4 ? (
         <div className="practice-warning" role="status">
           <strong>Select only what you need.</strong>
           <span>
@@ -1156,7 +1334,7 @@ function ActivationBar(props: {
           </span>
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && props.durationOptions.length ? (
+      {hasSelection && props.isReviewOpen && isActivateMode && props.durationOptions.length ? (
         <div className="field">
           <label>Activation time</label>
           <select
@@ -1173,11 +1351,11 @@ function ActivationBar(props: {
           </select>
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && props.requirements.needsJustification ? (
+      {hasSelection && props.isReviewOpen && showJustificationField ? (
         <div className="field activation-form-field">
           <div className="justification-label-row">
             <label>
-              Justification <span className="required-marker" aria-label="required">*</span>
+              {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
             </label>
             <button
               className="btn icon-btn save-justification-button"
@@ -1194,7 +1372,7 @@ function ActivationBar(props: {
             rows={2}
             value={props.justification}
             onChange={(event) => props.setJustification(event.target.value)}
-            placeholder="Why do you need this activation?"
+            placeholder={isDeactivateMode ? "Why are you disabling this access early?" : "Why do you need this activation?"}
           />
         </div>
       ) : null}
@@ -1237,7 +1415,7 @@ function ActivationBar(props: {
           ) : null}
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && props.requirements.needsTicket ? (
+      {hasSelection && props.isReviewOpen && isActivateMode && props.requirements.needsTicket ? (
         <div className="activation-grid">
           <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
           <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
@@ -1246,8 +1424,10 @@ function ActivationBar(props: {
       {props.isReviewOpen || !hasSelection ? (
         <div className="button-row">
           {hasSelection && props.isReviewOpen ? (
-            <button className="btn primary" onClick={props.onActivate} disabled={props.isActivating}>
-              {props.isActivating ? "Activating..." : `Activate ${props.selectedCount} selected`}
+            <button className="btn primary" onClick={isDeactivateMode ? props.onDeactivate : props.onActivate} disabled={props.isActivating}>
+              {props.isActivating
+                ? isDeactivateMode ? "Disabling..." : "Activating..."
+                : isDeactivateMode ? `Disable ${props.selectedCount} selected` : `Activate ${props.selectedCount} selected`}
             </button>
           ) : null}
           {hasSelection ? (
@@ -1354,15 +1534,16 @@ function typeLabel(type: ActivationItem["type"]) {
   return "PIM group";
 }
 
-function formatActivationConfirmation(successCount: number, errorCount: number): string {
+function formatRequestConfirmation(requestType: "activation" | "deactivation", successCount: number, errorCount: number): string {
   const itemLabel = (count: number) => `item${count === 1 ? "" : "s"}`;
+  const noun = requestType === "deactivation" ? "Deactivation" : "Activation";
   if (successCount && !errorCount) {
-    return `Activation request submitted for ${successCount} ${itemLabel(successCount)}.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.`;
   }
   if (successCount && errorCount) {
-    return `Activation request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.`;
   }
-  return `Activation failed for ${errorCount} ${itemLabel(errorCount)}.`;
+  return `${noun} failed for ${errorCount} ${itemLabel(errorCount)}.`;
 }
 
 function scrollPopupToTop(): void {
@@ -1378,6 +1559,16 @@ function scrollPopupToTop(): void {
 function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatures: AccessSetupTarget[]): AccessSetupTarget[] {
   const enabled = new Set(enabledRoleFeatures);
   return targets.filter((target, index) => enabled.has(target) && targets.indexOf(target) === index);
+}
+
+function getRequestModeForItem(item: ActivationItem | undefined): PopupRequestMode | undefined {
+  if (item?.status === "eligible") {
+    return "activate";
+  }
+  if (item?.status === "active") {
+    return "deactivate";
+  }
+  return undefined;
 }
 
 async function fetchActivationSnapshot(targets: AccessSetupTarget[]): Promise<ActivationSnapshot> {

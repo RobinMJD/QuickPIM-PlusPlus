@@ -7,6 +7,7 @@ export type QuickPimFeature = PopupTab;
 export type TokenKind = "graph" | "azureManagement";
 export type AccessSetupTarget = ActivationItemType;
 export type AccessCapabilityStatus = "ready" | "needsPortalRefresh" | "limited";
+export type PopupRequestMode = "activate" | "deactivate";
 
 export interface UsageStats {
   activationCount: number;
@@ -27,6 +28,8 @@ export interface BaseActivationItem {
   scopeLabel: string;
   status: ActivationStatus;
   activeUntil?: string;
+  assignmentScheduleId?: string;
+  assignmentScheduleInstanceId?: string;
   isPrivileged?: boolean;
   activationRequirements?: {
     justification?: boolean;
@@ -83,6 +86,7 @@ export interface QuickPimPreferences {
   defaultSort: SortMode;
   recentJustificationLimit: number;
   darkMode: boolean;
+  showActivationCounters: boolean;
   enabledFeatures: QuickPimFeature[];
   autoEnabledFeaturesInitialized?: boolean;
   hiddenPopupTabs?: PopupTab[];
@@ -208,6 +212,7 @@ export interface DirectoryRoleApi {
   roleName?: string;
   action?: string;
   status?: string;
+  targetScheduleId?: string;
   scheduleInfo?: unknown;
   directoryScopeDisplayName?: string;
   directoryScope?: {
@@ -276,6 +281,10 @@ export interface AzureRoleApi {
     principalId?: string;
     roleDefinitionId?: string;
     roleEligibilityScheduleId?: string;
+    roleAssignmentScheduleId?: string;
+    roleAssignmentScheduleInstanceId?: string;
+    linkedRoleEligibilityScheduleId?: string;
+    linkedRoleEligibilityScheduleInstanceId?: string;
     scope?: string;
     endDateTime?: string;
     expandedProperties?: {
@@ -303,6 +312,7 @@ export interface PimGroupApi {
   accessId?: "member" | "owner";
   action?: string;
   status?: string;
+  targetScheduleId?: string;
   memberType?: string;
   endDateTime?: string;
   scheduleInfo?: {

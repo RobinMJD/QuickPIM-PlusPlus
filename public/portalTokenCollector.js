@@ -226,4 +226,11 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) scan();
   });
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message && message.action === "quickPimScanPortalTokens") {
+      void scan().then(() => sendResponse({ success: true }));
+      return true;
+    }
+    return false;
+  });
 })();

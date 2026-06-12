@@ -21,6 +21,7 @@ import {
   getRemainingSelectedIdsAfterActivationResults,
   getPortalUrlForTab,
   getActivatableItems,
+  getDeactivatableItems,
   getActiveStatusTitle,
   isHighPrivilegeItem,
   mergeEligibleWithActive,
@@ -324,6 +325,21 @@ describe("popup model helpers", () => {
 
   test("filters active and pending approval items out of activatable selections", () => {
     expect(getActivatableItems([directoryRole, { ...azureRole, status: "active" }, { ...directoryRole, status: "pendingApproval" }])).toEqual([directoryRole]);
+  });
+
+  test("can include active-only items for deactivation display", () => {
+    const activeOnlyRole: ActivationItem = {
+      ...azureRole,
+      status: "active",
+      activeUntil: "2026-05-18T15:00:00.000Z",
+      assignmentScheduleId: "schedule-1"
+    };
+
+    expect(mergeEligibleWithActive([directoryRole], [activeOnlyRole], { includeActiveOnly: true })).toEqual([
+      directoryRole,
+      activeOnlyRole
+    ]);
+    expect(getDeactivatableItems([directoryRole, activeOnlyRole, { ...directoryRole, status: "pendingApproval" }])).toEqual([activeOnlyRole]);
   });
 
   test("identifies high privilege rows from Microsoft-provided role metadata", () => {

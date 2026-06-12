@@ -1,5 +1,6 @@
 import {
   applyActivationRequirements,
+  buildDeactivationRequest,
   buildRolePolicyRequirementMap,
   buildActivationRequest,
   getActiveUntilFromScheduleInfo,
@@ -128,6 +129,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return capturePortalTokens(message.tokens, message.source, sender);
     case "activateItems":
       return activateItems(message.items, message.durationHours, message.justification, message.ticketInfo || {});
+    case "deactivateItems":
+      return deactivateItems(message.items, message.justification || "", message.ticketInfo || {});
     default:
       throw new Error("Unsupported QuickPIM++ message");
   }
@@ -1362,7 +1365,69 @@ async function activateItems(
   };
 }
 
-function assertTokenCanActivate(item: ActivationItem, token: string, tokenKind: TokenKind): void {
+async function deactivateItems(
+  items: ActivationItem[],
+  justification: string,
+  ticketInfo: TicketInfo
+): Promise<ActivationResponse> {
+  if (!items.length) {
+    throw new Error("Select at least one active item to deactivate.");
+  }
+
+  const tokens = await getStoredTokens();
+  const startDateTime = new Date().toISOString();
+  const results = await Promise.all(
+    items.map(async (item) => {
+      try {
+        const request = buildDeactivationRequest(item, justification.trim(), ticketInfo, startDateTime);
+        assertAllowedApiUrl(request.endpoint, request.tokenKind);
+        const token = getTokenForActivation(tokens, item, request.tokenKind);
+        if (!token) {
+          throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
+        }
+        assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
+
+        const response = await fetch(request.endpoint, {
+          method: request.method,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(request.body)
+        });
+
+        if (!response.ok) {
+          const errorData = await safeJson(response);
+          throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
+        }
+
+        const data = await safeJson(response);
+        return {
+          itemId: item.id,
+          itemName: item.displayName,
+          success: true,
+          requestId: getResponseIdentifier(data)
+        };
+      } catch (error) {
+        return {
+          itemId: item.id,
+          itemName: item.displayName,
+          success: false,
+          error: sanitizeErrorMessage(error)
+        };
+      }
+    })
+  );
+
+  const errors = results.filter((result) => !result.success);
+  return {
+    success: errors.length === 0,
+    results,
+    errors
+  };
+}
+
+function assertTokenCanActivate(item: ActivationItem, token: string, tokenKind: TokenKind, operation = "activation"): void {
   if (tokenKind !== "graph" || item.type === "azureRole") {
     return;
   }
@@ -1375,7 +1440,7 @@ function assertTokenCanActivate(item: ActivationItem, token: string, tokenKind: 
 
   const label = target === "pimGroup" ? "PIM group" : "Entra role";
   const requiredScopes = getRequiredGraphActivationScopes(target).join(" or ");
-  throw new Error(`${label} activation needs a captured Graph token with ${requiredScopes}. Run Access Setup and reload the matching Microsoft portal page.`);
+  throw new Error(`${label} ${operation} needs a captured Graph token with ${requiredScopes}. Run Access Setup and reload the matching Microsoft portal page.`);
 }
 
 function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, tokenKind: TokenKind): string | undefined {

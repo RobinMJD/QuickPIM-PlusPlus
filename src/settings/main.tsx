@@ -580,23 +580,52 @@ function AccessSetupPanel({
   }
 
   async function runPortalSetup() {
-    const targets = setupTargets;
-    const urls = getPortalUrlsForTargets(targets);
-    for (const url of urls) {
-      if (chrome.tabs?.create) {
-        void chrome.tabs.create({ url });
-      } else {
-        window.open(url, "_blank", "noopener");
-      }
-    }
-
+    const initialTargets = setupTargets;
     setIsRunningSetup(true);
     try {
-      const latestTokens = await waitForPortalTokens(targets);
-      await onRefreshAccessData(latestTokens, targets);
+      const scannedTokens = await scanExistingPortalTabsForTokens();
+      const remainingTargets = getAccessSetupTargets(
+        buildAccessCapabilityItems(scannedTokens, dataCache, enabledRoleFeatures)
+      ).filter((target) => initialTargets.includes(target));
+      const urls = getPortalUrlsForTargets(remainingTargets);
+      for (const url of urls) {
+        if (chrome.tabs?.create) {
+          void chrome.tabs.create({ url });
+        } else {
+          safeOpenUrl(url);
+        }
+      }
+
+      const latestTokens = remainingTargets.length ? await waitForPortalTokens(remainingTargets) : scannedTokens;
+      await onRefreshAccessData(latestTokens, remainingTargets.length ? remainingTargets : initialTargets);
     } finally {
       setIsRunningSetup(false);
     }
+  }
+
+  async function scanExistingPortalTabsForTokens(): Promise<TokenStatus> {
+    if (chrome.tabs?.query && chrome.tabs?.sendMessage) {
+      try {
+        const tabs = await chrome.tabs.query({ url: "https://entra.microsoft.com/*" });
+        await Promise.all(
+          tabs
+            .filter((tab) => typeof tab.id === "number")
+            .map(async (tab) => {
+              try {
+                await chrome.tabs.sendMessage(tab.id as number, { action: "quickPimScanPortalTokens" });
+              } catch {
+                // Some existing portal tabs may not have the content script loaded yet.
+              }
+            })
+        );
+        if (tabs.length) {
+          await delay(250);
+        }
+      } catch {
+        // If tab scanning is unavailable, fall back to opening the targeted portal pages.
+      }
+    }
+    return sendMessage<TokenStatus>({ action: "getTokenStatus" });
   }
 
   async function waitForPortalTokens(targets: AccessSetupTarget[]): Promise<TokenStatus> {
@@ -728,6 +757,17 @@ function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[numbe
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeOpenUrl(url: string): void {
+  if (isTestRuntime()) {
+    return;
+  }
+  try {
+    window.open(url, "_blank", "noopener");
+  } catch {
+    // Some test and restricted browser contexts expose window.open but block it.
+  }
 }
 
 function AliasesPanel({
@@ -1152,6 +1192,7 @@ function PreferencesPanel({
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
+  const [showActivationCounters, setShowActivationCounters] = useState(settings.preferences.showActivationCounters);
   const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
 
   useEffect(() => {
@@ -1159,13 +1200,15 @@ function PreferencesPanel({
     setDefaultSort(settings.preferences.defaultSort);
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
     setDarkMode(settings.preferences.darkMode);
+    setShowActivationCounters(settings.preferences.showActivationCounters);
     setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
   }, [
     settings.preferences.darkMode,
     settings.preferences.defaultDurationHours,
     settings.preferences.defaultSort,
     settings.preferences.enabledFeatures,
-    settings.preferences.recentJustificationLimit
+    settings.preferences.recentJustificationLimit,
+    settings.preferences.showActivationCounters
   ]);
 
   async function save() {
@@ -1177,6 +1220,7 @@ function PreferencesPanel({
         defaultSort,
         recentJustificationLimit,
         darkMode,
+        showActivationCounters,
         enabledFeatures: [...enabledFeatures],
         autoEnabledFeaturesInitialized: true
       }
@@ -1244,6 +1288,19 @@ function PreferencesPanel({
             <strong>Dark mode</strong>
             <br />
             <span className="muted">Use dark surfaces in the popup and settings.</span>
+          </span>
+        </label>
+        <label className="checkbox-option preference-toggle">
+          <input
+            type="checkbox"
+            checked={showActivationCounters}
+            onChange={(event) => setShowActivationCounters(event.target.checked)}
+            aria-label="Show activation counters in popup"
+          />
+          <span>
+            <strong>Show activation counters</strong>
+            <br />
+            <span className="muted">Display the compact usage number on each popup row.</span>
           </span>
         </label>
       </div>

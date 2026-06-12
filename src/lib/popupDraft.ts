@@ -1,4 +1,4 @@
-import type { PopupTab, SortMode } from "./types";
+import type { PopupRequestMode, PopupTab, SortMode } from "./types";
 
 export const POPUP_DRAFT_KEY = "quickPimPopupDraft.v1";
 
@@ -25,6 +25,7 @@ export interface PopupDraft {
   ticketSystem: string;
   ticketNumber: string;
   isActivationReviewOpen: boolean;
+  requestMode?: PopupRequestMode;
 }
 
 export type PopupDraftInput = Omit<PopupDraft, "updatedAt"> & { updatedAt?: number };
@@ -68,7 +69,8 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
     justification: sanitizeString(value.justification, MAX_JUSTIFICATION_LENGTH),
     ticketSystem: sanitizeString(value.ticketSystem, MAX_TICKET_FIELD_LENGTH),
     ticketNumber: sanitizeString(value.ticketNumber, MAX_TICKET_FIELD_LENGTH),
-    isActivationReviewOpen: Boolean(value.isActivationReviewOpen && selectedIds.length)
+    isActivationReviewOpen: Boolean(value.isActivationReviewOpen && selectedIds.length),
+    ...(isPopupRequestMode(value.requestMode) ? { requestMode: value.requestMode } : {})
   };
 
   return hasPopupDraftContent(draft) ? draft : undefined;
@@ -116,6 +118,10 @@ function isPopupTab(value: unknown): value is PopupTab {
 
 function isSortMode(value: unknown): value is SortMode {
   return typeof value === "string" && SORT_MODES.includes(value as SortMode);
+}
+
+function isPopupRequestMode(value: unknown): value is PopupRequestMode {
+  return value === "activate" || value === "deactivate";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

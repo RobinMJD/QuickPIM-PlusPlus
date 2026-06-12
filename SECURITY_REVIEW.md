@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.4.0.
+Reviewed for v2.5.0.
 
 ## Threat Model
 
@@ -18,6 +18,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 
 - Host permissions are limited to `https://graph.microsoft.com/*`, `https://management.azure.com/*`, `https://entra.microsoft.com/*`, and `https://api.github.com/*` for public changelog metadata.
 - Entra content-script token messages are accepted only from the `entra.microsoft.com` origin and still pass the same token validation before storage. The content script runs in matching frames only and limits scanned databases, stores, records, value length, recursion depth, and token count.
+- Access Setup can ask already-open Entra tabs to rescan portal token storage before opening new setup pages; the extension still does not request Chrome cookie access.
 - Extension pages use an explicit MV3 content security policy.
 - Background runtime messages are accepted only from this extension and are validated before privileged actions run.
 - Unsupported token injection paths are not exposed; users can clear captured tokens from Settings.

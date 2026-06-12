@@ -151,6 +151,7 @@ export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleIte
     directoryScopeId,
     scopeLabel: directoryScopeId === "/" ? "Tenant" : scopeName || directoryScopeId,
     status: "eligible",
+    ...(role.targetScheduleId || role.id ? { assignmentScheduleId: role.targetScheduleId || role.id } : {}),
     ...(typeof isPrivileged === "boolean" ? { isPrivileged } : {}),
     activationRequirements: {
       justification: true,
@@ -184,6 +185,10 @@ export function normalizeAzureRole(role: AzureRoleApi): AzureRoleItem {
     subscriptionId: role.subscriptionId,
     subscriptionName: role.subscriptionName,
     roleEligibilityScheduleId: properties.roleEligibilityScheduleId,
+    ...(properties.roleAssignmentScheduleId ? { assignmentScheduleId: properties.roleAssignmentScheduleId } : {}),
+    ...(properties.roleAssignmentScheduleInstanceId || role.id || role.name
+      ? { assignmentScheduleInstanceId: properties.roleAssignmentScheduleInstanceId || role.id || role.name }
+      : {}),
     scopeLabel,
     status: "eligible",
     activationRequirements: {
@@ -208,6 +213,7 @@ export function normalizePimGroup(group: PimGroupApi, groupInfo: GroupInfo = {})
     groupId,
     accessId,
     memberType: group.memberType,
+    ...(group.targetScheduleId || group.id ? { assignmentScheduleId: group.targetScheduleId || group.id } : {}),
     scopeLabel: accessId === "owner" ? "Owner" : "Member",
     status: "eligible",
     activationRequirements: {
@@ -305,6 +311,96 @@ export function buildActivationRequest(
     justification: requestJustification
   };
 
+  addTicketInfo(body, ticketInfo);
+
+  return {
+    endpoint: graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests"),
+    method: "POST",
+    tokenKind: "graph",
+    body
+  };
+}
+
+export function buildDeactivationRequest(
+  item: ActivationItem,
+  justification = "",
+  ticketInfo: TicketInfo = {},
+  startDateTime = new Date().toISOString(),
+  requestId: string = crypto.randomUUID()
+): ActivationRequest {
+  validateDeactivationInput(item, justification, ticketInfo);
+  const requestJustification = formatOptionalJustification(justification);
+
+  if (item.type === "directoryRole") {
+    const body: Record<string, unknown> = {
+      action: "selfDeactivate",
+      principalId: item.principalId,
+      roleDefinitionId: item.roleDefinitionId,
+      directoryScopeId: item.directoryScopeId || "/",
+      targetScheduleId: item.assignmentScheduleId,
+      scheduleInfo: {
+        startDateTime,
+        expiration: {
+          type: "NoExpiration"
+        }
+      }
+    };
+    if (requestJustification) {
+      body.justification = requestJustification;
+    }
+    addTicketInfo(body, ticketInfo);
+
+    return {
+      endpoint: graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests"),
+      method: "POST",
+      tokenKind: "graph",
+      body
+    };
+  }
+
+  if (item.type === "azureRole") {
+    const properties: Record<string, unknown> = {
+      principalId: item.principalId,
+      roleDefinitionId: item.roleDefinitionId,
+      requestType: "SelfDeactivate",
+      targetRoleAssignmentScheduleId: item.assignmentScheduleId
+    };
+    if (item.assignmentScheduleInstanceId) {
+      properties.targetRoleAssignmentScheduleInstanceId = item.assignmentScheduleInstanceId;
+    }
+    if (requestJustification) {
+      properties.justification = requestJustification;
+    }
+    addTicketInfo(properties, ticketInfo);
+
+    return {
+      endpoint: azureManagementUrl(
+        `${item.scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${encodePathSegment(requestId)}?api-version=2020-10-01`
+      ),
+      method: "PUT",
+      tokenKind: "azureManagement",
+      body: {
+        properties
+      }
+    };
+  }
+
+  const body: Record<string, unknown> = {
+    accessId: item.accessId,
+    principalId: item.principalId,
+    groupId: item.groupId,
+    action: "selfDeactivate",
+    targetScheduleId: item.assignmentScheduleId,
+    scheduleInfo: {
+      startDateTime,
+      expiration: {
+        type: "noExpiration"
+      }
+    }
+  };
+  if (requestJustification) {
+    body.justification = requestJustification;
+  }
   addTicketInfo(body, ticketInfo);
 
   return {
@@ -451,6 +547,67 @@ function validateActivationInput(
   }
 
   throw new Error("Unsupported activation item type.");
+}
+
+function validateDeactivationInput(
+  item: ActivationItem,
+  justification: string,
+  ticketInfo: TicketInfo
+): void {
+  if (typeof justification !== "string" || justification.length > MAX_JUSTIFICATION_LENGTH) {
+    throw new Error(`Deactivation justification must be ${MAX_JUSTIFICATION_LENGTH} characters or fewer.`);
+  }
+  const genericJustificationWarning = getGenericJustificationWarning(justification);
+  if (genericJustificationWarning) {
+    throw new Error(`Generic deactivation justification is not allowed. ${genericJustificationWarning}`);
+  }
+
+  if ((ticketInfo.ticketSystem?.length || 0) > MAX_TICKET_FIELD_LENGTH || (ticketInfo.ticketNumber?.length || 0) > MAX_TICKET_FIELD_LENGTH) {
+    throw new Error(`Ticket fields must be ${MAX_TICKET_FIELD_LENGTH} characters or fewer.`);
+  }
+
+  if (!item || typeof item !== "object") {
+    throw new Error("Deactivation item is invalid.");
+  }
+
+  if (item.status !== "active") {
+    throw new Error("Only active items can be deactivated.");
+  }
+
+  if (!item.id || !item.displayName || !item.principalId) {
+    throw new Error("Deactivation item is missing required identifiers.");
+  }
+
+  if (!item.assignmentScheduleId) {
+    throw new Error("Deactivation item is missing the active assignment schedule.");
+  }
+
+  if (item.type === "directoryRole") {
+    if (!item.roleDefinitionId || !item.directoryScopeId) {
+      throw new Error("Directory role deactivation item is missing required identifiers.");
+    }
+    return;
+  }
+
+  if (item.type === "azureRole") {
+    if (!isSafeAzureScope(item.scope) || !item.roleDefinitionId) {
+      throw new Error("Azure role deactivation item has an invalid scope or role definition.");
+    }
+    return;
+  }
+
+  if (item.type === "pimGroup") {
+    if (!item.groupId || (item.accessId !== "member" && item.accessId !== "owner")) {
+      throw new Error("PIM group deactivation item is missing required identifiers.");
+    }
+    return;
+  }
+
+  throw new Error("Unsupported deactivation item type.");
+}
+
+function formatOptionalJustification(justification: string): string | undefined {
+  return justification.trim() ? formatJustificationForActivationRequest(justification) : undefined;
 }
 
 function isSafeAzureScope(scope: string): boolean {
