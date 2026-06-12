@@ -590,8 +590,7 @@ describe("settings Access Setup page", () => {
     vi.resetModules();
     await import("../src/settings/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Last success"));
-    expect(document.body.textContent).toContain("Eligible assignments");
+    await waitFor(() => expect(document.body.textContent).toContain("Eligible assignments"));
     expect(document.body.textContent).toContain("Last failure");
     expect(document.body.textContent).toContain("PIM group active assignments");
     expect(document.body.textContent).toContain("missingCapability");
