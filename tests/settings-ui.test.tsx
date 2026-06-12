@@ -29,19 +29,6 @@ function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: str
   field.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-function setCheckboxValue(field: HTMLInputElement, checked: boolean) {
-  if (field.checked !== checked) {
-    field.click();
-  }
-  if (field.checked === checked) {
-    return;
-  }
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
-  setter?.call(field, checked);
-  field.dispatchEvent(new Event("input", { bubbles: true }));
-  field.dispatchEvent(new Event("change", { bubbles: true }));
-}
-
 function createDefaultSettings() {
   return structuredClone(DEFAULT_SETTINGS);
 }
@@ -1513,7 +1500,16 @@ describe("settings dark mode", () => {
 
     expect(document.body.textContent).not.toContain("Usage counters");
     expect(document.body.textContent).not.toContain("Background pre-refresh");
-    setCheckboxValue(document.querySelector<HTMLInputElement>('input[aria-label="Show advanced settings"]')!, true);
+
+    const cleanupWindow = window as Window & { __quickPimSettingsUnmount?: () => void };
+    cleanupWindow.__quickPimSettingsUnmount?.();
+    document.body.innerHTML = '<div id="root"></div>';
+    const advancedSettings = createDefaultSettings();
+    advancedSettings.preferences.showAdvancedSettings = true;
+    storageData[SETTINGS_KEY] = advancedSettings;
+    vi.resetModules();
+    await import("../src/settings/main");
+
     await waitFor(() => expect(document.body.textContent).toContain("Usage counters"));
     expect(document.body.textContent).toContain("Background pre-refresh");
   });
