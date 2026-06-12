@@ -174,6 +174,22 @@ npm audit --audit-level=low
 
 The extension version is declared in both `package.json` and `public/manifest.json`; keep them synchronized for each release.
 
+## Release Automation
+
+Pushing a `v*` tag builds the extension, creates or updates the GitHub release ZIP, and can submit the same ZIP to the Chrome Web Store automatically.
+
+Chrome Web Store publishing is skipped until these GitHub repository secrets are configured:
+
+- `CHROME_WEBSTORE_CLIENT_ID`
+- `CHROME_WEBSTORE_CLIENT_SECRET`
+- `CHROME_WEBSTORE_REFRESH_TOKEN`
+- `CHROME_WEBSTORE_PUBLISHER_ID`
+- `CHROME_WEBSTORE_EXTENSION_ID`
+
+To create the credentials, enable the Chrome Web Store API in Google Cloud, create an OAuth web client, and generate a refresh token for the `https://www.googleapis.com/auth/chromewebstore` scope. Google documents the same flow in the official Chrome Web Store API guide: <https://developer.chrome.com/docs/webstore/using-api>.
+
+Once the secrets are present, the release workflow uploads `release/quickpim-plusplus-vX.Y.Z-chrome-webstore.zip` to the existing Chrome Web Store item and calls the publish endpoint, which submits the update for Chrome review.
+
 ## Manual Verification
 
 After building and loading `dist/`, verify:
@@ -218,7 +234,7 @@ After building and loading `dist/`, verify:
 - Adds quick filter chips, compact row policy details, clearer row action reasons, and bundle preflight summaries.
 - Adds local activation/deactivation activity history with Settings filters, clear, and export support.
 - Reorganizes Settings into Overview, Setup, Daily Use, Preferences, Maintenance, and About sections with advanced controls hidden until needed.
-- Adds GitHub Actions CI and tag-based release automation for Web Store ZIP artifacts.
+- Adds GitHub Actions CI and tag-based release automation for Web Store ZIP artifacts and optional Chrome Web Store submission when repository secrets are configured.
 
 ### v2.6.2
 
