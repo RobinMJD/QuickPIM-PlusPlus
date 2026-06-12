@@ -6,7 +6,7 @@
   "scripts": {
     "type-check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1 --minWorkers=1 --no-file-parallelism",
     "test:watch": "vitest"
   },
   "dependencies": {
