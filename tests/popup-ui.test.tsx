@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_CACHE_KEY } from "../src/lib/cache";
+import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import type { ActivationItem } from "../src/lib/types";
 
@@ -976,7 +977,7 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Create role bundles from Settings."));
     clickButton("Open settings");
 
-    expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#bundles"]);
+    await waitFor(() => expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#bundles"]));
     expect(chromeMock.runtime.openOptionsPage).not.toHaveBeenCalled();
   });
 
@@ -1590,6 +1591,105 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("PermissionScopeNotGranted");
   });
 
+  test("shows matching portal actions for claims challenge activation errors", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:user-admin:/",
+      type: "directoryRole",
+      sourceName: "User Administrator",
+      displayName: "User Administrator",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "user-admin",
+      directoryScopeId: "/",
+      activationRequirements: {
+        justification: true,
+        ticket: false
+      }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+    const claims = encodeURIComponent(JSON.stringify({ access_token: { acrs: { essential: true, value: "c1" } } }));
+    const createTab = vi.fn();
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "activateItems") {
+            const error = `Authorization failed. &claims=${claims}`;
+            return Promise.resolve({
+              success: true,
+              data: {
+                success: false,
+                results: [{ itemId: eligibleItem.id, itemName: "User Administrator", success: false, error }],
+                errors: [{ itemId: eligibleItem.id, itemName: "User Administrator", success: false, error }]
+              }
+            });
+          }
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            });
+          }
+          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: createTab
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("User Administrator"));
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    clickButton("Continue");
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
+    setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "Needed to resolve helpdesk escalation.");
+    clickButton("Activate 1 selected");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
+    expect(document.body.textContent).toContain("User Administrator: Microsoft requires an additional sign-in or MFA challenge");
+    expect(document.body.textContent).toContain("Complete the Microsoft prompt in the matching portal page");
+    expect(document.body.textContent).toContain("Activate 1 selected");
+    expect(document.body.textContent).not.toContain(claims);
+    expect(document.body.textContent).not.toContain("claims=");
+
+    clickButton("Open Entra Roles portal");
+    await waitFor(() => expect(createTab).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining("aadmigratedroles") })));
+
+    clickButton("Access Setup");
+    await waitFor(() => expect(createTab).toHaveBeenCalledWith({ url: "chrome-extension://quickpim/settings.html#access" }));
+  });
+
   test("toggles favorite rows with a star button and keeps favorites first", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const items: ActivationItem[] = [
@@ -1922,6 +2022,180 @@ describe("popup activation guardrails", () => {
   });
 });
 
+describe("popup draft persistence", () => {
+  const pimGroupItem: ActivationItem = {
+    id: "pimGroup:group-1:member",
+    type: "pimGroup",
+    sourceName: "Privileged Group",
+    displayName: "Privileged Group",
+    principalId: "principal-1",
+    groupId: "group-1",
+    accessId: "member",
+    scopeLabel: "Group",
+    status: "eligible",
+    activationRequirements: {
+      justification: true,
+      ticket: true,
+      maxDurationHours: 2
+    }
+  };
+
+  function popupChromeMock(storageData: Record<string, unknown>, item: ActivationItem = pimGroupItem) {
+    return {
+      runtime: {
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getActivationSnapshot") {
+            return {
+              success: true,
+              data: {
+                eligible: { items: [item], errors: [], diagnostics: [] },
+                active: { items: [], errors: [], diagnostics: [] },
+                eligibleByTarget: { [item.type]: { items: [item], errors: [], diagnostics: [] } },
+                activeByTarget: { [item.type]: { items: [], errors: [], diagnostics: [] } }
+              }
+            };
+          }
+          if (message.action === "getTokenStatus") {
+            return {
+              success: true,
+              data: {
+                graph: { hasToken: true, isExpired: false, tokenAge: 1 },
+                azureManagement: { hasToken: false }
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async (key: string) => {
+            delete storageData[key];
+          })
+        }
+      },
+      tabs: {
+        create: vi.fn()
+      }
+    };
+  }
+
+  test("restores selection, tab, search, sort, review state, duration, justification, and tickets", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [POPUP_DRAFT_KEY]: {
+        updatedAt: Date.now(),
+        tab: "pimGroup",
+        search: "Privileged",
+        sortMode: "activationCount",
+        selectedIds: [pimGroupItem.id],
+        durationHours: 2,
+        justification: "Needed for group maintenance",
+        ticketSystem: "ServiceNow",
+        ticketNumber: "INC-123",
+        isActivationReviewOpen: true
+      }
+    };
+
+    vi.stubGlobal("chrome", popupChromeMock(storageData));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
+    expect(document.querySelector<HTMLInputElement>('input[aria-label="Filter roles"]')?.value).toBe("Privileged");
+    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Sort roles"]')?.value).toBe("activationCount");
+    expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.value).toBe("Needed for group maintenance");
+    const inputs = [...document.querySelectorAll<HTMLInputElement>(".activation-grid .input")];
+    expect(inputs.map((input) => input.value)).toEqual(["ServiceNow", "INC-123"]);
+    expect(document.querySelector<HTMLSelectElement>(".activation-bar .select")?.value).toBe("2");
+  });
+
+  test("keeps restored selected ids until activation data loads, then prunes invalid ids", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const snapshot = deferred<{ success: true; data: { eligible: { items: ActivationItem[]; errors: []; diagnostics: [] }; active: { items: []; errors: []; diagnostics: [] } } }>();
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [POPUP_DRAFT_KEY]: {
+        updatedAt: Date.now(),
+        tab: "pimGroup",
+        search: "",
+        sortMode: "name",
+        selectedIds: [pimGroupItem.id],
+        durationHours: 1,
+        justification: "Needed for group maintenance",
+        ticketSystem: "",
+        ticketNumber: "",
+        isActivationReviewOpen: true
+      }
+    };
+    const chromeMock = popupChromeMock(storageData);
+    (chromeMock.runtime as any).sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getActivationSnapshot") {
+        return snapshot.promise;
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: true, isExpired: false }, azureManagement: { hasToken: false } } };
+      }
+      return { success: true, data: true };
+    });
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(storageData[POPUP_DRAFT_KEY]).toBeTruthy();
+    snapshot.resolve({ success: true, data: { eligible: { items: [], errors: [], diagnostics: [] }, active: { items: [], errors: [], diagnostics: [] } } });
+
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toBeUndefined());
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+  });
+
+  test("saves draft after edits, preserves it before opening portal, and clears it from Unselect all", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS
+    };
+    const chromeMock = popupChromeMock(storageData);
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    document.querySelector<HTMLElement>(".role-row.selectable")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    clickButton("Continue");
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
+    setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "Needed for group maintenance");
+    const inputs = [...document.querySelectorAll<HTMLInputElement>(".activation-grid .input")];
+    setFieldValue(inputs[0], "ServiceNow");
+    setFieldValue(inputs[1], "INC-456");
+
+    await waitFor(() => {
+      expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({
+        tab: "pimGroup",
+        selectedIds: [pimGroupItem.id],
+        justification: "Needed for group maintenance",
+        ticketSystem: "ServiceNow",
+        ticketNumber: "INC-456",
+        isActivationReviewOpen: true
+      });
+    });
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Open PIM Groups in Microsoft Entra"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await waitFor(() => expect(chromeMock.tabs.create).toHaveBeenCalled());
+    expect(storageData[POPUP_DRAFT_KEY]).toBeTruthy();
+
+    clickButton("Unselect all");
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toBeUndefined());
+  });
+});
+
 describe("popup role row styling", () => {
   test("right-aligns activation count and status badge in the status column", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
@@ -1939,7 +2213,20 @@ describe("popup role row styling", () => {
 
     expect(headerActionsRule).toContain("justify-content: flex-end;");
     expect(toolbarRule).toContain("grid-template-columns: minmax(0, 1fr) 150px;");
-    expect(activationButtonRule).toContain("margin-top: 10px;");
+    expect(activationButtonRule).toContain("margin-top: 0;");
+  });
+
+  test("keeps activation review in flow with sticky bottom behavior instead of fixed overlap", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
+    const activationRule = css.match(/\.activation-bar\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(contentRule).toContain("padding-bottom: 12px;");
+    expect(contentRule).not.toContain("padding-bottom: 248px;");
+    expect(activationRule).toContain("position: sticky;");
+    expect(activationRule).toContain("z-index: 20;");
+    expect(activationRule).toContain("overflow-y: auto;");
+    expect(activationRule).not.toContain("position: fixed;");
   });
 
   test("keeps activation progress visible near the top while the popup scrolls", () => {

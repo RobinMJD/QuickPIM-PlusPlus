@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.3.0.
+Reviewed for v2.4.0.
 
 ## Threat Model
 
@@ -25,6 +25,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 ## Storage And Settings
 
 - Imported settings are normalized through length, type, range, and count limits.
+- Popup activation drafts are bounded, stored locally, expire after 24 hours, and are cleared when the in-progress selection is no longer useful.
 - Saved justifications, aliases, learned names, bundles, usage history, and preferences remain local to the browser profile.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.
 

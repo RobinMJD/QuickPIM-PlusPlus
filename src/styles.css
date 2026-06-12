@@ -268,7 +268,7 @@ button {
 
 .content {
   padding: 12px;
-  padding-bottom: 248px;
+  padding-bottom: 12px;
 }
 
 .settings-content {
@@ -780,13 +780,14 @@ a.btn {
 }
 
 .activation-bar {
-  position: fixed;
-  left: 0;
-  right: 0;
+  position: sticky;
   bottom: 0;
-  width: 520px;
+  z-index: 20;
+  width: 100%;
+  max-height: min(370px, calc(100vh - 96px));
   display: grid;
   gap: 10px;
+  overflow-y: auto;
   padding: 12px;
   background: #ffffff;
   border-top: 1px solid #e5e7eb;
@@ -794,14 +795,19 @@ a.btn {
 }
 
 .activation-bar .button-row {
-  margin-top: 10px;
+  margin-top: 0;
+}
+
+.activation-form-field {
+  margin-top: 0;
 }
 
 .activation-grid {
   display: grid;
   grid-template-columns: 96px 1fr;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-top: 0;
+  margin-bottom: 0;
 }
 
 .message {
@@ -826,6 +832,29 @@ a.btn {
 .message.error {
   background: #fee2e2;
   color: #991b1b;
+}
+
+.activation-error-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.activation-error-list {
+  display: grid;
+  gap: 6px;
+}
+
+.activation-error-list p,
+.activation-error-help {
+  margin: 0;
+}
+
+.activation-error-help {
+  font-weight: 600;
+}
+
+.activation-error-actions {
+  margin-top: 2px;
 }
 
 .empty-state {

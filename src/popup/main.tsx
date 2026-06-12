@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import {
@@ -12,6 +12,7 @@ import {
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../lib/cache";
+import { CLAIMS_CHALLENGE_MESSAGE } from "../lib/apiErrors";
 import {
   buildAccessCapabilityItems,
   buildTokenCacheKey,
@@ -61,6 +62,13 @@ import {
   saveReferenceData
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
+import {
+  clearPopupDraft,
+  hasPopupDraftContent,
+  loadPopupDraft,
+  savePopupDraft,
+  type PopupDraftInput
+} from "../lib/popupDraft";
 import type {
   AccessSetupTarget,
   ActivationSnapshot,
@@ -88,11 +96,54 @@ interface LoadingProgress {
   label: string;
 }
 
+interface ActivationFailureNotice {
+  errors: string[];
+  claimsChallengeTargets: RoleTab[];
+}
+
 const ACTIVATION_STEPS: LoadingProgress[] = [
   { current: 1, total: 3, label: "Sending activation request" },
   { current: 2, total: 3, label: "Saving activation result" },
   { current: 3, total: 3, label: "Refreshing activation status" }
 ];
+
+function buildActivationFailureNotice(
+  errors: ActivationResponse["errors"],
+  activatableItems: ActivationItem[]
+): ActivationFailureNotice {
+  const itemsById = new Map(activatableItems.map((item) => [item.id, item.type]));
+  const claimsChallengeTargets = new Set<RoleTab>();
+  const formattedErrors = errors.map((errorItem) => {
+    const rawError = errorItem.error || "";
+    const formatted = formatActivationError(errorItem);
+    if (formatLoadMessages([rawError]).includes(CLAIMS_CHALLENGE_MESSAGE)) {
+      const target = itemsById.get(errorItem.itemId) || inferRoleTabFromItemId(errorItem.itemId);
+      if (target) {
+        claimsChallengeTargets.add(target);
+      }
+    }
+    return formatted;
+  });
+
+  return {
+    errors: formattedErrors,
+    claimsChallengeTargets: [...claimsChallengeTargets]
+  };
+}
+
+function formatActivationError(item: ActivationResponse["errors"][number]): string {
+  const error = item.error || "Activation failed.";
+  const formatted = formatLoadMessages([error])[0] || error;
+  return `${item.itemName}: ${formatted}`;
+}
+
+function inferRoleTabFromItemId(itemId: string): RoleTab | undefined {
+  const [prefix] = itemId.split(":");
+  if (prefix === "directoryRole" || prefix === "pimGroup" || prefix === "azureRole") {
+    return prefix;
+  }
+  return undefined;
+}
 
 function PopupApp() {
   const [tab, setTab] = useState<PopupTab>("directoryRole");
@@ -115,16 +166,25 @@ function PopupApp() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [activationProgress, setActivationProgress] = useState<LoadingProgress | null>(null);
+  const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
   const [isActivating, setIsActivating] = useState(false);
+  const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
+  const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
+  const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
 
   useEffect(() => {
-    void refresh({ force: false });
+    void initializePopup();
   }, []);
 
   useEffect(() => {
+    if (!isPopupDraftReady || hasRestoredPopupDraft) {
+      return;
+    }
     setSortMode(settings.preferences.defaultSort);
     setDurationHours(settings.preferences.defaultDurationHours);
-  }, [settings.preferences.defaultDurationHours, settings.preferences.defaultSort]);
+  }, [hasRestoredPopupDraft, isPopupDraftReady, settings.preferences.defaultDurationHours, settings.preferences.defaultSort]);
 
   useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
@@ -170,17 +230,31 @@ function PopupApp() {
   );
 
   useEffect(() => {
+    if (!hasActivationDataLoaded) {
+      return;
+    }
     if (durationOptions.length) {
       setDurationHours((current) => coerceDurationForItems(current, selectedItems));
     }
-  }, [durationOptions, selectedItems]);
+  }, [durationOptions, hasActivationDataLoaded, selectedItems]);
 
   useEffect(() => {
+    if (!hasActivationDataLoaded) {
+      return;
+    }
     setSelectedIds((current) => {
       const next = new Set([...current].filter((id) => itemsById.get(id)?.status === "eligible"));
+      if (!next.size && current.size) {
+        if (draftSaveTimer.current) {
+          clearTimeout(draftSaveTimer.current);
+          draftSaveTimer.current = undefined;
+        }
+        latestPopupDraft.current = undefined;
+        void clearPopupDraft();
+      }
       return next.size === current.size ? current : next;
     });
-  }, [itemsById]);
+  }, [hasActivationDataLoaded, itemsById]);
 
   useEffect(() => {
     if (visibleTabs.length && !visibleTabs.includes(tab)) {
@@ -189,10 +263,68 @@ function PopupApp() {
   }, [tab, visibleTabs]);
 
   useEffect(() => {
-    if (!selectedItems.length) {
+    if (hasActivationDataLoaded && !selectedItems.length) {
       setIsActivationReviewOpen(false);
     }
-  }, [selectedItems.length]);
+  }, [hasActivationDataLoaded, selectedItems.length]);
+
+  useEffect(() => {
+    if (!isPopupDraftReady) {
+      return;
+    }
+
+    const draft = buildCurrentPopupDraft();
+    latestPopupDraft.current = draft;
+    if (!hasPopupDraftContent(draft)) {
+      return;
+    }
+
+    if (draftSaveTimer.current) {
+      clearTimeout(draftSaveTimer.current);
+    }
+    draftSaveTimer.current = setTimeout(() => {
+      void savePopupDraft(draft);
+    }, 200);
+
+    return () => {
+      if (draftSaveTimer.current) {
+        clearTimeout(draftSaveTimer.current);
+      }
+    };
+  }, [
+    durationHours,
+    isActivationReviewOpen,
+    isPopupDraftReady,
+    justification,
+    search,
+    selectedIds,
+    sortMode,
+    tab,
+    ticketNumber,
+    ticketSystem
+  ]);
+
+  useEffect(() => {
+    if (!isPopupDraftReady) {
+      return;
+    }
+
+    const saveLatestDraft = () => {
+      const draft = latestPopupDraft.current;
+      if (draft && hasPopupDraftContent(draft)) {
+        void savePopupDraft(draft);
+      } else {
+        void clearPopupDraft();
+      }
+    };
+
+    window.addEventListener("pagehide", saveLatestDraft);
+    window.addEventListener("beforeunload", saveLatestDraft);
+    return () => {
+      window.removeEventListener("pagehide", saveLatestDraft);
+      window.removeEventListener("beforeunload", saveLatestDraft);
+    };
+  }, [isPopupDraftReady]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -205,10 +337,76 @@ function PopupApp() {
     return sortItems(filtered, settings, sortMode, referenceData);
   }, [displayItems, referenceData, search, settings, sortMode, tab]);
 
+  async function initializePopup() {
+    try {
+      const draft = await loadPopupDraft();
+      if (draft) {
+        setTab(draft.tab);
+        setSearch(draft.search);
+        setSortMode(draft.sortMode);
+        setSelectedIds(new Set(draft.selectedIds));
+        setDurationHours(draft.durationHours);
+        setJustification(draft.justification);
+        setTicketSystem(draft.ticketSystem);
+        setTicketNumber(draft.ticketNumber);
+        setIsActivationReviewOpen(draft.isActivationReviewOpen);
+        setHasRestoredPopupDraft(true);
+      }
+    } finally {
+      setIsPopupDraftReady(true);
+      void refresh({ force: false });
+    }
+  }
+
+  function buildCurrentPopupDraft(overrides: Partial<PopupDraftInput> = {}): PopupDraftInput {
+    return {
+      tab,
+      search,
+      sortMode,
+      selectedIds: [...selectedIds],
+      durationHours,
+      justification,
+      ticketSystem,
+      ticketNumber,
+      isActivationReviewOpen,
+      ...overrides
+    };
+  }
+
+  async function flushPopupDraft(overrides: Partial<PopupDraftInput> = {}) {
+    if (draftSaveTimer.current) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = undefined;
+    }
+    const draft = buildCurrentPopupDraft(overrides);
+    if (hasPopupDraftContent(draft)) {
+      latestPopupDraft.current = draft;
+      await savePopupDraft(draft);
+    } else {
+      latestPopupDraft.current = undefined;
+      await clearPopupDraft();
+    }
+  }
+
+  async function clearSelectionAndDraft() {
+    if (draftSaveTimer.current) {
+      clearTimeout(draftSaveTimer.current);
+      draftSaveTimer.current = undefined;
+    }
+    setSelectedIds(new Set());
+    setIsActivationReviewOpen(false);
+    setJustification("");
+    setTicketSystem("");
+    setTicketNumber("");
+    latestPopupDraft.current = undefined;
+    await clearPopupDraft();
+  }
+
   async function refresh(options: { force: boolean; showLoading?: boolean; suppressMessage?: boolean; targets?: AccessSetupTarget[] }) {
     const showBlockingLoading = options.showLoading !== false;
     if (!options.suppressMessage) {
       setError("");
+      setActivationFailureNotice(null);
     }
     try {
       const [
@@ -333,6 +531,7 @@ function PopupApp() {
         setMessage(formatLoadMessages([...loadErrors, refreshMessage].filter(Boolean)).join("\n"));
       }
     } catch (loadError) {
+      setActivationFailureNotice(null);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       setIsLoading(false);
@@ -356,6 +555,7 @@ function PopupApp() {
     setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(nextSettings)));
     setEligibleItems(applyDisplayData(eligible.items, nextSettings, nextReferenceData));
     setActiveItems(applyDisplayData(active.items, nextSettings, nextReferenceData));
+    setHasActivationDataLoaded(true);
   }
 
   function toggleSelected(itemId: string) {
@@ -385,6 +585,7 @@ function PopupApp() {
       await saveSettings(updated);
       setSettings(updated);
     } catch (saveError) {
+      setActivationFailureNotice(null);
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     }
   }
@@ -392,6 +593,7 @@ function PopupApp() {
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
     const activatableItems = getActivatableItems(items);
     if (!activatableItems.length) {
+      setActivationFailureNotice(null);
       setError(items.length ? "No selected items are currently eligible to activate." : "Select at least one role or group.");
       return;
     }
@@ -406,11 +608,13 @@ function PopupApp() {
 
     if (activationRequirements.needsJustification) {
       if (!effectiveJustification.trim()) {
+        setActivationFailureNotice(null);
         setError("Enter a justification or choose a saved one.");
         return;
       }
       const genericJustificationWarning = getGenericJustificationWarning(effectiveJustification);
       if (genericJustificationWarning) {
+        setActivationFailureNotice(null);
         setError(genericJustificationWarning);
         return;
       }
@@ -420,6 +624,7 @@ function PopupApp() {
     setActivationProgress(ACTIVATION_STEPS[0]);
     scrollPopupToTop();
     setError("");
+    setActivationFailureNotice(null);
     setMessage("");
     try {
       const response = await sendMessage<ActivationResponse>({
@@ -439,10 +644,13 @@ function PopupApp() {
       updatedSettings = recordActivations(updatedSettings, successItems, new Date().toISOString(), bundle?.name);
       await saveSettings(updatedSettings);
       setSettings(updatedSettings);
-      setSelectedIds((current) => getRemainingSelectedIdsAfterActivationResults(current, response.results));
+      const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
+      setSelectedIds(remainingSelectedIds);
       setActivationProgress(ACTIVATION_STEPS[2]);
       if (response.errors.length) {
-        setError(response.errors.map(formatActivationError).join(" "));
+        setActivationFailureNotice(buildActivationFailureNotice(response.errors, activatableItems));
+      } else {
+        setActivationFailureNotice(null);
       }
       if (successItems.length) {
         await refresh({
@@ -452,8 +660,15 @@ function PopupApp() {
           targets: [...new Set(successItems.map((item) => item.type))]
         });
       }
+      if (remainingSelectedIds.size) {
+        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true });
+      } else {
+        latestPopupDraft.current = undefined;
+        await clearPopupDraft();
+      }
       setMessage(formatActivationConfirmation(successItems.length, response.errors.length));
     } catch (activationError) {
+      setActivationFailureNotice(null);
       setError(activationError instanceof Error ? activationError.message : String(activationError));
     } finally {
       setActivationProgress(null);
@@ -461,15 +676,10 @@ function PopupApp() {
     }
   }
 
-  function formatActivationError(item: ActivationResponse["errors"][number]): string {
-    const error = item.error || "Activation failed.";
-    const formatted = formatLoadMessages([error])[0] || error;
-    return `${item.itemName}: ${formatted}`;
-  }
-
   async function saveCurrentJustification() {
     const genericJustificationWarning = getGenericJustificationWarning(justification);
     if (genericJustificationWarning) {
+      setActivationFailureNotice(null);
       setError(genericJustificationWarning);
       return;
     }
@@ -488,8 +698,9 @@ function PopupApp() {
     setTab("directoryRole");
   }
 
-  function openPortalForCurrentTab() {
-    const url = getPortalUrlForTab(tab);
+  async function openPortalForTarget(target: PopupTab) {
+    await flushPopupDraft();
+    const url = getPortalUrlForTab(target);
     if (!url) return;
     if (chrome.tabs?.create) {
       void chrome.tabs.create({ url });
@@ -498,7 +709,12 @@ function PopupApp() {
     }
   }
 
-  function openSettingsSection(section: "access" | "bundles" | "preferences") {
+  function openPortalForCurrentTab() {
+    void openPortalForTarget(tab);
+  }
+
+  async function openSettingsSection(section: "access" | "bundles" | "preferences") {
+    await flushPopupDraft();
     const url = chrome.runtime.getURL(`settings.html#${section}`);
     if (chrome.tabs?.create) {
       void chrome.tabs.create({ url });
@@ -578,7 +794,15 @@ function PopupApp() {
         </nav>
       ) : null}
 
-      {error ? <p className="message error">{error}</p> : null}
+      {activationFailureNotice ? (
+        <ActivationFailureBanner
+          notice={activationFailureNotice}
+          onOpenPortal={(target) => void openPortalForTarget(target)}
+          onOpenAccessSetup={() => void openSettingsSection("access")}
+        />
+      ) : error ? (
+        <p className="message error">{error}</p>
+      ) : null}
       {message ? <p className="message">{message}</p> : null}
       {isLoading ? <LoadingState /> : null}
       {activationProgress ? <ActivationProgressPanel progress={activationProgress} /> : null}
@@ -635,7 +859,8 @@ function PopupApp() {
             onContinue={() => setIsActivationReviewOpen(true)}
             onActivate={() => void activate(selectedItems)}
             onSaveJustification={() => void saveCurrentJustification()}
-            onClearSelection={() => setSelectedIds(new Set())}
+            onClearSelection={() => void clearSelectionAndDraft()}
+            onOpenSettings={() => void openSettingsSection("preferences")}
           />
         </>
       ) : null}
@@ -666,7 +891,7 @@ function PopupApp() {
           ) : (
             <EmptyState text="Create role bundles from Settings." />
           )}
-          <button className="btn" onClick={() => openSettingsSection("bundles")}>
+          <button className="btn" onClick={() => void openSettingsSection("bundles")}>
             Open settings
           </button>
         </section>
@@ -675,7 +900,7 @@ function PopupApp() {
       {!isLoading && !visibleTabs.length ? (
         <section className="content item-list empty-state">
           <p>No enabled features have data yet. Enable features in Settings or refresh data.</p>
-          <button className="btn" onClick={() => openSettingsSection("preferences")}>
+          <button className="btn" onClick={() => void openSettingsSection("preferences")}>
             Settings
           </button>
         </section>
@@ -736,6 +961,44 @@ function ActivationProgressPanel({ progress }: { progress: LoadingProgress }) {
       <span>
         Activation in progress (step {progress.current}/{progress.total}): {progress.label}
       </span>
+    </section>
+  );
+}
+
+function ActivationFailureBanner({
+  notice,
+  onOpenPortal,
+  onOpenAccessSetup
+}: {
+  notice: ActivationFailureNotice;
+  onOpenPortal: (target: RoleTab) => void;
+  onOpenAccessSetup: () => void;
+}) {
+  const hasClaimsChallenge = notice.claimsChallengeTargets.length > 0;
+  return (
+    <section className="message error activation-error-panel" role="alert" aria-live="assertive">
+      <div className="activation-error-list">
+        {notice.errors.map((errorMessage, index) => (
+          <p key={`${index}:${errorMessage}`}>{errorMessage}</p>
+        ))}
+      </div>
+      {hasClaimsChallenge ? (
+        <>
+          <p className="activation-error-help">
+            Complete the Microsoft prompt in the matching portal page, then retry the still-selected item.
+          </p>
+          <div className="button-row activation-error-actions">
+            {notice.claimsChallengeTargets.map((target) => (
+              <button className="btn primary" type="button" key={target} onClick={() => onOpenPortal(target)}>
+                Open {tabLabel(target)} portal
+              </button>
+            ))}
+            <button className="btn" type="button" onClick={onOpenAccessSetup}>
+              Access Setup
+            </button>
+          </div>
+        </>
+      ) : null}
     </section>
   );
 }
@@ -852,6 +1115,7 @@ function ActivationBar(props: {
   onActivate: () => void;
   onSaveJustification: () => void;
   onClearSelection: () => void;
+  onOpenSettings: () => void;
 }) {
   const [isSavedListOpen, setIsSavedListOpen] = useState(false);
   const hasSelection = props.selectedCount > 0;
@@ -879,7 +1143,7 @@ function ActivationBar(props: {
           <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
             Unselect all
           </button>
-          <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
+          <button className="btn" onClick={props.onOpenSettings}>
             Settings
           </button>
         </div>
@@ -910,7 +1174,7 @@ function ActivationBar(props: {
         </div>
       ) : null}
       {hasSelection && props.isReviewOpen && props.requirements.needsJustification ? (
-        <div className="field" style={{ marginTop: 8 }}>
+        <div className="field activation-form-field">
           <div className="justification-label-row">
             <label>
               Justification <span className="required-marker" aria-label="required">*</span>
@@ -974,7 +1238,7 @@ function ActivationBar(props: {
         </div>
       ) : null}
       {hasSelection && props.isReviewOpen && props.requirements.needsTicket ? (
-        <div className="activation-grid" style={{ marginTop: 8 }}>
+        <div className="activation-grid">
           <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
           <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
         </div>
@@ -991,7 +1255,7 @@ function ActivationBar(props: {
               Unselect all
             </button>
           ) : null}
-          <button className="btn" onClick={() => chrome.runtime.openOptionsPage()}>
+          <button className="btn" onClick={props.onOpenSettings}>
             Settings
           </button>
         </div>
