@@ -461,6 +461,38 @@ describe("settings Access Setup page", () => {
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graphDirectoryRole::",
+          errors: [],
+          items: [],
+          diagnostics: [
+            {
+              target: "directoryRole",
+              success: true,
+              checkedAt: "2026-06-12T10:00:00.000Z",
+              operation: "eligible",
+              endpointLabel: "Entra role eligibility"
+            }
+          ]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graphPimGroup::",
+          errors: ["PermissionScopeNotGranted"],
+          items: [],
+          diagnostics: [
+            {
+              target: "pimGroup",
+              success: false,
+              checkedAt: "2026-06-12T10:01:00.000Z",
+              operation: "active",
+              endpointLabel: "PIM group active assignments",
+              failureKind: "missingCapability",
+              error: "PIM group access is limited."
+            }
+          ]
+        },
         eligibleByTarget: {
           directoryRole: {
             fetchedAt: Date.now(),
@@ -1450,7 +1482,7 @@ describe("settings dark mode", () => {
 
     expect(document.body.textContent).not.toContain("Usage counters");
     expect(document.body.textContent).not.toContain("Background pre-refresh");
-    document.querySelector<HTMLInputElement>('input[aria-label="Show advanced settings"]')!.click();
+    document.querySelector<HTMLInputElement>('input[aria-label="Show advanced settings"]')!.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     await waitFor(() => expect(document.body.textContent).toContain("Usage counters"));
     expect(document.body.textContent).toContain("Background pre-refresh");
   });
@@ -1497,6 +1529,7 @@ describe("settings dark mode", () => {
     vi.resetModules();
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Dark mode"));
+    await waitFor(() => expect(document.querySelector<HTMLInputElement>('input[aria-label="Show last enablement date in popup"]')).toBeTruthy());
 
     const darkModeToggle = document.querySelector<HTMLInputElement>('input[aria-label="Dark mode"]');
     const lastEnablementDateToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show last enablement date in popup"]');

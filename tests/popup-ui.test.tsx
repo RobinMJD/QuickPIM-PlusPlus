@@ -104,7 +104,7 @@ describe("popup loading UI", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/popup/main");
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitFor(() => expect(document.querySelector(".progress-track")).toBeTruthy());
 
     expect(document.body.textContent?.match(/Loading access/g) || []).toHaveLength(1);
     expect(document.body.textContent).toContain("Loading access data");
@@ -2416,6 +2416,7 @@ describe("popup draft persistence", () => {
     await import("../src/popup/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
     expect(document.querySelector<HTMLInputElement>('input[aria-label="Filter roles"]')?.value).toBe("Privileged");
     expect(document.querySelector<HTMLSelectElement>('select[aria-label="Sort roles"]')?.value).toBe("activationCount");
     expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.value).toBe("Needed for group maintenance");
