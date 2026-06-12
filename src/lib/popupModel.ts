@@ -1,5 +1,5 @@
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
-import type { ActivationItem, ActivationResult, ActivationStatus, PopupTab, RoleTab, TokenStatusEntry } from "./types";
+import type { ActivationItem, ActivationResult, ActivationStatus, PopupRequestMode, PopupTab, QuickPimBundle, RoleTab, TokenStatusEntry } from "./types";
 export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
@@ -153,6 +153,8 @@ export function mergeEligibleWithActive(
           ...item,
           status: activeItem.status,
           activeUntil: activeItem.activeUntil || item.activeUntil,
+          assignmentScheduleId: activeItem.assignmentScheduleId || item.assignmentScheduleId,
+          assignmentScheduleInstanceId: activeItem.assignmentScheduleInstanceId || item.assignmentScheduleInstanceId,
           ...(Object.keys(activationRequirements).length ? { activationRequirements } : {})
         }
       : item;
@@ -172,7 +174,149 @@ export function getActivatableItems(items: ActivationItem[]): ActivationItem[] {
 }
 
 export function getDeactivatableItems(items: ActivationItem[]): ActivationItem[] {
-  return items.filter((item) => item.status === "active");
+  return items.filter((item) => getRowActionState(item).selectable && getRowActionState(item).mode === "deactivate");
+}
+
+export type QuickFilter = "favorites" | "eligible" | "active" | "requiresApproval" | "requiresJustification" | "highPrivilege";
+
+export interface RowActionState {
+  mode?: PopupRequestMode;
+  selectable: boolean;
+  reason?: string;
+}
+
+export interface BundlePreflight {
+  readyItems: ActivationItem[];
+  readyCount: number;
+  alreadyActiveCount: number;
+  pendingApprovalCount: number;
+  missingCount: number;
+  blockedCount: number;
+  needsJustification: boolean;
+  needsTicket: boolean;
+  needsApproval: boolean;
+  strictestMaxDurationHours?: number;
+  durationHours?: number;
+  isBlocked: boolean;
+  blockedReason?: string;
+}
+
+export function getRowActionState(item: ActivationItem | undefined): RowActionState {
+  if (!item) {
+    return { selectable: false, reason: "Item is not available." };
+  }
+  if (item.status === "eligible") {
+    return { mode: "activate", selectable: true };
+  }
+  if (item.status === "pendingApproval") {
+    return { selectable: false, reason: "This request is pending approval." };
+  }
+  if (item.status === "active") {
+    if (item.assignmentScheduleId || item.assignmentScheduleInstanceId) {
+      return { mode: "deactivate", selectable: true };
+    }
+    return {
+      mode: "deactivate",
+      selectable: false,
+      reason: "Microsoft did not expose a schedule identifier needed to disable this active item."
+    };
+  }
+  return { selectable: false, reason: "This item cannot be requested from here." };
+}
+
+export function getRowPolicySummary(item: ActivationItem): string[] {
+  const requirements = item.activationRequirements || {};
+  const maxDuration = requirements.maxDurationHours
+    ? `Max duration: ${formatDurationLabel(requirements.maxDurationHours)}`
+    : "Max duration: tenant policy default";
+  const approval = requirements.approval ? "Approval required" : "Approval not required";
+  const justification = requirements.justification === false ? "Reason not required" : "Reason required";
+  const ticket = requirements.ticket ? "Ticket required" : "Ticket not required";
+  const activeUntil = item.status === "active" && item.activeUntil ? `Active until: ${item.activeUntil.slice(0, 10)}` : undefined;
+  const disableReason = item.status === "active" ? getRowActionState(item).reason : undefined;
+  return [maxDuration, justification, ticket, approval, activeUntil, disableReason].filter((value): value is string => Boolean(value));
+}
+
+export function applyQuickFilters(
+  items: ActivationItem[],
+  filters: QuickFilter[],
+  favoriteIds: Set<string>
+): ActivationItem[] {
+  const filterSet = new Set(filters);
+  if (!filterSet.size) {
+    return items;
+  }
+  return items.filter((item) => {
+    if (filterSet.has("favorites") && !favoriteIds.has(item.id)) return false;
+    if (filterSet.has("eligible") && item.status !== "eligible") return false;
+    if (filterSet.has("active") && item.status !== "active") return false;
+    if (filterSet.has("requiresApproval") && item.activationRequirements?.approval !== true) return false;
+    if (filterSet.has("requiresJustification") && item.activationRequirements?.justification === false) return false;
+    if (filterSet.has("highPrivilege") && !isHighPrivilegeItem(item)) return false;
+    return true;
+  });
+}
+
+export function getBundlePreflight(
+  bundle: QuickPimBundle,
+  items: ActivationItem[],
+  justification: string
+): BundlePreflight {
+  const itemsById = new Map(items.map((item) => [item.id, item]));
+  const readyItems: ActivationItem[] = [];
+  let alreadyActiveCount = 0;
+  let pendingApprovalCount = 0;
+  let missingCount = 0;
+  let blockedCount = 0;
+
+  for (const itemId of bundle.itemIds) {
+    const item = itemsById.get(itemId);
+    if (!item) {
+      missingCount += 1;
+      continue;
+    }
+    if (item.status === "eligible") {
+      readyItems.push(item);
+      continue;
+    }
+    if (item.status === "active") {
+      alreadyActiveCount += 1;
+      continue;
+    }
+    if (item.status === "pendingApproval") {
+      pendingApprovalCount += 1;
+      continue;
+    }
+    blockedCount += 1;
+  }
+
+  const requirements = getActivationRequirements(readyItems);
+  const strictestMaxDurationHours = getSelectedMaxDurationHours(readyItems);
+  const durationHours = coerceDurationForItems(bundle.defaultDurationHours || strictestMaxDurationHours || BASE_DURATION_VALUES[0], readyItems);
+  const needsJustification = requirements.needsJustification;
+  const missingJustification = needsJustification && !(bundle.defaultJustification || justification).trim();
+  const isBlocked = !readyItems.length || missingJustification;
+  const blockedReason = !readyItems.length
+    ? "No bundle items are currently eligible."
+    : missingJustification
+      ? "A required justification is missing."
+      : undefined;
+
+  return {
+    readyItems,
+    readyCount: readyItems.length,
+    alreadyActiveCount,
+    pendingApprovalCount,
+    missingCount,
+    blockedCount,
+    needsJustification,
+    needsTicket: requirements.needsTicket,
+    needsApproval: readyItems.some((item) => item.activationRequirements?.approval === true),
+    strictestMaxDurationHours,
+    durationHours,
+    isBlocked,
+    blockedReason
+  };
 }
 
 export function isHighPrivilegeItem(item: ActivationItem): boolean {

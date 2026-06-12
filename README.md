@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.6.2**
+Current version: **v2.7.0**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -29,6 +29,13 @@ The extension does not create a separate OAuth app registration and does not ask
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
+- Use quick filter chips for favorites, eligible items, active items, approval, reason, and high-privilege roles.
+- Review compact row policy details such as maximum duration, approval, ticket, required reason, active-until date, and disable availability.
+- Preflight bundle activation to show actionable, skipped, pending, and blocked entries before sending requests.
+- Track local activation and deactivation activity with searchable Settings history.
+- Keep captured Microsoft portal tokens in session-only browser storage while preserving non-sensitive settings and caches locally.
+- Background-refresh stale eligible and active data every 10 minutes when session tokens are available, with a setting to disable it.
+- Use richer Access Setup diagnostics for feature-specific success, failure, stale, and limited states.
 - Hide activation counters and last enablement dates by default, with preferences to show them when useful.
 - Enable only the feature areas you use, skip disabled feature fetches, and automatically omit empty role-type tabs.
 - Use dark mode from settings.
@@ -58,7 +65,9 @@ The popup is designed for daily activation:
 - Separate tabs for Entra Roles, PIM Groups, Azure Roles, and Bundles.
 - Search and sort controls with compact icons.
 - Refresh and portal-link actions in the top control area, with visible refresh progress.
+- Manual refresh shows progress, and background pre-refresh keeps cached data warmer when possible.
 - Favorite stars on role rows.
+- Quick filter chips to narrow the current tab without leaving the popup.
 - Row click selection, plus checkbox selection.
 - Active rows can be selected for early disable, while eligible rows are selected for activation.
 - Enable and disable selections are mutually exclusive until the selection is cleared.
@@ -67,6 +76,7 @@ The popup is designed for daily activation:
 - Duration options capped to what the selected roles or groups allow.
 - Justification, ticket system, and ticket number fields shown only when required by selected items.
 - Clear progress and completion/error feedback during activation.
+- Per-row action reasons explain why a row is selectable, read-only, pending, or missing disable metadata.
 
 ## Settings Experience
 
@@ -199,6 +209,16 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.7.0
+
+- Moves captured Microsoft portal tokens to session-only browser storage and migrates/removes valid legacy local token keys on first read.
+- Adds background pre-refresh with Chrome alarms so stale enabled feature data can refresh quietly when valid session tokens exist.
+- Adds richer feature-specific diagnostics in Access Setup, including last success, last failure, operation labels, safe failure kinds, and recommended next actions.
+- Adds quick filter chips, compact row policy details, clearer row action reasons, and bundle preflight summaries.
+- Adds local activation/deactivation activity history with Settings filters, clear, and export support.
+- Reorganizes Settings into Overview, Setup, Daily Use, Preferences, Maintenance, and About sections with advanced controls hidden until needed.
+- Adds GitHub Actions CI and tag-based release automation for Web Store ZIP artifacts.
 
 ### v2.6.2
 

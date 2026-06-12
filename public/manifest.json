@@ -1,9 +1,9 @@
 {
   "name": "QuickPIM++",
-  "version": "2.6.2",
+  "version": "2.7.0",
   "description": "Quickly view, select, group, and activate Microsoft Entra, Azure, and PIM group roles.",
   "manifest_version": 3,
-  "permissions": ["storage", "webRequest"],
+  "permissions": ["storage", "webRequest", "alarms"],
   "host_permissions": [
     "https://graph.microsoft.com/*",
     "https://management.azure.com/*",

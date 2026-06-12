@@ -37,9 +37,9 @@ import {
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
 import { APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
-type SettingsTab = "home" | "access" | "aliases" | "justifications" | "bundles" | "preferences" | "data" | "about";
+type SettingsTab = "home" | "access" | "activity" | "justifications" | "bundles" | "aliases" | "preferences" | "data" | "diagnostics" | "about";
 
 const ORIGINAL_AUTHOR = "Daniel Bradley";
 const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
@@ -52,8 +52,10 @@ const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Overview", tabs: ["home"] },
   { title: "Setup", tabs: ["access"] },
-  { title: "Configuration", tabs: ["aliases", "justifications", "bundles", "preferences"] },
-  { title: "Maintenance", tabs: ["data", "about"] }
+  { title: "Daily Use", tabs: ["activity", "justifications", "bundles", "aliases"] },
+  { title: "Preferences", tabs: ["preferences"] },
+  { title: "Maintenance", tabs: ["data", "diagnostics"] },
+  { title: "About", tabs: ["about"] }
 ];
 
 interface ChangelogItem {
@@ -349,6 +351,7 @@ function SettingsApp() {
                 onClearReferenceData={clearLearnedReferences}
               />
             ) : null}
+            {tab === "activity" ? <ActivityPanel settings={settings} onSave={persist} /> : null}
             {tab === "aliases" ? <AliasesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
             {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
             {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
@@ -362,6 +365,7 @@ function SettingsApp() {
                 onClearMessage={() => setMessage("")}
               />
             ) : null}
+            {tab === "diagnostics" ? <DiagnosticsPanel tokenStatus={tokenStatus} dataCache={dataCache} /> : null}
           </div>
         </div>
       </section>
@@ -470,11 +474,13 @@ function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
   const pathByTab: Record<SettingsTab, string[]> = {
     home: ["M3 11.5 12 4l9 7.5", "M5 10.5V20h14v-9.5", "M9 20v-6h6v6"],
     access: ["M12 3l7 3v5c0 4.5-2.8 8.1-7 10-4.2-1.9-7-5.5-7-10V6l7-3z", "M9.5 12.5l1.8 1.8 3.8-4.4"],
+    activity: ["M4 19h16", "M7 16V8", "M12 16V5", "M17 16v-6"],
     aliases: ["M4 7h16", "M7 4v6", "M17 4v6", "M6 14h7", "M6 18h11"],
     justifications: ["M6 4h9l3 3v13H6z", "M14 4v4h4", "M9 12h6", "M9 16h6"],
     bundles: ["M5 7h14v5H5z", "M7 12v5h10v-5", "M9 7V5h6v2"],
     preferences: ["M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", "M12 2v3", "M12 19v3", "M4.9 4.9 7 7", "M17 17l2.1 2.1", "M2 12h3", "M19 12h3"],
     data: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
+    diagnostics: ["M4 5h16", "M4 12h16", "M4 19h16", "M8 5v14", "M16 5v14"],
     about: ["M12 17v-5", "M12 8h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"]
   };
   return (
@@ -742,12 +748,34 @@ function AccessStatusRow({ item }: { item: ReturnType<typeof buildAccessCapabili
           <p>{item.detail}</p>
         </div>
         <div>
-          <strong>{item.status === "ready" ? "Last success" : "What is limited"}</strong>
-          <p>{item.status === "ready" ? item.lastSuccessAt || "Token is available." : item.lastError || "Open the matching portal page to refresh access."}</p>
+          <strong>Last success</strong>
+          <p>{item.lastSuccessAt ? `${formatAccessOperation(item.lastSuccessOperation)} at ${formatDateOnly(item.lastSuccessAt) || item.lastSuccessAt}` : "No successful API check recorded yet."}</p>
+        </div>
+        <div>
+          <strong>Last failure</strong>
+          <p>
+            {item.lastFailureAt
+              ? `${formatAccessOperation(item.lastFailureOperation)}${item.lastFailureEndpoint ? ` / ${item.lastFailureEndpoint}` : ""}: ${item.lastError || "Unknown failure"}${item.failureKind ? ` (${item.failureKind})` : ""}`
+              : item.status === "ready" ? "No recent failure." : item.lastError || "Open the matching portal page to refresh access."}
+          </p>
+        </div>
+        <div>
+          <strong>Next action</strong>
+          <p>{item.recommendedAction || (item.status === "ready" ? "No action needed." : "Open Access Setup and reload the matching portal page.")}</p>
         </div>
       </div>
     </article>
   );
+}
+
+function formatAccessOperation(operation: ReturnType<typeof buildAccessCapabilityItems>[number]["lastSuccessOperation"]): string {
+  if (operation === "active") return "Active assignments";
+  if (operation === "eligible") return "Eligible assignments";
+  if (operation === "policy") return "Policy lookup";
+  if (operation === "nameLookup") return "Name lookup";
+  if (operation === "activation") return "Activation request";
+  if (operation === "deactivation") return "Deactivation request";
+  return "API check";
 }
 
 function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[number]["status"]): string {
@@ -758,6 +786,136 @@ function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[numbe
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function ActivityPanel({
+  settings,
+  onSave
+}: {
+  settings: QuickPimSettings;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+}) {
+  const [search, setSearch] = useState("");
+  const [actionFilter, setActionFilter] = useState<ActivityAction | "all">("all");
+  const [resultFilter, setResultFilter] = useState<ActivityResult | "all">("all");
+  const [typeFilter, setTypeFilter] = useState<ActivationItem["type"] | "all">("all");
+  const filtered = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    return settings.activityHistory.filter((entry) => {
+      if (actionFilter !== "all" && entry.action !== actionFilter) return false;
+      if (resultFilter !== "all" && entry.result !== resultFilter) return false;
+      if (typeFilter !== "all" && entry.itemType !== typeFilter) return false;
+      if (!term) return true;
+      return [entry.itemName, entry.scopeLabel, entry.bundleName, entry.justification, entry.error].some((value) =>
+        value?.toLowerCase().includes(term)
+      );
+    });
+  }, [actionFilter, resultFilter, search, settings.activityHistory, typeFilter]);
+
+  return (
+    <section className="panel">
+      <div className="panel-title-row">
+        <div>
+          <h2>Activity</h2>
+          <p className="muted">Local activation and deactivation outcomes for troubleshooting and audit context.</p>
+        </div>
+        <button className="btn danger" onClick={() => void onSave({ ...settings, activityHistory: [] }, "Activity history cleared.")}>
+          Clear activity
+        </button>
+      </div>
+      <div className="toolbar settings-section-gap activity-toolbar">
+        <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search activity" aria-label="Search activity" />
+        <select className="select" value={actionFilter} onChange={(event) => setActionFilter(event.target.value as ActivityAction | "all")} aria-label="Filter activity action">
+          <option value="all">All actions</option>
+          <option value="activate">Activations</option>
+          <option value="deactivate">Deactivations</option>
+        </select>
+        <select className="select" value={resultFilter} onChange={(event) => setResultFilter(event.target.value as ActivityResult | "all")} aria-label="Filter activity result">
+          <option value="all">All results</option>
+          <option value="success">Success</option>
+          <option value="failed">Failed</option>
+          <option value="skipped">Skipped</option>
+        </select>
+        <select className="select" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as ActivationItem["type"] | "all")} aria-label="Filter activity type">
+          <option value="all">All types</option>
+          <option value="directoryRole">Entra Roles</option>
+          <option value="pimGroup">PIM Groups</option>
+          <option value="azureRole">Azure Roles</option>
+        </select>
+      </div>
+      <div className="activity-list">
+        {filtered.map((entry) => (
+          <article className={`activity-row ${entry.result}`} key={entry.id}>
+            <div>
+              <strong>{entry.itemName}</strong>
+              <p className="muted">
+                {entry.action} / {entry.result} / {popupTabLabel(entry.itemType)}
+                {entry.scopeLabel ? ` / ${entry.scopeLabel}` : ""}
+              </p>
+              {entry.justification ? <p>{entry.justification}</p> : null}
+              {entry.error ? <p className="message error settings-inline-message">{entry.error}</p> : null}
+            </div>
+            <div className="activity-time">
+              <span>{formatDateOnly(entry.completedAt || entry.requestedAt) || entry.completedAt || entry.requestedAt}</span>
+              {entry.durationHours ? <span>{entry.durationHours}h</span> : null}
+              {entry.bundleName ? <span>{entry.bundleName}</span> : null}
+            </div>
+          </article>
+        ))}
+        {!filtered.length ? <p className="muted">No activity matches the current filters.</p> : null}
+      </div>
+    </section>
+  );
+}
+
+function DiagnosticsPanel({
+  tokenStatus,
+  dataCache
+}: {
+  tokenStatus: TokenStatus | null;
+  dataCache: QuickPimDataCache;
+}) {
+  const diagnostics = [
+    dataCache.eligible,
+    dataCache.active,
+    ...Object.values(dataCache.eligibleByTarget || {}),
+    ...Object.values(dataCache.activeByTarget || {})
+  ].flatMap((entry) => entry?.diagnostics || []);
+
+  return (
+    <section className="panel">
+      <h2>Diagnostics</h2>
+      <p className="muted">Safe local status information for troubleshooting. Tokens and raw authorization headers are not displayed.</p>
+      <div className="permission-detail-grid settings-section-gap">
+        <div>
+          <strong>Graph token</strong>
+          <p>{tokenStatus?.graph.hasToken ? "Captured in this browser session" : "Missing"}</p>
+        </div>
+        <div>
+          <strong>Azure token</strong>
+          <p>{tokenStatus?.azureManagement.hasToken ? "Captured in this browser session" : "Missing"}</p>
+        </div>
+      </div>
+      <div className="activity-list">
+        {diagnostics.map((diagnostic, index) => (
+          <article className={`activity-row ${diagnostic.success ? "success" : "failed"}`} key={`${diagnostic.target}:${diagnostic.checkedAt}:${index}`}>
+            <div>
+              <strong>{popupTabLabel(diagnostic.target)}</strong>
+              <p className="muted">
+                {formatAccessOperation(diagnostic.operation)} / {diagnostic.endpointLabel || "API check"} / {diagnostic.success ? "success" : diagnostic.failureKind || "failed"}
+                {diagnostic.fromCache ? " / cache" : ""}
+              </p>
+              {diagnostic.error ? <p>{diagnostic.error}</p> : null}
+            </div>
+            <div className="activity-time">
+              <span>{formatDateOnly(diagnostic.checkedAt) || diagnostic.checkedAt}</span>
+            </div>
+          </article>
+        ))}
+        {!diagnostics.length ? <p className="muted">No diagnostics recorded yet.</p> : null}
+      </div>
+    </section>
+  );
 }
 
 function safeOpenUrl(url: string): void {
@@ -1192,26 +1350,35 @@ function PreferencesPanel({
   const [defaultDurationHours, setDefaultDurationHours] = useState(settings.preferences.defaultDurationHours);
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
   const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
+  const [activityHistoryLimit, setActivityHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
   const [showActivationCounters, setShowActivationCounters] = useState(settings.preferences.showActivationCounters);
   const [showLastEnablementDate, setShowLastEnablementDate] = useState(settings.preferences.showLastEnablementDate);
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(settings.preferences.showAdvancedSettings);
+  const [backgroundPreRefreshEnabled, setBackgroundPreRefreshEnabled] = useState(settings.preferences.backgroundPreRefreshEnabled);
   const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
 
   useEffect(() => {
     setDefaultDurationHours(settings.preferences.defaultDurationHours);
     setDefaultSort(settings.preferences.defaultSort);
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
+    setActivityHistoryLimit(settings.preferences.activityHistoryLimit);
     setDarkMode(settings.preferences.darkMode);
     setShowActivationCounters(settings.preferences.showActivationCounters);
     setShowLastEnablementDate(settings.preferences.showLastEnablementDate);
+    setShowAdvancedSettings(settings.preferences.showAdvancedSettings);
+    setBackgroundPreRefreshEnabled(settings.preferences.backgroundPreRefreshEnabled);
     setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
   }, [
+    settings.preferences.activityHistoryLimit,
+    settings.preferences.backgroundPreRefreshEnabled,
     settings.preferences.darkMode,
     settings.preferences.defaultDurationHours,
     settings.preferences.defaultSort,
     settings.preferences.enabledFeatures,
     settings.preferences.recentJustificationLimit,
     settings.preferences.showActivationCounters,
+    settings.preferences.showAdvancedSettings,
     settings.preferences.showLastEnablementDate
   ]);
 
@@ -1223,9 +1390,12 @@ function PreferencesPanel({
         defaultDurationHours,
         defaultSort,
         recentJustificationLimit,
+        activityHistoryLimit,
         darkMode,
         showActivationCounters,
         showLastEnablementDate,
+        showAdvancedSettings,
+        backgroundPreRefreshEnabled,
         enabledFeatures: [...enabledFeatures],
         autoEnabledFeaturesInitialized: true
       }
@@ -1286,7 +1456,7 @@ function PreferencesPanel({
         </div>
       </div>
       <div className="preference-section">
-        <h3>Appearance</h3>
+        <h3>Display</h3>
         <label className="checkbox-option preference-toggle">
           <input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} aria-label="Dark mode" />
           <span>
@@ -1298,30 +1468,77 @@ function PreferencesPanel({
         <label className="checkbox-option preference-toggle">
           <input
             type="checkbox"
-            checked={showActivationCounters}
-            onChange={(event) => setShowActivationCounters(event.target.checked)}
-            aria-label="Show activation counters in popup"
+            checked={showAdvancedSettings}
+            onChange={(event) => setShowAdvancedSettings(event.target.checked)}
+            aria-label="Show advanced settings"
           />
           <span>
-            <strong>Show activation counters</strong>
+            <strong>Show advanced settings</strong>
             <br />
-            <span className="muted">Display the compact usage number on each popup row.</span>
+            <span className="muted">Reveal cache, diagnostics, usage, and background refresh controls.</span>
           </span>
         </label>
-        <label className="checkbox-option preference-toggle">
-          <input
-            type="checkbox"
-            checked={showLastEnablementDate}
-            onChange={(event) => setShowLastEnablementDate(event.target.checked)}
-            aria-label="Show last enablement date in popup"
-          />
-          <span>
-            <strong>Show last enablement date</strong>
-            <br />
-            <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
-          </span>
-        </label>
+        {showAdvancedSettings ? (
+          <>
+            <label className="checkbox-option preference-toggle">
+              <input
+                type="checkbox"
+                checked={showActivationCounters}
+                onChange={(event) => setShowActivationCounters(event.target.checked)}
+                aria-label="Show activation counters in popup"
+              />
+              <span>
+                <strong>Show activation counters</strong>
+                <br />
+                <span className="muted">Display the compact usage number on each popup row.</span>
+              </span>
+            </label>
+            <label className="checkbox-option preference-toggle">
+              <input
+                type="checkbox"
+                checked={showLastEnablementDate}
+                onChange={(event) => setShowLastEnablementDate(event.target.checked)}
+                aria-label="Show last enablement date in popup"
+              />
+              <span>
+                <strong>Show last enablement date</strong>
+                <br />
+                <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
+              </span>
+            </label>
+          </>
+        ) : null}
       </div>
+      {showAdvancedSettings ? (
+        <div className="preference-section">
+          <h3>Access & cache</h3>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={backgroundPreRefreshEnabled}
+              onChange={(event) => setBackgroundPreRefreshEnabled(event.target.checked)}
+              aria-label="Enable background pre-refresh"
+            />
+            <span>
+              <strong>Background pre-refresh</strong>
+              <br />
+              <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
+            </span>
+          </label>
+          <div className="field settings-field-gap">
+            <label>Activity history limit</label>
+            <input
+              className="input"
+              type="number"
+              min="10"
+              max="200"
+              value={activityHistoryLimit}
+              onChange={(event) => setActivityHistoryLimit(Number(event.target.value))}
+            />
+            <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
+          </div>
+        </div>
+      ) : null}
       <div className="preference-section">
         <h3>Enabled features</h3>
         <p className="muted">Only enabled role features are fetched, shown in the popup, and checked by Access Setup. Empty enabled role tabs are still hidden automatically.</p>
@@ -1344,24 +1561,26 @@ function PreferencesPanel({
           Save preferences
         </button>
       </div>
-      <div className="panel">
-        <h3>Usage counters</h3>
-        {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
-          <div className="settings-row" key={id}>
-            <span>
-              {id}
-              <br />
-              <span className="muted">
-                {stats.activationCount} activation(s)
-                {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
+      {showAdvancedSettings ? (
+        <div className="panel">
+          <h3>Usage counters</h3>
+          {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
+            <div className="settings-row" key={id}>
+              <span>
+                {id}
+                <br />
+                <span className="muted">
+                  {stats.activationCount} activation(s)
+                  {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
+                </span>
               </span>
-            </span>
-          </div>
-        ))}
-        <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [] }, "Usage data reset.")}>
-          Reset usage data
-        </button>
-      </div>
+            </div>
+          ))}
+          <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [], activityHistory: [] }, "Usage data reset.")}>
+            Reset usage data
+          </button>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1409,11 +1628,13 @@ function tabLabel(tab: SettingsTab): string {
   const labels: Record<SettingsTab, string> = {
     home: "Home",
     access: "Access Setup",
+    activity: "Activity",
     aliases: "Aliases",
     justifications: "Justifications",
     bundles: "Bundles",
     preferences: "Preferences",
     data: "Import / Export",
+    diagnostics: "Diagnostics",
     about: "About"
   };
   return labels[tab];
@@ -1424,7 +1645,7 @@ function tabFromHash(): SettingsTab {
   if (value === "permissions") {
     return "access";
   }
-  if (["home", "about", "access", "aliases", "justifications", "bundles", "preferences", "data"].includes(value)) {
+  if (["home", "about", "access", "activity", "aliases", "justifications", "bundles", "preferences", "data", "diagnostics"].includes(value)) {
     return value as SettingsTab;
   }
   return "home";

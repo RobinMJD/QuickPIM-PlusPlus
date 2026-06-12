@@ -216,6 +216,36 @@ button {
   padding: 12px;
 }
 
+.quick-filter-row {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 0 12px 8px;
+}
+
+.filter-chip {
+  flex: 0 0 auto;
+  min-height: 28px;
+  border: 1px solid #dbe3ee;
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #ffffff;
+  color: #475569;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.filter-chip:hover {
+  background: #f1f5f9;
+}
+
+.filter-chip.active {
+  border-color: #93c5fd;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
 .control-with-icon {
   position: relative;
 }
@@ -483,6 +513,32 @@ button {
   margin-top: 5px;
   color: #64748b;
   font-size: 11px;
+}
+
+.role-details {
+  margin-top: 6px;
+  color: #475569;
+  font-size: 11px;
+}
+
+.role-details summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  color: #2563eb;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.role-details ul {
+  display: grid;
+  gap: 3px;
+  margin: 3px 0 0;
+  padding-left: 18px;
+}
+
+.role-details li {
+  overflow-wrap: anywhere;
 }
 
 .scope-label {
@@ -1245,6 +1301,17 @@ a.btn {
   font-size: 14px;
 }
 
+.bundle-preflight {
+  margin: 0;
+  border-radius: 6px;
+  padding: 8px 9px;
+  background: #f1f5f9;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
 .justification-chip {
   max-width: 100%;
   border-radius: 999px;
@@ -1343,6 +1410,66 @@ a.btn {
   white-space: pre;
 }
 
+.activity-toolbar {
+  padding: 0;
+}
+
+.activity-list {
+  display: grid;
+  gap: 8px;
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid #e5e7eb;
+  border-left-width: 4px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.activity-row.success {
+  border-left-color: #16a34a;
+}
+
+.activity-row.failed {
+  border-left-color: #dc2626;
+  background: #fffafa;
+}
+
+.activity-row.skipped {
+  border-left-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.activity-row strong {
+  display: block;
+  color: #0f172a;
+  font-size: 13px;
+}
+
+.activity-row p {
+  margin: 3px 0 0;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.activity-time {
+  display: grid;
+  gap: 3px;
+  justify-items: end;
+  min-width: 80px;
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: right;
+}
+
 body.dark-mode {
   color-scheme: dark;
   background: #0f172a;
@@ -1378,6 +1505,9 @@ body.dark-mode .textarea {
 body.dark-mode .brand p,
 body.dark-mode .muted,
 body.dark-mode .role-meta,
+body.dark-mode .role-details,
+body.dark-mode .activity-row p,
+body.dark-mode .activity-time,
 body.dark-mode .field label,
 body.dark-mode .settings-nav button,
 body.dark-mode .settings-nav-heading,
@@ -1417,6 +1547,7 @@ body.dark-mode .textarea,
 body.dark-mode .checkbox-option,
 body.dark-mode .bundle-card,
 body.dark-mode .permission-row,
+body.dark-mode .activity-row,
 body.dark-mode .saved-justification-menu {
   background: #0f172a;
   border-color: #334155;
@@ -1432,6 +1563,7 @@ body.dark-mode .permission-note,
 body.dark-mode .checkbox-grid,
 body.dark-mode .message,
 body.dark-mode .justification-chip,
+body.dark-mode .bundle-preflight,
 body.dark-mode .activation-count,
 body.dark-mode .status-badge.eligible,
 body.dark-mode .badge {
@@ -1552,6 +1684,38 @@ body.dark-mode .permission-doc-link {
 
 body.dark-mode .favorite-button:hover {
   background: #334155;
+}
+
+body.dark-mode .filter-chip {
+  border-color: #334155;
+  background: #1e293b;
+  color: #cbd5e1;
+}
+
+body.dark-mode .filter-chip:hover {
+  background: #334155;
+}
+
+body.dark-mode .filter-chip.active {
+  border-color: #3b82f6;
+  background: #1e3a8a;
+  color: #bfdbfe;
+}
+
+body.dark-mode .role-details summary {
+  color: #93c5fd;
+}
+
+body.dark-mode .activity-row.failed {
+  background: #2b1212;
+}
+
+body.dark-mode .activity-row.skipped {
+  background: #2b2111;
+}
+
+body.dark-mode .activity-row strong {
+  color: #f8fafc;
 }
 
 body.dark-mode .saved-justification-option {

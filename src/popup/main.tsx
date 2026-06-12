@@ -29,15 +29,20 @@ import {
   getActivationRequirements,
   getActivationStatusTitle,
   getActivatableItems,
+  applyQuickFilters,
   getDeactivatableItems,
+  getBundlePreflight,
   getDurationOptions,
   getRemainingSelectedIdsAfterActivationResults,
   isHighPrivilegeItem,
+  getRowActionState,
+  getRowPolicySummary,
   mergeEligibleWithActive,
   getPortalUrlForTab,
   tabLabel,
   tokenStatusText,
   tokenStatusTone,
+  type QuickFilter,
   type PopupTab,
   type RoleTab
 } from "../lib/popupModel";
@@ -53,6 +58,7 @@ import {
   getScopeLabel,
   getUsage,
   loadSettings,
+  recordActivityResults,
   recordActivations,
   saveSettings,
   sortItems
@@ -165,6 +171,7 @@ function PopupApp() {
   const [accessCapabilities, setAccessCapabilities] = useState<AccessCapabilityItem[]>([]);
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("name");
+  const [quickFilters, setQuickFilters] = useState<Set<QuickFilter>>(new Set());
   const [durationHours, setDurationHours] = useState(DEFAULT_SETTINGS.preferences.defaultDurationHours);
   const [justification, setJustification] = useState("");
   const [ticketSystem, setTicketSystem] = useState("");
@@ -367,8 +374,21 @@ function PopupApp() {
       const scope = getScopeLabel(item, referenceData).toLowerCase();
       return matchesType && (!term || name.includes(term) || scope.includes(term));
     });
-    return sortItems(filtered, settings, sortMode, referenceData);
-  }, [displayItems, referenceData, search, settings, sortMode, tab]);
+    const quickFiltered = applyQuickFilters(filtered, [...quickFilters], favoriteIds);
+    return sortItems(quickFiltered, settings, sortMode, referenceData);
+  }, [displayItems, favoriteIds, quickFilters, referenceData, search, settings, sortMode, tab]);
+
+  function toggleQuickFilter(filter: QuickFilter) {
+    setQuickFilters((current) => {
+      const next = new Set(current);
+      if (next.has(filter)) {
+        next.delete(filter);
+      } else {
+        next.add(filter);
+      }
+      return next;
+    });
+  }
 
   async function initializePopup() {
     try {
@@ -717,6 +737,7 @@ function PopupApp() {
     setActivationFailureNotice(null);
     setMessage("");
     try {
+      const requestedAt = new Date().toISOString();
       const response = await sendMessage<ActivationResponse>({
         action: "activateItems",
         items: activatableItems,
@@ -732,6 +753,16 @@ function PopupApp() {
 
       let updatedSettings = addRecentJustification(settings, effectiveJustification);
       updatedSettings = recordActivations(updatedSettings, successItems, new Date().toISOString(), bundle?.name);
+      updatedSettings = recordActivityResults(updatedSettings, {
+        action: "activate",
+        items: activatableItems,
+        response,
+        requestedAt,
+        completedAt: new Date().toISOString(),
+        durationHours: effectiveDuration,
+        justification: effectiveJustification,
+        bundleName: bundle?.name
+      });
       await saveSettings(updatedSettings);
       setSettings(updatedSettings);
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
@@ -782,6 +813,7 @@ function PopupApp() {
     setActivationFailureNotice(null);
     setMessage("");
     try {
+      const requestedAt = new Date().toISOString();
       const response = await sendMessage<ActivationResponse>({
         action: "deactivateItems",
         items: deactivatableItems,
@@ -795,7 +827,25 @@ function PopupApp() {
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
-        const updatedSettings = addRecentJustification(settings, justification);
+        let updatedSettings = addRecentJustification(settings, justification);
+        updatedSettings = recordActivityResults(updatedSettings, {
+          action: "deactivate",
+          items: deactivatableItems,
+          response,
+          requestedAt,
+          completedAt: new Date().toISOString(),
+          justification
+        });
+        await saveSettings(updatedSettings);
+        setSettings(updatedSettings);
+      } else {
+        const updatedSettings = recordActivityResults(settings, {
+          action: "deactivate",
+          items: deactivatableItems,
+          response,
+          requestedAt,
+          completedAt: new Date().toISOString()
+        });
         await saveSettings(updatedSettings);
         setSettings(updatedSettings);
       }
@@ -995,6 +1045,7 @@ function PopupApp() {
               </select>
             </div>
           </section>
+          <QuickFilterBar activeFilters={quickFilters} onToggle={toggleQuickFilter} />
           <section className="content">
             <RoleList
               items={visibleEligibleItems}
@@ -1041,6 +1092,7 @@ function PopupApp() {
           {settings.bundles.length ? (
             settings.bundles.map((bundle) => {
               const expansion = expandBundle(bundle, displayItems);
+              const preflight = getBundlePreflight(bundle, displayItems, justification);
               return (
                 <div className="bundle-card" key={bundle.id}>
                   <h3>{bundle.name}</h3>
@@ -1048,11 +1100,17 @@ function PopupApp() {
                     {expansion.items.length} available item(s)
                     {bundle.defaultJustification ? ` / ${bundle.defaultJustification}` : ""}
                   </p>
+                  <p className="bundle-preflight">
+                    {preflight.readyCount} ready / {preflight.alreadyActiveCount} already active / {preflight.pendingApprovalCount} pending
+                    {preflight.missingCount ? ` / ${preflight.missingCount} missing` : ""}
+                    {preflight.strictestMaxDurationHours ? ` / max ${preflight.strictestMaxDurationHours}h` : ""}
+                  </p>
+                  {preflight.blockedReason ? <p className="muted">{preflight.blockedReason}</p> : null}
                   <div className="button-row">
                     <button className="btn" onClick={() => useBundleDefaults(bundle)}>
                       Use defaults
                     </button>
-                    <button className="btn primary" onClick={() => void activate(expansion.items, bundle)} disabled={!expansion.items.length || isActivating}>
+                    <button className="btn primary" onClick={() => void activate(preflight.readyItems, bundle)} disabled={preflight.isBlocked || isActivating}>
                       {isActivating ? "Activating..." : "Activate bundle"}
                     </button>
                   </div>
@@ -1153,6 +1211,38 @@ function ActivationProgressPanel({ progress, mode }: { progress: LoadingProgress
   );
 }
 
+function QuickFilterBar({
+  activeFilters,
+  onToggle
+}: {
+  activeFilters: Set<QuickFilter>;
+  onToggle: (filter: QuickFilter) => void;
+}) {
+  const filters: Array<{ id: QuickFilter; label: string }> = [
+    { id: "favorites", label: "Favorites" },
+    { id: "eligible", label: "Eligible" },
+    { id: "active", label: "Active" },
+    { id: "requiresApproval", label: "Approval" },
+    { id: "requiresJustification", label: "Needs reason" },
+    { id: "highPrivilege", label: "High privilege" }
+  ];
+  return (
+    <div className="quick-filter-row" aria-label="Quick filters">
+      {filters.map((filter) => (
+        <button
+          type="button"
+          className={`filter-chip ${activeFilters.has(filter.id) ? "active" : ""}`}
+          onClick={() => onToggle(filter.id)}
+          key={filter.id}
+          aria-pressed={activeFilters.has(filter.id)}
+        >
+          {filter.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function ActivationFailureBanner({
   notice,
   onOpenPortal,
@@ -1224,14 +1314,17 @@ function RoleList({
     <div className="item-list">
       {items.map((item) => {
         const usage = getUsage(item, settings);
-        const itemMode = getRequestModeForItem(item);
-        const isActionable = !readonly && Boolean(itemMode);
+        const actionState = getRowActionState(item);
+        const itemMode = actionState.mode;
+        const isActionable = !readonly && actionState.selectable && Boolean(itemMode);
         const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
         const selected = isSelectable && selectedIds.has(item.id);
         const displayName = getDisplayName(item, settings, referenceData);
         const isFavorite = favoriteIds.has(item.id);
         const statusTitle = getActivationStatusTitle(item);
         const lastEnabledDate = showLastEnablementDate ? formatDateOnly(usage.lastUsedAt) : "";
+        const policySummary = getRowPolicySummary(item);
+        const rowTitle = actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
         const body = (
           <>
             <button
@@ -1256,6 +1349,16 @@ function RoleList({
                 <span className="scope-label">{getScopeLabel(item, referenceData)}</span>
                 {lastEnabledDate ? <span>last enabled {lastEnabledDate}</span> : null}
               </div>
+              {policySummary.length ? (
+                <details className="role-details" onClick={(event) => event.stopPropagation()}>
+                  <summary>Details</summary>
+                  <ul>
+                    {policySummary.map((detail) => (
+                      <li key={detail}>{detail}</li>
+                    ))}
+                  </ul>
+                </details>
+              ) : null}
             </div>
             <div className="role-status-stack">
               {showActivationCounters ? (
@@ -1272,7 +1375,11 @@ function RoleList({
 
         if (!isActionable) {
           return (
-            <div className={`role-row readonly ${item.status === "active" ? "active-row" : item.status === "pendingApproval" ? "pending-row" : ""}`} key={item.id}>
+            <div
+              className={`role-row readonly ${item.status === "active" ? "active-row" : item.status === "pendingApproval" ? "pending-row" : ""}`}
+              key={item.id}
+              title={rowTitle}
+            >
               {body}
             </div>
           );
@@ -1287,7 +1394,7 @@ function RoleList({
                 onToggle?.(item.id);
               }
             }}
-            title={!isSelectable && requestMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined}
+            title={rowTitle}
           >
             <input
               type="checkbox"
@@ -1606,13 +1713,8 @@ function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatur
 }
 
 function getRequestModeForItem(item: ActivationItem | undefined): PopupRequestMode | undefined {
-  if (item?.status === "eligible") {
-    return "activate";
-  }
-  if (item?.status === "active") {
-    return "deactivate";
-  }
-  return undefined;
+  const actionState = getRowActionState(item);
+  return actionState.selectable ? actionState.mode : undefined;
 }
 
 async function fetchActivationSnapshot(targets: AccessSetupTarget[]): Promise<ActivationSnapshot> {

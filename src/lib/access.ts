@@ -7,6 +7,8 @@ import {
 import type {
   AccessCapabilityStatus,
   AccessDiagnostic,
+  AccessDiagnosticOperation,
+  AccessFailureKind,
   AccessSetupTarget,
   QuickPimDataCache,
   TokenStatus,
@@ -19,7 +21,13 @@ export interface AccessCapabilityItem {
   status: AccessCapabilityStatus;
   detail: string;
   lastSuccessAt?: string;
+  lastSuccessOperation?: AccessDiagnosticOperation;
+  lastFailureAt?: string;
+  lastFailureOperation?: AccessDiagnosticOperation;
+  lastFailureEndpoint?: string;
+  failureKind?: AccessFailureKind;
   lastError?: string;
+  recommendedAction?: string;
 }
 
 const TARGET_LABELS: Record<AccessSetupTarget, string> = {
@@ -72,6 +80,43 @@ export function getPortalUrlsForTargets(targets: AccessSetupTarget[]): string[] 
       })
     )
   ];
+}
+
+export function classifyAccessFailure(error: string | undefined): AccessFailureKind {
+  const text = (error || "").toLowerCase();
+  if (!text) {
+    return "unknown";
+  }
+  if (text.includes("token is missing")) {
+    return "missingToken";
+  }
+  if (text.includes("expired") || text.includes("expiry utc time")) {
+    return "expiredToken";
+  }
+  if (text.includes("missing permission") || text.includes("permissionscopenotgranted") || text.includes("missing activation scope") || text.includes("limited in the captured portal token")) {
+    return "missingCapability";
+  }
+  if (text.includes("mfa challenge") || text.includes("additional sign-in") || text.includes("claims")) {
+    return "claimsChallenge";
+  }
+  if (text.includes("forbidden") || text.includes(" 403") || text === "403") {
+    return "forbidden";
+  }
+  if (text.includes("failed to fetch") || text.includes("network")) {
+    return "network";
+  }
+  return "unknown";
+}
+
+export function summarizeAccessDiagnostics(diagnostics: AccessDiagnostic[]): {
+  lastSuccess?: AccessDiagnostic;
+  lastFailure?: AccessDiagnostic;
+} {
+  const sorted = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
+  return {
+    lastSuccess: sorted.find((item) => item.success),
+    lastFailure: sorted.find((item) => !item.success)
+  };
 }
 
 export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined): string {
@@ -130,17 +175,18 @@ function buildAccessCapabilityItem(
   hasLoadedItems: boolean
 ): AccessCapabilityItem {
   const token = getTokenStatusForTarget(target, tokenStatus);
+  const summary = summarizeAccessDiagnostics(diagnostics);
   const latestDiagnostic = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))[0];
-  const latestSuccess = [...diagnostics]
-    .filter((item) => item.success)
-    .sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))[0];
+  const latestSuccess = summary.lastSuccess;
+  const diagnosticMetadata = getCapabilityDiagnosticMetadata(target, summary);
 
   if (!token?.hasToken || token.isExpired) {
     return {
       target,
       label: TARGET_LABELS[target],
       status: "needsPortalRefresh",
-      detail: token?.isExpired ? "Captured token expired. Open the portal to refresh it." : "Open the portal so QuickPIM++ can capture a token."
+      detail: token?.isExpired ? "Captured token expired. Open the portal to refresh it." : "Open the portal so QuickPIM++ can capture a token.",
+      ...diagnosticMetadata
     };
   }
 
@@ -151,7 +197,9 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "limited",
       detail: missingActivationScopeDetail.detail,
-      lastError: missingActivationScopeDetail.lastError
+      lastError: missingActivationScopeDetail.lastError,
+      recommendedAction: getRecommendedAction(target, "missingCapability"),
+      ...diagnosticMetadata
     };
   }
 
@@ -161,7 +209,8 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "ready",
       detail: "Last API check succeeded.",
-      lastSuccessAt: latestSuccess.checkedAt
+      lastSuccessAt: latestSuccess.checkedAt,
+      ...diagnosticMetadata
     };
   }
 
@@ -170,7 +219,8 @@ function buildAccessCapabilityItem(
       target,
       label: TARGET_LABELS[target],
       status: "ready",
-      detail: "Loaded eligible or active items."
+      detail: "Loaded eligible or active items.",
+      ...diagnosticMetadata
     };
   }
 
@@ -180,7 +230,9 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "limited",
       detail: "The portal token was captured, but this feature is still blocked by Microsoft API access.",
-      lastError: latestDiagnostic.error
+      lastError: latestDiagnostic.error,
+      recommendedAction: getRecommendedAction(target, latestDiagnostic.failureKind || classifyAccessFailure(latestDiagnostic.error)),
+      ...diagnosticMetadata
     };
   }
 
@@ -189,7 +241,8 @@ function buildAccessCapabilityItem(
       target,
       label: TARGET_LABELS[target],
       status: "ready",
-      detail: "Azure Management token captured."
+      detail: "Azure Management token captured.",
+      ...diagnosticMetadata
     };
   }
 
@@ -200,7 +253,8 @@ function buildAccessCapabilityItem(
       target,
       label: TARGET_LABELS[target],
       status: "ready",
-      detail: `Token includes ${matchedScope}.`
+      detail: `Token includes ${matchedScope}.`,
+      ...diagnosticMetadata
     };
   }
 
@@ -208,8 +262,46 @@ function buildAccessCapabilityItem(
     target,
     label: TARGET_LABELS[target],
     status: "needsPortalRefresh",
-    detail: "Open the matching portal page so Microsoft can request the needed access."
+    detail: "Open the matching portal page so Microsoft can request the needed access.",
+    ...diagnosticMetadata
   };
+}
+
+function getCapabilityDiagnosticMetadata(
+  target: AccessSetupTarget,
+  summary: ReturnType<typeof summarizeAccessDiagnostics>
+): Pick<AccessCapabilityItem, "lastSuccessAt" | "lastSuccessOperation" | "lastFailureAt" | "lastFailureOperation" | "lastFailureEndpoint" | "failureKind" | "recommendedAction" | "lastError"> {
+  const failureKind = summary.lastFailure?.failureKind || classifyAccessFailure(summary.lastFailure?.error);
+  return {
+    ...(summary.lastSuccess ? {
+      lastSuccessAt: summary.lastSuccess.checkedAt,
+      lastSuccessOperation: summary.lastSuccess.operation
+    } : {}),
+    ...(summary.lastFailure ? {
+      lastFailureAt: summary.lastFailure.checkedAt,
+      lastFailureOperation: summary.lastFailure.operation,
+      lastFailureEndpoint: summary.lastFailure.endpointLabel,
+      failureKind,
+      lastError: summary.lastFailure.error,
+      recommendedAction: getRecommendedAction(target, failureKind)
+    } : {})
+  };
+}
+
+function getRecommendedAction(target: AccessSetupTarget, failureKind: AccessFailureKind): string {
+  if (failureKind === "claimsChallenge") {
+    return "Open the matching Microsoft portal page, complete the prompt, then retry.";
+  }
+  if (failureKind === "missingToken" || failureKind === "expiredToken") {
+    return "Open the matching portal page so QuickPIM++ can capture a fresh token.";
+  }
+  if (target === "pimGroup") {
+    return "Reload the PIM Groups portal page, then recheck access.";
+  }
+  if (target === "directoryRole") {
+    return "Reload the Entra Roles portal page, then recheck access.";
+  }
+  return "Reload the Azure Roles portal page, then recheck access.";
 }
 
 function getTokenStatusForTarget(

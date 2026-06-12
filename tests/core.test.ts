@@ -366,9 +366,12 @@ describe("settings helpers", () => {
         defaultDurationHours: 99,
         defaultSort: "invalid" as any,
         recentJustificationLimit: 99,
+        activityHistoryLimit: 999,
         darkMode: true,
         showActivationCounters: true,
         showLastEnablementDate: true,
+        showAdvancedSettings: true,
+        backgroundPreRefreshEnabled: false,
         enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
     });
@@ -389,9 +392,12 @@ describe("settings helpers", () => {
       defaultDurationHours: 24,
       defaultSort: "name",
       recentJustificationLimit: 20,
+      activityHistoryLimit: 200,
       darkMode: true,
       showActivationCounters: true,
       showLastEnablementDate: true,
+      showAdvancedSettings: true,
+      backgroundPreRefreshEnabled: false,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
   });

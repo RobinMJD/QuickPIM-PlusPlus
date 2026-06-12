@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag and manifest version
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const manifest = JSON.parse(fs.readFileSync("public/manifest.json", "utf8"));
+          if (pkg.version !== version || manifest.version !== version) {
+            throw new Error(`Tag/version mismatch: tag=${version}, package=${pkg.version}, manifest=${manifest.version}`);
+          }
+          NODE
+
+      - name: Build
+        run: npm run build
+
+      - name: Package Web Store ZIP
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          (cd dist && zip -qr "../release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" . -x "*.DS_Store")
+          unzip -p "release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" manifest.json > /tmp/quickpim-manifest.json
+          node - <<'NODE'
+          const fs = require("fs");
+          const version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
+          const manifest = JSON.parse(fs.readFileSync("/tmp/quickpim-manifest.json", "utf8"));
+          if (manifest.version !== version) {
+            throw new Error(`ZIP manifest version mismatch: expected ${version}, got ${manifest.version}`);
+          }
+          NODE
+
+      - name: Create or update GitHub release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$ZIP" --title "QuickPIM++ $GITHUB_REF_NAME" --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}

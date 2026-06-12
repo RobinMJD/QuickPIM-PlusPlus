@@ -1,6 +1,9 @@
 import type {
   ActivationHistoryEntry,
   ActivationItem,
+  ActivationResponse,
+  ActivityHistoryEntry,
+  ActivityResult,
   BundleExpansion,
   QuickPimBundle,
   QuickPimFeature,
@@ -10,9 +13,11 @@ import type {
 } from "./types";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
 import { isGenericJustification } from "./justifications";
+import { sanitizeErrorMessage } from "./security";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
 const MAX_HISTORY_ENTRIES = 50;
+const MAX_ACTIVITY_HISTORY_ENTRIES = 200;
 const MAX_ALIASES = 300;
 const MAX_FAVORITES = 300;
 const MAX_ALIAS_LENGTH = 120;
@@ -28,21 +33,25 @@ export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "p
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 
 export const DEFAULT_SETTINGS: QuickPimSettings = {
-  version: 1,
+  version: 2,
   aliasesByItemId: {},
   favoriteItemIds: [],
   savedJustifications: [],
   recentJustifications: [],
   bundles: [],
   usageStatsByItemId: {},
+  activityHistory: [],
   activationHistory: [],
   preferences: {
     defaultDurationHours: 0.5,
     defaultSort: "name",
     recentJustificationLimit: 8,
+    activityHistoryLimit: 100,
     darkMode: false,
     showActivationCounters: false,
     showLastEnablementDate: false,
+    showAdvancedSettings: false,
+    backgroundPreRefreshEnabled: true,
     enabledFeatures: ALL_FEATURES,
     autoEnabledFeaturesInitialized: false,
     permissionWarningIgnored: false
@@ -60,8 +69,9 @@ export function mergeSettings(input: Partial<QuickPimSettings> | undefined): Qui
     savedJustifications: sanitizeJustificationList(source.savedJustifications, MAX_SAVED_JUSTIFICATIONS),
     recentJustifications: sanitizeJustificationList(source.recentJustifications, 20),
     bundles: sanitizeBundles(source.bundles),
+    activityHistory: sanitizeActivityHistory(source.activityHistory, source.activationHistory, source.preferences),
     activationHistory: sanitizeActivationHistory(source.activationHistory),
-    version: 1
+    version: 2
   };
 }
 
@@ -187,6 +197,49 @@ export function recordActivations(
   };
 }
 
+export function recordActivityResults(
+  settings: QuickPimSettings,
+  input: {
+    action: "activate" | "deactivate";
+    items: ActivationItem[];
+    response: ActivationResponse;
+    requestedAt: string;
+    completedAt: string;
+    durationHours?: number;
+    justification?: string;
+    bundleName?: string;
+  }
+): QuickPimSettings {
+  const itemsById = new Map(input.items.map((item) => [item.id, item]));
+  const entries = input.response.results.map((result): ActivityHistoryEntry => {
+    const item = itemsById.get(result.itemId);
+    const historyResult: ActivityResult = result.success ? "success" : "failed";
+    return {
+      id: `${input.completedAt}:${input.action}:${result.itemId}:${historyResult}`,
+      action: input.action,
+      result: historyResult,
+      itemId: result.itemId,
+      itemName: item?.displayName || result.itemName,
+      itemType: item?.type || inferItemType(result.itemId),
+      scopeLabel: item?.scopeLabel,
+      requestedAt: input.requestedAt,
+      completedAt: input.completedAt,
+      ...(input.durationHours && input.action === "activate" ? { durationHours: input.durationHours } : {}),
+      ...(input.bundleName ? { bundleName: input.bundleName } : {}),
+      ...(input.justification?.trim() ? { justification: sanitizeString(input.justification, MAX_JUSTIFICATION_LENGTH) } : {}),
+      ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {})
+    };
+  });
+
+  return {
+    ...settings,
+    activityHistory: [
+      ...entries,
+      ...settings.activityHistory
+    ].slice(0, settings.preferences.activityHistoryLimit || DEFAULT_SETTINGS.preferences.activityHistoryLimit)
+  };
+}
+
 export function createActivationHistoryEntries(
   items: ActivationItem[],
   bundleName: string | undefined,
@@ -296,9 +349,12 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
+    activityHistoryLimit: clampInteger(preferences.activityHistoryLimit, 10, MAX_ACTIVITY_HISTORY_ENTRIES, DEFAULT_SETTINGS.preferences.activityHistoryLimit),
     darkMode: preferences.darkMode === true,
     showActivationCounters: preferences.showActivationCounters === true,
     showLastEnablementDate: preferences.showLastEnablementDate === true,
+    showAdvancedSettings: preferences.showAdvancedSettings === true,
+    backgroundPreRefreshEnabled: preferences.backgroundPreRefreshEnabled !== false,
     enabledFeatures: sanitizeEnabledFeatures(preferences.enabledFeatures, preferences.hiddenPopupTabs),
     autoEnabledFeaturesInitialized: preferences.autoEnabledFeaturesInitialized === true,
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,
@@ -413,6 +469,68 @@ function sanitizeActivationHistory(value: unknown): ActivationHistoryEntry[] {
   });
 }
 
+function sanitizeActivityHistory(
+  value: unknown,
+  legacyActivationHistory: unknown,
+  preferences: unknown
+): ActivityHistoryEntry[] {
+  const limit = clampInteger(
+    isRecord(preferences) ? preferences.activityHistoryLimit : undefined,
+    10,
+    MAX_ACTIVITY_HISTORY_ENTRIES,
+    DEFAULT_SETTINGS.preferences.activityHistoryLimit
+  );
+  const source = Array.isArray(value) ? value : migrateActivationHistoryToActivity(legacyActivationHistory);
+
+  return source.slice(0, limit).flatMap((entry) => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+    const id = sanitizeString(entry.id, MAX_ITEM_ID_LENGTH);
+    const action = entry.action === "deactivate" ? "deactivate" : entry.action === "activate" ? "activate" : undefined;
+    const result = entry.result === "failed" || entry.result === "skipped" || entry.result === "success" ? entry.result : undefined;
+    const itemId = sanitizeString(entry.itemId, MAX_ITEM_ID_LENGTH);
+    const itemName = sanitizeString(entry.itemName, MAX_ALIAS_LENGTH);
+    const itemType = isActivationItemType(entry.itemType) ? entry.itemType : undefined;
+    const requestedAt = sanitizeString(entry.requestedAt, 64);
+    if (!id || !action || !result || !itemId || !itemName || !itemType || !requestedAt) {
+      return [];
+    }
+    const durationHours = clampOptionalNumber(entry.durationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS);
+    return [
+      {
+        id,
+        action,
+        result,
+        itemId,
+        itemName,
+        itemType,
+        requestedAt,
+        ...(sanitizeString(entry.completedAt, 64) ? { completedAt: sanitizeString(entry.completedAt, 64) } : {}),
+        ...(sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) ? { scopeLabel: sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) } : {}),
+        ...(durationHours ? { durationHours } : {}),
+        ...(sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) ? { bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) } : {}),
+        ...(sanitizeString(entry.justification, MAX_JUSTIFICATION_LENGTH) ? { justification: sanitizeString(entry.justification, MAX_JUSTIFICATION_LENGTH) } : {}),
+        ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {})
+      }
+    ];
+  });
+}
+
+function migrateActivationHistoryToActivity(value: unknown): ActivityHistoryEntry[] {
+  return sanitizeActivationHistory(value).map((entry) => ({
+    id: entry.id,
+    action: "activate",
+    result: "success",
+    itemId: entry.itemId,
+    itemName: entry.itemName,
+    itemType: entry.itemType,
+    requestedAt: entry.activatedAt,
+    completedAt: entry.activatedAt,
+    ...(entry.bundleName ? { bundleName: entry.bundleName } : {})
+  }));
+}
+
 function sanitizeStringList(value: unknown, maxItems: number, maxLength: number): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -455,6 +573,19 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 
 function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
   return Math.round(clampNumber(value, min, max, fallback));
+}
+
+function clampOptionalNumber(value: unknown, min: number, max: number): number | undefined {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return undefined;
+  }
+  return Math.min(max, Math.max(min, numberValue));
+}
+
+function inferItemType(itemId: string): ActivationItem["type"] {
+  const [type] = itemId.split(":");
+  return isActivationItemType(type) ? type : "directoryRole";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

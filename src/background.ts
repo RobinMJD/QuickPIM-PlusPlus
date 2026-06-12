@@ -13,6 +13,34 @@ import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrl
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./lib/apiErrors";
 import { mapWithConcurrency } from "./lib/concurrency";
 import {
+  buildFeatureCacheKey,
+  getEnabledRoleFeatures,
+  loadSettings,
+  SETTINGS_KEY
+} from "./lib/settings";
+import {
+  loadReferenceData,
+  learnReferenceDataFromItems,
+  saveReferenceData
+} from "./lib/referenceData";
+import {
+  loadDataCache,
+  saveDataCache,
+  splitActivationResultByTarget,
+  updateCacheFromTargetResults
+} from "./lib/cache";
+import {
+  buildTargetCacheKeys,
+  buildTokenCacheKey,
+  classifyAccessFailure
+} from "./lib/access";
+import {
+  PRE_REFRESH_ALARM_NAME,
+  getPreRefreshTargets,
+  shouldSkipPreRefresh,
+  syncPreRefreshAlarm
+} from "./lib/preRefresh";
+import {
   getRequiredGraphActivationScopes,
   getGraphTokenOverallScore,
   getGraphTokenTargetScore,
@@ -30,6 +58,13 @@ import {
   validateCapturedToken
 } from "./lib/security";
 import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
+import {
+  clearStoredTokens,
+  getStoredTokensFromSession,
+  removeStoredTokenKeys,
+  setStoredTokensInSession,
+  type StoredTokens
+} from "./lib/tokenStorage";
 import type {
   ActivationItem,
   ActivationDataResult,
@@ -48,21 +83,6 @@ import type {
   TokenKind,
   TokenStatus
 } from "./lib/types";
-
-interface StoredTokens {
-  graphToken?: string;
-  tokenTimestamp?: number;
-  tokenSource?: string;
-  graphDirectoryRoleToken?: string;
-  graphDirectoryRoleTokenTimestamp?: number;
-  graphDirectoryRoleTokenSource?: string;
-  graphPimGroupToken?: string;
-  graphPimGroupTokenTimestamp?: number;
-  graphPimGroupTokenSource?: string;
-  azureManagementToken?: string;
-  azureManagementTokenTimestamp?: number;
-  azureManagementTokenSource?: string;
-}
 
 type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
 interface AzureRoleDefinitionResponse {
@@ -83,11 +103,48 @@ interface AzureRoleDefinitionInfo {
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
 const TOKEN_KINDS: TokenKind[] = ["graph", "azureManagement"];
 
+const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
+  directoryRole: {
+    eligible: "Entra role eligibility",
+    active: "Entra role active assignments"
+  },
+  pimGroup: {
+    eligible: "PIM group eligibility",
+    active: "PIM group active assignments"
+  },
+  azureRole: {
+    eligible: "Azure role eligibility",
+    active: "Azure role active assignments"
+  }
+};
+
 chrome.webRequest.onSendHeaders.addListener(
   (details) => captureToken(details),
   { urls: ["https://graph.microsoft.com/*", "https://management.azure.com/*"] },
   REQUEST_HEADER_OPTIONS
 );
+
+void initializeBackgroundRefresh();
+
+chrome.runtime.onInstalled?.addListener(() => {
+  void initializeBackgroundRefresh();
+});
+
+chrome.runtime.onStartup?.addListener(() => {
+  void initializeBackgroundRefresh();
+});
+
+chrome.storage.onChanged?.addListener((changes, areaName) => {
+  if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
+    void initializeBackgroundRefresh();
+  }
+});
+
+chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (alarm.name === PRE_REFRESH_ALARM_NAME) {
+    void runBackgroundPreRefresh();
+  }
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isTrustedRuntimeSender(sender)) {
@@ -111,6 +168,85 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
   return true;
 });
+
+async function initializeBackgroundRefresh(): Promise<void> {
+  if (!chrome.alarms) {
+    return;
+  }
+  try {
+    const settings = await loadSettings();
+    await syncPreRefreshAlarm(chrome.alarms, settings.preferences.backgroundPreRefreshEnabled);
+  } catch {
+    await syncPreRefreshAlarm(chrome.alarms, true);
+  }
+}
+
+async function runBackgroundPreRefresh(): Promise<void> {
+  const settings = await loadSettings();
+  if (!settings.preferences.backgroundPreRefreshEnabled) {
+    await syncPreRefreshAlarm(chrome.alarms, false);
+    return;
+  }
+
+  const tokenStatus = await getTokenStatus();
+  if (shouldSkipPreRefresh(tokenStatus)) {
+    return;
+  }
+
+  const enabledRoleFeatures = getEnabledRoleFeatures(settings);
+  const dataCache = await loadDataCache();
+  const targets = getPreRefreshTargets({
+    cache: dataCache,
+    enabledTargets: enabledRoleFeatures,
+    tokenStatus
+  });
+  if (!targets.length) {
+    return;
+  }
+
+  const snapshot = await getActivationSnapshot(targets);
+  const fetchedAt = Date.now();
+  const targetCacheKeys = buildTargetCacheKeys(tokenStatus, enabledRoleFeatures);
+  let nextCache = updateCacheFromTargetResults(
+    dataCache,
+    "eligible",
+    targets,
+    snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, targets),
+    fetchedAt,
+    targetCacheKeys
+  );
+  nextCache = updateCacheFromTargetResults(
+    nextCache,
+    "active",
+    targets,
+    snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, targets),
+    fetchedAt,
+    targetCacheKeys
+  );
+
+  const tokenCacheKey = buildTokenCacheKey(tokenStatus);
+  const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
+  nextCache = {
+    ...nextCache,
+    eligible: {
+      items: snapshot.eligible.items,
+      errors: snapshot.eligible.errors,
+      diagnostics: snapshot.eligible.diagnostics,
+      fetchedAt,
+      cacheKey: legacyCacheKey
+    },
+    active: {
+      items: snapshot.active.items,
+      errors: snapshot.active.errors,
+      diagnostics: snapshot.active.diagnostics,
+      fetchedAt,
+      cacheKey: legacyCacheKey
+    }
+  };
+  await saveDataCache(nextCache);
+  const referenceData = learnReferenceDataFromItems(await loadReferenceData(), [...snapshot.eligible.items, ...snapshot.active.items]);
+  await saveReferenceData(referenceData);
+}
 
 async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender): Promise<unknown> {
   switch (message.action) {
@@ -210,7 +346,7 @@ async function storeCapturedToken(tokenKind: TokenKind, token: string, source: s
     }
   }
 
-  await chrome.storage.local.set({
+  await setStoredTokensInSession({
     azureManagementToken: token,
     azureManagementTokenTimestamp: timestamp,
     azureManagementTokenSource: source
@@ -243,7 +379,7 @@ async function storeCapturedGraphToken(
     return false;
   }
 
-  await chrome.storage.local.set(updates);
+  await setStoredTokensInSession(updates);
   return true;
 }
 
@@ -320,42 +456,16 @@ function getTokenCaptureScore(decoded: Record<string, unknown>, tokenKind: Token
 }
 
 async function getStoredTokens(): Promise<StoredTokens> {
-  return chrome.storage.local.get([
-    "graphToken",
-    "tokenTimestamp",
-    "tokenSource",
-    "graphDirectoryRoleToken",
-    "graphDirectoryRoleTokenTimestamp",
-    "graphDirectoryRoleTokenSource",
-    "graphPimGroupToken",
-    "graphPimGroupTokenTimestamp",
-    "graphPimGroupTokenSource",
-    "azureManagementToken",
-    "azureManagementTokenTimestamp",
-    "azureManagementTokenSource"
-  ]);
+  return getStoredTokensFromSession();
 }
 
 async function clearTokens(): Promise<void> {
-  await chrome.storage.local.remove([
-    "graphToken",
-    "tokenTimestamp",
-    "tokenSource",
-    "graphDirectoryRoleToken",
-    "graphDirectoryRoleTokenTimestamp",
-    "graphDirectoryRoleTokenSource",
-    "graphPimGroupToken",
-    "graphPimGroupTokenTimestamp",
-    "graphPimGroupTokenSource",
-    "azureManagementToken",
-    "azureManagementTokenTimestamp",
-    "azureManagementTokenSource"
-  ]);
+  await clearStoredTokens();
 }
 
 async function clearTokenKind(tokenKind: "graph" | "azureManagement"): Promise<void> {
   if (tokenKind === "graph") {
-    await chrome.storage.local.remove([
+    await removeStoredTokenKeys([
       "graphToken",
       "tokenTimestamp",
       "tokenSource",
@@ -369,7 +479,7 @@ async function clearTokenKind(tokenKind: "graph" | "azureManagement"): Promise<v
     return;
   }
 
-  await chrome.storage.local.remove([
+  await removeStoredTokenKeys([
     "azureManagementToken",
     "azureManagementTokenTimestamp",
     "azureManagementTokenSource"
@@ -464,9 +574,9 @@ function selectGraphTokenForStatus(tokens: StoredTokens): { token?: string; time
 async function getActivationItems(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
   const tokens = await getStoredTokens();
   const fetchers: Record<AccessSetupTarget, () => Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }>> = {
-    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getDirectoryRoles),
-    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getAzureRoles),
-    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getPimGroups)
+    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getDirectoryRoles, "eligible"),
+    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getAzureRoles, "eligible"),
+    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getPimGroups, "eligible")
   };
   const results = await Promise.all(targets.map((target) => fetchers[target]()));
 
@@ -480,9 +590,9 @@ async function getActivationItems(targets: AccessSetupTarget[] = ["directoryRole
 async function getActiveItems(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<{ items: ActivationItem[]; errors: string[]; diagnostics: AccessDiagnostic[] }> {
   const tokens = await getStoredTokens();
   const fetchers: Record<AccessSetupTarget, () => Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }>> = {
-    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getActiveDirectoryRoles),
-    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getActiveAzureRoles),
-    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getActivePimGroups)
+    directoryRole: () => fetchItemGroup("directoryRole", "graph", getGraphTokenForTarget(tokens, "directoryRole"), getActiveDirectoryRoles, "active"),
+    azureRole: () => fetchItemGroup("azureRole", "azureManagement", tokens.azureManagementToken, getActiveAzureRoles, "active"),
+    pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getActivePimGroups, "active")
   };
   const results = await Promise.all(targets.map((target) => fetchers[target]()));
 
@@ -543,8 +653,8 @@ async function fetchSnapshotGroup(
     const error = tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.";
     return {
       target,
-      eligible: makeSnapshotData(target, [], error),
-      active: makeSnapshotData(target, [], error)
+      eligible: makeSnapshotData(target, [], error, "eligible"),
+      active: makeSnapshotData(target, [], error, "active")
     };
   }
 
@@ -552,20 +662,20 @@ async function fetchSnapshotGroup(
     const [eligibleItems, activeItems] = await fetcher(token);
     return {
       target,
-      eligible: makeSnapshotData(target, eligibleItems),
-      active: makeSnapshotData(target, activeItems)
+      eligible: makeSnapshotData(target, eligibleItems, undefined, "eligible"),
+      active: makeSnapshotData(target, activeItems, undefined, "active")
     };
   } catch (error) {
     const sanitized = sanitizeErrorMessage(error);
     return {
       target,
-      eligible: makeSnapshotData(target, [], sanitized),
-      active: makeSnapshotData(target, [], sanitized)
+      eligible: makeSnapshotData(target, [], sanitized, "eligible"),
+      active: makeSnapshotData(target, [], sanitized, "active")
     };
   }
 }
 
-function makeSnapshotData(target: AccessSetupTarget, items: ActivationItem[], error?: string): ActivationDataResult {
+function makeSnapshotData(target: AccessSetupTarget, items: ActivationItem[], error?: string, operation: "eligible" | "active" = "eligible"): ActivationDataResult {
   const checkedAt = new Date().toISOString();
   return {
     items,
@@ -574,7 +684,9 @@ function makeSnapshotData(target: AccessSetupTarget, items: ActivationItem[], er
       target,
       success: !error,
       checkedAt,
-      ...(error ? { error } : {})
+      operation,
+      endpointLabel: ENDPOINT_LABELS[target][operation],
+      ...(error ? { error, failureKind: classifyAccessFailure(error) } : {})
     }]
   };
 }
@@ -599,7 +711,8 @@ async function fetchItemGroup(
   target: AccessSetupTarget,
   tokenKind: TokenKind,
   token: string | undefined,
-  fetcher: (token: string) => Promise<ActivationItem[]>
+  fetcher: (token: string) => Promise<ActivationItem[]>,
+  operation: "eligible" | "active"
 ): Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }> {
   const checkedAt = new Date().toISOString();
   if (!token) {
@@ -610,7 +723,10 @@ async function fetchItemGroup(
         target,
         success: false,
         checkedAt,
-        error: tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing."
+        error: tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.",
+        operation,
+        endpointLabel: ENDPOINT_LABELS[target][operation],
+        failureKind: "missingToken"
       }
     };
   }
@@ -622,7 +738,9 @@ async function fetchItemGroup(
       diagnostic: {
         target,
         success: true,
-        checkedAt
+        checkedAt,
+        operation,
+        endpointLabel: ENDPOINT_LABELS[target][operation]
       }
     };
   } catch (error) {
@@ -634,7 +752,10 @@ async function fetchItemGroup(
         target,
         success: false,
         checkedAt,
-        error: sanitized
+        error: sanitized,
+        operation,
+        endpointLabel: ENDPOINT_LABELS[target][operation],
+        failureKind: classifyAccessFailure(sanitized)
       }
     };
   }

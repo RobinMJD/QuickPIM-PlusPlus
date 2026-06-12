@@ -8,6 +8,8 @@ export type TokenKind = "graph" | "azureManagement";
 export type AccessSetupTarget = ActivationItemType;
 export type AccessCapabilityStatus = "ready" | "needsPortalRefresh" | "limited";
 export type PopupRequestMode = "activate" | "deactivate";
+export type AccessDiagnosticOperation = "eligible" | "active" | "policy" | "nameLookup" | "activation" | "deactivation";
+export type AccessFailureKind = "missingToken" | "expiredToken" | "missingCapability" | "forbidden" | "claimsChallenge" | "network" | "unknown";
 
 export interface UsageStats {
   activationCount: number;
@@ -81,13 +83,35 @@ export interface ActivationHistoryEntry {
   activatedAt: string;
 }
 
+export type ActivityAction = "activate" | "deactivate";
+export type ActivityResult = "success" | "failed" | "skipped";
+
+export interface ActivityHistoryEntry {
+  id: string;
+  action: ActivityAction;
+  result: ActivityResult;
+  itemId: string;
+  itemName: string;
+  itemType: ActivationItemType;
+  scopeLabel?: string;
+  requestedAt: string;
+  completedAt?: string;
+  durationHours?: number;
+  bundleName?: string;
+  justification?: string;
+  error?: string;
+}
+
 export interface QuickPimPreferences {
   defaultDurationHours: number;
   defaultSort: SortMode;
   recentJustificationLimit: number;
+  activityHistoryLimit: number;
   darkMode: boolean;
   showActivationCounters: boolean;
   showLastEnablementDate: boolean;
+  showAdvancedSettings: boolean;
+  backgroundPreRefreshEnabled: boolean;
   enabledFeatures: QuickPimFeature[];
   autoEnabledFeaturesInitialized?: boolean;
   hiddenPopupTabs?: PopupTab[];
@@ -118,6 +142,9 @@ export interface AccessDiagnostic {
   checkedAt: string;
   error?: string;
   fromCache?: boolean;
+  operation?: AccessDiagnosticOperation;
+  endpointLabel?: string;
+  failureKind?: AccessFailureKind;
 }
 
 export interface ReferenceValue {
@@ -136,13 +163,14 @@ export interface ReferenceDataCache {
 }
 
 export interface QuickPimSettings {
-  version: 1;
+  version: 2;
   aliasesByItemId: Record<string, string>;
   favoriteItemIds: string[];
   savedJustifications: string[];
   recentJustifications: string[];
   bundles: QuickPimBundle[];
   usageStatsByItemId: Record<string, UsageStats>;
+  activityHistory: ActivityHistoryEntry[];
   activationHistory: ActivationHistoryEntry[];
   preferences: QuickPimPreferences;
 }

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check version sync
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+          const manifest = JSON.parse(fs.readFileSync("public/manifest.json", "utf8"));
+          if (pkg.version !== lock.version || pkg.version !== lock.packages[""].version || pkg.version !== manifest.version) {
+            throw new Error(`Version mismatch: package=${pkg.version}, lock=${lock.version}, root=${lock.packages[""].version}, manifest=${manifest.version}`);
+          }
+          NODE
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Audit
+        run: npm audit --audit-level=low
+
+      - name: Package Web Store ZIP
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          mkdir -p release
+          (cd dist && zip -qr "../release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" . -x "*.DS_Store")
+
+      - name: Upload Web Store ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-webstore-zip
+          path: release/quickpim-plusplus-v*-chrome-webstore.zip
+          if-no-files-found: error
+
