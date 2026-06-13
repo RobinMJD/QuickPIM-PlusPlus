@@ -1817,8 +1817,8 @@ describe("popup compact controls", () => {
     expect(await renderWithCounterPreference(true)).toBeTruthy();
   });
 
-  test("hides last enablement dates by default and shows them as yyyy-MM-dd when enabled", async () => {
-    async function renderWithDatePreference(showLastEnablementDate: boolean) {
+  test("separates policy details from last enablement dates", async () => {
+    async function renderWithDetailPreferences(showEnablementDetails: boolean, showLastEnablementDate: boolean) {
       document.body.innerHTML = '<div id="root"></div>';
       const eligibleItem: ActivationItem = {
         id: "directoryRole:reader:/",
@@ -1829,13 +1829,20 @@ describe("popup compact controls", () => {
         scopeLabel: "Tenant",
         status: "eligible",
         roleDefinitionId: "reader",
-        directoryScopeId: "/"
+        directoryScopeId: "/",
+        activationRequirements: {
+          approval: true,
+          justification: true,
+          maxDurationHours: 4,
+          ticket: false
+        }
       };
       const storageData: Record<string, unknown> = {
         [SETTINGS_KEY]: {
           ...DEFAULT_SETTINGS,
           preferences: {
             ...DEFAULT_SETTINGS.preferences,
+            showEnablementDetails,
             showLastEnablementDate
           },
           usageStatsByItemId: {
@@ -1891,12 +1898,24 @@ describe("popup compact controls", () => {
       return document.body.textContent || "";
     }
 
-    expect(await renderWithDatePreference(false)).not.toContain("last enabled");
+    const hiddenText = await renderWithDetailPreferences(false, false);
+    expect(hiddenText).not.toContain("Max duration");
+    expect(hiddenText).not.toContain("Reason required");
+    expect(hiddenText).not.toContain("last enabled");
     const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
     cleanupWindow.__quickPimPopupUnmount?.();
     cleanupWindow.__quickPimPopupUnmount = undefined;
     vi.unstubAllGlobals();
-    const text = await renderWithDatePreference(true);
+    const policyText = await renderWithDetailPreferences(true, false);
+    expect(policyText).toContain("Max duration: 4 hours");
+    expect(policyText).toContain("Reason required");
+    expect(policyText).not.toContain("last enabled");
+    const policyCleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
+    policyCleanupWindow.__quickPimPopupUnmount?.();
+    policyCleanupWindow.__quickPimPopupUnmount = undefined;
+    vi.unstubAllGlobals();
+    const text = await renderWithDetailPreferences(false, true);
+    expect(text).not.toContain("Max duration");
     expect(text).toContain("last enabled 2026-06-12");
     expect(text).not.toContain("6/12/2026");
   });

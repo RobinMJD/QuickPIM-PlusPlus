@@ -1055,6 +1055,7 @@ function PopupApp() {
               favoriteIds={favoriteIds}
               requestMode={requestMode}
               showActivationCounters={settings.preferences.showActivationCounters}
+              showEnablementDetails={settings.preferences.showEnablementDetails}
               showLastEnablementDate={settings.preferences.showLastEnablementDate}
               onToggle={toggleSelected}
               onToggleFavorite={(itemId) => void toggleFavorite(itemId)}
@@ -1289,6 +1290,7 @@ function RoleList({
   favoriteIds,
   requestMode,
   showActivationCounters,
+  showEnablementDetails,
   showLastEnablementDate,
   onToggle,
   onToggleFavorite,
@@ -1301,6 +1303,7 @@ function RoleList({
   favoriteIds: Set<string>;
   requestMode?: PopupRequestMode;
   showActivationCounters: boolean;
+  showEnablementDetails: boolean;
   showLastEnablementDate: boolean;
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
@@ -1323,7 +1326,7 @@ function RoleList({
         const isFavorite = favoriteIds.has(item.id);
         const statusTitle = getActivationStatusTitle(item);
         const lastEnabledDate = showLastEnablementDate ? formatDateOnly(usage.lastUsedAt) : "";
-        const policySummary = getRowPolicySummary(item);
+        const policySummary = showEnablementDetails ? getRowPolicySummary(item) : [];
         const rowTitle = actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
         const body = (
           <>

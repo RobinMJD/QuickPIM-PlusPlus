@@ -1353,8 +1353,8 @@ function PreferencesPanel({
   const [activityHistoryLimit, setActivityHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
   const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
   const [showActivationCounters, setShowActivationCounters] = useState(settings.preferences.showActivationCounters);
+  const [showEnablementDetails, setShowEnablementDetails] = useState(settings.preferences.showEnablementDetails);
   const [showLastEnablementDate, setShowLastEnablementDate] = useState(settings.preferences.showLastEnablementDate);
-  const [showAdvancedSettings, setShowAdvancedSettings] = useState(settings.preferences.showAdvancedSettings);
   const [backgroundPreRefreshEnabled, setBackgroundPreRefreshEnabled] = useState(settings.preferences.backgroundPreRefreshEnabled);
   const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
 
@@ -1365,8 +1365,8 @@ function PreferencesPanel({
     setActivityHistoryLimit(settings.preferences.activityHistoryLimit);
     setDarkMode(settings.preferences.darkMode);
     setShowActivationCounters(settings.preferences.showActivationCounters);
+    setShowEnablementDetails(settings.preferences.showEnablementDetails);
     setShowLastEnablementDate(settings.preferences.showLastEnablementDate);
-    setShowAdvancedSettings(settings.preferences.showAdvancedSettings);
     setBackgroundPreRefreshEnabled(settings.preferences.backgroundPreRefreshEnabled);
     setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
   }, [
@@ -1378,7 +1378,7 @@ function PreferencesPanel({
     settings.preferences.enabledFeatures,
     settings.preferences.recentJustificationLimit,
     settings.preferences.showActivationCounters,
-    settings.preferences.showAdvancedSettings,
+    settings.preferences.showEnablementDetails,
     settings.preferences.showLastEnablementDate
   ]);
 
@@ -1393,8 +1393,9 @@ function PreferencesPanel({
         activityHistoryLimit,
         darkMode,
         showActivationCounters,
+        showEnablementDetails,
         showLastEnablementDate,
-        showAdvancedSettings,
+        showAdvancedSettings: false,
         backgroundPreRefreshEnabled,
         enabledFeatures: [...enabledFeatures],
         autoEnabledFeaturesInitialized: true
@@ -1465,80 +1466,75 @@ function PreferencesPanel({
             <span className="muted">Use dark surfaces in the popup and settings.</span>
           </span>
         </label>
+      </div>
+      <div className="preference-section">
+        <h3>Advanced settings</h3>
+        <p className="muted">Optional detail, usage, and cache controls for users who want more visibility.</p>
         <label className="checkbox-option preference-toggle">
           <input
             type="checkbox"
-            checked={showAdvancedSettings}
-            onChange={(event) => setShowAdvancedSettings(event.target.checked)}
-            aria-label="Show advanced settings"
+            checked={showActivationCounters}
+            onChange={(event) => setShowActivationCounters(event.target.checked)}
+            aria-label="Show activation counters in popup"
           />
           <span>
-            <strong>Show advanced settings</strong>
+            <strong>Show activation counters</strong>
             <br />
-            <span className="muted">Reveal cache, diagnostics, usage, and background refresh controls.</span>
+            <span className="muted">Display the compact usage number on each popup row.</span>
           </span>
         </label>
-        {showAdvancedSettings ? (
-          <>
-            <label className="checkbox-option preference-toggle">
-              <input
-                type="checkbox"
-                checked={showActivationCounters}
-                onChange={(event) => setShowActivationCounters(event.target.checked)}
-                aria-label="Show activation counters in popup"
-              />
-              <span>
-                <strong>Show activation counters</strong>
-                <br />
-                <span className="muted">Display the compact usage number on each popup row.</span>
-              </span>
-            </label>
-            <label className="checkbox-option preference-toggle">
-              <input
-                type="checkbox"
-                checked={showLastEnablementDate}
-                onChange={(event) => setShowLastEnablementDate(event.target.checked)}
-                aria-label="Show last enablement date in popup"
-              />
-              <span>
-                <strong>Show last enablement date</strong>
-                <br />
-                <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
-              </span>
-            </label>
-          </>
-        ) : null}
-      </div>
-      {showAdvancedSettings ? (
-        <div className="preference-section">
-          <h3>Access & cache</h3>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={backgroundPreRefreshEnabled}
-              onChange={(event) => setBackgroundPreRefreshEnabled(event.target.checked)}
-              aria-label="Enable background pre-refresh"
-            />
-            <span>
-              <strong>Background pre-refresh</strong>
-              <br />
-              <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
-            </span>
-          </label>
-          <div className="field settings-field-gap">
-            <label>Activity history limit</label>
-            <input
-              className="input"
-              type="number"
-              min="10"
-              max="200"
-              value={activityHistoryLimit}
-              onChange={(event) => setActivityHistoryLimit(Number(event.target.value))}
-            />
-            <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
-          </div>
+        <label className="checkbox-option preference-toggle">
+          <input
+            type="checkbox"
+            checked={showEnablementDetails}
+            onChange={(event) => setShowEnablementDetails(event.target.checked)}
+            aria-label="Show enablement details in popup"
+          />
+          <span>
+            <strong>Show enablement details</strong>
+            <br />
+            <span className="muted">Display per-row policy details such as max duration, required reason, ticket, and approval.</span>
+          </span>
+        </label>
+        <label className="checkbox-option preference-toggle">
+          <input
+            type="checkbox"
+            checked={showLastEnablementDate}
+            onChange={(event) => setShowLastEnablementDate(event.target.checked)}
+            aria-label="Show last enablement date in popup"
+          />
+          <span>
+            <strong>Show last enablement date</strong>
+            <br />
+            <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
+          </span>
+        </label>
+        <label className="checkbox-option preference-toggle">
+          <input
+            type="checkbox"
+            checked={backgroundPreRefreshEnabled}
+            onChange={(event) => setBackgroundPreRefreshEnabled(event.target.checked)}
+            aria-label="Enable background pre-refresh"
+          />
+          <span>
+            <strong>Background pre-refresh</strong>
+            <br />
+            <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
+          </span>
+        </label>
+        <div className="field settings-field-gap">
+          <label>Activity history limit</label>
+          <input
+            className="input"
+            type="number"
+            min="10"
+            max="200"
+            value={activityHistoryLimit}
+            onChange={(event) => setActivityHistoryLimit(Number(event.target.value))}
+          />
+          <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
         </div>
-      ) : null}
+      </div>
       <div className="preference-section">
         <h3>Enabled features</h3>
         <p className="muted">Only enabled role features are fetched, shown in the popup, and checked by Access Setup. Empty enabled role tabs are still hidden automatically.</p>
@@ -1561,26 +1557,24 @@ function PreferencesPanel({
           Save preferences
         </button>
       </div>
-      {showAdvancedSettings ? (
-        <div className="panel">
-          <h3>Usage counters</h3>
-          {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
-            <div className="settings-row" key={id}>
-              <span>
-                {id}
-                <br />
-                <span className="muted">
-                  {stats.activationCount} activation(s)
-                  {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
-                </span>
+      <div className="panel">
+        <h3>Usage counters</h3>
+        {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
+          <div className="settings-row" key={id}>
+            <span>
+              {id}
+              <br />
+              <span className="muted">
+                {stats.activationCount} activation(s)
+                {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
               </span>
-            </div>
-          ))}
-          <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [], activityHistory: [] }, "Usage data reset.")}>
-            Reset usage data
-          </button>
-        </div>
-      ) : null}
+            </span>
+          </div>
+        ))}
+        <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [], activityHistory: [] }, "Usage data reset.")}>
+          Reset usage data
+        </button>
+      </div>
     </section>
   );
 }

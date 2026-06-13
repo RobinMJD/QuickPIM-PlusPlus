@@ -109,6 +109,7 @@ export interface QuickPimPreferences {
   activityHistoryLimit: number;
   darkMode: boolean;
   showActivationCounters: boolean;
+  showEnablementDetails: boolean;
   showLastEnablementDate: boolean;
   showAdvancedSettings: boolean;
   backgroundPreRefreshEnabled: boolean;

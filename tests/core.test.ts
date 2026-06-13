@@ -369,6 +369,7 @@ describe("settings helpers", () => {
         activityHistoryLimit: 999,
         darkMode: true,
         showActivationCounters: true,
+        showEnablementDetails: true,
         showLastEnablementDate: true,
         showAdvancedSettings: true,
         backgroundPreRefreshEnabled: false,
@@ -395,8 +396,9 @@ describe("settings helpers", () => {
       activityHistoryLimit: 200,
       darkMode: true,
       showActivationCounters: true,
+      showEnablementDetails: true,
       showLastEnablementDate: true,
-      showAdvancedSettings: true,
+      showAdvancedSettings: false,
       backgroundPreRefreshEnabled: false,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
@@ -404,10 +406,14 @@ describe("settings helpers", () => {
 
   test("hides popup row metadata by default while allowing explicit display preferences", () => {
     expect(DEFAULT_SETTINGS.preferences.showActivationCounters).toBe(false);
+    expect(DEFAULT_SETTINGS.preferences.showEnablementDetails).toBe(false);
     expect(DEFAULT_SETTINGS.preferences.showLastEnablementDate).toBe(false);
     expect(mergeSettings({ preferences: { showActivationCounters: true } as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(true);
-    expect(mergeSettings({ preferences: { showLastEnablementDate: true } as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(true);
+    expect(mergeSettings({ preferences: { showEnablementDetails: true } as QuickPimSettings["preferences"] }).preferences.showEnablementDetails).toBe(true);
+    expect(mergeSettings({ preferences: { showLastEnablementDate: true } as unknown as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(true);
+    expect(mergeSettings({ preferences: { showLastEnablementDate: true } as unknown as QuickPimSettings["preferences"] }).preferences.showEnablementDetails).toBe(false);
     expect(mergeSettings({ preferences: { showActivationCounters: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(false);
+    expect(mergeSettings({ preferences: { showEnablementDetails: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showEnablementDetails).toBe(false);
     expect(mergeSettings({ preferences: { showLastEnablementDate: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(false);
   });
 });
