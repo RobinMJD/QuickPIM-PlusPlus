@@ -19,6 +19,8 @@ export function makeTokenStatus(
 
   return {
     hasToken: true,
+    ...(typeof decoded?.tid === "string" ? { tenantId: decoded.tid } : {}),
+    ...(typeof decoded?.oid === "string" ? { principalId: decoded.oid } : {}),
     capturedAt: timestamp,
     tokenAge,
     expiresAt: expiresAtMs === undefined ? undefined : new Date(expiresAtMs).toISOString(),

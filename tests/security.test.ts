@@ -7,6 +7,7 @@ import {
   validateCapturedToken
 } from "../src/lib/security";
 import {
+  getGraphTokenAuthStrengthScore,
   getGraphTokenOverallScore,
   getGraphTokenTargetScore,
   getGraphTokenTargets,
@@ -44,7 +45,7 @@ describe("security allowlists and token validation", () => {
     expect(validateCapturedToken(makeToken({ aud: "https://evil.example", exp: Math.floor((now + 60_000) / 1000), oid: "user-1" }), "graph", now)).toMatchObject({
       ok: false
     });
-    expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now + 60_000) / 1000) }), "graph", now)).toMatchObject({ ok: true });
+    expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now + 60_000) / 1000), tid: undefined, oid: undefined }), "graph", now)).toMatchObject({ ok: false });
     expect(validateCapturedToken(makeToken({ aud: "https://graph.microsoft.com", exp: Math.floor((now - 60_000) / 1000), oid: "user-1" }), "graph", now)).toMatchObject({
       ok: false
     });
@@ -117,6 +118,25 @@ describe("Graph token capability detection", () => {
     expect(hasGraphActivationScope(activationToken, "pimGroup")).toBe(true);
     expect(getGraphTokenTargetScore(activationToken, "pimGroup")).toBeGreaterThan(getGraphTokenTargetScore(readOnlyToken, "pimGroup"));
   });
+
+  test("detects MFA and authentication-context claims on portal Graph tokens", () => {
+    const regularActivationToken = {
+      scp: "RoleAssignmentSchedule.ReadWrite.Directory",
+      exp: Math.floor((now + 60 * 60_000) / 1000)
+    };
+    const challengedActivationToken = {
+      ...regularActivationToken,
+      amr: ["fido", "rsa", "mfa"],
+      acrs: ["p1", "c1", "c2", "c3", "pfdr"]
+    };
+
+    expect(getGraphTokenTargetScore(challengedActivationToken, "directoryRole")).toBe(
+      getGraphTokenTargetScore(regularActivationToken, "directoryRole")
+    );
+    expect(getGraphTokenAuthStrengthScore(challengedActivationToken)).toBeGreaterThan(
+      getGraphTokenAuthStrengthScore(regularActivationToken)
+    );
+  });
 });
 
 describe("runtime message validation", () => {
@@ -135,9 +155,22 @@ describe("runtime message validation", () => {
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: "not-array" })).toThrow(/items/i);
-    expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(
-      /justification/i
-    );
+    expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(/between 1 and 100/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [{ id: "x", type: "unknown", principalId: "user", status: "eligible" }],
+      durationHours: 1,
+      justification: "Need access"
+    })).toThrow(/unsupported/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: Array.from({ length: 101 }, () => ({
+        id: "directoryRole:reader:/", type: "directoryRole", principalId: "user", status: "eligible",
+        roleDefinitionId: "reader", directoryScopeId: "/"
+      })),
+      durationHours: 1,
+      justification: "Need access"
+    })).toThrow(/100/i);
   });
 });
 
@@ -179,6 +212,6 @@ describe("activation request validation", () => {
 });
 
 function makeToken(payload: Record<string, unknown>): string {
-  const encodedPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const encodedPayload = btoa(JSON.stringify({ tid: "tenant-1", oid: "user-1", ...payload })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   return `header.${encodedPayload}.signature`;
 }

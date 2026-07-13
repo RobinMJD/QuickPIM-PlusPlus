@@ -22,3 +22,17 @@ export async function mapWithConcurrency<T, R>(
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
   return results;
 }
+
+export function mapWithConcurrencySettled<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<Array<PromiseSettledResult<R>>> {
+  return mapWithConcurrency(items, limit, async (item, index) => {
+    try {
+      return { status: "fulfilled", value: await mapper(item, index) } as const;
+    } catch (reason) {
+      return { status: "rejected", reason } as const;
+    }
+  });
+}

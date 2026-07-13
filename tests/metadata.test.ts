@@ -15,7 +15,7 @@ describe("versioning and extension manifest", () => {
     expect(packageLockJson.packages[""].name).toBe("quickpim-plusplus");
   });
 
-  test("keeps package, lockfile, and manifest versions in sync at v2.7.1", () => {
+  test("keeps package, lockfile, and manifest versions in sync at v2.8.0", () => {
     expect(packageJson.version).toBe(APP_VERSION);
     expect(packageLockJson.packages[""].version).toBe(APP_VERSION);
     expect(packageLockJson.version).toBe(APP_VERSION);
@@ -24,6 +24,7 @@ describe("versioning and extension manifest", () => {
 
   test("uses only required host permissions and an explicit extension CSP", () => {
     expect(manifest.permissions).toEqual(["storage", "webRequest", "alarms"]);
+    expect(manifest.minimum_chrome_version).toBe("102");
     expect(manifest.host_permissions).toEqual([
       "https://graph.microsoft.com/*",
       "https://management.azure.com/*",
@@ -42,6 +43,13 @@ describe("versioning and extension manifest", () => {
     expect(manifest.content_security_policy?.extension_pages).toContain("object-src 'none'");
     expect(manifest.content_security_policy?.extension_pages).toContain("connect-src 'self'");
     expect(manifest.content_security_policy?.extension_pages).toContain("https://api.github.com");
+    expect(manifest.content_security_policy?.extension_pages).toContain("default-src 'self'");
+    expect(manifest.content_security_policy?.extension_pages).toContain("style-src 'self'");
+    expect(manifest.content_security_policy?.extension_pages).toContain("img-src 'self' data:");
+    expect(manifest.content_security_policy?.extension_pages).toContain("frame-src 'none'");
+    expect(manifest.content_security_policy?.extension_pages).toContain("form-action 'none'");
+    const popupSource = readFileSync(resolve("src/popup/main.tsx"), "utf8");
+    expect(popupSource).not.toContain("style={{");
   });
 
   test("keeps build-only tooling out of production dependencies", () => {
@@ -60,7 +68,7 @@ describe("versioning and extension manifest", () => {
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
     expect(readme).toContain("Original author: Daniel Bradley");
-    expect(readme).toContain("v2.7.1");
+    expect(readme).toContain("v2.8.0");
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");

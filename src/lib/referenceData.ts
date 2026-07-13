@@ -22,7 +22,11 @@ export async function loadReferenceData(): Promise<ReferenceDataCache> {
 }
 
 export async function saveReferenceData(referenceData: ReferenceDataCache): Promise<void> {
-  await chrome.storage.local.set({ [REFERENCE_DATA_KEY]: mergeReferenceData(referenceData) });
+  const next = mergeReferenceData(referenceData);
+  const current = await loadReferenceData();
+  if (JSON.stringify(current) !== JSON.stringify(next)) {
+    await chrome.storage.local.set({ [REFERENCE_DATA_KEY]: next });
+  }
 }
 
 export async function clearReferenceData(): Promise<void> {
@@ -130,8 +134,8 @@ function applyReferenceDataToItem(item: ActivationItem, referenceData: Reference
 
   return {
     ...item,
-    ...(displayName ? { displayName, sourceName: displayName } : {}),
-    ...(scopeLabel ? { scopeLabel } : {})
+    ...(displayName ? { displayName } : {}),
+    ...(scopeLabel ? { scopeLabel, sourceScopeLabel: item.sourceScopeLabel || item.scopeLabel } : {})
   } as ActivationItem;
 }
 
@@ -150,6 +154,9 @@ function setReference(target: Record<string, ReferenceValue>, key: string | unde
   if (!safeKey || !safeName) {
     return;
   }
+  if (target[safeKey]?.name === safeName) {
+    return;
+  }
   target[safeKey] = { name: safeName, updatedAt };
 }
 
@@ -159,16 +166,18 @@ function sanitizeReferenceMap(value: unknown): Record<string, ReferenceValue> {
   }
 
   const entries = Object.entries(value)
-    .slice(0, MAX_REFERENCE_ITEMS)
     .flatMap(([key, entry]) => {
       if (!isRecord(entry)) {
         return [];
       }
       const safeKey = sanitizeString(key, MAX_REFERENCE_KEY_LENGTH);
       const safeName = sanitizeString(entry.name, MAX_REFERENCE_NAME_LENGTH);
-      const updatedAt = sanitizeString(entry.updatedAt, 64) || new Date(0).toISOString();
+      const rawUpdatedAt = sanitizeString(entry.updatedAt, 64);
+      const updatedAt = rawUpdatedAt && Number.isFinite(Date.parse(rawUpdatedAt)) ? new Date(rawUpdatedAt).toISOString() : new Date(0).toISOString();
       return safeKey && safeName ? [[safeKey, { name: safeName, updatedAt }] as const] : [];
-    });
+    })
+    .sort((a, b) => Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt))
+    .slice(0, MAX_REFERENCE_ITEMS);
   return Object.fromEntries(entries);
 }
 

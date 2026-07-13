@@ -6,6 +6,7 @@ const entry = (path: string) => new URL(path, import.meta.url).pathname;
 export default defineConfig({
   plugins: [react()],
   build: {
+    target: "chrome102",
     outDir: "dist",
     emptyOutDir: true,
     rollupOptions: {

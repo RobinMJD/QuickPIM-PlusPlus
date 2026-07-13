@@ -28,6 +28,7 @@ export interface BaseActivationItem {
   displayName: string;
   principalId: string;
   scopeLabel: string;
+  sourceScopeLabel?: string;
   status: ActivationStatus;
   activeUntil?: string;
   assignmentScheduleId?: string;
@@ -111,7 +112,6 @@ export interface QuickPimPreferences {
   showActivationCounters: boolean;
   showEnablementDetails: boolean;
   showLastEnablementDate: boolean;
-  showAdvancedSettings: boolean;
   backgroundPreRefreshEnabled: boolean;
   enabledFeatures: QuickPimFeature[];
   autoEnabledFeaturesInitialized?: boolean;
@@ -178,6 +178,8 @@ export interface QuickPimSettings {
 
 export interface TokenStatusEntry {
   hasToken: boolean;
+  tenantId?: string;
+  principalId?: string;
   capturedAt?: number;
   tokenAge?: number;
   expiresAt?: string;
@@ -204,6 +206,7 @@ export interface ActivationSnapshot {
   active: ActivationDataResult;
   eligibleByTarget?: Partial<Record<AccessSetupTarget, ActivationDataResult>>;
   activeByTarget?: Partial<Record<AccessSetupTarget, ActivationDataResult>>;
+  tokenStatus?: TokenStatus;
 }
 
 export interface ActivationRequest {
@@ -243,6 +246,13 @@ export interface DirectoryRoleApi {
   action?: string;
   status?: string;
   targetScheduleId?: string;
+  roleAssignmentScheduleId?: string;
+  roleEligibilityScheduleId?: string;
+  roleAssignmentOriginId?: string;
+  assignmentType?: string;
+  memberType?: string;
+  startDateTime?: string;
+  endDateTime?: string;
   scheduleInfo?: unknown;
   directoryScopeDisplayName?: string;
   directoryScope?: {
@@ -317,6 +327,7 @@ export interface AzureRoleApi {
     linkedRoleEligibilityScheduleInstanceId?: string;
     scope?: string;
     endDateTime?: string;
+    assignmentType?: string;
     expandedProperties?: {
       roleDefinition?: {
         id?: string;
@@ -343,6 +354,9 @@ export interface PimGroupApi {
   action?: string;
   status?: string;
   targetScheduleId?: string;
+  assignmentScheduleId?: string;
+  eligibilityScheduleId?: string;
+  assignmentType?: string;
   memberType?: string;
   endDateTime?: string;
   scheduleInfo?: {

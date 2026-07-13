@@ -1,8 +1,9 @@
 {
   "name": "QuickPIM++",
-  "version": "2.7.1",
+  "version": "2.8.0",
   "description": "Quickly view, select, group, and activate Microsoft Entra, Azure, and PIM group roles.",
   "manifest_version": 3,
+  "minimum_chrome_version": "102",
   "permissions": ["storage", "webRequest", "alarms"],
   "host_permissions": [
     "https://graph.microsoft.com/*",
@@ -11,7 +12,7 @@
     "https://api.github.com/*"
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; connect-src 'self' https://graph.microsoft.com https://management.azure.com https://api.github.com"
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'; connect-src 'self' https://graph.microsoft.com https://management.azure.com https://api.github.com"
   },
   "icons": {
     "16": "img/QuickPim16.png",

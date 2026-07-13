@@ -42,11 +42,11 @@ describe("Chrome Web Store publish script", () => {
   });
 
   test("classifies upload states from top-level and nested API payloads", () => {
-    expect(getUploadState({ uploadState: "UPLOAD_IN_PROGRESS" })).toBe("UPLOAD_IN_PROGRESS");
-    expect(getUploadState({ item: { uploadState: "SUCCESS" } })).toBe("SUCCESS");
-    expect(isUploadInProgress({ uploadState: "UPLOAD_IN_PROGRESS" })).toBe(true);
-    expect(isUploadSuccess({ uploadState: "SUCCESS" })).toBe(true);
-    expect(isUploadFailure({ uploadState: "FAILURE" })).toBe(true);
+    expect(getUploadState({ lastAsyncUploadState: "IN_PROGRESS" })).toBe("IN_PROGRESS");
+    expect(getUploadState({ item: { lastAsyncUploadState: "SUCCEEDED" } })).toBe("SUCCEEDED");
+    expect(isUploadInProgress({ lastAsyncUploadState: "IN_PROGRESS" })).toBe(true);
+    expect(isUploadSuccess({ lastAsyncUploadState: "SUCCEEDED" })).toBe(true);
+    expect(isUploadFailure({ lastAsyncUploadState: "FAILED" })).toBe(true);
   });
 
   test("redacts token-like text from API messages", () => {
@@ -61,8 +61,22 @@ describe("release workflow Chrome Web Store publishing", () => {
     const workflow = readFileSync(".github/workflows/release.yml", "utf8");
 
     expect(workflow).toContain("Publish to Chrome Web Store");
+    expect(workflow).toContain("environment: chrome-web-store");
     expect(workflow).toContain("CHROME_WEBSTORE_CLIENT_ID");
     expect(workflow).toContain("CHROME_WEBSTORE_REFRESH_TOKEN");
     expect(workflow).toContain("scripts/publish-chrome-webstore.mjs");
+    expect(workflow).toContain("npm test");
+    expect(workflow).toContain("npm audit --audit-level=low");
+    expect(workflow).not.toContain("--clobber");
+    for (const action of workflow.matchAll(/uses:\s+[^@\s]+@([^\s#]+)/g)) {
+      expect(action[1]).toMatch(/^[a-f0-9]{40}$/);
+    }
+  });
+
+  test("fails rather than silently skipping an unconfigured store deployment", () => {
+    const publisher = readFileSync("scripts/publish-chrome-webstore.mjs", "utf8");
+
+    expect(publisher).toContain("Missing required Chrome Web Store configuration");
+    expect(publisher).not.toContain("publish skipped");
   });
 });

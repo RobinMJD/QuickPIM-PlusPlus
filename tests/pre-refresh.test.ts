@@ -36,6 +36,12 @@ describe("background pre-refresh", () => {
     expect(alarms.clear).toHaveBeenCalledWith(PRE_REFRESH_ALARM_NAME);
   });
 
+  test("does not postpone an already-correct recurring alarm", async () => {
+    const alarms = makeAlarms({ name: PRE_REFRESH_ALARM_NAME, scheduledTime: now, periodInMinutes: PRE_REFRESH_PERIOD_MINUTES });
+    await syncPreRefreshAlarm(alarms, true);
+    expect(alarms.create).not.toHaveBeenCalled();
+  });
+
   test("skips pre-refresh when no valid tokens are available", () => {
     expect(shouldSkipPreRefresh({ graph: { hasToken: false }, azureManagement: { hasToken: false } })).toBe(true);
     expect(shouldSkipPreRefresh(tokenStatus)).toBe(false);
@@ -62,8 +68,9 @@ describe("background pre-refresh", () => {
   });
 });
 
-function makeAlarms(): ChromeAlarmsLike {
+function makeAlarms(existing?: chrome.alarms.Alarm): ChromeAlarmsLike {
   return {
+    get: vi.fn(async () => existing),
     create: vi.fn(async () => undefined),
     clear: vi.fn(async () => true)
   };

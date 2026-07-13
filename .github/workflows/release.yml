@@ -5,17 +5,31 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
-  github-release:
+  verify-package:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Checkout exact tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tagged commit is on main
+        run: |
+          git fetch origin main --no-tags
+          TAG_COMMIT="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          git merge-base --is-ancestor "$TAG_COMMIT" origin/main
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 24
           cache: npm
@@ -23,47 +37,90 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify tag and manifest version
-        run: |
-          node - <<'NODE'
-          const fs = require("fs");
-          const version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
-          const manifest = JSON.parse(fs.readFileSync("public/manifest.json", "utf8"));
-          if (pkg.version !== version || manifest.version !== version) {
-            throw new Error(`Tag/version mismatch: tag=${version}, package=${pkg.version}, manifest=${manifest.version}`);
-          }
-          NODE
+      - name: Verify tag and all version consumers
+        run: node scripts/check-version-sync.mjs
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Test
+        run: npm test
+
+      - name: Audit
+        run: npm audit --audit-level=low
 
       - name: Build
         run: npm run build
 
-      - name: Package Web Store ZIP
+      - name: Package and verify Web Store ZIP
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p release
-          (cd dist && zip -qr "../release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" . -x "*.DS_Store")
-          unzip -p "release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" manifest.json > /tmp/quickpim-manifest.json
-          node - <<'NODE'
-          const fs = require("fs");
-          const version = process.env.GITHUB_REF_NAME.replace(/^v/, "");
-          const manifest = JSON.parse(fs.readFileSync("/tmp/quickpim-manifest.json", "utf8"));
-          if (manifest.version !== version) {
-            throw new Error(`ZIP manifest version mismatch: expected ${version}, got ${manifest.version}`);
-          }
-          NODE
-
-      - name: Create or update GitHub release
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           ZIP="release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" "$ZIP" --title "QuickPIM++ $GITHUB_REF_NAME" --generate-notes
-          fi
+          (cd dist && zip -qr "../${ZIP}" . -x "*.DS_Store")
+          unzip -p "$ZIP" manifest.json > /tmp/quickpim-manifest.json
+          node -e 'const m=require("/tmp/quickpim-manifest.json"); if(m.version !== process.env.GITHUB_REF_NAME.slice(1)) throw new Error(`ZIP version ${m.version} does not match tag`);'
+
+      - name: Upload verified ZIP artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: chrome-webstore-zip-${{ github.ref_name }}
+          path: release/quickpim-plusplus-v*-chrome-webstore.zip
+          if-no-files-found: error
+
+  github-release:
+    needs: verify-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified ZIP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: chrome-webstore-zip-${{ github.ref_name }}
+          path: release
+
+      - name: Create immutable GitHub release asset
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
+          LOCAL="release/${ZIP}"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$ZIP"; then
+              mkdir -p /tmp/existing-release
+              gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$ZIP" --dir /tmp/existing-release
+              cmp "$LOCAL" "/tmp/existing-release/$ZIP" || { echo "Existing release asset differs; refusing to overwrite it." >&2; exit 1; }
+            else
+              gh release upload "$GITHUB_REF_NAME" "$LOCAL" --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" "$LOCAL" --repo "$GITHUB_REPOSITORY" --title "QuickPIM++ $GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+
+  chrome-web-store:
+    needs: [verify-package, github-release]
+    runs-on: ubuntu-latest
+    environment: chrome-web-store
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout publisher script
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+
+      - name: Download verified ZIP
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: chrome-webstore-zip-${{ github.ref_name }}
+          path: release
 
       - name: Publish to Chrome Web Store
         run: node scripts/publish-chrome-webstore.mjs

@@ -58,11 +58,12 @@ export function buildAccessCapabilityItems(
   cache: QuickPimDataCache | undefined,
   targets: AccessSetupTarget[] = ["directoryRole", "pimGroup", "azureRole"]
 ): AccessCapabilityItem[] {
-  const diagnostics = collectDiagnostics(cache);
-  const loadedTargets = collectLoadedTargets(cache);
-  return targets.map((target) =>
-    buildAccessCapabilityItem(target, tokenStatus, diagnostics.filter((item) => item.target === target), loadedTargets.has(target))
-  );
+  return targets.map((target) => {
+    const entries = getCurrentTargetEntries(cache, tokenStatus, target);
+    const diagnostics = entries.flatMap((entry) => entry.diagnostics || []).filter((item) => item.target === target);
+    const hasLoadedItems = entries.some((entry) => entry.items.some((item) => item.type === target));
+    return buildAccessCapabilityItem(target, tokenStatus, diagnostics, hasLoadedItems);
+  });
 }
 
 export function getAccessSetupTargets(items: AccessCapabilityItem[]): AccessSetupTarget[] {
@@ -165,7 +166,8 @@ function buildTokenCachePart(label: string, token: TokenStatusEntry | undefined)
   }
 
   const scopes = [...(token.grantedScopes || [])].sort((a, b) => a.localeCompare(b)).join(",");
-  return `${label}:${token.expiresAt || ""}:${scopes}`;
+  const identity = token.tenantId && token.principalId ? `${token.tenantId}:${token.principalId}:` : "";
+  return `${label}:${identity}${token.expiresAt || ""}:${scopes}`;
 }
 
 function buildAccessCapabilityItem(
@@ -203,6 +205,20 @@ function buildAccessCapabilityItem(
     };
   }
 
+  if (latestDiagnostic && !latestDiagnostic.success && isPermissionOrAuthFailure(latestDiagnostic.error)) {
+    return {
+      target,
+      label: TARGET_LABELS[target],
+      status: "limited",
+      detail: hasLoadedItems
+        ? "Cached data is available, but the latest Microsoft API check was blocked."
+        : "The portal token was captured, but this feature is still blocked by Microsoft API access.",
+      lastError: latestDiagnostic.error,
+      recommendedAction: getRecommendedAction(target, latestDiagnostic.failureKind || classifyAccessFailure(latestDiagnostic.error)),
+      ...diagnosticMetadata
+    };
+  }
+
   if (latestSuccess) {
     return {
       target,
@@ -220,18 +236,6 @@ function buildAccessCapabilityItem(
       label: TARGET_LABELS[target],
       status: "ready",
       detail: "Loaded eligible or active items.",
-      ...diagnosticMetadata
-    };
-  }
-
-  if (latestDiagnostic && !latestDiagnostic.success && isPermissionOrAuthFailure(latestDiagnostic.error)) {
-    return {
-      target,
-      label: TARGET_LABELS[target],
-      status: "limited",
-      detail: "The portal token was captured, but this feature is still blocked by Microsoft API access.",
-      lastError: latestDiagnostic.error,
-      recommendedAction: getRecommendedAction(target, latestDiagnostic.failureKind || classifyAccessFailure(latestDiagnostic.error)),
       ...diagnosticMetadata
     };
   }
@@ -339,25 +343,14 @@ function hasKnownScopes(token: TokenStatusEntry): boolean {
   return Boolean(token.grantedScopes?.length);
 }
 
-function collectDiagnostics(cache: QuickPimDataCache | undefined): AccessDiagnostic[] {
-  return [
-    cache?.eligible,
-    cache?.active,
-    ...Object.values(cache?.eligibleByTarget || {}),
-    ...Object.values(cache?.activeByTarget || {})
-  ].flatMap((entry) => entry?.diagnostics || []);
-}
-
-function collectLoadedTargets(cache: QuickPimDataCache | undefined): Set<AccessSetupTarget> {
-  return new Set(
-    [
-      cache?.eligible,
-      cache?.active,
-      ...Object.values(cache?.eligibleByTarget || {}),
-      ...Object.values(cache?.activeByTarget || {})
-    ]
-      .flatMap((entry) => entry?.items || [])
-      .map((item) => item.type)
+function getCurrentTargetEntries(
+  cache: QuickPimDataCache | undefined,
+  tokenStatus: TokenStatus | null | undefined,
+  target: AccessSetupTarget
+) {
+  const expectedCacheKey = buildTargetCacheKey(tokenStatus, target);
+  return [cache?.eligibleByTarget?.[target], cache?.activeByTarget?.[target]].filter(
+    (entry): entry is NonNullable<typeof entry> => Boolean(entry && entry.cacheKey === expectedCacheKey)
   );
 }
 

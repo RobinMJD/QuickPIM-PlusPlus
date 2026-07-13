@@ -5,11 +5,13 @@ import {
   createActivationHistoryEntries,
   expandBundle,
   getDisplayName,
+  mergeImportedSettings,
   mergeSettings,
   recordActivations,
   sortItems
 } from "../src/lib/settings";
 import {
+  buildActivationValidationRequest,
   buildDeactivationRequest,
   buildActivationRequest,
   buildRolePolicyRequirementMap,
@@ -371,7 +373,6 @@ describe("settings helpers", () => {
         showActivationCounters: true,
         showEnablementDetails: true,
         showLastEnablementDate: true,
-        showAdvancedSettings: true,
         backgroundPreRefreshEnabled: false,
         enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
@@ -398,10 +399,38 @@ describe("settings helpers", () => {
       showActivationCounters: true,
       showEnablementDetails: true,
       showLastEnablementDate: true,
-      showAdvancedSettings: false,
       backgroundPreRefreshEnabled: false,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
+    expect(imported.preferences).not.toHaveProperty("showAdvancedSettings");
+  });
+
+  test("preserves omitted sections when importing a partial settings object", () => {
+    const current: QuickPimSettings = {
+      ...baseSettings,
+      savedJustifications: ["Existing incident reason"],
+      preferences: { ...baseSettings.preferences, darkMode: true }
+    };
+    const imported = mergeImportedSettings(current, {
+      aliasesByItemId: { "directoryRole:reader:/": "Imported alias" }
+    });
+
+    expect(imported.aliasesByItemId).toEqual({ "directoryRole:reader:/": "Imported alias" });
+    expect(imported.savedJustifications).toEqual(["Existing incident reason"]);
+    expect(imported.preferences.darkMode).toBe(true);
+  });
+
+  test("drops empty imported bundles and repairs duplicate bundle identifiers", () => {
+    const imported = mergeSettings({
+      bundles: [
+        { id: "bundle:duplicate", name: "Empty", itemIds: [] },
+        { id: "bundle:duplicate", name: "First", itemIds: ["directoryRole:reader:/"] },
+        { id: "bundle:duplicate", name: "Second", itemIds: ["pimGroup:group-1:member"] }
+      ]
+    });
+
+    expect(imported.bundles.map((bundle) => bundle.name)).toEqual(["First", "Second"]);
+    expect(new Set(imported.bundles.map((bundle) => bundle.id)).size).toBe(2);
   });
 
   test("hides popup row metadata by default while allowing explicit display preferences", () => {
@@ -576,6 +605,47 @@ describe("activation request builders", () => {
     });
   });
 
+  test("builds a portal-style directory role activation validation payload", () => {
+    const request = buildActivationValidationRequest(
+      {
+        id: "directoryRole:hybrid:/",
+        type: "directoryRole",
+        sourceName: "Hybrid Identity Administrator",
+        displayName: "Hybrid Identity Administrator",
+        principalId: "user-1",
+        roleDefinitionId: "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3",
+        directoryScopeId: "/",
+        scopeLabel: "Tenant",
+        status: "eligible"
+      },
+      2,
+      "Need access",
+      {},
+      "2026-07-09T08:29:52.248Z"
+    );
+
+    expect(request).toMatchObject({
+      endpoint: "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleRequests",
+      method: "POST",
+      tokenKind: "graph",
+      body: {
+        action: "selfActivate",
+        directoryScopeId: "/",
+        isValidationOnly: true,
+        justification: "Need access {Activated using QuickPIM++}",
+        principalId: "user-1",
+        roleDefinitionId: "9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3",
+        scheduleInfo: {
+          expiration: {
+            duration: "PT120M",
+            type: "AfterDuration"
+          },
+          startDateTime: "2026-07-09T08:29:52.248Z"
+        }
+      }
+    });
+  });
+
   test("builds directory, Azure, and PIM group deactivation payloads", () => {
     const directoryRequest = buildDeactivationRequest(
       {
@@ -644,6 +714,29 @@ describe("activation request builders", () => {
         }
       }
     });
+
+    const azureInstanceOnlyRequest = buildDeactivationRequest(
+      {
+        id: "azureRole:reader:/subscriptions/sub-1",
+        type: "azureRole",
+        sourceName: "Reader",
+        displayName: "Reader",
+        principalId: "user-1",
+        roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/reader",
+        scope: "/subscriptions/sub-1",
+        scopeLabel: "Production",
+        status: "active",
+        assignmentScheduleInstanceId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentScheduleInstances/instance-2"
+      },
+      "",
+      {},
+      "2026-06-12T10:00:00.000Z",
+      "request-instance-only"
+    );
+    expect(azureInstanceOnlyRequest.body.properties).toMatchObject({
+      targetRoleAssignmentScheduleInstanceId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignmentScheduleInstances/instance-2"
+    });
+    expect(azureInstanceOnlyRequest.body.properties).not.toHaveProperty("targetRoleAssignmentScheduleId");
 
     const pimGroupRequest = buildDeactivationRequest(
       {

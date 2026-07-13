@@ -75,6 +75,9 @@ export function validateCapturedToken(token: string, tokenKind: TokenKind, now =
   if (!isAllowedAudience(decoded.aud, tokenKind)) {
     return { ok: false, reason: "Token audience does not match the requested API." };
   }
+  if (typeof decoded.tid !== "string" || !decoded.tid || typeof decoded.oid !== "string" || !decoded.oid) {
+    return { ok: false, reason: "Token does not contain a stable tenant and principal identity." };
+  }
 
   return { ok: true, decoded };
 }

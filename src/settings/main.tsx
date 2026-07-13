@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
@@ -25,11 +25,11 @@ import {
   getEnabledRoleFeatures,
   getScopeLabel,
   loadSettings,
+  mergeImportedSettings,
   mergeSettings,
   saveSettings
 } from "../lib/settings";
 import {
-  applyReferenceDataToItems,
   clearReferenceData,
   learnReferenceDataFromItems,
   loadReferenceData,
@@ -89,6 +89,13 @@ function SettingsApp() {
   const [exportText, setExportText] = useState("");
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
+  const [isSettingsReady, setIsSettingsReady] = useState(false);
+  const exportTextDirty = useRef(false);
+
+  function replaceExportText(value: string, dirty = false) {
+    exportTextDirty.current = dirty;
+    setExportText(value);
+  }
 
   useEffect(() => {
     void refresh();
@@ -105,7 +112,9 @@ function SettingsApp() {
       }
       const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
       setSettings(merged);
-      setExportText(JSON.stringify(merged, null, 2));
+      if (!exportTextDirty.current) {
+        replaceExportText(JSON.stringify(merged, null, 2));
+      }
     }
     storageChangeEvent.addListener(handleStorageChange);
     return () => storageChangeEvent.removeListener(handleStorageChange);
@@ -114,6 +123,13 @@ function SettingsApp() {
   useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
   }, [settings.preferences.darkMode]);
+
+  useEffect(() => {
+    if (!isSettingsReady) {
+      return;
+    }
+    setItems((current) => applyDisplayData(current, settings, referenceData));
+  }, [isSettingsReady, referenceData, settings.aliasesByItemId]);
 
   useEffect(() => {
     function handleHashChange() {
@@ -130,27 +146,37 @@ function SettingsApp() {
     }
     setError("");
     try {
-      const [loadedSettings, loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
-        loadSettings(),
+      const loadedSettings = await loadSettings();
+      setSettings(loadedSettings);
+      if (!exportTextDirty.current) {
+        replaceExportText(JSON.stringify(loadedSettings, null, 2));
+      }
+      setIsSettingsReady(true);
+      const [loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
         sendMessage<TokenStatus>({ action: "getTokenStatus" }),
         loadDataCache(),
         loadReferenceData()
       ]);
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
-      const targetCacheKeys = buildTargetCacheKeys(loadedTokens, enabledRoleFeatures);
-      const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
+      let effectiveTokenStatus = loadedTokens;
+      let targetCacheKeys = buildTargetCacheKeys(effectiveTokenStatus, enabledRoleFeatures);
+      let legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
       let nextCache = loadedCache;
       if (options.showProgress && enabledRoleFeatures.length) {
         const snapshot = await fetchActivationSnapshot(enabledRoleFeatures);
         const fetchedAt = Date.now();
+        effectiveTokenStatus = snapshot.tokenStatus || loadedTokens;
+        const snapshotTargetCacheKeys = buildTargetCacheKeys(effectiveTokenStatus, enabledRoleFeatures);
+        targetCacheKeys = snapshotTargetCacheKeys;
+        legacyCacheKey = buildFeatureCacheKey(buildTokenCacheKey(effectiveTokenStatus), enabledRoleFeatures);
         nextCache = updateCacheFromTargetResults(
           nextCache,
           "eligible",
           enabledRoleFeatures,
           snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, enabledRoleFeatures),
           fetchedAt,
-          targetCacheKeys
+          snapshotTargetCacheKeys
         );
         nextCache = updateCacheFromTargetResults(
           nextCache,
@@ -158,7 +184,7 @@ function SettingsApp() {
           enabledRoleFeatures,
           snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, enabledRoleFeatures),
           fetchedAt,
-          targetCacheKeys
+          snapshotTargetCacheKeys
         );
         await saveDataCache(nextCache);
       }
@@ -175,10 +201,12 @@ function SettingsApp() {
       await saveReferenceData(nextReferenceData);
       setSettings(loadedSettings);
       setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
-      setTokenStatus(loadedTokens);
+      setTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
-      setExportText(JSON.stringify(loadedSettings, null, 2));
+      if (!exportTextDirty.current) {
+        replaceExportText(JSON.stringify(loadedSettings, null, 2));
+      }
       if (options.showProgress) {
         setMessage(
           eligible.items.length
@@ -207,7 +235,6 @@ function SettingsApp() {
       const tokenCacheKey = buildTokenCacheKey(latestTokens);
       const enabledRoleFeatures = getEnabledRoleFeatures(settings);
       const refreshTargets = normalizeRefreshTargets(targets?.length ? targets : enabledRoleFeatures, enabledRoleFeatures);
-      const targetCacheKeys = buildTargetCacheKeys(latestTokens, enabledRoleFeatures);
       const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
       const snapshot = refreshTargets.length
         ? await fetchActivationSnapshot(refreshTargets)
@@ -218,13 +245,15 @@ function SettingsApp() {
             activeByTarget: {}
           };
       const fetchedAt = Date.now();
+      const snapshotTokenStatus = snapshot.tokenStatus || latestTokens;
+      const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
       let nextCache = updateCacheFromTargetResults(
         dataCache,
         "eligible",
         refreshTargets,
         snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, refreshTargets),
         fetchedAt,
-        targetCacheKeys
+        snapshotTargetCacheKeys
       );
       nextCache = updateCacheFromTargetResults(
         nextCache,
@@ -232,16 +261,16 @@ function SettingsApp() {
         refreshTargets,
         snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, refreshTargets),
         fetchedAt,
-        targetCacheKeys
+        snapshotTargetCacheKeys
       );
       await saveDataCache(nextCache);
-      const eligibleCache = getTargetEntriesFromCache(nextCache, "eligible", enabledRoleFeatures, targetCacheKeys, {
+      const eligibleCache = getTargetEntriesFromCache(nextCache, "eligible", enabledRoleFeatures, snapshotTargetCacheKeys, {
         legacyCacheKey,
         now: fetchedAt,
         freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
         usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
       });
-      const activeCache = getTargetEntriesFromCache(nextCache, "active", enabledRoleFeatures, targetCacheKeys, {
+      const activeCache = getTargetEntriesFromCache(nextCache, "active", enabledRoleFeatures, snapshotTargetCacheKeys, {
         legacyCacheKey,
         now: fetchedAt,
         freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
@@ -250,11 +279,11 @@ function SettingsApp() {
       const active = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), fetchedAt, legacyCacheKey);
       const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [...eligible.items, ...active.items]);
       await saveReferenceData(nextReferenceData);
-      setTokenStatus(latestTokens);
+      setTokenStatus(snapshotTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
-      const limitedAreas = buildAccessCapabilityItems(latestTokens, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
+      const limitedAreas = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
       setMessage(
         limitedAreas
           ? `Access data refreshed. ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
@@ -269,26 +298,63 @@ function SettingsApp() {
   }
 
   async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
-    const merged = mergeSettings(next);
-    await saveSettings(merged);
-    setSettings(merged);
-    setExportText(JSON.stringify(merged, null, 2));
-    setMessage(successMessage);
+    if (!isSettingsReady) {
+      setError("Wait for saved settings to finish loading before making changes.");
+      return false;
+    }
+    try {
+      const latest = await loadSettings();
+      const mergedInput: QuickPimSettings = { ...latest };
+      for (const key of [
+        "aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles",
+        "usageStatsByItemId", "activityHistory", "activationHistory", "preferences"
+      ] as const) {
+        if (JSON.stringify(next[key]) !== JSON.stringify(settings[key])) {
+          (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
+        }
+      }
+      const merged = mergeSettings(mergedInput);
+      await saveSettings(merged);
+      setSettings(merged);
+      if (!exportTextDirty.current) {
+        replaceExportText(JSON.stringify(merged, null, 2));
+      }
+      setError("");
+      setMessage(successMessage);
+      return true;
+    } catch (saveError) {
+      setMessage("");
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+      return false;
+    }
   }
 
   async function clearCapturedTokens() {
-    await sendMessage<boolean>({ action: "clearToken" });
-    setTokenStatus({
-      graph: { hasToken: false },
-      azureManagement: { hasToken: false }
-    });
-    setMessage("Captured tokens cleared.");
+    try {
+      await sendMessage<boolean>({ action: "clearToken" });
+      setTokenStatus({
+        graph: { hasToken: false },
+        azureManagement: { hasToken: false }
+      });
+      setError("");
+      setMessage("Captured tokens cleared.");
+    } catch (clearError) {
+      setMessage("");
+      setError(clearError instanceof Error ? clearError.message : String(clearError));
+    }
   }
 
   async function clearLearnedReferences() {
-    await clearReferenceData();
-    setReferenceData(undefined);
-    setMessage("Learned names cleared.");
+    try {
+      await clearReferenceData();
+      setReferenceData(undefined);
+      setItems((current) => applyDisplayData(current, settings, undefined));
+      setError("");
+      setMessage("Learned names cleared.");
+    } catch (clearError) {
+      setMessage("");
+      setError(clearError instanceof Error ? clearError.message : String(clearError));
+    }
   }
 
   function selectTab(nextTab: SettingsTab) {
@@ -321,9 +387,9 @@ function SettingsApp() {
       </header>
 
       <section className="settings-content">
-        {error ? <p className="message error">{error}</p> : null}
-        {message ? <p className={message === "Settings saved." ? "message success" : "message"}>{message}</p> : null}
-        <div className="settings-layout">
+        {error ? <p className="message error" role="alert">{error}</p> : null}
+        {message ? <p className={message === "Settings saved." ? "message success" : "message"} role="status">{message}</p> : null}
+        <div className={`settings-layout ${isSettingsReady ? "" : "settings-loading"}`} aria-busy={!isSettingsReady}>
           <nav className="settings-nav" aria-label="Settings sections">
             {NAV_SECTIONS.map((section) => (
               <div className="settings-nav-group" key={section.title}>
@@ -360,9 +426,10 @@ function SettingsApp() {
               <DataPanel
                 settings={settings}
                 exportText={exportText}
-                setExportText={setExportText}
+                setExportText={replaceExportText}
                 onSave={persist}
                 onClearMessage={() => setMessage("")}
+                onError={setError}
               />
             ) : null}
             {tab === "diagnostics" ? <DiagnosticsPanel tokenStatus={tokenStatus} dataCache={dataCache} /> : null}
@@ -562,7 +629,7 @@ function AccessSetupPanel({
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
   isRefreshingAccess: boolean;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
   onRefreshAccessData: (tokens?: TokenStatus, targets?: AccessSetupTarget[]) => Promise<void>;
   onClearReferenceData: () => Promise<void>;
 }) {
@@ -691,7 +758,7 @@ function AccessSetupPanel({
             "Recheck now"
           )}
         </button>
-        <button className="btn danger" onClick={() => void onClearReferenceData()}>
+        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRefreshingAccess}>
           Clear learned names
         </button>
       </div>
@@ -793,7 +860,7 @@ function ActivityPanel({
   onSave
 }: {
   settings: QuickPimSettings;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
   const [search, setSearch] = useState("");
   const [actionFilter, setActionFilter] = useState<ActivityAction | "all">("all");
@@ -938,7 +1005,7 @@ function AliasesPanel({
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
   const [itemId, setItemId] = useState("");
   const [alias, setAlias] = useState("");
@@ -1014,7 +1081,7 @@ function JustificationsPanel({
   onSave
 }: {
   settings: QuickPimSettings;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
   const [value, setValue] = useState("");
   const [validationWarning, setValidationWarning] = useState("");
@@ -1145,7 +1212,7 @@ function BundlesPanel({
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
   const [name, setName] = useState("");
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
@@ -1345,7 +1412,7 @@ function PreferencesPanel({
   onSave
 }: {
   settings: QuickPimSettings;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
   const [defaultDurationHours, setDefaultDurationHours] = useState(settings.preferences.defaultDurationHours);
   const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
@@ -1357,8 +1424,12 @@ function PreferencesPanel({
   const [showLastEnablementDate, setShowLastEnablementDate] = useState(settings.preferences.showLastEnablementDate);
   const [backgroundPreRefreshEnabled, setBackgroundPreRefreshEnabled] = useState(settings.preferences.backgroundPreRefreshEnabled);
   const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
+  const [isDirty, setIsDirty] = useState(false);
 
   useEffect(() => {
+    if (isDirty) {
+      return;
+    }
     setDefaultDurationHours(settings.preferences.defaultDurationHours);
     setDefaultSort(settings.preferences.defaultSort);
     setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
@@ -1379,11 +1450,12 @@ function PreferencesPanel({
     settings.preferences.recentJustificationLimit,
     settings.preferences.showActivationCounters,
     settings.preferences.showEnablementDetails,
-    settings.preferences.showLastEnablementDate
+    settings.preferences.showLastEnablementDate,
+    isDirty
   ]);
 
   async function save() {
-    await onSave({
+    const saved = await onSave({
       ...settings,
       preferences: {
         ...settings.preferences,
@@ -1395,15 +1467,18 @@ function PreferencesPanel({
         showActivationCounters,
         showEnablementDetails,
         showLastEnablementDate,
-        showAdvancedSettings: false,
         backgroundPreRefreshEnabled,
         enabledFeatures: [...enabledFeatures],
         autoEnabledFeaturesInitialized: true
       }
     });
+    if (saved) {
+      setIsDirty(false);
+    }
   }
 
   function toggleFeature(feature: QuickPimFeature, enabled: boolean) {
+    setIsDirty(true);
     setEnabledFeatures((current) => {
       const next = new Set(current);
       if (enabled) {
@@ -1427,7 +1502,10 @@ function PreferencesPanel({
             <select
               className="select"
               value={String(defaultDurationHours)}
-              onChange={(event) => setDefaultDurationHours(Number(event.target.value))}
+              onChange={(event) => {
+                setDefaultDurationHours(Number(event.target.value));
+                setIsDirty(true);
+              }}
               aria-label="Default activation duration"
             >
               {DEFAULT_DURATION_OPTIONS.map((option) => (
@@ -1440,7 +1518,10 @@ function PreferencesPanel({
           </div>
           <div className="field">
             <label>Default sort order</label>
-            <select className="select" value={defaultSort} onChange={(event) => setDefaultSort(event.target.value as SortMode)}>
+            <select className="select" value={defaultSort} onChange={(event) => {
+              setDefaultSort(event.target.value as SortMode);
+              setIsDirty(true);
+            }}>
               <option value="name">Name</option>
               <option value="lastUsed">Last use</option>
               <option value="activationCount">Activation count</option>
@@ -1451,7 +1532,10 @@ function PreferencesPanel({
           </div>
           <div className="field">
             <label>Recent justification history limit</label>
-            <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => setRecentJustificationLimit(Number(event.target.value))} />
+            <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => {
+              setRecentJustificationLimit(Number(event.target.value));
+              setIsDirty(true);
+            }} />
             <p className="muted">How many recent reasons the picker keeps.</p>
           </div>
         </div>
@@ -1459,7 +1543,10 @@ function PreferencesPanel({
       <div className="preference-section">
         <h3>Display</h3>
         <label className="checkbox-option preference-toggle">
-          <input type="checkbox" checked={darkMode} onChange={(event) => setDarkMode(event.target.checked)} aria-label="Dark mode" />
+          <input type="checkbox" checked={darkMode} onChange={(event) => {
+            setDarkMode(event.target.checked);
+            setIsDirty(true);
+          }} aria-label="Dark mode" />
           <span>
             <strong>Dark mode</strong>
             <br />
@@ -1474,7 +1561,10 @@ function PreferencesPanel({
           <input
             type="checkbox"
             checked={showActivationCounters}
-            onChange={(event) => setShowActivationCounters(event.target.checked)}
+            onChange={(event) => {
+              setShowActivationCounters(event.target.checked);
+              setIsDirty(true);
+            }}
             aria-label="Show activation counters in popup"
           />
           <span>
@@ -1487,7 +1577,10 @@ function PreferencesPanel({
           <input
             type="checkbox"
             checked={showEnablementDetails}
-            onChange={(event) => setShowEnablementDetails(event.target.checked)}
+            onChange={(event) => {
+              setShowEnablementDetails(event.target.checked);
+              setIsDirty(true);
+            }}
             aria-label="Show enablement details in popup"
           />
           <span>
@@ -1500,7 +1593,10 @@ function PreferencesPanel({
           <input
             type="checkbox"
             checked={showLastEnablementDate}
-            onChange={(event) => setShowLastEnablementDate(event.target.checked)}
+            onChange={(event) => {
+              setShowLastEnablementDate(event.target.checked);
+              setIsDirty(true);
+            }}
             aria-label="Show last enablement date in popup"
           />
           <span>
@@ -1513,7 +1609,10 @@ function PreferencesPanel({
           <input
             type="checkbox"
             checked={backgroundPreRefreshEnabled}
-            onChange={(event) => setBackgroundPreRefreshEnabled(event.target.checked)}
+            onChange={(event) => {
+              setBackgroundPreRefreshEnabled(event.target.checked);
+              setIsDirty(true);
+            }}
             aria-label="Enable background pre-refresh"
           />
           <span>
@@ -1530,7 +1629,10 @@ function PreferencesPanel({
             min="10"
             max="200"
             value={activityHistoryLimit}
-            onChange={(event) => setActivityHistoryLimit(Number(event.target.value))}
+            onChange={(event) => {
+              setActivityHistoryLimit(Number(event.target.value));
+              setIsDirty(true);
+            }}
           />
           <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
         </div>
@@ -1584,25 +1686,38 @@ function DataPanel({
   exportText,
   setExportText,
   onSave,
-  onClearMessage
+  onClearMessage,
+  onError
 }: {
   settings: QuickPimSettings;
   exportText: string;
-  setExportText: (value: string) => void;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<void>;
+  setExportText: (value: string, dirty?: boolean) => void;
+  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
   onClearMessage: () => void;
+  onError: (message: string) => void;
 }) {
   async function importSettings() {
     onClearMessage();
-    const parsed = JSON.parse(exportText) as Partial<QuickPimSettings>;
-    await onSave(mergeSettings(parsed), "Settings imported.");
+    onError("");
+    try {
+      const parsed: unknown = JSON.parse(exportText);
+      if (!isSettingsImportObject(parsed)) {
+        throw new Error("Import JSON must be a QuickPIM++ settings object with at least one recognized section.");
+      }
+      const imported = mergeImportedSettings(settings, parsed);
+      if (await onSave(imported, "Settings imported.")) {
+        setExportText(JSON.stringify(imported, null, 2));
+      }
+    } catch (importError) {
+      onError(importError instanceof Error ? importError.message : String(importError));
+    }
   }
 
   return (
     <section className="panel">
       <h2>Import / Export</h2>
       <p className="muted">Settings are stored locally in Chrome storage under {SETTINGS_KEY}.</p>
-      <textarea className="textarea code-box" value={exportText} onChange={(event) => setExportText(event.target.value)} />
+      <textarea aria-label="QuickPIM++ settings JSON" className="textarea code-box" value={exportText} onChange={(event) => setExportText(event.target.value, true)} />
       <div className="button-row settings-form-actions">
         <button className="btn" onClick={() => setExportText(JSON.stringify(settings, null, 2))}>
           Refresh export
@@ -1610,12 +1725,25 @@ function DataPanel({
         <button className="btn primary" onClick={() => void importSettings()}>
           Import JSON
         </button>
-        <button className="btn danger" onClick={() => void onSave(DEFAULT_SETTINGS, "Settings reset.")}>
+        <button className="btn danger" onClick={() => void (async () => {
+          if (await onSave(DEFAULT_SETTINGS, "Settings reset.")) {
+            setExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2));
+          }
+        })()}>
           Reset all settings
         </button>
       </div>
     </section>
   );
+}
+
+function isSettingsImportObject(value: unknown): value is Partial<QuickPimSettings> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const keys = new Set(Object.keys(value));
+  return ["aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles", "usageStatsByItemId", "activityHistory", "preferences"]
+    .some((key) => keys.has(key));
 }
 
 function tabLabel(tab: SettingsTab): string {
@@ -1648,13 +1776,21 @@ function tabFromHash(): SettingsTab {
 function applyDisplayData(
   items: ActivationItem[],
   settings: QuickPimSettings,
-  referenceData: ReferenceDataCache
+  referenceData: ReferenceDataCache | undefined
 ): ActivationItem[] {
-  return applyReferenceDataToItems(items, referenceData).map((item) => ({
-    ...item,
-    displayName: getDisplayName(item, settings, referenceData),
-    scopeLabel: getScopeLabel(item, referenceData)
-  }));
+  return items.map((item) => {
+    const canonical = {
+      ...item,
+      displayName: item.sourceName,
+      scopeLabel: item.sourceScopeLabel || item.scopeLabel,
+      sourceScopeLabel: item.sourceScopeLabel || item.scopeLabel
+    } as ActivationItem;
+    return {
+      ...canonical,
+      displayName: getDisplayName(canonical, settings, referenceData),
+      scopeLabel: getScopeLabel(canonical, referenceData)
+    } as ActivationItem;
+  });
 }
 
 function getDuplicateBundleName(name: string, existingNames: string[]): string {

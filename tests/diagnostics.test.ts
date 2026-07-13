@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildAccessCapabilityItems,
+  buildTargetCacheKey,
   classifyAccessFailure,
   summarizeAccessDiagnostics
 } from "../src/lib/access";
@@ -61,6 +62,7 @@ describe("capability diagnostics", () => {
           items: [],
           errors: [],
           fetchedAt: Date.now(),
+          cacheKey: buildTargetCacheKey(tokenStatus, "pimGroup"),
           diagnostics: [
             {
               target: "pimGroup",
@@ -77,6 +79,7 @@ describe("capability diagnostics", () => {
           items: [],
           errors: ["PIM Groups access is limited in the captured portal token."],
           fetchedAt: Date.now(),
+          cacheKey: buildTargetCacheKey(tokenStatus, "pimGroup"),
           diagnostics: [
             {
               target: "pimGroup",

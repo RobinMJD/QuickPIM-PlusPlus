@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.7.1.
+Reviewed for v2.8.0.
 
 ## Threat Model
 
@@ -12,7 +12,8 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Legacy local token keys are migrated only after validation, copied to session storage for the current browser session, and removed from local storage. Invalid or expired legacy token values are removed without migration.
 - Session-stored tokens are cleared by Chrome when the browser session ends.
 - The GitHub changelog fetch is read-only public metadata and does not include captured tokens, settings, or local role data.
-- Tokens are validated before storage for API audience, parseable expiry, and non-expired status. Graph principal IDs are read from the token when present or resolved through Microsoft Graph `/me` when needed.
+- Tokens are validated before storage for API audience, parseable expiry, non-expired status, tenant ID, and principal ID. A token from another tenant or principal clears the previous session token set before it is stored.
+- Token capture, migration, replacement, and cleanup mutations are serialized. Cleanup removes an invalid token only if the stored value still matches the validated stale snapshot, so it cannot delete a token captured concurrently.
 - Expired or invalid stored tokens are cleared when detected.
 - Errors are redacted before being displayed or returned from the background worker.
 
@@ -32,11 +33,13 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Popup activation drafts are bounded, stored locally, expire after 24 hours, and are cleared when the in-progress selection is no longer useful.
 - Saved justifications, aliases, learned names, bundles, activity history, usage history, popup drafts, cached role data, and preferences remain local to the browser profile.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.
+- Cached role data is keyed by tenant, principal, token capability, and expiry so one signed-in identity cannot reuse another identity's PIM snapshot.
 
 ## Dependency And Repository Hygiene
 
 - Build tooling is kept in `devDependencies`.
-- `npm audit --audit-level=low` is part of the v2 verification checklist and GitHub Actions CI.
+- `npm audit --audit-level=low` is part of CI and the exact-tag release gate.
+- Release workflows pin third-party actions to immutable commit SHAs, rerun tests and audit, and refuse to overwrite a different existing release asset.
 - Generated build output, dependencies, and bundled tool runtimes remain ignored by git.
 
 ## Remaining Accepted Risks

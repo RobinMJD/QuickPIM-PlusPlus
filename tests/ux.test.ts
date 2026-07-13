@@ -8,7 +8,10 @@ import {
   getDataWithCache,
   getTargetCacheStatus,
   getTargetEntriesFromCache,
-  isCacheEntryFresh
+  isCacheEntryFresh,
+  mergeDataCachesForSave,
+  splitActivationResultByTarget,
+  updateCacheFromTargetResults
 } from "../src/lib/cache";
 import {
   ENTRA_PORTAL_URLS,
@@ -70,6 +73,73 @@ describe("popup cache helpers", () => {
       isCacheEntryFresh({ items: [], errors: [], fetchedAt: now - DEFAULT_ACTIVE_CACHE_TTL_MS - 1 }, DEFAULT_ACTIVE_CACHE_TTL_MS, now)
     ).toBe(false);
     expect(DEFAULT_ACTIVE_CACHE_TTL_MS).toBeGreaterThanOrEqual(10 * 60 * 1000);
+    expect(isCacheEntryFresh({ items: [], errors: [], fetchedAt: now + 10 * 60_000 }, DEFAULT_ACTIVE_CACHE_TTL_MS, now)).toBe(false);
+  });
+
+  test("preserves same-identity cached items when a forced target refresh fails", () => {
+    const now = Date.parse("2026-05-18T12:10:00.000Z");
+    const cache = updateCacheFromTargetResults(
+      {
+        eligibleByTarget: {
+          directoryRole: { items: [directoryRole], errors: [], fetchedAt: now - 60_000, cacheKey: "tenant-a" }
+        }
+      },
+      "eligible",
+      ["directoryRole"],
+      {
+        directoryRole: {
+          items: [],
+          errors: ["Graph request failed"],
+          diagnostics: [{ target: "directoryRole", success: false, checkedAt: new Date(now).toISOString(), error: "Graph request failed" }]
+        }
+      },
+      now,
+      { directoryRole: "tenant-a" }
+    );
+    expect(cache.eligibleByTarget?.directoryRole?.items).toEqual([directoryRole]);
+    expect(cache.eligibleByTarget?.directoryRole?.fetchedAt).toBe(now - 60_000);
+  });
+
+  test("preserves disjoint target refreshes when cache writers save different feature areas", () => {
+    const now = Date.parse("2026-05-18T12:10:00.000Z");
+    const merged = mergeDataCachesForSave(
+      {
+        eligibleByTarget: {
+          directoryRole: { items: [directoryRole], errors: [], fetchedAt: now, cacheKey: "tenant-a:user-a:directoryRole" }
+        }
+      },
+      {
+        eligibleByTarget: {
+          azureRole: { items: [azureRole], errors: [], fetchedAt: now + 1, cacheKey: "tenant-a:user-a:azureRole" }
+        }
+      }
+    );
+
+    expect(merged.eligibleByTarget?.directoryRole?.items).toEqual([directoryRole]);
+    expect(merged.eligibleByTarget?.azureRole?.items).toEqual([azureRole]);
+  });
+
+  test("replaces older cache entries when the captured identity changes", () => {
+    const current = { items: [directoryRole], errors: [], fetchedAt: 200, cacheKey: "tenant-a:user-a" };
+    const incoming = { items: [], errors: ["Missing token"], fetchedAt: 0, cacheKey: "tenant-b:user-b" };
+
+    expect(mergeDataCachesForSave({ eligible: current }, { eligible: incoming }).eligible).toEqual(incoming);
+  });
+
+  test("does not copy one feature failure into unrelated target results", () => {
+    const split = splitActivationResultByTarget(
+      {
+        items: [directoryRole],
+        errors: ["PIM Groups failed"],
+        diagnostics: [
+          { target: "directoryRole", success: true, checkedAt: "2026-05-18T12:00:00.000Z" },
+          { target: "pimGroup", success: false, checkedAt: "2026-05-18T12:00:00.000Z", error: "PIM Groups failed" }
+        ]
+      },
+      ["directoryRole", "pimGroup"]
+    );
+    expect(split.directoryRole?.errors).toEqual([]);
+    expect(split.pimGroup?.errors).toEqual(["PIM Groups failed"]);
   });
 
   test("formats cache age in minutes for status copy", () => {
@@ -350,7 +420,8 @@ describe("popup model helpers", () => {
 
     expect(mergeEligibleWithActive([directoryRole], [activeOnlyRole, activeOnlyPimGroup], { includeActiveOnly: true })).toEqual([
       directoryRole,
-      activeOnlyRole
+      activeOnlyRole,
+      activeOnlyPimGroup
     ]);
     expect(getDeactivatableItems([directoryRole, activeOnlyRole, { ...directoryRole, status: "pendingApproval" }])).toEqual([activeOnlyRole]);
   });

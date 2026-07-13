@@ -165,7 +165,7 @@ export function mergeEligibleWithActive(
   }
 
   const mergedIds = new Set(merged.map((item) => item.id));
-  const activeOnlyItems = activeItems.filter((item) => item.type !== "pimGroup" && !mergedIds.has(item.id));
+  const activeOnlyItems = activeItems.filter((item) => !mergedIds.has(item.id));
   return [...merged, ...activeOnlyItems];
 }
 
@@ -212,13 +212,16 @@ export function getRowActionState(item: ActivationItem | undefined): RowActionSt
     return { selectable: false, reason: "This request is pending approval." };
   }
   if (item.status === "active") {
-    if (item.assignmentScheduleId || item.assignmentScheduleInstanceId) {
+    const hasDisableTarget = item.type === "azureRole"
+      ? Boolean(item.assignmentScheduleId || item.assignmentScheduleInstanceId)
+      : Boolean(item.assignmentScheduleId);
+    if (hasDisableTarget) {
       return { mode: "deactivate", selectable: true };
     }
     return {
       mode: "deactivate",
       selectable: false,
-      reason: "Microsoft did not expose a schedule identifier needed to disable this active item."
+      reason: "Microsoft did not expose the schedule identifier needed to disable this active item."
     };
   }
   return { selectable: false, reason: "This item cannot be requested from here." };
@@ -295,12 +298,14 @@ export function getBundlePreflight(
   const durationHours = coerceDurationForItems(bundle.defaultDurationHours || strictestMaxDurationHours || BASE_DURATION_VALUES[0], readyItems);
   const needsJustification = requirements.needsJustification;
   const missingJustification = needsJustification && !(bundle.defaultJustification || justification).trim();
-  const isBlocked = !readyItems.length || missingJustification;
+  const isBlocked = !readyItems.length || missingJustification || requirements.needsTicket;
   const blockedReason = !readyItems.length
     ? "No bundle items are currently eligible."
     : missingJustification
       ? "A required justification is missing."
-      : undefined;
+      : requirements.needsTicket
+        ? "This bundle contains a ticket-required item. Use defaults, then enter the ticket details in the activation review."
+        : undefined;
 
   return {
     readyItems,

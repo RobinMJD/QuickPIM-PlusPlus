@@ -53,7 +53,7 @@ describe("popup action helpers", () => {
     expect(getRowActionState(blockedActiveRole)).toMatchObject({
       mode: "deactivate",
       selectable: false,
-      reason: "Microsoft did not expose a schedule identifier needed to disable this active item."
+      reason: "Microsoft did not expose the schedule identifier needed to disable this active item."
     });
     expect(getRowActionState(pendingRole)).toMatchObject({
       selectable: false,

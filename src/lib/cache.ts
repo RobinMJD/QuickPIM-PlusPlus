@@ -6,6 +6,8 @@ export const DEFAULT_ACTIVE_CACHE_TTL_MS = 10 * 60 * 1000;
 export const STALE_ELIGIBLE_CACHE_TTL_MS = 60 * 60 * 1000;
 export const CACHE_TARGETS: AccessSetupTarget[] = ["directoryRole", "pimGroup", "azureRole"];
 
+let dataCacheMutationQueue: Promise<void> = Promise.resolve();
+
 type CacheBucket = "eligible" | "active";
 
 export interface TargetCacheStatus {
@@ -21,7 +23,14 @@ export function isCacheEntryFresh(
   now = Date.now(),
   cacheKey?: string
 ): entry is CachedActivationEntry {
-  return Boolean(entry && now - entry.fetchedAt < ttlMs && (cacheKey === undefined || entry.cacheKey === cacheKey));
+  const age = entry ? now - entry.fetchedAt : Number.POSITIVE_INFINITY;
+  return Boolean(
+    entry &&
+      Number.isFinite(entry.fetchedAt) &&
+      age >= -5 * 60 * 1000 &&
+      age < ttlMs &&
+      (cacheKey === undefined || entry.cacheKey === cacheKey)
+  );
 }
 
 export function formatCacheAge(fetchedAt: number | undefined, now = Date.now()): string {
@@ -48,11 +57,27 @@ export async function loadDataCache(): Promise<QuickPimDataCache> {
 }
 
 export async function saveDataCache(cache: QuickPimDataCache): Promise<void> {
-  await chrome.storage.local.set({ [DATA_CACHE_KEY]: cache });
+  const mutation = dataCacheMutationQueue.then(async () => {
+    const current = await loadDataCache();
+    await chrome.storage.local.set({ [DATA_CACHE_KEY]: mergeDataCachesForSave(current, cache) });
+  });
+  dataCacheMutationQueue = mutation.catch(() => undefined);
+  await mutation;
 }
 
 export async function clearDataCache(): Promise<void> {
-  await chrome.storage.local.remove(DATA_CACHE_KEY);
+  const mutation = dataCacheMutationQueue.then(() => chrome.storage.local.remove(DATA_CACHE_KEY));
+  dataCacheMutationQueue = mutation.catch(() => undefined);
+  await mutation;
+}
+
+export function mergeDataCachesForSave(current: QuickPimDataCache, incoming: QuickPimDataCache): QuickPimDataCache {
+  return {
+    eligible: chooseCacheEntry(current.eligible, incoming.eligible),
+    active: chooseCacheEntry(current.active, incoming.active),
+    eligibleByTarget: mergeTargetCache(current.eligibleByTarget, incoming.eligibleByTarget),
+    activeByTarget: mergeTargetCache(current.activeByTarget, incoming.activeByTarget)
+  };
 }
 
 export async function getDataWithCache(
@@ -226,11 +251,22 @@ export function updateCacheFromTargetResults(
     if (!result) {
       continue;
     }
+    const previous = nextByTarget[target];
+    const diagnostics = result.diagnostics?.filter((item) => item.target === target);
+    const failed = Boolean(result.errors?.length) && !diagnostics?.some((item) => item.success);
+    if (failed && previous && previous.cacheKey === cacheKeys[target]) {
+      nextByTarget[target] = {
+        ...previous,
+        errors: result.errors || [],
+        diagnostics: mergeDiagnostics(previous.diagnostics, diagnostics)
+      };
+      continue;
+    }
     nextByTarget[target] = {
       items: result.items.filter((item) => item.type === target),
       errors: result.errors || [],
       diagnostics: result.diagnostics,
-      fetchedAt,
+      fetchedAt: failed ? 0 : fetchedAt,
       cacheKey: cacheKeys[target]
     };
   }
@@ -245,16 +281,24 @@ export function splitActivationResultByTarget(
   result: ActivationDataResult,
   targets: AccessSetupTarget[]
 ): Partial<Record<AccessSetupTarget, ActivationDataResult>> {
-  return Object.fromEntries(
-    targets.map((target) => [
-      target,
-      {
-        items: result.items.filter((item) => item.type === target),
-        errors: result.errors || [],
-        diagnostics: result.diagnostics?.filter((item) => item.target === target)
-      }
-    ])
-  );
+  return Object.fromEntries(targets.map((target) => {
+    const diagnostics = result.diagnostics?.filter((item) => item.target === target);
+    const diagnosticErrors = diagnostics?.filter((item) => !item.success).map((item) => item.error).filter((item): item is string => Boolean(item)) || [];
+    return [target, {
+      items: result.items.filter((item) => item.type === target),
+      errors: diagnosticErrors.length ? diagnosticErrors : targets.length === 1 ? result.errors || [] : [],
+      diagnostics
+    }];
+  }));
+}
+
+function mergeDiagnostics(
+  previous: CachedActivationEntry["diagnostics"],
+  incoming: CachedActivationEntry["diagnostics"]
+): CachedActivationEntry["diagnostics"] {
+  return [...(previous || []), ...(incoming || [])]
+    .sort((a, b) => a.checkedAt.localeCompare(b.checkedAt))
+    .slice(-20);
 }
 
 function markDiagnosticsFromCache(entry: CachedActivationEntry, fromCache: boolean): CachedActivationEntry {
@@ -291,4 +335,33 @@ function getLegacyTargetEntry(cache: QuickPimDataCache, bucket: CacheBucket, tar
 
 function dedupeItems(items: CachedActivationEntry["items"]): CachedActivationEntry["items"] {
   return [...new Map(items.map((item) => [item.id, item])).values()];
+}
+
+function mergeTargetCache(
+  current: TargetActivationCache | undefined,
+  incoming: TargetActivationCache | undefined
+): TargetActivationCache | undefined {
+  if (!current && !incoming) {
+    return undefined;
+  }
+
+  return Object.fromEntries(
+    CACHE_TARGETS.flatMap((target) => {
+      const entry = chooseCacheEntry(current?.[target], incoming?.[target]);
+      return entry ? [[target, entry] as const] : [];
+    })
+  );
+}
+
+function chooseCacheEntry(
+  current: CachedActivationEntry | undefined,
+  incoming: CachedActivationEntry | undefined
+): CachedActivationEntry | undefined {
+  if (!incoming) {
+    return current;
+  }
+  if (!current || incoming.cacheKey !== current.cacheKey || incoming.fetchedAt >= current.fetchedAt) {
+    return incoming;
+  }
+  return current;
 }

@@ -43,20 +43,26 @@ export function buildChromeWebStoreEndpoints({ publisherId, extensionId }) {
 }
 
 export function getUploadState(payload) {
-  const state = payload?.uploadState || payload?.item?.uploadState || payload?.status?.uploadState;
+  const state =
+    payload?.lastAsyncUploadState ||
+    payload?.uploadState ||
+    payload?.item?.lastAsyncUploadState ||
+    payload?.item?.uploadState ||
+    payload?.status?.lastAsyncUploadState ||
+    payload?.status?.uploadState;
   return typeof state === "string" ? state : "";
 }
 
 export function isUploadInProgress(payload) {
-  return /IN_PROGRESS|PENDING/i.test(getUploadState(payload));
+  return ["IN_PROGRESS", "ITEM_UPLOAD_STATE_IN_PROGRESS", "UPLOAD_IN_PROGRESS"].includes(getUploadState(payload).toUpperCase());
 }
 
 export function isUploadSuccess(payload) {
-  return /SUCCESS|SUCCEEDED|OK/i.test(getUploadState(payload));
+  return ["SUCCEEDED", "SUCCESS", "ITEM_UPLOAD_STATE_SUCCEEDED"].includes(getUploadState(payload).toUpperCase());
 }
 
 export function isUploadFailure(payload) {
-  return /FAIL|ERROR|REJECT/i.test(getUploadState(payload));
+  return ["FAILED", "FAILURE", "ITEM_UPLOAD_STATE_FAILED"].includes(getUploadState(payload).toUpperCase());
 }
 
 export function sanitizeChromeWebStoreMessage(value) {
@@ -71,11 +77,7 @@ export function sanitizeChromeWebStoreMessage(value) {
 async function main() {
   const missing = getMissingChromeWebStoreConfig();
   if (missing.length) {
-    console.log(
-      `::notice title=Chrome Web Store publish skipped::Missing repository secrets: ${missing.join(", ")}. ` +
-        "Add them to enable automatic Chrome Web Store submission on release tags."
-    );
-    return;
+    throw new Error(`Missing required Chrome Web Store configuration: ${missing.join(", ")}.`);
   }
 
   const config = readChromeWebStoreConfig();

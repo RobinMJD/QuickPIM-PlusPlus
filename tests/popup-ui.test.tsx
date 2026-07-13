@@ -2481,7 +2481,7 @@ describe("popup draft persistence", () => {
     expect(storageData[POPUP_DRAFT_KEY]).toBeTruthy();
     snapshot.resolve({ success: true, data: { eligible: { items: [], errors: [], diagnostics: [] }, active: { items: [], errors: [], diagnostics: [] } } });
 
-    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toBeUndefined());
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({ selectedIds: [], tab: "bundles" }));
     expect(document.body.textContent).not.toContain("Activate 1 selected");
   });
 

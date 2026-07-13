@@ -11,6 +11,7 @@ describe("popup draft storage", () => {
         tab: "pimGroup",
         search: " groups ",
         sortMode: "activationCount",
+        quickFilters: ["favorites", "active", "favorites", "bad"],
         selectedIds: ["pimGroup:group-1:member", "pimGroup:group-1:member", 42],
         durationHours: 3.7,
         justification: " Need access ",
@@ -26,6 +27,7 @@ describe("popup draft storage", () => {
       tab: "pimGroup",
       search: "groups",
       sortMode: "activationCount",
+      quickFilters: ["favorites", "active"],
       selectedIds: ["pimGroup:group-1:member"],
       durationHours: 3.5,
       justification: "Need access",
@@ -39,6 +41,12 @@ describe("popup draft storage", () => {
   test("drops expired or empty drafts", () => {
     expect(sanitizePopupDraft({ updatedAt: now - 25 * 60 * 60 * 1000, selectedIds: ["role-1"] }, now)).toBeUndefined();
     expect(sanitizePopupDraft({ updatedAt: now, selectedIds: [], isActivationReviewOpen: true }, now)).toBeUndefined();
+    expect(sanitizePopupDraft({ updatedAt: now + 6 * 60 * 1000, selectedIds: ["role-1"] }, now)).toBeUndefined();
+    expect(sanitizePopupDraft({ updatedAt: now, selectedIds: [], tab: "pimGroup", search: "ops" }, now)).toMatchObject({
+      tab: "pimGroup",
+      search: "ops",
+      selectedIds: []
+    });
     expect(
       hasPopupDraftContent({
         tab: "directoryRole",

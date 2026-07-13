@@ -151,7 +151,7 @@ export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleIte
     directoryScopeId,
     scopeLabel: directoryScopeId === "/" ? "Tenant" : scopeName || directoryScopeId,
     status: "eligible",
-    ...(role.targetScheduleId || role.id ? { assignmentScheduleId: role.targetScheduleId || role.id } : {}),
+    ...(role.roleAssignmentScheduleId || role.targetScheduleId ? { assignmentScheduleId: role.roleAssignmentScheduleId || role.targetScheduleId } : {}),
     ...(typeof isPrivileged === "boolean" ? { isPrivileged } : {}),
     activationRequirements: {
       justification: true,
@@ -213,7 +213,7 @@ export function normalizePimGroup(group: PimGroupApi, groupInfo: GroupInfo = {})
     groupId,
     accessId,
     memberType: group.memberType,
-    ...(group.targetScheduleId || group.id ? { assignmentScheduleId: group.targetScheduleId || group.id } : {}),
+    ...(group.assignmentScheduleId || group.targetScheduleId ? { assignmentScheduleId: group.assignmentScheduleId || group.targetScheduleId } : {}),
     scopeLabel: accessId === "owner" ? "Owner" : "Member",
     status: "eligible",
     activationRequirements: {
@@ -321,6 +321,22 @@ export function buildActivationRequest(
   };
 }
 
+export function buildActivationValidationRequest(
+  item: ActivationItem,
+  durationHours: number,
+  justification: string,
+  ticketInfo: TicketInfo = {},
+  startDateTime = new Date().toISOString()
+): ActivationRequest | undefined {
+  validateActivationInput(item, durationHours, justification, ticketInfo);
+  if (item.type !== "directoryRole") {
+    return undefined;
+  }
+
+  const request = buildActivationRequest(item, durationHours, justification, ticketInfo, startDateTime);
+  return { ...request, body: { ...request.body, isValidationOnly: true } };
+}
+
 export function buildDeactivationRequest(
   item: ActivationItem,
   justification = "",
@@ -362,9 +378,11 @@ export function buildDeactivationRequest(
     const properties: Record<string, unknown> = {
       principalId: item.principalId,
       roleDefinitionId: item.roleDefinitionId,
-      requestType: "SelfDeactivate",
-      targetRoleAssignmentScheduleId: item.assignmentScheduleId
+      requestType: "SelfDeactivate"
     };
+    if (item.assignmentScheduleId) {
+      properties.targetRoleAssignmentScheduleId = item.assignmentScheduleId;
+    }
     if (item.assignmentScheduleInstanceId) {
       properties.targetRoleAssignmentScheduleInstanceId = item.assignmentScheduleInstanceId;
     }
@@ -578,7 +596,7 @@ function validateDeactivationInput(
     throw new Error("Deactivation item is missing required identifiers.");
   }
 
-  if (!item.assignmentScheduleId) {
+  if (!item.assignmentScheduleId && (item.type !== "azureRole" || !item.assignmentScheduleInstanceId)) {
     throw new Error("Deactivation item is missing the active assignment schedule.");
   }
 

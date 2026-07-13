@@ -25,6 +25,8 @@ export const GRAPH_TOKEN_TARGETS: GraphTokenTarget[] = ["directoryRole", "pimGro
 
 const DIRECTORY_ROLE_ACTIVATION_SCOPES = ["RoleAssignmentSchedule.ReadWrite.Directory", "RoleManagement.ReadWrite.Directory"];
 const PIM_GROUP_ACTIVATION_SCOPES = ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup", "PrivilegedAccess.ReadWrite.AzureADGroup"];
+const MFA_AUTH_METHODS = new Set(["mfa", "fido", "rsa"]);
+const CHALLENGE_AUTH_CONTEXTS = new Set(["c1", "c2", "c3", "pfdr"]);
 
 export function getGrantedTokenScopes(decoded: Record<string, unknown>): Set<string> {
   const scopes = typeof decoded.scp === "string" ? decoded.scp.split(/\s+/).filter(Boolean) : [];
@@ -75,6 +77,19 @@ export function hasGraphActivationScope(decoded: Record<string, unknown>, target
   return Boolean(getMatchedGraphActivationScope(target, getGrantedTokenScopes(decoded)));
 }
 
+export function getGraphTokenAuthStrengthScore(decoded: Record<string, unknown>): number {
+  const authMethods = getStringClaimValues(decoded.amr);
+  const authContexts = getStringClaimValues(decoded.acrs);
+  let score = 0;
+
+  if (authMethods.some((method) => MFA_AUTH_METHODS.has(method.toLowerCase()))) {
+    score += 100;
+  }
+
+  score += authContexts.filter((context) => CHALLENGE_AUTH_CONTEXTS.has(context.toLowerCase())).length * 25;
+  return score;
+}
+
 export function getGraphTokenOverallScore(decoded: Record<string, unknown>): number {
   const scopes = getGrantedTokenScopes(decoded);
   const directoryScore = getGraphTokenTargetScore(decoded, "directoryRole", scopes);
@@ -83,4 +98,11 @@ export function getGraphTokenOverallScore(decoded: Record<string, unknown>): num
     ? 5
     : 0;
   return directoryScore + pimGroupScore + broadPrivilegedScore + Math.min(scopes.size, 20);
+}
+
+function getStringClaimValues(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+  return typeof value === "string" ? [value] : [];
 }

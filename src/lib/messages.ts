@@ -26,6 +26,10 @@ const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", 
 const MAX_PORTAL_TOKENS = 20;
 const MAX_PORTAL_TOKEN_LENGTH = 8192;
 const MAX_PORTAL_SOURCE_LENGTH = 160;
+const MAX_ACTIVATION_ITEMS = 100;
+const MAX_ITEM_FIELD_LENGTH = 512;
+const MAX_JUSTIFICATION_LENGTH = 1024;
+const MAX_TICKET_FIELD_LENGTH = 128;
 
 export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (!isRecord(message) || typeof message.action !== "string") {
@@ -47,12 +51,9 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     if (!Array.isArray(message.tokens)) {
       throw new Error("Portal tokens must be an array.");
     }
-    const tokens = message.tokens.slice(0, MAX_PORTAL_TOKENS).map((token) => {
-      if (typeof token !== "string" || token.length > MAX_PORTAL_TOKEN_LENGTH || !isJwtLike(token)) {
-        throw new Error("Portal token is malformed.");
-      }
-      return token;
-    });
+    const tokens = message.tokens
+      .filter((token): token is string => typeof token === "string" && token.length <= MAX_PORTAL_TOKEN_LENGTH && isJwtLike(token))
+      .slice(0, MAX_PORTAL_TOKENS);
     if (!tokens.length) {
       throw new Error("Portal tokens must not be empty.");
     }
@@ -70,21 +71,22 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (!Array.isArray(message.items)) {
     throw new Error("Activation items must be an array.");
   }
+  if (!message.items.length || message.items.length > MAX_ACTIVATION_ITEMS) {
+    throw new Error(`Activation requests must contain between 1 and ${MAX_ACTIVATION_ITEMS} items.`);
+  }
+  const expectedStatus = message.action === "activateItems" ? "eligible" : "active";
+  const items = message.items.map((item) => validateActivationItem(item, expectedStatus));
 
   if (message.action === "deactivateItems") {
-    if (message.justification !== undefined && typeof message.justification !== "string") {
+    if (message.justification !== undefined && (typeof message.justification !== "string" || message.justification.length > MAX_JUSTIFICATION_LENGTH)) {
       throw new Error("Deactivation justification must be text.");
-    }
-
-    if (message.ticketInfo !== undefined && !isRecord(message.ticketInfo)) {
-      throw new Error("Ticket information must be an object.");
     }
 
     return {
       action: "deactivateItems",
-      items: message.items as ActivationItem[],
+      items,
       justification: typeof message.justification === "string" ? message.justification : undefined,
-      ticketInfo: message.ticketInfo as TicketInfo | undefined
+      ticketInfo: validateTicketInfo(message.ticketInfo)
     };
   }
 
@@ -92,21 +94,61 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     throw new Error("Activation duration is required.");
   }
 
-  if (typeof message.justification !== "string") {
+  if (typeof message.justification !== "string" || message.justification.length > MAX_JUSTIFICATION_LENGTH) {
     throw new Error("Activation justification is required.");
-  }
-
-  if (message.ticketInfo !== undefined && !isRecord(message.ticketInfo)) {
-    throw new Error("Ticket information must be an object.");
   }
 
   return {
     action: "activateItems",
-    items: message.items as ActivationItem[],
+    items,
     durationHours: Number(message.durationHours),
     justification: message.justification,
-    ticketInfo: message.ticketInfo as TicketInfo | undefined
+    ticketInfo: validateTicketInfo(message.ticketInfo)
   };
+}
+
+function validateActivationItem(value: unknown, expectedStatus: "eligible" | "active"): ActivationItem {
+  if (!isRecord(value) || !isBoundedString(value.id) || !isBoundedString(value.principalId) || value.status !== expectedStatus) {
+    throw new Error(`Activation items must be valid ${expectedStatus} items.`);
+  }
+  if (value.type === "directoryRole") {
+    if (!isBoundedString(value.roleDefinitionId) || !isBoundedString(value.directoryScopeId)) {
+      throw new Error("Entra role item identifiers are invalid.");
+    }
+  } else if (value.type === "pimGroup") {
+    if (!isBoundedString(value.groupId) || (value.accessId !== "member" && value.accessId !== "owner")) {
+      throw new Error("PIM group item identifiers are invalid.");
+    }
+  } else if (value.type === "azureRole") {
+    if (!isBoundedString(value.roleDefinitionId) || !isBoundedString(value.scope)) {
+      throw new Error("Azure role item identifiers are invalid.");
+    }
+  } else {
+    throw new Error("Activation item type is unsupported.");
+  }
+  return value as unknown as ActivationItem;
+}
+
+function validateTicketInfo(value: unknown): TicketInfo | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new Error("Ticket information must be an object.");
+  }
+  for (const field of [value.ticketSystem, value.ticketNumber]) {
+    if (field !== undefined && (typeof field !== "string" || field.length > MAX_TICKET_FIELD_LENGTH)) {
+      throw new Error("Ticket information is invalid or too long.");
+    }
+  }
+  return {
+    ...(typeof value.ticketSystem === "string" ? { ticketSystem: value.ticketSystem } : {}),
+    ...(typeof value.ticketNumber === "string" ? { ticketNumber: value.ticketNumber } : {})
+  };
+}
+
+function isBoundedString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_ITEM_FIELD_LENGTH;
 }
 
 export function isTrustedRuntimeSender(sender: chrome.runtime.MessageSender): boolean {

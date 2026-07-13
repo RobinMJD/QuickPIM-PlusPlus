@@ -31,6 +31,7 @@ describe("reference data cache", () => {
     ]);
 
     const withLearnedName = applyReferenceDataToItems([rawDirectoryRole], learned)[0];
+    expect(withLearnedName.sourceName).toBe("reader");
     expect(getDisplayName(withLearnedName, DEFAULT_SETTINGS, learned)).toBe("Global Reader");
     expect(getDisplayName(rawDirectoryRole, DEFAULT_SETTINGS, learned)).toBe("Global Reader");
 
@@ -67,6 +68,17 @@ describe("reference data cache", () => {
     expect(Object.keys(imported.pimGroups)).toHaveLength(300);
   });
 
+  test("retains the newest learned names when a reference map exceeds its bound", () => {
+    const imported = mergeReferenceData({
+      pimGroups: Object.fromEntries(Array.from({ length: 301 }, (_, index) => [
+        `group-${index}`,
+        { name: `Group ${index}`, updatedAt: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString() }
+      ]))
+    });
+    expect(imported.pimGroups).not.toHaveProperty("group-0");
+    expect(imported.pimGroups).toHaveProperty("group-300");
+  });
+
   test("learns and reapplies directory scope names for admin units and devices", () => {
     const scopedRole: ActivationItem = {
       ...rawDirectoryRole,
@@ -83,7 +95,8 @@ describe("reference data cache", () => {
 
     expect(getScopeLabel(rawScopedRole, learned)).toBe("Paris Devices");
     expect(applyReferenceDataToItems([rawScopedRole], learned)[0]).toMatchObject({
-      scopeLabel: "Paris Devices"
+      scopeLabel: "Paris Devices",
+      sourceScopeLabel: "/administrativeUnits/au-1"
     });
   });
 

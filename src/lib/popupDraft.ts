@@ -1,4 +1,5 @@
 import type { PopupRequestMode, PopupTab, SortMode } from "./types";
+import type { QuickFilter } from "./popupModel";
 
 export const POPUP_DRAFT_KEY = "quickPimPopupDraft.v1";
 
@@ -10,15 +11,18 @@ const MAX_JUSTIFICATION_LENGTH = 1024;
 const MAX_TICKET_FIELD_LENGTH = 120;
 const MIN_DURATION_HOURS = 0.5;
 const MAX_DURATION_HOURS = 24;
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const POPUP_TABS: PopupTab[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
 const SORT_MODES: SortMode[] = ["name", "lastUsed", "activationCount", "type", "scope"];
+const QUICK_FILTERS: QuickFilter[] = ["favorites", "eligible", "active", "requiresApproval", "requiresJustification", "highPrivilege"];
 
 export interface PopupDraft {
   updatedAt: number;
   tab: PopupTab;
   search: string;
   sortMode: SortMode;
+  quickFilters: QuickFilter[];
   selectedIds: string[];
   durationHours: number;
   justification: string;
@@ -28,7 +32,7 @@ export interface PopupDraft {
   requestMode?: PopupRequestMode;
 }
 
-export type PopupDraftInput = Omit<PopupDraft, "updatedAt"> & { updatedAt?: number };
+export type PopupDraftInput = Omit<PopupDraft, "updatedAt" | "quickFilters"> & { updatedAt?: number; quickFilters?: QuickFilter[] };
 
 export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | undefined> {
   const result = await chrome.storage.local.get(POPUP_DRAFT_KEY);
@@ -54,7 +58,7 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
   }
 
   const updatedAt = typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) ? value.updatedAt : 0;
-  if (!updatedAt || now - updatedAt > POPUP_DRAFT_TTL_MS) {
+  if (!updatedAt || now - updatedAt > POPUP_DRAFT_TTL_MS || updatedAt - now > MAX_FUTURE_CLOCK_SKEW_MS) {
     return undefined;
   }
 
@@ -64,6 +68,7 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
     tab: isPopupTab(value.tab) ? value.tab : "directoryRole",
     search: sanitizeString(value.search, MAX_SEARCH_LENGTH),
     sortMode: isSortMode(value.sortMode) ? value.sortMode : "name",
+    quickFilters: sanitizeQuickFilters(value.quickFilters),
     selectedIds,
     durationHours: sanitizeDuration(value.durationHours),
     justification: sanitizeString(value.justification, MAX_JUSTIFICATION_LENGTH),
@@ -77,7 +82,20 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
 }
 
 export function hasPopupDraftContent(draft: PopupDraftInput): boolean {
-  return draft.selectedIds.length > 0;
+  return Boolean(
+    draft.selectedIds.length ||
+      draft.search.trim() ||
+      draft.tab !== "directoryRole" ||
+      draft.sortMode !== "name" ||
+      draft.quickFilters?.length
+  );
+}
+
+function sanitizeQuickFilters(value: unknown): QuickFilter[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value.filter((item): item is QuickFilter => typeof item === "string" && QUICK_FILTERS.includes(item as QuickFilter)))];
 }
 
 function sanitizeSelectedIds(value: unknown): string[] {

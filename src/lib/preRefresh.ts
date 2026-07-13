@@ -9,6 +9,7 @@ import type { AccessSetupTarget, QuickPimDataCache, TokenStatus } from "./types"
 export interface ChromeAlarmsLike {
   create(name: string, alarmInfo: chrome.alarms.AlarmCreateInfo): Promise<void> | void;
   clear(name: string): Promise<boolean> | boolean;
+  get?(name: string): Promise<chrome.alarms.Alarm | undefined>;
 }
 
 export const PRE_REFRESH_ALARM_NAME = "quickPimPreRefresh";
@@ -16,6 +17,10 @@ export const PRE_REFRESH_PERIOD_MINUTES = 10;
 
 export async function syncPreRefreshAlarm(alarms: ChromeAlarmsLike, enabled: boolean): Promise<void> {
   if (enabled) {
+    const existing = await alarms.get?.(PRE_REFRESH_ALARM_NAME);
+    if (existing?.periodInMinutes === PRE_REFRESH_PERIOD_MINUTES) {
+      return;
+    }
     await alarms.create(PRE_REFRESH_ALARM_NAME, { periodInMinutes: PRE_REFRESH_PERIOD_MINUTES });
     return;
   }

@@ -64,7 +64,6 @@ import {
   sortItems
 } from "../lib/settings";
 import {
-  applyReferenceDataToItems,
   learnReferenceDataFromItems,
   loadReferenceData,
   saveReferenceData
@@ -193,6 +192,7 @@ function PopupApp() {
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
+  const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     void initializePopup();
@@ -284,9 +284,8 @@ function PopupApp() {
           clearTimeout(draftSaveTimer.current);
           draftSaveTimer.current = undefined;
         }
-        latestPopupDraft.current = undefined;
         setRequestMode(undefined);
-        void clearPopupDraft();
+        setIsActivationReviewOpen(false);
       }
       if (next.size && !requestMode && mode) {
         setRequestMode(mode);
@@ -315,6 +314,7 @@ function PopupApp() {
     const draft = buildCurrentPopupDraft();
     latestPopupDraft.current = draft;
     if (!hasPopupDraftContent(draft)) {
+      void clearPopupDraft();
       return;
     }
 
@@ -335,6 +335,7 @@ function PopupApp() {
     isActivationReviewOpen,
     isPopupDraftReady,
     justification,
+    quickFilters,
     search,
     selectedIds,
     sortMode,
@@ -397,6 +398,7 @@ function PopupApp() {
         setTab(draft.tab);
         setSearch(draft.search);
         setSortMode(draft.sortMode);
+        setQuickFilters(new Set(draft.quickFilters));
         setSelectedIds(new Set(draft.selectedIds));
         setDurationHours(draft.durationHours);
         setJustification(draft.justification);
@@ -417,6 +419,7 @@ function PopupApp() {
       tab,
       search,
       sortMode,
+      quickFilters: [...quickFilters],
       selectedIds: [...selectedIds],
       durationHours,
       justification,
@@ -560,13 +563,15 @@ function PopupApp() {
       }
       const snapshot = await fetchActivationSnapshot(staleTargets);
       const fetchedAt = Date.now();
+      const snapshotTokenStatus = snapshot.tokenStatus || loadedTokens;
+      const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
       let nextCache = updateCacheFromTargetResults(
         currentCache,
         "eligible",
         staleTargets,
         snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, staleTargets),
         fetchedAt,
-        targetCacheKeys
+        snapshotTargetCacheKeys
       );
       nextCache = updateCacheFromTargetResults(
         nextCache,
@@ -574,20 +579,24 @@ function PopupApp() {
         staleTargets,
         snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, staleTargets),
         fetchedAt,
-        targetCacheKeys
+        snapshotTargetCacheKeys
       );
 
       let nextSettings = loadedSettings;
-      if (
-        !loadedSettings.preferences.autoEnabledFeaturesInitialized &&
-        snapshot.eligible.items.length > 0
-      ) {
+      const eligibleResultsByTarget = snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, staleTargets);
+      const allFeatureResultsResolved = enabledRoleFeatures.every((target) => {
+        if (eligibleCache[target]?.isUsable) return true;
+        const result = eligibleResultsByTarget[target];
+        return Boolean(result && (!result.errors.length || result.diagnostics?.some((diagnostic) => diagnostic.success)));
+      });
+      if (!loadedSettings.preferences.autoEnabledFeaturesInitialized && allFeatureResultsResolved) {
+        const resolvedEligibleItems = enabledRoleFeatures.flatMap((target) => nextCache.eligibleByTarget?.[target]?.items || []);
         nextSettings = {
           ...loadedSettings,
           preferences: {
             ...loadedSettings.preferences,
             enabledFeatures: getAutoEnabledFeatures(
-              snapshot.eligible.items,
+              resolvedEligibleItems,
               loadedSettings.preferences.enabledFeatures?.includes("bundles") !== false
             ),
             autoEnabledFeaturesInitialized: true
@@ -604,7 +613,7 @@ function PopupApp() {
           label: "Saving refreshed data"
         });
       }
-      const nextTargetCacheKeys = buildTargetCacheKeys(loadedTokens, getEnabledRoleFeatures(nextSettings));
+      const nextTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, getEnabledRoleFeatures(nextSettings));
       const nextEligibleCache = getTargetEntriesFromCache(nextCache, "eligible", getEnabledRoleFeatures(nextSettings), nextTargetCacheKeys, {
         legacyCacheKey: buildFeatureCacheKey(tokenCacheKey, getEnabledRoleFeatures(nextSettings)),
         now: fetchedAt,
@@ -618,8 +627,8 @@ function PopupApp() {
       });
       const nextEligible = mergeTargetEntries(getEnabledRoleFeatures(nextSettings).map((target) => nextEligibleCache[target]?.entry), fetchedAt);
       const nextActive = mergeTargetEntries(getEnabledRoleFeatures(nextSettings).map((target) => nextActiveCache[target]?.entry), fetchedAt);
-      await applyLoadedActivationData(nextSettings, loadedTokens, nextCache, loadedReferenceData, nextEligible, nextActive);
-      const nextAccessCapabilities = buildAccessCapabilityItems(loadedTokens, nextCache, getEnabledRoleFeatures(nextSettings));
+      await applyLoadedActivationData(nextSettings, snapshotTokenStatus, nextCache, loadedReferenceData, nextEligible, nextActive);
+      const nextAccessCapabilities = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, getEnabledRoleFeatures(nextSettings));
       const loadErrors = filterLoadErrorsForAccessState([...(snapshot.eligible.errors || []), ...(snapshot.active.errors || [])], nextAccessCapabilities);
       if (!options.suppressMessage) {
         setMessage(formatLoadMessages(loadErrors).join("\n"));
@@ -661,6 +670,9 @@ function PopupApp() {
   }
 
   function toggleSelected(itemId: string) {
+    if (isActivating) {
+      return;
+    }
     setSelectedIds((current) => {
       const item = itemsById.get(itemId);
       const itemMode = getRequestModeForItem(item);
@@ -684,16 +696,13 @@ function PopupApp() {
   }
 
   async function toggleFavorite(itemId: string) {
-    const favoriteItemIds = settings.favoriteItemIds.includes(itemId)
-      ? settings.favoriteItemIds.filter((id) => id !== itemId)
-      : [itemId, ...settings.favoriteItemIds];
-    const updated = {
-      ...settings,
-      favoriteItemIds
-    };
     try {
-      await saveSettings(updated);
-      setSettings(updated);
+      await mutatePopupSettings((latest) => ({
+        ...latest,
+        favoriteItemIds: latest.favoriteItemIds.includes(itemId)
+          ? latest.favoriteItemIds.filter((id) => id !== itemId)
+          : [itemId, ...latest.favoriteItemIds]
+      }));
     } catch (saveError) {
       setActivationFailureNotice(null);
       setError(saveError instanceof Error ? saveError.message : String(saveError));
@@ -711,10 +720,9 @@ function PopupApp() {
     const activationRequirements = getActivationRequirements(activatableItems);
     const effectiveJustification = activationRequirements.needsJustification ? bundle?.defaultJustification || justification : "";
     const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, activatableItems);
-    const effectiveTicketInfo: TicketInfo = {
-      ticketSystem: ticketSystem || undefined,
-      ticketNumber: ticketNumber || undefined
-    };
+    const effectiveTicketInfo: TicketInfo = activationRequirements.needsTicket
+      ? { ticketSystem: ticketSystem.trim(), ticketNumber: ticketNumber.trim() }
+      : {};
 
     if (activationRequirements.needsJustification) {
       if (!effectiveJustification.trim()) {
@@ -728,6 +736,11 @@ function PopupApp() {
         setError(genericJustificationWarning);
         return;
       }
+    }
+    if (activationRequirements.needsTicket && (!effectiveTicketInfo.ticketSystem || !effectiveTicketInfo.ticketNumber)) {
+      setActivationFailureNotice(null);
+      setError("Enter both the ticket system and ticket number required by the selected policy.");
+      return;
     }
 
     setIsActivating(true);
@@ -751,20 +764,20 @@ function PopupApp() {
         .map((result) => activatableItems.find((item) => item.id === result.itemId))
         .filter((item): item is ActivationItem => Boolean(item));
 
-      let updatedSettings = addRecentJustification(settings, effectiveJustification);
-      updatedSettings = recordActivations(updatedSettings, successItems, new Date().toISOString(), bundle?.name);
-      updatedSettings = recordActivityResults(updatedSettings, {
-        action: "activate",
-        items: activatableItems,
-        response,
-        requestedAt,
-        completedAt: new Date().toISOString(),
-        durationHours: effectiveDuration,
-        justification: effectiveJustification,
-        bundleName: bundle?.name
+      await mutatePopupSettings((latest) => {
+        let updatedSettings = addRecentJustification(latest, effectiveJustification);
+        updatedSettings = recordActivations(updatedSettings, successItems, new Date().toISOString(), bundle?.name);
+        return recordActivityResults(updatedSettings, {
+          action: "activate",
+          items: activatableItems,
+          response,
+          requestedAt,
+          completedAt: new Date().toISOString(),
+          durationHours: effectiveDuration,
+          justification: effectiveJustification,
+          bundleName: bundle?.name
+        });
       });
-      await saveSettings(updatedSettings);
-      setSettings(updatedSettings);
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
       setSelectedIds(remainingSelectedIds);
       setActivationProgress(ACTIVATION_STEPS[2]);
@@ -827,27 +840,25 @@ function PopupApp() {
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
-        let updatedSettings = addRecentJustification(settings, justification);
-        updatedSettings = recordActivityResults(updatedSettings, {
-          action: "deactivate",
-          items: deactivatableItems,
-          response,
-          requestedAt,
-          completedAt: new Date().toISOString(),
-          justification
+        await mutatePopupSettings((latest) => {
+          const updatedSettings = addRecentJustification(latest, justification);
+          return recordActivityResults(updatedSettings, {
+            action: "deactivate",
+            items: deactivatableItems,
+            response,
+            requestedAt,
+            completedAt: new Date().toISOString(),
+            justification
+          });
         });
-        await saveSettings(updatedSettings);
-        setSettings(updatedSettings);
       } else {
-        const updatedSettings = recordActivityResults(settings, {
+        await mutatePopupSettings((latest) => recordActivityResults(latest, {
           action: "deactivate",
           items: deactivatableItems,
           response,
           requestedAt,
           completedAt: new Date().toISOString()
-        });
-        await saveSettings(updatedSettings);
-        setSettings(updatedSettings);
+        }));
       }
 
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
@@ -890,9 +901,7 @@ function PopupApp() {
       setError(genericJustificationWarning);
       return;
     }
-    const updated = addSavedJustification(settings, justification);
-    await saveSettings(updated);
-    setSettings(updated);
+    await mutatePopupSettings((latest) => addSavedJustification(latest, justification));
   }
 
   function useBundleDefaults(bundle: QuickPimBundle) {
@@ -932,16 +941,27 @@ function PopupApp() {
   }
 
   async function ignorePermissionWarning() {
-    const updated = {
-      ...settings,
+    await mutatePopupSettings((latest) => ({
+      ...latest,
       preferences: {
-        ...settings.preferences,
+        ...latest.preferences,
         permissionWarningIgnored: true,
         permissionWarningIgnoredAt: new Date().toISOString()
       }
-    };
-    await saveSettings(updated);
-    setSettings(updated);
+    }));
+  }
+
+  async function mutatePopupSettings(updater: (latest: QuickPimSettings) => QuickPimSettings): Promise<QuickPimSettings> {
+    let result = settings;
+    const operation = settingsMutationQueue.current.then(async () => {
+      const latest = await loadSettings();
+      result = updater(latest);
+      await saveSettings(result);
+      setSettings(result);
+    });
+    settingsMutationQueue.current = operation.catch(() => undefined);
+    await operation;
+    return result;
   }
 
   const activeTabIsVisible = visibleTabs.includes(tab);
@@ -1193,9 +1213,12 @@ function AccessProgressPanel({ title, progress, helperText }: { title: string; p
       </div>
       {helperText ? <p className="progress-helper">{helperText}</p> : null}
       <p className="progress-detail">{progress.label}</p>
-      <div className="progress-track" aria-hidden="true">
-        <span style={{ width: `${Math.round((progress.current / progress.total) * 100)}%` }} />
-      </div>
+      <progress
+        className="progress-track"
+        value={progress.current}
+        max={progress.total}
+        aria-label={`${title}: step ${progress.current} of ${progress.total}`}
+      />
     </section>
   );
 }
@@ -1401,6 +1424,7 @@ function RoleList({
           >
             <input
               type="checkbox"
+              aria-label={`${selected ? "Unselect" : "Select"} ${displayName}`}
               checked={selected}
               disabled={!isSelectable}
               onClick={(event) => event.stopPropagation()}
@@ -1675,11 +1699,19 @@ function applyDisplayData(
   settings: QuickPimSettings,
   referenceData: ReferenceDataCache
 ): ActivationItem[] {
-  return applyReferenceDataToItems(items, referenceData).map((item) => ({
-    ...item,
-    displayName: getDisplayName(item, settings, referenceData),
-    scopeLabel: getScopeLabel(item, referenceData)
-  }));
+  return items.map((item) => {
+    const canonical = {
+      ...item,
+      displayName: item.sourceName,
+      scopeLabel: item.sourceScopeLabel || item.scopeLabel,
+      sourceScopeLabel: item.sourceScopeLabel || item.scopeLabel
+    } as ActivationItem;
+    return {
+      ...canonical,
+      displayName: getDisplayName(canonical, settings, referenceData),
+      scopeLabel: getScopeLabel(canonical, referenceData)
+    } as ActivationItem;
+  });
 }
 
 function typeLabel(type: ActivationItem["type"]) {

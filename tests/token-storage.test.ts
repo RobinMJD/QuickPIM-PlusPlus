@@ -3,6 +3,8 @@ import {
   TOKEN_STORAGE_KEYS,
   getStoredTokensFromSession,
   migrateLegacyLocalTokensToSession,
+  removeStoredTokenGroupsIfMatching,
+  updateStoredTokensInSession,
   type ChromeStorageAreaLike
 } from "../src/lib/tokenStorage";
 
@@ -88,7 +90,90 @@ describe("session token storage", () => {
     });
 
     expect(tokens).toHaveProperty("azureManagementToken");
-    expect(tokens).not.toHaveProperty("graphToken");
+    expect(tokens).toHaveProperty("graphToken");
+    expect(localData).not.toHaveProperty("graphToken");
+  });
+
+  test("does not combine legacy tokens from a different tenant or principal", async () => {
+    const localData = {
+      azureManagementToken: makeToken({
+        aud: "https://management.core.windows.net/",
+        exp: Math.floor((now + 60 * 60_000) / 1000),
+        tid: "tenant-b",
+        oid: "user-b"
+      }),
+      azureManagementTokenTimestamp: now
+    };
+    const sessionData = {
+      graphToken: makeToken({
+        aud: "https://graph.microsoft.com",
+        exp: Math.floor((now + 60 * 60_000) / 1000),
+        tid: "tenant-a",
+        oid: "user-a"
+      }),
+      tokenTimestamp: now
+    };
+
+    await migrateLegacyLocalTokensToSession({
+      local: makeStorageArea(localData),
+      session: makeStorageArea(sessionData),
+      now
+    });
+
+    expect(sessionData).not.toHaveProperty("azureManagementToken");
+    expect(localData).not.toHaveProperty("azureManagementToken");
+  });
+
+  test("does not remove a freshly replaced token while cleaning an expired snapshot", async () => {
+    const staleToken = "stale-token";
+    const freshToken = "fresh-token";
+    const sessionData: Record<string, unknown> = {
+      graphToken: freshToken,
+      tokenTimestamp: now
+    };
+    const localData: Record<string, unknown> = {};
+    const session = makeStorageArea(sessionData);
+    const local = makeStorageArea(localData);
+
+    await removeStoredTokenGroupsIfMatching([{
+      tokenKey: "graphToken",
+      expectedToken: staleToken,
+      keys: ["graphToken", "tokenTimestamp", "tokenSource"]
+    }], { local, session });
+
+    expect(sessionData.graphToken).toBe(freshToken);
+    expect(session.remove).not.toHaveBeenCalled();
+
+    await removeStoredTokenGroupsIfMatching([{
+      tokenKey: "graphToken",
+      expectedToken: freshToken,
+      keys: ["graphToken", "tokenTimestamp", "tokenSource"]
+    }], { local, session });
+
+    expect(sessionData).not.toHaveProperty("graphToken");
+    expect(sessionData).not.toHaveProperty("tokenTimestamp");
+  });
+
+  test("serializes read-modify-write token updates against the latest session state", async () => {
+    const sessionData: Record<string, unknown> = {};
+    const session = makeStorageArea(sessionData);
+    const local = makeStorageArea({});
+
+    const first = updateStoredTokensInSession(async (current) => {
+      expect(current).not.toHaveProperty("graphToken");
+      await Promise.resolve();
+      return { set: { graphToken: "graph-token" }, result: "first" };
+    }, { local, session });
+    const second = updateStoredTokensInSession((current) => ({
+      set: { azureManagementToken: current.graphToken ? "azure-token" : "wrong-order" },
+      result: "second"
+    }), { local, session });
+
+    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+    expect(sessionData).toMatchObject({
+      graphToken: "graph-token",
+      azureManagementToken: "azure-token"
+    });
   });
 });
 
@@ -110,6 +195,6 @@ function makeStorageArea(data: Record<string, unknown>): ChromeStorageAreaLike {
 }
 
 function makeToken(payload: Record<string, unknown>): string {
-  const encodedPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const encodedPayload = btoa(JSON.stringify({ tid: "tenant-1", oid: "user-1", ...payload })).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
   return `header.${encodedPayload}.signature`;
 }

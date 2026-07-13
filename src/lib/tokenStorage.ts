@@ -22,6 +22,12 @@ export interface ChromeStorageAreaLike {
   remove(keys: string | string[]): Promise<void>;
 }
 
+export interface StoredTokenMutation<T> {
+  set?: Partial<StoredTokens>;
+  remove?: string[];
+  result: T;
+}
+
 export const TOKEN_STORAGE_KEYS = [
   "graphToken",
   "tokenTimestamp",
@@ -49,6 +55,8 @@ const TOKEN_GROUPS: Array<{ tokenKey: keyof StoredTokens; timestampKey: keyof St
   }
 ];
 
+let tokenMutationQueue: Promise<void> = Promise.resolve();
+
 export async function getStoredTokensFromSession(options?: {
   local?: ChromeStorageAreaLike;
   session?: ChromeStorageAreaLike;
@@ -56,24 +64,36 @@ export async function getStoredTokensFromSession(options?: {
 }): Promise<StoredTokens> {
   const session = options?.session || chrome.storage.session;
   const local = options?.local || chrome.storage.local;
-  const sessionTokens = await session.get(TOKEN_STORAGE_KEYS);
-  if (hasAnyStoredToken(sessionTokens)) {
-    return compactStoredTokens(sessionTokens);
-  }
-
   await migrateLegacyLocalTokensToSession({ local, session, now: options?.now });
   return compactStoredTokens(await session.get(TOKEN_STORAGE_KEYS));
 }
 
-export async function setStoredTokensInSession(values: Partial<StoredTokens>): Promise<void> {
-  await chrome.storage.session.set(values as Record<string, unknown>);
+export async function updateStoredTokensInSession<T>(
+  mutation: (current: StoredTokens) => StoredTokenMutation<T> | Promise<StoredTokenMutation<T>>,
+  options?: { local?: ChromeStorageAreaLike; session?: ChromeStorageAreaLike }
+): Promise<T> {
+  const local = options?.local || chrome.storage.local;
+  const session = options?.session || chrome.storage.session;
+  return enqueueTokenMutation(async () => {
+    const current = compactStoredTokens(await session.get(TOKEN_STORAGE_KEYS));
+    const update = await mutation(current);
+    if (update.remove?.length) {
+      await Promise.all([session.remove(update.remove), local.remove(update.remove)]);
+    }
+    if (update.set && Object.keys(update.set).length) {
+      await session.set(update.set as Record<string, unknown>);
+    }
+    return update.result;
+  });
 }
 
 export async function removeStoredTokenKeys(keys: string[]): Promise<void> {
-  await Promise.all([
-    chrome.storage.session.remove(keys),
-    chrome.storage.local.remove(keys)
-  ]);
+  await enqueueTokenMutation(async () => {
+    await Promise.all([
+      chrome.storage.session.remove(keys),
+      chrome.storage.local.remove(keys)
+    ]);
+  });
 }
 
 export async function clearStoredTokens(): Promise<void> {
@@ -88,10 +108,40 @@ export async function migrateLegacyLocalTokensToSession(options?: {
   const local = options?.local || chrome.storage.local;
   const session = options?.session || chrome.storage.session;
   const now = options?.now ?? Date.now();
+  return enqueueTokenMutation(() => migrateLegacyTokens({ local, session, now }));
+}
+
+export async function removeStoredTokenGroupsIfMatching(
+  groups: Array<{ tokenKey: keyof StoredTokens; expectedToken: string; keys: string[] }>,
+  options?: { local?: ChromeStorageAreaLike; session?: ChromeStorageAreaLike }
+): Promise<void> {
+  const local = options?.local || chrome.storage.local;
+  const session = options?.session || chrome.storage.session;
+  await enqueueTokenMutation(async () => {
+    const current = await session.get(groups.map((group) => String(group.tokenKey)));
+    const keys = groups.flatMap((group) => current[group.tokenKey] === group.expectedToken ? group.keys : []);
+    if (keys.length) {
+      await Promise.all([session.remove(keys), local.remove(keys)]);
+    }
+  });
+}
+
+async function migrateLegacyTokens(options: {
+  local: ChromeStorageAreaLike;
+  session: ChromeStorageAreaLike;
+  now: number;
+}): Promise<boolean> {
+  const { local, session, now } = options;
   const legacy = await local.get(TOKEN_STORAGE_KEYS);
+  const current = await session.get(TOKEN_STORAGE_KEYS);
   const updates: Partial<StoredTokens> = {};
+  let expectedIdentity = getFirstValidIdentity(current, now);
 
   for (const group of TOKEN_GROUPS) {
+    const currentToken = current[group.tokenKey];
+    if (typeof currentToken === "string" && validateCapturedToken(currentToken, group.kind, now).ok) {
+      continue;
+    }
     const token = legacy[group.tokenKey];
     if (typeof token !== "string") {
       continue;
@@ -100,6 +150,11 @@ export async function migrateLegacyLocalTokensToSession(options?: {
     if (!validation.ok) {
       continue;
     }
+    const identity = getTokenIdentity(validation.decoded);
+    if (expectedIdentity && identity && expectedIdentity !== identity) {
+      continue;
+    }
+    expectedIdentity ||= identity;
     setTokenUpdateValue(updates, group.tokenKey, token);
     const timestamp = legacy[group.timestampKey];
     const source = legacy[group.sourceKey];
@@ -118,12 +173,37 @@ export async function migrateLegacyLocalTokensToSession(options?: {
   return Object.keys(updates).length > 0;
 }
 
-function setTokenUpdateValue<K extends keyof StoredTokens>(updates: Partial<StoredTokens>, key: K, value: StoredTokens[K]): void {
-  updates[key] = value;
+async function enqueueTokenMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = tokenMutationQueue.then(mutation);
+  tokenMutationQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
-function hasAnyStoredToken(values: Record<string, unknown>): boolean {
-  return TOKEN_GROUPS.some((group) => typeof values[group.tokenKey] === "string");
+function getFirstValidIdentity(values: Record<string, unknown>, now: number): string | undefined {
+  for (const group of TOKEN_GROUPS) {
+    const token = values[group.tokenKey];
+    if (typeof token !== "string") {
+      continue;
+    }
+    const validation = validateCapturedToken(token, group.kind, now);
+    if (validation.ok) {
+      const identity = getTokenIdentity(validation.decoded);
+      if (identity) {
+        return identity;
+      }
+    }
+  }
+  return undefined;
+}
+
+function getTokenIdentity(decoded: Record<string, unknown>): string | undefined {
+  return typeof decoded.tid === "string" && typeof decoded.oid === "string"
+    ? `${decoded.tid.toLowerCase()}:${decoded.oid.toLowerCase()}`
+    : undefined;
+}
+
+function setTokenUpdateValue<K extends keyof StoredTokens>(updates: Partial<StoredTokens>, key: K, value: StoredTokens[K]): void {
+  updates[key] = value;
 }
 
 function compactStoredTokens(values: Record<string, unknown>): StoredTokens {

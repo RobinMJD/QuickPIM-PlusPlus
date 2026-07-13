@@ -325,6 +325,11 @@ button {
   gap: 20px;
 }
 
+.settings-layout.settings-loading {
+  pointer-events: none;
+  opacity: 0.65;
+}
+
 .settings-nav {
   display: grid;
   gap: 14px;
@@ -863,6 +868,8 @@ a.btn {
 
 .saved-justification-option {
   display: flex;
+  min-width: 0;
+  overflow-wrap: anywhere;
   justify-content: flex-start;
   width: 100%;
   min-height: 30px;
@@ -1056,18 +1063,28 @@ a.btn {
 }
 
 .progress-track {
+  width: 100%;
   height: 6px;
+  border: 0;
   overflow: hidden;
+  appearance: none;
   border-radius: 999px;
   background: #dbeafe;
 }
 
-.progress-track span {
-  display: block;
-  height: 100%;
+.progress-track::-webkit-progress-bar {
+  border-radius: inherit;
+  background: #dbeafe;
+}
+
+.progress-track::-webkit-progress-value {
   border-radius: inherit;
   background: #2563eb;
-  transition: width 0.2s ease;
+}
+
+.progress-track::-moz-progress-bar {
+  border-radius: inherit;
+  background: #2563eb;
 }
 
 .permissions-panel {
@@ -1314,6 +1331,8 @@ a.btn {
 
 .justification-chip {
   max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   border-radius: 999px;
   padding: 6px 10px;
   background: #f1f5f9;

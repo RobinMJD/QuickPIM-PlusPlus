@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.7.1**
+Current version: **v2.8.0**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -111,7 +111,7 @@ If the opened portal page asks you to sign in, refresh, or load PIM data, comple
 
 QuickPIM++ is local-first:
 
-- Tokens are stored only in the local browser profile.
+- Tokens are stored only in session storage for the current local browser session and are cleared when that session ends.
 - Settings, aliases, learned names, favorites, bundles, and justification history are local Chrome storage data.
 - The extension only calls Microsoft Graph and Azure Management for PIM operations.
 - Disabled role features are skipped during refreshes and Access Setup checks.
@@ -144,7 +144,7 @@ Then load the built extension:
 
 Requirements:
 
-- Node.js 20 or newer
+- Node.js 24 or newer
 - npm
 - Microsoft Edge or another Chromium browser for manual extension testing
 
@@ -172,13 +172,13 @@ Audit dependencies:
 npm audit --audit-level=low
 ```
 
-The extension version is declared in both `package.json` and `public/manifest.json`; keep them synchronized for each release.
+Run `node scripts/check-version-sync.mjs` to verify package, lockfile, manifest, runtime metadata, README, security review, and release-tag versions remain synchronized.
 
 ## Release Automation
 
-Pushing a `v*` tag builds the extension, creates or updates the GitHub release ZIP, and can submit the same ZIP to the Chrome Web Store automatically.
+Pushing a `v*` tag checks the exact tagged commit, reruns type checking, tests, dependency audit, and the production build, creates an immutable GitHub release ZIP, and submits that same verified ZIP to the Chrome Web Store automatically.
 
-Chrome Web Store publishing is skipped until these GitHub repository secrets are configured:
+Chrome Web Store publishing requires these GitHub repository secrets and fails visibly instead of silently skipping deployment when any value is missing:
 
 - `CHROME_WEBSTORE_CLIENT_ID`
 - `CHROME_WEBSTORE_CLIENT_SECRET`
@@ -225,6 +225,19 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.8.0
+
+- Isolates cached PIM data and captured Graph/Azure tokens by tenant and principal, clearing mixed-account session state during account changes.
+- Uses Microsoft current-user eligibility and assignment schedule-instance APIs so eligible, active, pending, and deactivation state are derived from the correct resources.
+- Preserves usable same-identity cache data when a refresh fails while preventing failed cross-identity refreshes from exposing old account data.
+- Adds bounded pagination, API fan-out, and activation/deactivation concurrency to avoid hangs, throttling spikes, repeated page loops, and unbounded responses.
+- Hardens portal token collection, token migration, runtime messages, ticket requirements, settings imports, bundle IDs, popup drafts, and strict MV3 CSP compatibility.
+- Serializes token and cache mutations so overlapping portal captures, refreshes, and stale-token cleanup cannot overwrite newer state.
+- Prevents stale Settings writes and concurrent feature refreshes from discarding unrelated saved preferences or cache entries.
+- Preserves unsaved Import / Export drafts during external settings updates and restores canonical names immediately when local aliases or learned names are cleared.
+- Makes GitHub releases immutable and fully verified, pins workflow actions, upgrades CI to Node 24, and makes missing Chrome Web Store configuration fail explicitly.
+- Updates the dependency lock to remove the vulnerable transitive WebSocket package version.
 
 ### v2.7.1
 

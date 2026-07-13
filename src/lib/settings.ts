@@ -51,7 +51,6 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     showActivationCounters: false,
     showEnablementDetails: false,
     showLastEnablementDate: false,
-    showAdvancedSettings: false,
     backgroundPreRefreshEnabled: true,
     enabledFeatures: ALL_FEATURES,
     autoEnabledFeaturesInitialized: false,
@@ -74,6 +73,13 @@ export function mergeSettings(input: Partial<QuickPimSettings> | undefined): Qui
     activationHistory: sanitizeActivationHistory(source.activationHistory),
     version: 2
   };
+}
+
+export function mergeImportedSettings(current: QuickPimSettings, input: Partial<QuickPimSettings>): QuickPimSettings {
+  const preferences = isRecord(input.preferences)
+    ? { ...current.preferences, ...input.preferences }
+    : current.preferences;
+  return mergeSettings({ ...current, ...input, preferences });
 }
 
 export async function loadSettings(): Promise<QuickPimSettings> {
@@ -270,12 +276,8 @@ export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): B
 }
 
 export function createBundleId(name: string): string {
-  const slug = name
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/(^-|-$)/g, "");
-  return `bundle:${slug || crypto.randomUUID()}`;
+  void name;
+  return `bundle:${crypto.randomUUID()}`;
 }
 
 function sanitizeAliases(value: unknown): Record<string, string> {
@@ -355,7 +357,6 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
     showActivationCounters: preferences.showActivationCounters === true,
     showEnablementDetails: preferences.showEnablementDetails === true,
     showLastEnablementDate: preferences.showLastEnablementDate === true,
-    showAdvancedSettings: false,
     backgroundPreRefreshEnabled: preferences.backgroundPreRefreshEnabled !== false,
     enabledFeatures: sanitizeEnabledFeatures(preferences.enabledFeatures, preferences.hiddenPopupTabs),
     autoEnabledFeaturesInitialized: preferences.autoEnabledFeaturesInitialized === true,
@@ -414,7 +415,7 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
     return [];
   }
 
-  return value.slice(0, MAX_BUNDLES).flatMap((bundle) => {
+  const bundles = value.slice(0, MAX_BUNDLES).flatMap((bundle) => {
     if (!isRecord(bundle)) {
       return [];
     }
@@ -424,6 +425,9 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
     }
     const id = sanitizeString(bundle.id, MAX_ITEM_ID_LENGTH) || createBundleId(name);
     const itemIds = sanitizeStringList(bundle.itemIds, MAX_BUNDLE_ITEMS, MAX_ITEM_ID_LENGTH);
+    if (!itemIds.length) {
+      return [];
+    }
     const defaultJustification = sanitizeString(bundle.defaultJustification, MAX_JUSTIFICATION_LENGTH);
     return [
       {
@@ -434,6 +438,18 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
         defaultJustification: defaultJustification && !isGenericJustification(defaultJustification) ? defaultJustification : undefined
       }
     ];
+  });
+
+  const seenIds = new Set<string>();
+  return bundles.map((bundle) => {
+    const normalizedId = bundle.id.toLowerCase();
+    if (!seenIds.has(normalizedId)) {
+      seenIds.add(normalizedId);
+      return bundle;
+    }
+    const id = createBundleId(bundle.name);
+    seenIds.add(id.toLowerCase());
+    return { ...bundle, id };
   });
 }
 

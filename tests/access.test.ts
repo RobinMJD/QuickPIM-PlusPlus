@@ -64,17 +64,20 @@ describe("portal-driven access setup", () => {
 
   test("uses successful API diagnostics over missing token scope claims", () => {
     const cache: QuickPimDataCache = {
-      eligible: {
-        items: [],
-        errors: [],
-        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
-        diagnostics: [
-          {
-            target: "pimGroup",
-            success: true,
-            checkedAt: "2026-05-18T12:00:00.000Z"
-          }
-        ]
+      eligibleByTarget: {
+        pimGroup: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "pimGroup"),
+          diagnostics: [
+            {
+              target: "pimGroup",
+              success: true,
+              checkedAt: "2026-05-18T12:00:00.000Z"
+            }
+          ]
+        }
       }
     };
 
@@ -88,29 +91,32 @@ describe("portal-driven access setup", () => {
 
   test("does not mark PIM groups ready when activation write scope is missing", () => {
     const cache: QuickPimDataCache = {
-      eligible: {
-        items: [
-          {
-            id: "pimGroup:group-1:member",
-            type: "pimGroup",
-            sourceName: "Ops Group",
-            displayName: "Ops Group",
-            principalId: "user-1",
-            groupId: "group-1",
-            accessId: "member",
-            scopeLabel: "Group",
-            status: "eligible"
-          }
-        ],
-        errors: [],
-        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
-        diagnostics: [
-          {
-            target: "pimGroup",
-            success: true,
-            checkedAt: "2026-05-18T12:00:00.000Z"
-          }
-        ]
+      eligibleByTarget: {
+        pimGroup: {
+          items: [
+            {
+              id: "pimGroup:group-1:member",
+              type: "pimGroup",
+              sourceName: "Ops Group",
+              displayName: "Ops Group",
+              principalId: "user-1",
+              groupId: "group-1",
+              accessId: "member",
+              scopeLabel: "Group",
+              status: "eligible"
+            }
+          ],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithPimGroupReadOnlyScope, "pimGroup"),
+          diagnostics: [
+            {
+              target: "pimGroup",
+              success: true,
+              checkedAt: "2026-05-18T12:00:00.000Z"
+            }
+          ]
+        }
       }
     };
 
@@ -124,7 +130,7 @@ describe("portal-driven access setup", () => {
     expect(getAccessSetupTargets(status)).toContain("pimGroup");
   });
 
-  test("uses loaded cached items as a ready signal when old caches have no diagnostics", () => {
+  test("does not use an unscoped legacy cache as evidence for the current identity", () => {
     const cache: QuickPimDataCache = {
       eligible: {
         items: [
@@ -148,67 +154,80 @@ describe("portal-driven access setup", () => {
     const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
 
     expect(status.find((item) => item.target === "directoryRole")).toMatchObject({
-      status: "ready",
-      detail: "Loaded eligible or active items."
+      status: "needsPortalRefresh"
     });
   });
 
-  test("uses loaded items over stale failed diagnostics", () => {
+  test("surfaces the newest permission failure while retaining cached items", () => {
     const cache: QuickPimDataCache = {
-      eligible: {
-        items: [
-          {
-            id: "pimGroup:group-1:member",
-            type: "pimGroup",
-            sourceName: "Ops Group",
-            displayName: "Ops Group",
-            principalId: "user-1",
-            groupId: "group-1",
-            accessId: "member",
-            scopeLabel: "Group",
-            status: "eligible"
-          }
-        ],
-        errors: [],
-        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
-        diagnostics: [
-          {
-            target: "pimGroup",
-            success: false,
-            checkedAt: "2026-05-18T12:01:00.000Z",
-            error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
-          }
-        ]
+      eligibleByTarget: {
+        pimGroup: {
+          items: [
+            {
+              id: "pimGroup:group-1:member",
+              type: "pimGroup",
+              sourceName: "Ops Group",
+              displayName: "Ops Group",
+              principalId: "user-1",
+              groupId: "group-1",
+              accessId: "member",
+              scopeLabel: "Group",
+              status: "eligible"
+            }
+          ],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "pimGroup"),
+          diagnostics: [
+            {
+              target: "pimGroup",
+              success: false,
+              checkedAt: "2026-05-18T12:01:00.000Z",
+              error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
+            }
+          ]
+        }
       }
     };
 
     const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
 
     expect(status.find((item) => item.target === "pimGroup")).toMatchObject({
-      status: "ready",
-      detail: "Loaded eligible or active items."
+      status: "limited",
+      detail: "Cached data is available, but the latest Microsoft API check was blocked."
     });
   });
 
   test("isolates feature failures instead of marking every feature limited", () => {
     const cache: QuickPimDataCache = {
-      eligible: {
-        items: [],
-        errors: [],
-        fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
-        diagnostics: [
-          {
-            target: "directoryRole",
-            success: true,
-            checkedAt: "2026-05-18T12:00:00.000Z"
-          },
-          {
-            target: "pimGroup",
-            success: false,
-            checkedAt: "2026-05-18T12:01:00.000Z",
-            error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
-          }
-        ]
+      eligibleByTarget: {
+        directoryRole: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "directoryRole"),
+          diagnostics: [
+            {
+              target: "directoryRole",
+              success: true,
+              checkedAt: "2026-05-18T12:00:00.000Z"
+            }
+          ]
+        },
+        pimGroup: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "pimGroup"),
+          diagnostics: [
+            {
+              target: "pimGroup",
+              success: false,
+              checkedAt: "2026-05-18T12:01:00.000Z",
+              error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
+            }
+          ]
+        }
       }
     };
 
@@ -217,6 +236,32 @@ describe("portal-driven access setup", () => {
     expect(status.find((item) => item.target === "directoryRole")).toMatchObject({ status: "ready" });
     expect(status.find((item) => item.target === "pimGroup")).toMatchObject({ status: "limited" });
     expect(status.find((item) => item.target === "azureRole")).toMatchObject({ status: "ready" });
+  });
+
+  test("ignores capability diagnostics cached for another tenant or principal", () => {
+    const oldStatus: TokenStatus = {
+      graph: { hasToken: true, tenantId: "tenant-a", principalId: "user-a", grantedScopes: [] },
+      azureManagement: { hasToken: false }
+    };
+    const currentStatus: TokenStatus = {
+      graph: { hasToken: true, tenantId: "tenant-b", principalId: "user-b", grantedScopes: [] },
+      azureManagement: { hasToken: false }
+    };
+    const cache: QuickPimDataCache = {
+      eligibleByTarget: {
+        directoryRole: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(oldStatus, "directoryRole"),
+          diagnostics: [{ target: "directoryRole", success: true, checkedAt: "2026-05-18T12:00:00.000Z" }]
+        }
+      }
+    };
+
+    expect(buildAccessCapabilityItems(currentStatus, cache, ["directoryRole"])[0]).toMatchObject({
+      status: "needsPortalRefresh"
+    });
   });
 
   test("builds cache keys from token capability instead of capture time", () => {
@@ -324,5 +369,17 @@ describe("portal-driven access setup", () => {
     expect(buildTargetCacheKey(second, "directoryRole")).toBe(buildTargetCacheKey(first, "directoryRole"));
     expect(buildTargetCacheKey(second, "azureRole")).toBe(buildTargetCacheKey(first, "azureRole"));
     expect(buildTargetCacheKey(second, "pimGroup")).not.toBe(buildTargetCacheKey(first, "pimGroup"));
+  });
+
+  test("isolates cached role data by tenant and principal", () => {
+    const first: TokenStatus = {
+      graph: { hasToken: true, tenantId: "tenant-a", principalId: "user-a" },
+      azureManagement: { hasToken: false }
+    };
+    const second: TokenStatus = {
+      graph: { hasToken: true, tenantId: "tenant-b", principalId: "user-a" },
+      azureManagement: { hasToken: false }
+    };
+    expect(buildTargetCacheKey(first, "directoryRole")).not.toBe(buildTargetCacheKey(second, "directoryRole"));
   });
 });

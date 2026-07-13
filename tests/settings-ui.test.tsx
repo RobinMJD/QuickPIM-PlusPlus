@@ -23,7 +23,7 @@ function clickButton(label: string): HTMLButtonElement {
 }
 
 function setFieldValue(field: HTMLInputElement | HTMLTextAreaElement, value: string) {
-  const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const prototype = field.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
   setter?.call(field, value);
   field.dispatchEvent(new Event("input", { bubbles: true }));
@@ -62,14 +62,14 @@ describe("settings Home page", () => {
       [SETTINGS_KEY]: createDefaultSettings()
     };
     const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/releases/tags/v2.7.1")) {
+      if (url.endsWith("/releases/tags/v2.8.0")) {
         return {
           ok: true,
           json: async () => ({
-            tag_name: "v2.7.1",
-            name: "QuickPIM++ v2.7.1",
+            tag_name: "v2.8.0",
+            name: "QuickPIM++ v2.8.0",
             body: "React rewrite, bundles, PIM groups, and cleaner settings.",
-            html_url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.7.1",
+            html_url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.8.0",
             published_at: "2026-05-18T10:00:00.000Z"
           })
         };
@@ -78,7 +78,7 @@ describe("settings Home page", () => {
     });
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -110,7 +110,7 @@ describe("settings Home page", () => {
     await import("../src/settings/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ is a local-first activation console"));
-    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ v2.7.1"));
+    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ v2.8.0"));
     expect(document.body.textContent).toContain("2026-05-18");
     expect(document.body.textContent).not.toContain("5/18/2026");
     expect(document.body.textContent).toContain("Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.");
@@ -135,7 +135,7 @@ describe("settings Home page", () => {
     ]);
     expect(navButtons.at(-1)).toBe("About");
     expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(10);
-    expect(fetchMock.mock.calls[0][0]).toBe("https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/v2.7.1");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/v2.8.0");
   });
 
   test("uses cached GitHub changelog data without fetching again", async () => {
@@ -146,12 +146,12 @@ describe("settings Home page", () => {
       [SETTINGS_KEY]: createDefaultSettings(),
       "quickPimChangelog.v2": {
         fetchedAt: Date.now(),
-        releaseTag: "v2.7.1",
+        releaseTag: "v2.8.0",
         items: [
           {
-            title: "Cached v2.7.1",
+            title: "Cached v2.8.0",
             description: "Cached release notes.",
-            url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.7.1",
+            url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.8.0",
             date: "2026-05-18T10:00:00.000Z"
           }
         ]
@@ -162,7 +162,7 @@ describe("settings Home page", () => {
     });
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -193,7 +193,7 @@ describe("settings Home page", () => {
     vi.resetModules();
     await import("../src/settings/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Cached v2.7.1"));
+    await waitFor(() => expect(document.body.textContent).toContain("Cached v2.8.0"));
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -217,14 +217,14 @@ describe("settings Home page", () => {
       }
     };
     const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/releases/tags/v2.7.1")) {
+      if (url.endsWith("/releases/tags/v2.8.0")) {
         return {
           ok: true,
           json: async () => ({
-            tag_name: "v2.7.1",
-            name: "QuickPIM++ v2.7.1",
+            tag_name: "v2.8.0",
+            name: "QuickPIM++ v2.8.0",
             body: "Fixes the settings changelog cache.",
-            html_url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.7.1",
+            html_url: "https://github.com/RobinMJD/QuickPIM-PlusPlus/releases/tag/v2.8.0",
             published_at: "2026-05-21T10:00:00.000Z"
           })
         };
@@ -233,7 +233,7 @@ describe("settings Home page", () => {
     });
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -264,11 +264,11 @@ describe("settings Home page", () => {
     vi.resetModules();
     await import("../src/settings/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ v2.7.1"));
+    await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ v2.8.0"));
     expect(document.body.textContent).not.toContain("Cached v2.1.0");
-    expect(fetchMock.mock.calls[0][0]).toBe("https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/v2.7.1");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/v2.8.0");
     expect(storageData["quickPimChangelog.v2"]).toMatchObject({
-      releaseTag: "v2.7.1"
+      releaseTag: "v2.8.0"
     });
   });
 });
@@ -315,7 +315,7 @@ describe("settings About page", () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
 
     const text = document.body.textContent || "";
-    expect(text).toContain("QuickPIM++ 2.7.1");
+    expect(text).toContain("QuickPIM++ 2.8.0");
     expect(text).not.toContain("0.0.0");
     expect(text).toContain("Original author: Daniel Bradley");
     expect(document.querySelector<HTMLAnchorElement>('a[href="https://github.com/DanielBradley1/QuickPIM"]')?.textContent).toBe(
@@ -357,7 +357,7 @@ describe("settings Access Setup page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             throw new Error("Settings should use cached eligible data.");
@@ -402,7 +402,7 @@ describe("settings Access Setup page", () => {
     const openedUrls: string[] = [];
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems" || message.action === "getActiveItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -463,7 +463,7 @@ describe("settings Access Setup page", () => {
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
-          cacheKey: "graphDirectoryRole::",
+          cacheKey: "graphDirectory::",
           errors: [],
           items: [],
           diagnostics: [
@@ -496,7 +496,7 @@ describe("settings Access Setup page", () => {
         eligibleByTarget: {
           directoryRole: {
             fetchedAt: Date.now(),
-            cacheKey: "graphDirectoryRole::",
+            cacheKey: "graphDirectory::",
             errors: [],
             items: [],
             diagnostics: [
@@ -550,7 +550,7 @@ describe("settings Access Setup page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -594,7 +594,7 @@ describe("settings Access Setup page", () => {
     let tokenRequests = 0;
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems" || message.action === "getActiveItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -658,7 +658,7 @@ describe("settings Access Setup page", () => {
     let tokenRequests = 0;
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return {
@@ -742,7 +742,7 @@ describe("settings Access Setup page", () => {
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             eligibleCalls += 1;
@@ -805,7 +805,7 @@ describe("settings Access Setup page", () => {
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             eligibleCalls += 1;
@@ -896,7 +896,7 @@ describe("settings Activity page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -960,7 +960,7 @@ describe("settings justification guardrails", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1017,7 +1017,7 @@ describe("settings justification guardrails", () => {
     const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1083,7 +1083,7 @@ describe("settings justification guardrails", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1180,7 +1180,7 @@ describe("settings Bundles page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             throw new Error("Settings should use cached eligible data.");
@@ -1239,7 +1239,7 @@ describe("settings Bundles page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1305,7 +1305,7 @@ describe("settings Bundles page", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             throw new Error("Settings should use cached eligible data.");
@@ -1372,7 +1372,7 @@ describe("settings Bundles page", () => {
     expect(storageData[SETTINGS_KEY]).toMatchObject({
       bundles: expect.arrayContaining([
         expect.objectContaining({ id: "bundle:daily-ops", name: "Daily operations" }),
-        expect.objectContaining({ id: "bundle:daily-operations-copy", name: "Daily operations copy" })
+        expect.objectContaining({ id: expect.stringMatching(/^bundle:[0-9a-f-]+$/), name: "Daily operations copy" })
       ])
     });
   });
@@ -1402,6 +1402,119 @@ describe("settings layout spacing", () => {
 });
 
 describe("settings dark mode", () => {
+  test("preserves an unsaved import draft when settings change elsewhere", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#data");
+
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
+    const emptyTokenStatus = { graph: { hasToken: false }, azureManagement: { hasToken: false } };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return { success: true, data: emptyTokenStatus };
+          }
+          if (message.action === "getActivationSnapshot") {
+            return {
+              success: true,
+              data: {
+                eligible: { items: [], errors: [], diagnostics: [] },
+                active: { items: [], errors: [], diagnostics: [] },
+                tokenStatus: emptyTokenStatus
+              }
+            };
+          }
+          return { success: true, data: { items: [], errors: [], diagnostics: [] } };
+        }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        },
+        onChanged: {
+          addListener: vi.fn((listener: (changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void) => storageListeners.push(listener)),
+          removeListener: vi.fn()
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.querySelector("textarea.code-box")).toBeTruthy());
+    await waitFor(() => expect(storageListeners).toHaveLength(1));
+
+    const textarea = document.querySelector<HTMLTextAreaElement>("textarea.code-box")!;
+    const localDraft = '{"savedJustifications":["Local draft"]}';
+    setFieldValue(textarea, localDraft);
+    await waitFor(() => expect(textarea.value).toBe(localDraft));
+
+    const current = storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS;
+    const external = { ...current, favoriteItemIds: ["directoryRole:reader:/"] };
+    storageData[SETTINGS_KEY] = external;
+    storageListeners[0]({ [SETTINGS_KEY]: { oldValue: current, newValue: external } }, "local");
+
+    await waitFor(() => expect(textarea.value).toBe(localDraft));
+  });
+
+  test("keeps an unsaved preference draft when another settings section changes", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#preferences");
+
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
+    const chromeMock = {
+      runtime: {
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
+        sendMessage: vi.fn(async (message: { action: string }) => message.action === "getTokenStatus"
+          ? { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } }
+          : { success: true, data: { items: [], errors: [] } }),
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        },
+        onChanged: {
+          addListener: vi.fn((listener: (changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void) => storageListeners.push(listener)),
+          removeListener: vi.fn()
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
+    await waitFor(() => expect(storageListeners).toHaveLength(1));
+
+    const sortSelect = [...document.querySelectorAll<HTMLSelectElement>(".popup-defaults-grid select")][1];
+    sortSelect.value = "scope";
+    sortSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => expect(sortSelect.value).toBe("scope"));
+
+    const current = storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS;
+    const external = { ...current, savedJustifications: ["Remote saved reason"] };
+    storageData[SETTINGS_KEY] = external;
+    storageListeners[0]({ [SETTINGS_KEY]: { oldValue: current, newValue: external } }, "local");
+
+    await waitFor(() => expect(sortSelect.value).toBe("scope"));
+    clickButton("Save preferences");
+    await waitFor(() => {
+      expect(storageData[SETTINGS_KEY]).toMatchObject({
+        savedJustifications: ["Remote saved reason"],
+        preferences: expect.objectContaining({ defaultSort: "scope" })
+      });
+    });
+  });
+
   test("clarifies popup defaults and uses labeled activation duration options", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#preferences");
@@ -1411,7 +1524,7 @@ describe("settings dark mode", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -1470,7 +1583,7 @@ describe("settings dark mode", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1522,7 +1635,7 @@ describe("settings dark mode", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -1591,7 +1704,7 @@ describe("settings dark mode", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getTokenStatus") {
             return {
@@ -1635,7 +1748,7 @@ describe("settings dark mode", () => {
     };
     const chromeMock = {
       runtime: {
-        getManifest: () => ({ name: "QuickPIM++", version: "2.7.1" }),
+        getManifest: () => ({ name: "QuickPIM++", version: "2.8.0" }),
         sendMessage: vi.fn(async (message: { action: string }) => {
           if (message.action === "getActivationItems") {
             return { success: true, data: { items: [], errors: [] } };
