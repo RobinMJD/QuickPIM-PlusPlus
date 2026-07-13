@@ -145,7 +145,7 @@ Then load the built extension:
 Requirements:
 
 - Node.js 24 or newer
-- npm
+- npm 11.6.2 (the CI and release workflows pin this version for lockfile reproducibility)
 - Microsoft Edge or another Chromium browser for manual extension testing
 
 Install dependencies:
