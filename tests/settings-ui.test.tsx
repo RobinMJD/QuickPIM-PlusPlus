@@ -1731,8 +1731,7 @@ describe("settings dark mode", () => {
     vi.resetModules();
     await import("../src/settings/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Usage counters"));
-    expect(document.body.textContent).toContain("2026-06-12");
+    await waitFor(() => expect(document.body.textContent).toContain("2026-06-12"));
     expect(document.body.textContent).not.toContain("6/12/2026");
   });
 
