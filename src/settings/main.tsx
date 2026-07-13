@@ -199,14 +199,10 @@ function SettingsApp() {
       const eligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey);
       const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, eligible.items);
       await saveReferenceData(nextReferenceData);
-      setSettings(loadedSettings);
       setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
       setTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
-      if (!exportTextDirty.current) {
-        replaceExportText(JSON.stringify(loadedSettings, null, 2));
-      }
       if (options.showProgress) {
         setMessage(
           eligible.items.length

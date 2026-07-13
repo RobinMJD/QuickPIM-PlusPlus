@@ -1494,6 +1494,7 @@ describe("settings dark mode", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
     await waitFor(() => expect(storageListeners).toHaveLength(1));
+    await waitFor(() => expect(document.querySelector(".settings-layout")?.getAttribute("aria-busy")).toBe("false"));
 
     const sortSelect = [...document.querySelectorAll<HTMLSelectElement>(".popup-defaults-grid select")][1];
     sortSelect.value = "scope";
