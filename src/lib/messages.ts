@@ -2,6 +2,7 @@ import type { AccessSetupTarget, ActivationItem, TicketInfo } from "./types";
 
 export type QuickPimMessage =
   | { action: "getTokenStatus" }
+  | { action: "refreshPortalTokens" }
   | { action: "clearToken" }
   | { action: "getActivationItems"; targets?: AccessSetupTarget[] }
   | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
@@ -21,7 +22,7 @@ export type QuickPimMessage =
       ticketInfo?: TicketInfo;
     };
 
-const SIMPLE_ACTIONS = new Set(["getTokenStatus", "clearToken"]);
+const SIMPLE_ACTIONS = new Set(["getTokenStatus", "refreshPortalTokens", "clearToken"]);
 const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", "getActivationSnapshot"]);
 const MAX_PORTAL_TOKENS = 20;
 const MAX_PORTAL_TOKEN_LENGTH = 8192;

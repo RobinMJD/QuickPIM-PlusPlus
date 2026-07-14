@@ -142,6 +142,7 @@ describe("Graph token capability detection", () => {
 describe("runtime message validation", () => {
   test("rejects unsupported and malformed privileged messages", () => {
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
+    expect(validateQuickPimMessage({ action: "refreshPortalTokens" })).toEqual({ action: "refreshPortalTokens" });
     expect(validateQuickPimMessage({ action: "getActivationSnapshot", targets: ["directoryRole", "directoryRole", "azureRole"] })).toEqual({
       action: "getActivationSnapshot",
       targets: ["directoryRole", "azureRole"]

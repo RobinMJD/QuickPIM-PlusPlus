@@ -56,6 +56,7 @@ const TOKEN_GROUPS: Array<{ tokenKey: keyof StoredTokens; timestampKey: keyof St
 ];
 
 let tokenMutationQueue: Promise<void> = Promise.resolve();
+let defaultLegacyMigration: Promise<boolean> | undefined;
 
 export async function getStoredTokensFromSession(options?: {
   local?: ChromeStorageAreaLike;
@@ -64,7 +65,15 @@ export async function getStoredTokensFromSession(options?: {
 }): Promise<StoredTokens> {
   const session = options?.session || chrome.storage.session;
   const local = options?.local || chrome.storage.local;
-  await migrateLegacyLocalTokensToSession({ local, session, now: options?.now });
+  if (options?.local || options?.session || options?.now !== undefined) {
+    await migrateLegacyLocalTokensToSession({ local, session, now: options?.now });
+  } else {
+    defaultLegacyMigration ||= migrateLegacyLocalTokensToSession().catch((error) => {
+      defaultLegacyMigration = undefined;
+      throw error;
+    });
+    await defaultLegacyMigration;
+  }
   return compactStoredTokens(await session.get(TOKEN_STORAGE_KEYS));
 }
 

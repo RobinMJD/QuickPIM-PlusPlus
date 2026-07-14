@@ -167,7 +167,7 @@ function buildTokenCachePart(label: string, token: TokenStatusEntry | undefined)
 
   const scopes = [...(token.grantedScopes || [])].sort((a, b) => a.localeCompare(b)).join(",");
   const identity = token.tenantId && token.principalId ? `${token.tenantId}:${token.principalId}:` : "";
-  return `${label}:${identity}${token.expiresAt || ""}:${scopes}`;
+  return `${label}:${identity}${scopes}`;
 }
 
 function buildAccessCapabilityItem(

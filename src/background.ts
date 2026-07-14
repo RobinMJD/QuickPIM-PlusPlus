@@ -37,6 +37,11 @@ import {
   syncPreRefreshAlarm
 } from "./lib/preRefresh";
 import {
+  getPortalTokenRecoveryTargets,
+  getStaleCacheTargets,
+  scanOpenEntraTabs
+} from "./lib/portalTokenRefresh";
+import {
   getRequiredGraphActivationScopes,
   getGraphTokenAuthStrengthScore,
   getGraphTokenOverallScore,
@@ -77,6 +82,7 @@ import type {
   DirectoryRoleApi,
   GroupInfo,
   PimGroupApi,
+  PortalTokenRefreshResult,
   RoleManagementPolicyAssignmentApi,
   TicketInfo,
   TokenKind,
@@ -101,6 +107,7 @@ interface AzureRoleDefinitionInfo {
 
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
 const TOKEN_KINDS: TokenKind[] = ["graph", "azureManagement"];
+let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
 
 const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
   directoryRole: {
@@ -130,7 +137,7 @@ chrome.runtime.onInstalled?.addListener(() => {
 });
 
 chrome.runtime.onStartup?.addListener(() => {
-  void initializeBackgroundRefresh();
+  void initializeBackgroundRefresh().then(() => runBackgroundPreRefresh());
 });
 
 chrome.storage.onChanged?.addListener((changes, areaName) => {
@@ -187,13 +194,26 @@ async function runBackgroundPreRefresh(): Promise<void> {
     return;
   }
 
-  const tokenStatus = await getTokenStatus();
+  const enabledRoleFeatures = getEnabledRoleFeatures(settings);
+  const [dataCache, initialTokenStatus] = await Promise.all([loadDataCache(), getTokenStatus()]);
+  const staleBeforeTokenRecovery = getStaleCacheTargets({
+    cache: dataCache,
+    enabledTargets: enabledRoleFeatures,
+    tokenStatus: initialTokenStatus
+  });
+  const tokenRecoveryTargets = getPortalTokenRecoveryTargets({
+    cache: dataCache,
+    enabledTargets: enabledRoleFeatures,
+    staleTargets: staleBeforeTokenRecovery,
+    tokenStatus: initialTokenStatus
+  });
+  const tokenStatus = tokenRecoveryTargets.length
+    ? (await refreshPortalTokensFromOpenTabs()).tokenStatus
+    : initialTokenStatus;
   if (shouldSkipPreRefresh(tokenStatus)) {
     return;
   }
 
-  const enabledRoleFeatures = getEnabledRoleFeatures(settings);
-  const dataCache = await loadDataCache();
   const targets = getPreRefreshTargets({
     cache: dataCache,
     enabledTargets: enabledRoleFeatures,
@@ -233,6 +253,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
   switch (message.action) {
     case "getTokenStatus":
       return getTokenStatus();
+    case "refreshPortalTokens":
+      return refreshPortalTokensFromOpenTabs();
     case "clearToken":
       await clearTokens();
       return true;
@@ -251,6 +273,24 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     default:
       throw new Error("Unsupported QuickPIM++ message");
   }
+}
+
+function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
+  if (portalTokenRefreshInFlight) {
+    return portalTokenRefreshInFlight;
+  }
+
+  const refresh = (async (): Promise<PortalTokenRefreshResult> => {
+    const scanResult = await scanOpenEntraTabs(chrome.tabs);
+    return {
+      tokenStatus: await getTokenStatus(),
+      ...scanResult
+    };
+  })();
+  portalTokenRefreshInFlight = refresh.finally(() => {
+    portalTokenRefreshInFlight = undefined;
+  });
+  return portalTokenRefreshInFlight;
 }
 
 function captureToken(details: chrome.webRequest.WebRequestHeadersDetails): void {

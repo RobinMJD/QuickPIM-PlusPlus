@@ -94,6 +94,25 @@ describe("session token storage", () => {
     expect(localData).not.toHaveProperty("graphToken");
   });
 
+  test("checks legacy local tokens only once for concurrent default session reads", async () => {
+    const local = makeStorageArea({});
+    const session = makeStorageArea({});
+    vi.stubGlobal("chrome", { storage: { local, session } });
+
+    try {
+      await Promise.all([
+        getStoredTokensFromSession(),
+        getStoredTokensFromSession(),
+        getStoredTokensFromSession()
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(local.get).toHaveBeenCalledTimes(1);
+    expect(local.remove).toHaveBeenCalledTimes(1);
+  });
+
   test("does not combine legacy tokens from a different tenant or principal", async () => {
     const localData = {
       azureManagementToken: makeToken({

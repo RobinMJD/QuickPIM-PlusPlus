@@ -69,6 +69,7 @@ import {
   saveReferenceData
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
+import { getPortalTokenRecoveryTargets } from "../lib/portalTokenRefresh";
 import {
   clearPopupDraft,
   hasPopupDraftContent,
@@ -87,6 +88,7 @@ import type {
   ReferenceDataCache,
   QuickPimSettings,
   PopupRequestMode,
+  PortalTokenRefreshResult,
   SortMode,
   TicketInfo,
   TokenStatus
@@ -119,7 +121,7 @@ const DEACTIVATION_STEPS: LoadingProgress[] = [
   { current: 2, total: 3, label: "Saving deactivation result" },
   { current: 3, total: 3, label: "Refreshing deactivation status" }
 ];
-const REFRESH_TOTAL_STEPS = 4;
+const INITIAL_REFRESH_TOTAL_STEPS = 3;
 
 function buildActivationFailureNotice(
   errors: ActivationResponse["errors"],
@@ -191,6 +193,7 @@ function PopupApp() {
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const refreshRunId = useRef(0);
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
 
@@ -227,9 +230,9 @@ function PopupApp() {
   const roleTabs = useMemo<RoleTab[]>(
     () =>
       (["directoryRole", "pimGroup", "azureRole"] as RoleTab[]).filter(
-        (roleTab) => enabledFeatures.has(roleTab) && (isLoading || itemTypesWithData.has(roleTab))
+        (roleTab) => enabledFeatures.has(roleTab) && (isLoading || isRefreshing || itemTypesWithData.has(roleTab))
       ),
-    [enabledFeatures, isLoading, itemTypesWithData]
+    [enabledFeatures, isLoading, isRefreshing, itemTypesWithData]
   );
   const visibleTabs = useMemo<PopupTab[]>(() => {
     const tabs: PopupTab[] = [...roleTabs];
@@ -254,8 +257,8 @@ function PopupApp() {
   const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
   const showPermissionWarning = useMemo(
-    () => tokenStatus !== null && !settings.preferences.permissionWarningIgnored && accessSetupTargets.length > 0,
-    [accessSetupTargets.length, settings, tokenStatus]
+    () => hasActivationDataLoaded && tokenStatus !== null && !settings.preferences.permissionWarningIgnored && accessSetupTargets.length > 0,
+    [accessSetupTargets.length, hasActivationDataLoaded, settings, tokenStatus]
   );
 
   useEffect(() => {
@@ -462,6 +465,8 @@ function PopupApp() {
   }
 
   async function refresh(options: { force: boolean; showLoading?: boolean; suppressMessage?: boolean; targets?: AccessSetupTarget[] }) {
+    const runId = ++refreshRunId.current;
+    const isCurrentRun = () => refreshRunId.current === runId;
     const showBlockingLoading = options.showLoading !== false;
     const shouldShowProgress = !options.suppressMessage;
     if (!options.suppressMessage) {
@@ -474,7 +479,7 @@ function PopupApp() {
       }
       setRefreshProgress({
         current: 1,
-        total: REFRESH_TOTAL_STEPS,
+        total: INITIAL_REFRESH_TOTAL_STEPS,
         label: showBlockingLoading ? "Reading local state" : "Checking local data"
       });
     }
@@ -490,36 +495,38 @@ function PopupApp() {
         loadReferenceData(),
         sendMessage<TokenStatus>({ action: "getTokenStatus" })
       ]);
-      const now = Date.now();
-      const tokenCacheKey = buildTokenCacheKey(loadedTokens);
-      const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
-      const refreshTargets = normalizeRefreshTargets(options.targets || enabledRoleFeatures, enabledRoleFeatures);
-      const targetCacheKeys = buildTargetCacheKeys(loadedTokens, enabledRoleFeatures);
-      const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
-      const eligibleCache = getTargetEntriesFromCache(currentCache, "eligible", enabledRoleFeatures, targetCacheKeys, {
-        legacyCacheKey,
-        now,
-        freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
-        usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
-      });
-      const activeCache = getTargetEntriesFromCache(currentCache, "active", enabledRoleFeatures, targetCacheKeys, {
-        legacyCacheKey,
-        now,
-        freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
-      });
-      const cachedEligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey);
-      const cachedActive = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), now, legacyCacheKey);
-      const canShowCachedData = !options.force && cachedEligible.items.length > 0;
-      if (shouldShowProgress) {
-        setRefreshProgress({
-          current: 2,
-          total: REFRESH_TOTAL_STEPS,
-          label: "Checking cache and tokens"
-        });
+      if (!isCurrentRun()) {
+        return;
       }
 
+      const now = Date.now();
+      const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
+      const refreshTargets = normalizeRefreshTargets(options.targets || enabledRoleFeatures, enabledRoleFeatures);
+      setSettings(loadedSettings);
+      setTokenStatus(loadedTokens);
+      setReferenceData(loadedReferenceData);
+      setAccessCapabilities(buildAccessCapabilityItems(loadedTokens, currentCache, enabledRoleFeatures));
+      const initialCacheView = getActivationCacheView(currentCache, loadedTokens, enabledRoleFeatures, now);
+      let currentCacheView = initialCacheView;
+      let progressiveCache = currentCache;
+      let progressiveTokens = loadedTokens;
+      let progressiveReferenceData = learnReferenceDataFromItems(
+        loadedReferenceData,
+        [...initialCacheView.eligible.items, ...initialCacheView.active.items]
+      );
+      const canShowCachedData = !options.force && (
+        initialCacheView.eligible.items.length > 0 || initialCacheView.active.items.length > 0
+      );
+
       if (canShowCachedData) {
-        await applyLoadedActivationData(loadedSettings, loadedTokens, currentCache, loadedReferenceData, cachedEligible, cachedActive);
+        renderLoadedActivationData(
+          loadedSettings,
+          loadedTokens,
+          currentCache,
+          progressiveReferenceData,
+          initialCacheView.eligible,
+          initialCacheView.active
+        );
         setIsLoading(false);
       } else if (showBlockingLoading) {
         setIsLoading(true);
@@ -527,70 +534,179 @@ function PopupApp() {
         setIsRefreshing(true);
       }
 
-      const staleTargets = refreshTargets.filter(
-        (target) => options.force || !eligibleCache[target]?.isFresh || !activeCache[target]?.isFresh
+      let staleTargets = refreshTargets.filter(
+        (target) => options.force || !initialCacheView.eligibleCache[target]?.isFresh || !initialCacheView.activeCache[target]?.isFresh
       );
+      const portalTokenRecoveryTargets = getPortalTokenRecoveryTargets({
+        cache: currentCache,
+        enabledTargets: refreshTargets,
+        staleTargets,
+        tokenStatus: loadedTokens,
+        force: options.force,
+        now
+      });
+      const fetchProgressOffset = portalTokenRecoveryTargets.length ? 3 : 2;
       if (shouldShowProgress) {
+        const total = staleTargets.length + fetchProgressOffset + 1;
         setRefreshProgress({
-          current: 3,
-          total: REFRESH_TOTAL_STEPS,
-          label: "Checking what needs refresh"
+          current: 2,
+          total,
+          label: portalTokenRecoveryTargets.length
+            ? "Checking existing Microsoft portal tabs"
+            : staleTargets.length
+            ? `Fetching latest data from ${staleTargets.length} role source${staleTargets.length === 1 ? "" : "s"} in parallel`
+            : "Local data is current"
         });
+      }
+
+      if (portalTokenRecoveryTargets.length) {
+        setIsRefreshing(true);
+        try {
+          const tokenRefresh = await sendMessage<PortalTokenRefreshResult>({ action: "refreshPortalTokens" });
+          if (!isCurrentRun()) {
+            return;
+          }
+          progressiveTokens = tokenRefresh.tokenStatus;
+          setTokenStatus(progressiveTokens);
+          setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
+          currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
+          staleTargets = refreshTargets.filter(
+            (target) => options.force || !currentCacheView.eligibleCache[target]?.isFresh || !currentCacheView.activeCache[target]?.isFresh
+          );
+          if (shouldShowProgress) {
+            setRefreshProgress({
+              current: 3,
+              total: staleTargets.length + fetchProgressOffset + 1,
+              label: staleTargets.length
+                ? `Fetching latest data from ${staleTargets.length} role source${staleTargets.length === 1 ? "" : "s"} in parallel`
+                : "Portal access and local data are current"
+            });
+          }
+        } catch {
+          // Existing tokens and cached data remain usable when no portal tab can answer the optional scan.
+        }
       }
       if (!staleTargets.length) {
         if (!canShowCachedData) {
-          await applyLoadedActivationData(loadedSettings, loadedTokens, currentCache, loadedReferenceData, cachedEligible, cachedActive);
+          renderLoadedActivationData(
+            loadedSettings,
+            progressiveTokens,
+            currentCache,
+            progressiveReferenceData,
+            currentCacheView.eligible,
+            currentCacheView.active
+          );
         }
+        setHasActivationDataLoaded(true);
         if (!options.suppressMessage) {
           setMessage("");
         }
         return;
       }
 
-      if (canShowCachedData || !showBlockingLoading) {
-        setIsRefreshing(true);
-        if (!options.suppressMessage) {
-          setMessage("");
-        }
+      setIsRefreshing(true);
+      if (!options.suppressMessage) {
+        setMessage("");
       }
 
-      if (shouldShowProgress) {
-        setRefreshProgress({
-          current: 3,
-          total: REFRESH_TOTAL_STEPS,
-          label: "Fetching latest data"
-        });
+      const preferredTarget = staleTargets[0];
+      const eligibleResultsByTarget: Partial<Record<AccessSetupTarget, ActivationSnapshot["eligible"]>> = {};
+      const activeResultsByTarget: Partial<Record<AccessSetupTarget, ActivationSnapshot["active"]>> = {};
+      const transportErrors: string[] = [];
+      const cachePersistence: Promise<void>[] = [];
+      let completedTargets = 0;
+
+      await Promise.all(staleTargets.map(async (target) => {
+        let targetSucceeded = false;
+        try {
+          const snapshot = await fetchActivationSnapshot([target]);
+          if (!isCurrentRun()) {
+            return;
+          }
+
+          const fetchedAt = Date.now();
+          progressiveTokens = snapshot.tokenStatus || progressiveTokens;
+          const targetCacheKeys = buildTargetCacheKeys(progressiveTokens, enabledRoleFeatures);
+          const eligibleResult = snapshot.eligibleByTarget?.[target]
+            || splitActivationResultByTarget(snapshot.eligible, [target])[target]
+            || { items: [], errors: [] };
+          const activeResult = snapshot.activeByTarget?.[target]
+            || splitActivationResultByTarget(snapshot.active, [target])[target]
+            || { items: [], errors: [] };
+          eligibleResultsByTarget[target] = eligibleResult;
+          activeResultsByTarget[target] = activeResult;
+          progressiveCache = updateCacheFromTargetResults(
+            progressiveCache,
+            "eligible",
+            [target],
+            { [target]: eligibleResult },
+            fetchedAt,
+            targetCacheKeys
+          );
+          progressiveCache = updateCacheFromTargetResults(
+            progressiveCache,
+            "active",
+            [target],
+            { [target]: activeResult },
+            fetchedAt,
+            targetCacheKeys
+          );
+          progressiveReferenceData = learnReferenceDataFromItems(
+            progressiveReferenceData,
+            [...eligibleResult.items, ...activeResult.items]
+          );
+
+          const progressiveView = getActivationCacheView(
+            progressiveCache,
+            progressiveTokens,
+            enabledRoleFeatures,
+            fetchedAt
+          );
+          renderLoadedActivationData(
+            loadedSettings,
+            progressiveTokens,
+            progressiveCache,
+            progressiveReferenceData,
+            progressiveView.eligible,
+            progressiveView.active
+          );
+          cachePersistence.push(saveDataCache(progressiveCache));
+          targetSucceeded = !eligibleResult.errors.length && !activeResult.errors.length;
+        } catch (targetError) {
+          if (isCurrentRun()) {
+            const detail = targetError instanceof Error ? targetError.message : String(targetError);
+            transportErrors.push(`${tabLabel(target)}: ${detail}`);
+          }
+        } finally {
+          if (!isCurrentRun()) {
+            return;
+          }
+          completedTargets += 1;
+          if (showBlockingLoading && (target === preferredTarget || completedTargets === staleTargets.length)) {
+            setIsLoading(false);
+          }
+          if (shouldShowProgress) {
+            setRefreshProgress({
+              current: completedTargets + fetchProgressOffset,
+              total: staleTargets.length + fetchProgressOffset + 1,
+              label: `${tabLabel(target)} ${targetSucceeded ? "ready" : "checked with an issue"} (${completedTargets}/${staleTargets.length})`
+            });
+          }
+        }
+      }));
+
+      if (!isCurrentRun()) {
+        return;
       }
-      const snapshot = await fetchActivationSnapshot(staleTargets);
-      const fetchedAt = Date.now();
-      const snapshotTokenStatus = snapshot.tokenStatus || loadedTokens;
-      const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
-      let nextCache = updateCacheFromTargetResults(
-        currentCache,
-        "eligible",
-        staleTargets,
-        snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, staleTargets),
-        fetchedAt,
-        snapshotTargetCacheKeys
-      );
-      nextCache = updateCacheFromTargetResults(
-        nextCache,
-        "active",
-        staleTargets,
-        snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, staleTargets),
-        fetchedAt,
-        snapshotTargetCacheKeys
-      );
 
       let nextSettings = loadedSettings;
-      const eligibleResultsByTarget = snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, staleTargets);
       const allFeatureResultsResolved = enabledRoleFeatures.every((target) => {
-        if (eligibleCache[target]?.isUsable) return true;
+        if (initialCacheView.eligibleCache[target]?.isUsable) return true;
         const result = eligibleResultsByTarget[target];
         return Boolean(result && (!result.errors.length || result.diagnostics?.some((diagnostic) => diagnostic.success)));
       });
       if (!loadedSettings.preferences.autoEnabledFeaturesInitialized && allFeatureResultsResolved) {
-        const resolvedEligibleItems = enabledRoleFeatures.flatMap((target) => nextCache.eligibleByTarget?.[target]?.items || []);
+        const resolvedEligibleItems = enabledRoleFeatures.flatMap((target) => progressiveCache.eligibleByTarget?.[target]?.items || []);
         nextSettings = {
           ...loadedSettings,
           preferences: {
@@ -602,34 +718,37 @@ function PopupApp() {
             autoEnabledFeaturesInitialized: true
           }
         };
-        await saveSettings(nextSettings);
       }
 
-      await saveDataCache(nextCache);
+      const finalEnabledRoleFeatures = getEnabledRoleFeatures(nextSettings);
+      const finalView = getActivationCacheView(progressiveCache, progressiveTokens, finalEnabledRoleFeatures, Date.now());
+      renderLoadedActivationData(
+        nextSettings,
+        progressiveTokens,
+        progressiveCache,
+        progressiveReferenceData,
+        finalView.eligible,
+        finalView.active
+      );
+      setHasActivationDataLoaded(true);
       if (shouldShowProgress) {
         setRefreshProgress({
-          current: 4,
-          total: REFRESH_TOTAL_STEPS,
+          current: staleTargets.length + fetchProgressOffset + 1,
+          total: staleTargets.length + fetchProgressOffset + 1,
           label: "Saving refreshed data"
         });
       }
-      const nextTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, getEnabledRoleFeatures(nextSettings));
-      const nextEligibleCache = getTargetEntriesFromCache(nextCache, "eligible", getEnabledRoleFeatures(nextSettings), nextTargetCacheKeys, {
-        legacyCacheKey: buildFeatureCacheKey(tokenCacheKey, getEnabledRoleFeatures(nextSettings)),
-        now: fetchedAt,
-        freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
-        usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
-      });
-      const nextActiveCache = getTargetEntriesFromCache(nextCache, "active", getEnabledRoleFeatures(nextSettings), nextTargetCacheKeys, {
-        legacyCacheKey: buildFeatureCacheKey(tokenCacheKey, getEnabledRoleFeatures(nextSettings)),
-        now: fetchedAt,
-        freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
-      });
-      const nextEligible = mergeTargetEntries(getEnabledRoleFeatures(nextSettings).map((target) => nextEligibleCache[target]?.entry), fetchedAt);
-      const nextActive = mergeTargetEntries(getEnabledRoleFeatures(nextSettings).map((target) => nextActiveCache[target]?.entry), fetchedAt);
-      await applyLoadedActivationData(nextSettings, snapshotTokenStatus, nextCache, loadedReferenceData, nextEligible, nextActive);
-      const nextAccessCapabilities = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, getEnabledRoleFeatures(nextSettings));
-      const loadErrors = filterLoadErrorsForAccessState([...(snapshot.eligible.errors || []), ...(snapshot.active.errors || [])], nextAccessCapabilities);
+      await Promise.all([
+        ...cachePersistence,
+        saveReferenceData(progressiveReferenceData),
+        ...(nextSettings === loadedSettings ? [] : [saveSettings(nextSettings)])
+      ]);
+      const nextAccessCapabilities = buildAccessCapabilityItems(progressiveTokens, progressiveCache, finalEnabledRoleFeatures);
+      const loadErrors = filterLoadErrorsForAccessState([
+        ...Object.values(eligibleResultsByTarget).flatMap((result) => result.errors || []),
+        ...Object.values(activeResultsByTarget).flatMap((result) => result.errors || []),
+        ...transportErrors
+      ], nextAccessCapabilities);
       if (!options.suppressMessage) {
         setMessage(formatLoadMessages(loadErrors).join("\n"));
         if (options.force && !loadErrors.length) {
@@ -644,29 +763,28 @@ function PopupApp() {
       setActivationFailureNotice(null);
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
-      setRefreshProgress(null);
+      if (isCurrentRun()) {
+        setIsLoading(false);
+        setIsRefreshing(false);
+        setRefreshProgress(null);
+      }
     }
   }
 
-  async function applyLoadedActivationData(
+  function renderLoadedActivationData(
     nextSettings: QuickPimSettings,
     nextTokens: TokenStatus,
     nextCache: QuickPimDataCache,
-    loadedReferenceData: ReferenceDataCache | undefined,
+    nextReferenceData: ReferenceDataCache,
     eligible: { items: ActivationItem[]; errors: string[] },
     active: { items: ActivationItem[]; errors: string[] }
   ) {
-    const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData || await loadReferenceData(), [...eligible.items, ...active.items]);
-    await saveReferenceData(nextReferenceData);
     setSettings(nextSettings);
     setTokenStatus(nextTokens);
     setReferenceData(nextReferenceData);
     setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(nextSettings)));
     setEligibleItems(applyDisplayData(eligible.items, nextSettings, nextReferenceData));
     setActiveItems(applyDisplayData(active.items, nextSettings, nextReferenceData));
-    setHasActivationDataLoaded(true);
   }
 
   function toggleSelected(itemId: string) {
@@ -979,7 +1097,7 @@ function PopupApp() {
           <div>
             <h1>QuickPIM++</h1>
             <p>
-              {isLoading ? null : `${activatableItemCount} eligible items`}
+              {isLoading ? null : `${activatableItemCount} eligible items${isRefreshing ? " so far" : ""}`}
             </p>
           </div>
         </div>
@@ -1038,7 +1156,13 @@ function PopupApp() {
       ) : null}
       {message ? <p className="message">{message}</p> : null}
       {isLoading ? (
-        refreshProgress ? <AccessProgressPanel title="Loading access data" progress={refreshProgress} helperText="This can take up to 15 seconds" /> : <LoadingState />
+        refreshProgress ? (
+          <AccessProgressPanel
+            title="Loading access data"
+            progress={refreshProgress}
+            helperText="Role types appear as soon as they are ready. This can take up to 15 seconds."
+          />
+        ) : <LoadingState />
       ) : null}
       {!isLoading && refreshProgress ? <AccessProgressPanel title="Refreshing access data" progress={refreshProgress} /> : null}
       {activationProgress ? <ActivationProgressPanel progress={activationProgress} mode={requestMode || "activate"} /> : null}
@@ -1745,6 +1869,34 @@ function scrollPopupToTop(): void {
 function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatures: AccessSetupTarget[]): AccessSetupTarget[] {
   const enabled = new Set(enabledRoleFeatures);
   return targets.filter((target, index) => enabled.has(target) && targets.indexOf(target) === index);
+}
+
+function getActivationCacheView(
+  cache: QuickPimDataCache,
+  tokenStatus: TokenStatus,
+  enabledRoleFeatures: AccessSetupTarget[],
+  now: number
+) {
+  const tokenCacheKey = buildTokenCacheKey(tokenStatus);
+  const targetCacheKeys = buildTargetCacheKeys(tokenStatus, enabledRoleFeatures);
+  const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
+  const eligibleCache = getTargetEntriesFromCache(cache, "eligible", enabledRoleFeatures, targetCacheKeys, {
+    legacyCacheKey,
+    now,
+    freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
+    usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
+  });
+  const activeCache = getTargetEntriesFromCache(cache, "active", enabledRoleFeatures, targetCacheKeys, {
+    legacyCacheKey,
+    now,
+    freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
+  });
+  return {
+    eligibleCache,
+    activeCache,
+    eligible: mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey),
+    active: mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), now, legacyCacheKey)
+  };
 }
 
 function getRequestModeForItem(item: ActivationItem | undefined): PopupRequestMode | undefined {

@@ -195,6 +195,13 @@ export interface TokenStatus {
   azureManagement: TokenStatusEntry;
 }
 
+export interface PortalTokenRefreshResult {
+  tokenStatus: TokenStatus;
+  tabsFound: number;
+  tabsScanned: number;
+  captured: TokenKind[];
+}
+
 export interface ActivationDataResult {
   items: ActivationItem[];
   errors: string[];

@@ -7,22 +7,61 @@
   const MAX_INDEXED_DB_DATABASES = 12;
   const MAX_INDEXED_DB_STORES = 40;
   const MAX_INDEXED_DB_RECORDS_PER_STORE = 100;
+  const CAPTURE_RESPONSE_TIMEOUT_MS = 5000;
   let attempts = 0;
-  let isScanning = false;
+  let activeScan;
+  let interval;
   let lastTokenFingerprint = "";
 
-  async function scan() {
-    if (isScanning) {
-      return;
+  function scan(options = {}) {
+    if (activeScan) {
+      return options.force ? activeScan.then(() => scan(options)) : activeScan;
     }
-    isScanning = true;
+
+    const scanRun = performScan(options);
+    const trackedRun = scanRun.finally(() => {
+      if (activeScan === trackedRun) {
+        activeScan = undefined;
+      }
+      if (attempts >= MAX_ATTEMPTS && interval !== undefined) {
+        clearInterval(interval);
+      }
+    });
+    activeScan = trackedRun;
+    return trackedRun;
+  }
+
+  async function performScan({ force = false, includeIndexedDb = false } = {}) {
     attempts += 1;
-    try {
-      const includeIndexedDb = window === window.top && (attempts <= 3 || attempts % 5 === 0);
-      const tokens = await collectPortalTokens(includeIndexedDb);
-      const fingerprint = tokens.slice().sort().join("|");
-      if (tokens.length && fingerprint !== lastTokenFingerprint) {
-        lastTokenFingerprint = fingerprint;
+    const shouldIncludeIndexedDb = window === window.top && (includeIndexedDb || attempts <= 3 || attempts % 5 === 0);
+    const tokens = await collectPortalTokens(shouldIncludeIndexedDb);
+    const fingerprint = tokens.slice().sort().join("|");
+    if (!tokens.length || (!force && fingerprint === lastTokenFingerprint)) {
+      return { tokenCount: tokens.length, captured: [] };
+    }
+
+    const result = await submitTokens(tokens);
+    if (result.delivered) {
+      lastTokenFingerprint = fingerprint;
+      if (result.captured.length && interval !== undefined) {
+        clearInterval(interval);
+      }
+    }
+    return { tokenCount: tokens.length, captured: result.captured };
+  }
+
+  function submitTokens(tokens) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          resolve(result);
+        }
+      };
+      const timeout = setTimeout(() => finish({ delivered: false, captured: [] }), CAPTURE_RESPONSE_TIMEOUT_MS);
+      try {
         chrome.runtime.sendMessage(
           {
             action: "capturePortalTokens",
@@ -30,19 +69,17 @@
             source: `entra.microsoft.com storage: ${location.hash.slice(0, 120)}`
           },
           (response) => {
-            void chrome.runtime.lastError;
-            if (response && response.success && response.data && response.data.captured && response.data.captured.length) {
-              clearInterval(interval);
-            }
+            const runtimeError = chrome.runtime.lastError;
+            const captured = response && response.success && Array.isArray(response.data?.captured)
+              ? response.data.captured
+              : [];
+            finish({ delivered: !runtimeError && Boolean(response?.success), captured });
           }
         );
+      } catch {
+        finish({ delivered: false, captured: [] });
       }
-    } finally {
-      isScanning = false;
-      if (attempts >= MAX_ATTEMPTS) {
-        clearInterval(interval);
-      }
-    }
+    });
   }
 
   async function collectPortalTokens(includeIndexedDb) {
@@ -255,15 +292,18 @@
     }
   }
 
-  scan();
-  const interval = setInterval(scan, 2000);
-  window.addEventListener("hashchange", scan);
+  void scan();
+  interval = setInterval(() => void scan(), 2000);
+  window.addEventListener("hashchange", () => void scan());
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) scan();
+    if (!document.hidden) void scan();
   });
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message && message.action === "quickPimScanPortalTokens") {
-      void scan().then(() => sendResponse({ success: true }));
+      void scan({ force: true, includeIndexedDb: true }).then(
+        (result) => sendResponse({ success: true, data: result }),
+        () => sendResponse({ success: false, error: "Portal token scan failed." })
+      );
       return true;
     }
     return false;

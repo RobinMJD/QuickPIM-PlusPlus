@@ -438,6 +438,8 @@ button {
 }
 
 .role-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
   display: grid;
   grid-template-columns: 24px 28px minmax(0, 1fr) minmax(58px, auto);
   gap: 10px;

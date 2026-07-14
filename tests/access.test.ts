@@ -295,6 +295,40 @@ describe("portal-driven access setup", () => {
     expect(second).toBe(first);
   });
 
+  test("keeps cache keys stable when a token is renewed with the same identity and scopes", () => {
+    const first: TokenStatus = {
+      graph: {
+        hasToken: true,
+        tenantId: "tenant-a",
+        principalId: "user-a",
+        expiresAt: "2026-05-18T14:00:00.000Z",
+        grantedScopes: ["RoleEligibilitySchedule.Read.Directory"]
+      },
+      azureManagement: {
+        hasToken: true,
+        tenantId: "tenant-a",
+        principalId: "user-a",
+        expiresAt: "2026-05-18T14:00:00.000Z"
+      }
+    };
+    const renewed: TokenStatus = {
+      graph: {
+        ...first.graph,
+        capturedAt: 2,
+        expiresAt: "2026-05-18T15:00:00.000Z"
+      },
+      azureManagement: {
+        ...first.azureManagement,
+        capturedAt: 2,
+        expiresAt: "2026-05-18T15:00:00.000Z"
+      }
+    };
+
+    expect(buildTokenCacheKey(renewed)).toBe(buildTokenCacheKey(first));
+    expect(buildTargetCacheKey(renewed, "directoryRole")).toBe(buildTargetCacheKey(first, "directoryRole"));
+    expect(buildTargetCacheKey(renewed, "azureRole")).toBe(buildTargetCacheKey(first, "azureRole"));
+  });
+
   test("includes target-specific Graph tokens in cache keys", () => {
     const first = buildTokenCacheKey({
       graph: {

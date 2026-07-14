@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_CACHE_KEY } from "../src/lib/cache";
+import { buildTargetCacheKey } from "../src/lib/access";
 import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import type { ActivationItem } from "../src/lib/types";
@@ -115,6 +116,206 @@ describe("popup loading UI", () => {
 
     eligible.resolve({ success: true, data: { items: [], errors: [] } });
     active.resolve({ success: true, data: { items: [], errors: [] } });
+  });
+
+  test("loads role types in parallel and renders the first completed tab immediately", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const directorySnapshot = deferred<{ success: true; data: {
+      eligible: { items: ActivationItem[]; errors: []; diagnostics: [] };
+      active: { items: ActivationItem[]; errors: []; diagnostics: [] };
+    } }>();
+    const pimGroupSnapshot = deferred<{ success: true; data: {
+      eligible: { items: ActivationItem[]; errors: []; diagnostics: [] };
+      active: { items: ActivationItem[]; errors: []; diagnostics: [] };
+    } }>();
+    const azureSnapshot = deferred<{ success: true; data: {
+      eligible: { items: ActivationItem[]; errors: []; diagnostics: [] };
+      active: { items: ActivationItem[]; errors: []; diagnostics: [] };
+    } }>();
+    const snapshots = {
+      directoryRole: directorySnapshot,
+      pimGroup: pimGroupSnapshot,
+      azureRole: azureSnapshot
+    };
+    const entraRole: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const pimGroup: ActivationItem = {
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Privileged Group",
+      displayName: "Privileged Group",
+      principalId: "principal-1",
+      scopeLabel: "Member",
+      status: "eligible",
+      groupId: "group-1",
+      accessId: "member"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string; targets?: Array<keyof typeof snapshots> }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: true, isExpired: false },
+            azureManagement: { hasToken: true, isExpired: false }
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return snapshots[message.targets![0]].promise;
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => {
+      const calls = sendMessage.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message.action === "getActivationSnapshot");
+      expect(calls).toHaveLength(3);
+      expect(calls.map((message) => message.targets?.[0])).toEqual(expect.arrayContaining(["directoryRole", "pimGroup", "azureRole"]));
+    });
+
+    directorySnapshot.resolve({
+      success: true,
+      data: {
+        eligible: { items: [entraRole], errors: [], diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] }
+      }
+    });
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    expect(document.body.textContent).not.toContain("Loading access data");
+    expect(document.querySelector(".refresh-progress-panel")?.textContent).toContain("Entra Roles ready (1/3)");
+
+    pimGroupSnapshot.resolve({
+      success: true,
+      data: {
+        eligible: { items: [pimGroup], errors: [], diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] }
+      }
+    });
+    clickButton("PIM Groups");
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    expect(document.querySelector(".refresh-progress-panel")).toBeTruthy();
+
+    azureSnapshot.resolve({
+      success: true,
+      data: {
+        eligible: { items: [], errors: [], diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] }
+      }
+    });
+    await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
+  });
+
+  test("keeps successful role data when another parallel source fails", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const directorySnapshot = deferred<{ success: true; data: {
+      eligible: { items: ActivationItem[]; errors: []; diagnostics: [] };
+      active: { items: ActivationItem[]; errors: []; diagnostics: [] };
+    } }>();
+    const entraRole: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: true, isExpired: false },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot" && message.targets?.[0] === "directoryRole") {
+        return directorySnapshot.promise;
+      }
+      if (message.targets?.[0] === "pimGroup") {
+        return Promise.resolve({ success: false, error: "Network unavailable" });
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => {
+      const targetCalls = sendMessage.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message.action === "getActivationSnapshot")
+        .map((message) => message.targets?.[0]);
+      expect(targetCalls).toEqual(expect.arrayContaining(["directoryRole", "pimGroup"]));
+    });
+    directorySnapshot.resolve({
+      success: true,
+      data: {
+        eligible: { items: [entraRole], errors: [], diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] }
+      }
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    await waitFor(() => expect(document.body.textContent).toContain("PIM Groups: Network unavailable"));
+    expect(document.querySelector(".refresh-progress-panel")).toBeFalsy();
   });
 });
 
@@ -259,6 +460,109 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.body.textContent).not.toContain("Loading access data");
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
+  });
+
+  test("renders cached data before renewing a near-expiry token and avoids an unnecessary role refetch", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const initialTokens = {
+      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          expiresInMinutes: 5,
+          expiresAt: "2026-07-14T10:05:00.000Z",
+          grantedScopes: ["RoleAssignmentSchedule.ReadWrite.Directory"]
+        }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const renewedTokens = {
+      ...initialTokens,
+      graphTargets: {
+        directoryRole: {
+          ...initialTokens.graphTargets.directoryRole,
+          capturedAt: 2,
+          expiresInMinutes: 60,
+          expiresAt: "2026-07-14T11:00:00.000Z"
+        }
+      }
+    };
+    const tokenRefresh = deferred<{ success: true; data: {
+      tokenStatus: typeof renewedTokens;
+      tabsFound: number;
+      tabsScanned: number;
+      captured: ["graph"];
+    } }>();
+    const cacheKey = buildTargetCacheKey(initialTokens, "directoryRole");
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          directoryRole: { fetchedAt: Date.now(), cacheKey, errors: [], items: [eligibleItem] }
+        },
+        activeByTarget: {
+          directoryRole: { fetchedAt: Date.now(), cacheKey, errors: [], items: [] }
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({ success: true, data: initialTokens });
+      }
+      if (message.action === "refreshPortalTokens") {
+        return tokenRefresh.promise;
+      }
+      if (message.action === "getActivationSnapshot") {
+        throw new Error("A same-capability token renewal must not invalidate fresh role data.");
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    expect(document.body.textContent).not.toContain("Loading access data");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "refreshPortalTokens" }));
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
+
+    tokenRefresh.resolve({
+      success: true,
+      data: { tokenStatus: renewedTokens, tabsFound: 1, tabsScanned: 1, captured: ["graph"] }
+    });
+    await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
     expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
   });
 
@@ -1648,7 +1952,7 @@ describe("popup compact controls", () => {
         eligibleByTarget: {
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup::",
+            cacheKey: "graphPimGroup:",
             errors: [],
             items: [eligibleItem, activeEligibleItem]
           }
@@ -1656,7 +1960,7 @@ describe("popup compact controls", () => {
         activeByTarget: {
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup::",
+            cacheKey: "graphPimGroup:",
             errors: [],
             items: [activeItem]
           }

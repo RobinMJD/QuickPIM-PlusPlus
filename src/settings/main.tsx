@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
-import { buildAccessCapabilityItems, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
+import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
 import { formatDateOnly } from "../lib/dateFormat";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
@@ -37,7 +37,8 @@ import {
 } from "../lib/referenceData";
 import { getGenericJustificationWarning } from "../lib/justifications";
 import { APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
 
 type SettingsTab = "home" | "access" | "activity" | "justifications" | "bundles" | "aliases" | "preferences" | "data" | "diagnostics" | "about";
 
@@ -48,6 +49,8 @@ const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus
 const CHANGELOG_CACHE_KEY = "quickPimChangelog.v2";
 const CHANGELOG_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
+const PORTAL_TOKEN_WAIT_TIMEOUT_MS = 12_000;
+const PORTAL_TOKEN_POLL_INTERVAL_MS = 1500;
 
 const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Overview", tabs: ["home"] },
@@ -77,6 +80,11 @@ interface MessageResponse<T> {
   error?: string;
 }
 
+interface AccessRefreshOptions {
+  skipTargetsWithCurrentTokenCache?: boolean;
+  completionMessage?: string;
+}
+
 function SettingsApp() {
   const [tab, setTab] = useState<SettingsTab>(() => tabFromHash());
   const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
@@ -90,7 +98,12 @@ function SettingsApp() {
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
   const [isSettingsReady, setIsSettingsReady] = useState(false);
+  const [sessionTokenRevision, setSessionTokenRevision] = useState(0);
   const exportTextDirty = useRef(false);
+  const accessRefreshQueue = useRef<Promise<void>>(Promise.resolve());
+  const pendingAccessRefreshes = useRef(0);
+  const pendingSessionTokenTargets = useRef(new Set<AccessSetupTarget>());
+  const suppressSessionTokenRefreshUntil = useRef(0);
 
   function replaceExportText(value: string, dirty = false) {
     exportTextDirty.current = dirty;
@@ -107,6 +120,17 @@ function SettingsApp() {
       return;
     }
     function handleStorageChange(changes: Record<string, chrome.storage.StorageChange>, areaName: string) {
+      if (areaName === "session") {
+        if (Date.now() < suppressSessionTokenRefreshUntil.current) {
+          return;
+        }
+        const targets = getTargetsForTokenStorageChanges(changes);
+        if (targets.length) {
+          targets.forEach((target) => pendingSessionTokenTargets.current.add(target));
+          setSessionTokenRevision((current) => current + 1);
+        }
+        return;
+      }
       if (areaName !== "local" || !changes[SETTINGS_KEY]) {
         return;
       }
@@ -119,6 +143,23 @@ function SettingsApp() {
     storageChangeEvent.addListener(handleStorageChange);
     return () => storageChangeEvent.removeListener(handleStorageChange);
   }, []);
+
+  useEffect(() => {
+    if (!isSettingsReady || !sessionTokenRevision) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      const targets = [...pendingSessionTokenTargets.current];
+      pendingSessionTokenTargets.current.clear();
+      if (targets.length) {
+        void forceRefreshAccessData(undefined, targets, {
+          skipTargetsWithCurrentTokenCache: true,
+          completionMessage: "Portal access updated."
+        });
+      }
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [isSettingsReady, sessionTokenRevision]);
 
   useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
@@ -222,75 +263,104 @@ function SettingsApp() {
     }
   }
 
-  async function forceRefreshAccessData(tokens?: TokenStatus, targets?: AccessSetupTarget[]) {
+  function forceRefreshAccessData(
+    tokens?: TokenStatus,
+    targets?: AccessSetupTarget[],
+    options: AccessRefreshOptions = {}
+  ): Promise<void> {
+    pendingAccessRefreshes.current += 1;
     setIsRefreshingAccess(true);
     setError("");
     setMessage("Refreshing access data...");
-    try {
-      const latestTokens = tokens ?? await sendMessage<TokenStatus>({ action: "getTokenStatus" });
-      const tokenCacheKey = buildTokenCacheKey(latestTokens);
-      const enabledRoleFeatures = getEnabledRoleFeatures(settings);
-      const refreshTargets = normalizeRefreshTargets(targets?.length ? targets : enabledRoleFeatures, enabledRoleFeatures);
-      const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
-      const snapshot = refreshTargets.length
-        ? await fetchActivationSnapshot(refreshTargets)
-        : {
-            eligible: { items: [], errors: [], diagnostics: [] },
-            active: { items: [], errors: [], diagnostics: [] },
-            eligibleByTarget: {},
-            activeByTarget: {}
-          };
-      const fetchedAt = Date.now();
-      const snapshotTokenStatus = snapshot.tokenStatus || latestTokens;
-      const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
-      let nextCache = updateCacheFromTargetResults(
-        dataCache,
-        "eligible",
-        refreshTargets,
-        snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, refreshTargets),
-        fetchedAt,
-        snapshotTargetCacheKeys
-      );
-      nextCache = updateCacheFromTargetResults(
-        nextCache,
-        "active",
-        refreshTargets,
-        snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, refreshTargets),
-        fetchedAt,
-        snapshotTargetCacheKeys
-      );
-      await saveDataCache(nextCache);
-      const eligibleCache = getTargetEntriesFromCache(nextCache, "eligible", enabledRoleFeatures, snapshotTargetCacheKeys, {
-        legacyCacheKey,
-        now: fetchedAt,
-        freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
-        usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
-      });
-      const activeCache = getTargetEntriesFromCache(nextCache, "active", enabledRoleFeatures, snapshotTargetCacheKeys, {
-        legacyCacheKey,
-        now: fetchedAt,
-        freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
-      });
-      const eligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), fetchedAt, legacyCacheKey);
-      const active = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), fetchedAt, legacyCacheKey);
-      const nextReferenceData = learnReferenceDataFromItems(referenceData || await loadReferenceData(), [...eligible.items, ...active.items]);
-      await saveReferenceData(nextReferenceData);
-      setTokenStatus(snapshotTokenStatus);
-      setDataCache(nextCache);
-      setReferenceData(nextReferenceData);
-      setItems(applyDisplayData(eligible.items, settings, nextReferenceData));
-      const limitedAreas = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
-      setMessage(
-        limitedAreas
-          ? `Access data refreshed. ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
-          : "Access data refreshed."
-      );
-    } catch (refreshError) {
+
+    const refreshRun = accessRefreshQueue.current.then(() => performAccessDataRefresh(tokens, targets, options));
+    accessRefreshQueue.current = refreshRun.then(() => undefined, () => undefined);
+
+    return refreshRun.catch((refreshError) => {
       setMessage("");
       setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
-    } finally {
-      setIsRefreshingAccess(false);
+    }).finally(() => {
+      pendingAccessRefreshes.current -= 1;
+      if (!pendingAccessRefreshes.current) {
+        setIsRefreshingAccess(false);
+      }
+    });
+  }
+
+  async function performAccessDataRefresh(
+    tokens: TokenStatus | undefined,
+    targets: AccessSetupTarget[] | undefined,
+    options: AccessRefreshOptions
+  ): Promise<void> {
+    const [loadedSettings, currentCache, currentReferenceData, loadedTokens] = await Promise.all([
+      loadSettings(),
+      loadDataCache(),
+      loadReferenceData(),
+      tokens ? Promise.resolve(tokens) : sendMessage<TokenStatus>({ action: "getTokenStatus" })
+    ]);
+    const latestTokens = loadedTokens;
+    const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
+    let refreshTargets = normalizeRefreshTargets(targets?.length ? targets : enabledRoleFeatures, enabledRoleFeatures);
+    if (options.skipTargetsWithCurrentTokenCache) {
+      refreshTargets = refreshTargets.filter((target) => !isTargetCacheCurrentForToken(currentCache, latestTokens, target));
     }
+
+    setSettings(loadedSettings);
+    setTokenStatus(latestTokens);
+    setDataCache(currentCache);
+    if (!refreshTargets.length) {
+      setMessage(options.completionMessage || "Access data is already current.");
+      return;
+    }
+
+    const snapshot = await fetchActivationSnapshot(refreshTargets);
+    const fetchedAt = Date.now();
+    const snapshotTokenStatus = snapshot.tokenStatus || latestTokens;
+    const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
+    const legacyCacheKey = buildFeatureCacheKey(buildTokenCacheKey(snapshotTokenStatus), enabledRoleFeatures);
+    let nextCache = updateCacheFromTargetResults(
+      currentCache,
+      "eligible",
+      refreshTargets,
+      snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, refreshTargets),
+      fetchedAt,
+      snapshotTargetCacheKeys
+    );
+    nextCache = updateCacheFromTargetResults(
+      nextCache,
+      "active",
+      refreshTargets,
+      snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, refreshTargets),
+      fetchedAt,
+      snapshotTargetCacheKeys
+    );
+    await saveDataCache(nextCache);
+    const eligibleCache = getTargetEntriesFromCache(nextCache, "eligible", enabledRoleFeatures, snapshotTargetCacheKeys, {
+      legacyCacheKey,
+      now: fetchedAt,
+      freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
+      usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
+    });
+    const activeCache = getTargetEntriesFromCache(nextCache, "active", enabledRoleFeatures, snapshotTargetCacheKeys, {
+      legacyCacheKey,
+      now: fetchedAt,
+      freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
+    });
+    const eligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), fetchedAt, legacyCacheKey);
+    const active = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), fetchedAt, legacyCacheKey);
+    const nextReferenceData = learnReferenceDataFromItems(currentReferenceData, [...eligible.items, ...active.items]);
+    await saveReferenceData(nextReferenceData);
+    setTokenStatus(snapshotTokenStatus);
+    setDataCache(nextCache);
+    setReferenceData(nextReferenceData);
+    setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
+    const limitedAreas = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
+    const completionPrefix = options.completionMessage || "Access data refreshed.";
+    setMessage(
+      limitedAreas
+        ? `${completionPrefix} ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
+        : completionPrefix
+    );
   }
 
   async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
@@ -327,6 +397,7 @@ function SettingsApp() {
 
   async function clearCapturedTokens() {
     try {
+      suppressSessionTokenRefreshUntil.current = Date.now() + 1000;
       await sendMessage<boolean>({ action: "clearToken" });
       setTokenStatus({
         graph: { hasToken: false },
@@ -626,10 +697,11 @@ function AccessSetupPanel({
   dataCache: QuickPimDataCache;
   isRefreshingAccess: boolean;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
-  onRefreshAccessData: (tokens?: TokenStatus, targets?: AccessSetupTarget[]) => Promise<void>;
+  onRefreshAccessData: (tokens?: TokenStatus, targets?: AccessSetupTarget[], options?: AccessRefreshOptions) => Promise<void>;
   onClearReferenceData: () => Promise<void>;
 }) {
   const [isRunningSetup, setIsRunningSetup] = useState(false);
+  const [isRecheckingPortalTabs, setIsRecheckingPortalTabs] = useState(false);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
   const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
@@ -658,57 +730,44 @@ function AccessSetupPanel({
         buildAccessCapabilityItems(scannedTokens, dataCache, enabledRoleFeatures)
       ).filter((target) => initialTargets.includes(target));
       const urls = getPortalUrlsForTargets(remainingTargets);
-      for (const url of urls) {
+      await Promise.all(urls.map(async (url) => {
         if (chrome.tabs?.create) {
-          void chrome.tabs.create({ url });
-        } else {
-          safeOpenUrl(url);
+          try {
+            await chrome.tabs.create({ url });
+            return;
+          } catch {
+            // Fall back to a normal extension-page navigation if tab creation is unavailable.
+          }
         }
+        safeOpenUrl(url);
+      }));
+
+      if (!remainingTargets.length) {
+        await onRefreshAccessData(scannedTokens, initialTargets, { skipTargetsWithCurrentTokenCache: true });
+        return;
       }
 
-      const latestTokens = remainingTargets.length ? await waitForPortalTokens(remainingTargets) : scannedTokens;
-      await onRefreshAccessData(latestTokens, remainingTargets.length ? remainingTargets : initialTargets);
+      const tokenRefresh = await waitForPortalTokens(remainingTargets, scannedTokens);
+      if (tokenRefresh.changedTargets.length) {
+        await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, { skipTargetsWithCurrentTokenCache: true });
+      }
+      const unchangedTargets = remainingTargets.filter((target) => !tokenRefresh.changedTargets.includes(target));
+      if (unchangedTargets.length) {
+        await onRefreshAccessData(tokenRefresh.tokens, unchangedTargets);
+      }
     } finally {
       setIsRunningSetup(false);
     }
   }
 
-  async function scanExistingPortalTabsForTokens(): Promise<TokenStatus> {
-    if (chrome.tabs?.query && chrome.tabs?.sendMessage) {
-      try {
-        const tabs = await chrome.tabs.query({ url: "https://entra.microsoft.com/*" });
-        await Promise.all(
-          tabs
-            .filter((tab) => typeof tab.id === "number")
-            .map(async (tab) => {
-              try {
-                await chrome.tabs.sendMessage(tab.id as number, { action: "quickPimScanPortalTokens" });
-              } catch {
-                // Some existing portal tabs may not have the content script loaded yet.
-              }
-            })
-        );
-        if (tabs.length) {
-          await delay(250);
-        }
-      } catch {
-        // If tab scanning is unavailable, fall back to opening the targeted portal pages.
-      }
+  async function recheckPortalAccess() {
+    setIsRecheckingPortalTabs(true);
+    try {
+      const scannedTokens = await scanExistingPortalTabsForTokens();
+      await onRefreshAccessData(scannedTokens, setupTargets.length ? setupTargets : enabledRoleFeatures);
+    } finally {
+      setIsRecheckingPortalTabs(false);
     }
-    return sendMessage<TokenStatus>({ action: "getTokenStatus" });
-  }
-
-  async function waitForPortalTokens(targets: AccessSetupTarget[]): Promise<TokenStatus> {
-    let latestTokens = tokenStatus || await sendMessage<TokenStatus>({ action: "getTokenStatus" });
-    const deadline = Date.now() + 90_000;
-    while (Date.now() < deadline) {
-      latestTokens = await sendMessage<TokenStatus>({ action: "getTokenStatus" });
-      if (targets.every((target) => hasRequiredPortalToken(target, latestTokens))) {
-        return latestTokens;
-      }
-      await delay(3000);
-    }
-    return latestTokens;
   }
 
   return (
@@ -730,7 +789,7 @@ function AccessSetupPanel({
       </div>
 
       <div className="button-row settings-action-lead">
-        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRefreshingAccess || !setupTargets.length}>
+        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || !setupTargets.length}>
           {isRunningSetup ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
@@ -742,19 +801,19 @@ function AccessSetupPanel({
         </button>
         <button
           className="btn"
-          onClick={() => void onRefreshAccessData(undefined, setupTargets.length ? setupTargets : enabledRoleFeatures)}
-          disabled={isRunningSetup || isRefreshingAccess}
+          onClick={() => void recheckPortalAccess()}
+          disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess}
         >
-          {isRefreshingAccess ? (
+          {isRecheckingPortalTabs || isRefreshingAccess ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
-              <span>Rechecking access...</span>
+              <span>{isRecheckingPortalTabs ? "Scanning portal tabs..." : "Rechecking access..."}</span>
             </span>
           ) : (
             "Recheck now"
           )}
         </button>
-        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRefreshingAccess}>
+        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess}>
           Clear learned names
         </button>
       </div>
@@ -845,6 +904,89 @@ function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[numbe
   if (status === "ready") return "Ready";
   if (status === "limited") return "Limited";
   return "Needs portal refresh";
+}
+
+async function scanExistingPortalTabsForTokens(): Promise<TokenStatus> {
+  const result = await sendMessage<PortalTokenRefreshResult>({ action: "refreshPortalTokens" });
+  return result.tokenStatus;
+}
+
+async function waitForPortalTokens(
+  targets: AccessSetupTarget[],
+  baselineTokens: TokenStatus
+): Promise<{ tokens: TokenStatus; changedTargets: AccessSetupTarget[] }> {
+  let latestTokens = baselineTokens;
+  let changedTargets: AccessSetupTarget[] = [];
+  const deadline = Date.now() + PORTAL_TOKEN_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    latestTokens = await scanExistingPortalTabsForTokens();
+    changedTargets = targets.filter((target) => hasTargetPortalTokenChanged(target, baselineTokens, latestTokens));
+    if (changedTargets.length === targets.length) {
+      break;
+    }
+    await delay(Math.min(PORTAL_TOKEN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+  }
+  return { tokens: latestTokens, changedTargets };
+}
+
+function hasTargetPortalTokenChanged(target: AccessSetupTarget, before: TokenStatus, after: TokenStatus): boolean {
+  if (!hasRequiredPortalToken(target, after)) {
+    return false;
+  }
+  if (!hasRequiredPortalToken(target, before)) {
+    return true;
+  }
+  const beforeToken = getTargetTokenStatus(before, target);
+  const afterToken = getTargetTokenStatus(after, target);
+  if ((afterToken?.capturedAt || 0) > (beforeToken?.capturedAt || 0)) {
+    return true;
+  }
+  return buildTargetCacheKey(before, target) !== buildTargetCacheKey(after, target);
+}
+
+function isTargetCacheCurrentForToken(
+  cache: QuickPimDataCache,
+  tokenStatus: TokenStatus,
+  target: AccessSetupTarget
+): boolean {
+  const eligible = cache.eligibleByTarget?.[target];
+  const active = cache.activeByTarget?.[target];
+  const expectedCacheKey = buildTargetCacheKey(tokenStatus, target);
+  if (!eligible || !active || eligible.cacheKey !== expectedCacheKey || active.cacheKey !== expectedCacheKey) {
+    return false;
+  }
+  const capturedAt = getTargetTokenStatus(tokenStatus, target)?.capturedAt;
+  return !capturedAt || (eligible.fetchedAt >= capturedAt && active.fetchedAt >= capturedAt);
+}
+
+function getTargetTokenStatus(tokenStatus: TokenStatus, target: AccessSetupTarget) {
+  if (target === "azureRole") {
+    return tokenStatus.azureManagement;
+  }
+  return tokenStatus.graphTargets?.[target] || tokenStatus.graph;
+}
+
+function getTargetsForTokenStorageChanges(
+  changes: Record<string, chrome.storage.StorageChange>
+): AccessSetupTarget[] {
+  const changedKeys = new Set(Object.keys(changes).filter((key) => TOKEN_STORAGE_KEYS.includes(key)));
+  const targets = new Set<AccessSetupTarget>();
+  const directoryRoleChanged = ["graphDirectoryRoleToken", "graphDirectoryRoleTokenTimestamp", "graphDirectoryRoleTokenSource"].some((key) => changedKeys.has(key));
+  const pimGroupChanged = ["graphPimGroupToken", "graphPimGroupTokenTimestamp", "graphPimGroupTokenSource"].some((key) => changedKeys.has(key));
+  if (directoryRoleChanged) {
+    targets.add("directoryRole");
+  }
+  if (pimGroupChanged) {
+    targets.add("pimGroup");
+  }
+  if (!directoryRoleChanged && !pimGroupChanged && ["graphToken", "tokenTimestamp", "tokenSource"].some((key) => changedKeys.has(key))) {
+    targets.add("directoryRole");
+    targets.add("pimGroup");
+  }
+  if (["azureManagementToken", "azureManagementTokenTimestamp", "azureManagementTokenSource"].some((key) => changedKeys.has(key))) {
+    targets.add("azureRole");
+  }
+  return [...targets];
 }
 
 function delay(ms: number): Promise<void> {

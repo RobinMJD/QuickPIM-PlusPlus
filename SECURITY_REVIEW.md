@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.8.0.
+Reviewed for v2.8.1.
 
 ## Threat Model
 
@@ -20,9 +20,9 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 ## Access And Messaging
 
 - Host permissions are limited to `https://graph.microsoft.com/*`, `https://management.azure.com/*`, `https://entra.microsoft.com/*`, and `https://api.github.com/*` for public changelog metadata.
-- The `alarms` permission is used only to schedule local background pre-refresh. The alarm skips work when no valid session tokens exist and does not display UI messages.
+- The `alarms` permission is used only to schedule local background pre-refresh. When a token is missing or near expiry, the alarm first asks already-open Entra tabs to rescan their bounded MSAL storage; it skips API work if no usable token is then available and never displays UI messages.
 - Entra content-script token messages are accepted only from the `entra.microsoft.com` origin and still pass the same token validation before storage. The content script runs in matching frames only and limits scanned databases, stores, records, value length, recursion depth, and token count.
-- Access Setup can ask already-open Entra tabs to rescan portal token storage before opening new setup pages; the extension still does not request Chrome cookie access.
+- Popup refresh, background pre-refresh, and Access Setup share a bounded, timed, single-flight scan of already-open Entra tabs before opening new setup pages; the extension does not request Chrome cookie access and cannot exchange Microsoft session cookies directly for API tokens.
 - Extension pages use an explicit MV3 content security policy.
 - Background runtime messages are accepted only from this extension and are validated before privileged actions run.
 - Unsupported token injection paths are not exposed; users can clear captured tokens from Settings.
@@ -33,7 +33,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Popup activation drafts are bounded, stored locally, expire after 24 hours, and are cleared when the in-progress selection is no longer useful.
 - Saved justifications, aliases, learned names, bundles, activity history, usage history, popup drafts, cached role data, and preferences remain local to the browser profile.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.
-- Cached role data is keyed by tenant, principal, token capability, and expiry so one signed-in identity cannot reuse another identity's PIM snapshot.
+- Cached role data is keyed by tenant, principal, and token capability so one signed-in identity cannot reuse another identity's PIM snapshot while a same-capability token renewal can keep fresh cached data.
 
 ## Dependency And Repository Hygiene
 
