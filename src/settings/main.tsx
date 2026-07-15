@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, hasRequiredPortalToken } from "../lib/access";
@@ -139,6 +139,7 @@ function SettingsApp() {
   const explicitPortalScanDepth = useRef(0);
   const settingsProgressRunId = useRef(0);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const pendingTabFlushRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -226,7 +227,7 @@ function SettingsApp() {
 
   useEffect(() => {
     function handleHashChange() {
-      setTab(tabFromHash());
+      void transitionToTab(tabFromHash(), false);
     }
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
@@ -625,11 +626,16 @@ function SettingsApp() {
     }
   }
 
-  function selectTab(nextTab: SettingsTab) {
+  function transitionToTab(nextTab: SettingsTab, updateHash = true) {
+    void pendingTabFlushRef.current?.();
     setTab(nextTab);
-    if (window.location.hash !== `#${nextTab}`) {
+    if (updateHash && window.location.hash !== `#${nextTab}`) {
       window.history.replaceState(null, "", `#${nextTab}`);
     }
+  }
+
+  function selectTab(nextTab: SettingsTab) {
+    transitionToTab(nextTab);
   }
 
   return (
@@ -714,7 +720,9 @@ function SettingsApp() {
             {tab === "aliases" ? <AliasesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
             {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
             {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
-            {tab === "preferences" ? <PreferencesPanel settings={settings} onSave={persist} /> : null}
+            {tab === "preferences" ? (
+              <PreferencesPanel settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
+            ) : null}
             {tab === "data" ? (
               <DataPanel
                 settings={settings}
@@ -2135,10 +2143,12 @@ function PreferenceSaveIndicator({ state }: { state: PreferenceSaveState }) {
 
 function PreferencesPanel({
   settings,
-  onSave
+  onSave,
+  navigationFlushRef
 }: {
   settings: QuickPimSettings;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  navigationFlushRef: MutableRefObject<(() => Promise<void>) | undefined>;
 }) {
   const [draft, setDraft] = useState<PreferenceDraft>(() => createPreferenceDraft(settings));
   const [saveState, setSaveState] = useState<PreferenceSaveState>("idle");
@@ -2204,6 +2214,16 @@ function PreferencesPanel({
     };
   }, []);
 
+  useEffect(() => {
+    const flushBeforeNavigation = () => queueAutosave(draftRef.current, revisionRef.current);
+    navigationFlushRef.current = flushBeforeNavigation;
+    return () => {
+      if (navigationFlushRef.current === flushBeforeNavigation) {
+        navigationFlushRef.current = undefined;
+      }
+    };
+  }, [navigationFlushRef]);
+
   function updateDraft(patch: Partial<PreferenceDraft>) {
     if (autosaveRetryTimerRef.current !== undefined) {
       window.clearTimeout(autosaveRetryTimerRef.current);
@@ -2221,13 +2241,13 @@ function PreferencesPanel({
     queueAutosave(draftRef.current, revisionRef.current);
   }
 
-  function queueAutosave(snapshot: PreferenceDraft, revision: number) {
+  function queueAutosave(snapshot: PreferenceDraft, revision: number): Promise<void> {
     if (
       revision <= savedRevisionRef.current
       || revision <= queuedRevisionRef.current
       || !isPreferenceDraftValid(snapshot)
     ) {
-      return;
+      return autosaveQueueRef.current;
     }
     queuedRevisionRef.current = revision;
     autosaveQueueRef.current = autosaveQueueRef.current.then(async () => {
@@ -2269,6 +2289,7 @@ function PreferencesPanel({
     }).catch(() => {
       handleAutosaveFailure(snapshot, revision);
     });
+    return autosaveQueueRef.current;
   }
 
   function handleAutosaveFailure(snapshot: PreferenceDraft, revision: number) {

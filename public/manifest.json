@@ -1,6 +1,6 @@
 {
   "name": "QuickPIM++",
-  "version": "2.10.9",
+  "version": "2.10.10",
   "description": "Quickly view, select, group, and activate Microsoft Entra, Azure, and PIM group roles.",
   "manifest_version": 3,
   "minimum_chrome_version": "102",
