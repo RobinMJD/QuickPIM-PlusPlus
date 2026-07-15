@@ -1049,9 +1049,10 @@ function PopupApp() {
         ...transportErrors
       ], nextAccessCapabilities);
       const formattedLoadErrors = formatLoadMessages(loadErrors);
+      const remainingAccessTargets = getAccessSetupTargets(nextAccessCapabilities);
       const isInitialAccessRequired = !finalView.eligible.items.length
         && !finalView.active.items.length
-        && getAccessSetupTargets(nextAccessCapabilities).length > 0
+        && remainingAccessTargets.length > 0
         && !options.force;
       if (formattedLoadErrors.length && !isInitialAccessRequired) {
         showProgressError(formattedLoadErrors.join("\n"), "Refresh completed with an issue");
@@ -1060,8 +1061,8 @@ function PopupApp() {
         if (!options.suppressMessage) {
           setMessage("");
         }
-        showProgressComplete("Refresh complete");
-        if (options.force && !loadErrors.length) {
+        showProgressComplete(remainingAccessTargets.length ? "Available role data loaded" : "Refresh complete");
+        if (options.force && !loadErrors.length && !remainingAccessTargets.length) {
           setRefreshSuccessKey(Date.now());
           refreshSuccessTimer.current = setTimeout(() => {
             setRefreshSuccessKey(0);

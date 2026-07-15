@@ -21,9 +21,12 @@ describe("popup access messages", () => {
     expect(errors).toEqual(["Service temporarily unavailable"]);
   });
 
-  test("keeps permission errors when an access area is still limited", () => {
+  test("routes permission errors to the feature-specific access warning", () => {
     const errors = filterLoadErrorsForAccessState(
-      ["Authorization failed due to missing permission scope RoleEligibilitySchedule.Read.Directory"],
+      [
+        "Authorization failed due to missing permission scope RoleEligibilitySchedule.Read.Directory",
+        "Service temporarily unavailable"
+      ],
       [
         readyCapabilities[0],
         { target: "pimGroup", label: "PIM Groups", status: "limited", detail: "Blocked." },
@@ -31,6 +34,21 @@ describe("popup access messages", () => {
       ]
     );
 
-    expect(errors).toEqual(["Authorization failed due to missing permission scope RoleEligibilitySchedule.Read.Directory"]);
+    expect(errors).toEqual(["Service temporarily unavailable"]);
+  });
+
+  test("routes missing-token and interactive-auth errors to access recovery", () => {
+    const errors = filterLoadErrorsForAccessState(
+      [
+        "Graph token is missing.",
+        "Additional sign-in is required by a claims challenge.",
+        "Network unavailable"
+      ],
+      [
+        { target: "directoryRole", label: "Entra Roles", status: "needsPortalRefresh", detail: "Open portal." }
+      ]
+    );
+
+    expect(errors).toEqual(["Network unavailable"]);
   });
 });

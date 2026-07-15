@@ -326,6 +326,92 @@ describe("popup loading UI", () => {
     expect(failedProgress?.textContent).toContain("Step 5/5");
     expect(failedProgress?.textContent).toContain("Refresh completed with an issue");
   });
+
+  test("does not leave a red refresh error when usable data loads with a capability warning", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const entraRole: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const tokenStatus = {
+      graph: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "principal-1" },
+      azureManagement: { hasToken: false }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const permissionError = '{"errorCode":"PermissionScopeNotGranted","message":"Authorization failed due to missing permission scope RoleAssignmentSchedule.Read.Directory"}';
+    const sendMessage = vi.fn((message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({ success: true, data: tokenStatus });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            tokenStatus,
+            eligible: {
+              items: [entraRole],
+              errors: [],
+              diagnostics: [{
+                target: "directoryRole",
+                success: true,
+                checkedAt: "2026-07-15T10:00:00.000Z",
+                operation: "eligible"
+              }]
+            },
+            active: {
+              items: [],
+              errors: [permissionError],
+              diagnostics: [{
+                target: "directoryRole",
+                success: false,
+                checkedAt: "2026-07-15T10:00:01.000Z",
+                operation: "active",
+                error: permissionError,
+                failureKind: "missingCapability"
+              }]
+            }
+          }
+        });
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
+    expect(document.body.textContent).not.toContain("Refresh completed with an issue");
+    expect(document.body.textContent).not.toContain("Microsoft Graph access is limited in the captured portal token");
+    expect(document.body.textContent).toContain("One role source needs a refresh.");
+  });
 });
 
 describe("popup compact controls", () => {
