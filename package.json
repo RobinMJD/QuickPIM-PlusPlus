@@ -1,6 +1,6 @@
 {
   "name": "quickpim-plusplus",
-  "version": "2.10.8",
+  "version": "2.10.9",
   "private": true,
   "packageManager": "npm@11.6.2",
   "engines": {

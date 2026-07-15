@@ -138,4 +138,38 @@ describe("popup draft storage", () => {
     expect(operations).toEqual(["save:start", "save:end", "clear"]);
     expect(values[POPUP_DRAFT_KEY]).toBeUndefined();
   });
+
+  test("does not look up the Chrome global after a queued mutation has started", async () => {
+    let releaseFirstWrite: (() => void) | undefined;
+    const firstWriteGate = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    const localStorage = {
+      set: vi.fn(async () => {
+        await firstWriteGate;
+      }),
+      remove: vi.fn(async () => undefined)
+    };
+    vi.stubGlobal("chrome", { storage: { local: localStorage } });
+
+    const save = savePopupDraft({
+      tab: "directoryRole",
+      search: "",
+      sortMode: "name",
+      selectedIds: ["directoryRole:reader:/"],
+      durationHours: 1,
+      justification: "Investigate production issue",
+      ticketSystem: "",
+      ticketNumber: "",
+      isActivationReviewOpen: true,
+      requestMode: "activate"
+    }, now);
+    await vi.waitFor(() => expect(localStorage.set).toHaveBeenCalledOnce());
+    const clear = clearPopupDraft();
+
+    vi.unstubAllGlobals();
+    releaseFirstWrite?.();
+    await expect(Promise.all([save, clear])).resolves.toEqual([undefined, undefined]);
+    expect(localStorage.remove).toHaveBeenCalledWith(POPUP_DRAFT_KEY);
+  });
 });

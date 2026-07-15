@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.10.8.
+Reviewed for v2.10.9.
 
 ## Threat Model
 

@@ -41,17 +41,19 @@ export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | und
 
 export async function savePopupDraft(draft: PopupDraftInput, now = Date.now()): Promise<void> {
   const safeDraft = sanitizePopupDraft({ ...draft, updatedAt: now }, now);
+  const storage = chrome.storage.local;
   return enqueuePopupDraftMutation(async () => {
     if (!safeDraft || !hasPopupDraftContent(safeDraft)) {
-      await chrome.storage.local.remove(POPUP_DRAFT_KEY);
+      await storage.remove(POPUP_DRAFT_KEY);
       return;
     }
-    await chrome.storage.local.set({ [POPUP_DRAFT_KEY]: safeDraft });
+    await storage.set({ [POPUP_DRAFT_KEY]: safeDraft });
   });
 }
 
 export async function clearPopupDraft(): Promise<void> {
-  return enqueuePopupDraftMutation(() => chrome.storage.local.remove(POPUP_DRAFT_KEY));
+  const storage = chrome.storage.local;
+  return enqueuePopupDraftMutation(() => storage.remove(POPUP_DRAFT_KEY));
 }
 
 export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft | undefined {
