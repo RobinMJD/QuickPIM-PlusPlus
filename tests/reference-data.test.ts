@@ -1,9 +1,12 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   DEFAULT_REFERENCE_DATA,
+  REFERENCE_DATA_KEY,
   applyReferenceDataToItems,
   learnReferenceDataFromItems,
-  mergeReferenceData
+  mergeReferenceData,
+  mergeReferenceDataForSave,
+  saveReferenceData
 } from "../src/lib/referenceData";
 import { DEFAULT_SETTINGS, getDisplayName, getScopeLabel, mergeSettings } from "../src/lib/settings";
 import type { ActivationItem } from "../src/lib/types";
@@ -108,5 +111,53 @@ describe("reference data cache", () => {
     });
 
     expect(settings.aliasesByItemId[rawDirectoryRole.id]).toBe("Alias");
+  });
+
+  test("merges concurrent learned names without replacing newer values", async () => {
+    const older = "2026-05-18T10:00:00.000Z";
+    const newer = "2026-05-18T11:00:00.000Z";
+    expect(mergeReferenceDataForSave(
+      {
+        ...DEFAULT_REFERENCE_DATA,
+        pimGroups: { "group-1": { name: "Current group", updatedAt: newer } }
+      },
+      {
+        ...DEFAULT_REFERENCE_DATA,
+        pimGroups: {
+          "group-1": { name: "Stale group", updatedAt: older },
+          "group-2": { name: "New group", updatedAt: newer }
+        }
+      }
+    ).pimGroups).toEqual({
+      "group-1": { name: "Current group", updatedAt: newer },
+      "group-2": { name: "New group", updatedAt: newer }
+    });
+
+    const values: Record<string, unknown> = {};
+    vi.stubGlobal("chrome", {
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: values[key] })),
+          set: vi.fn(async (items: Record<string, unknown>) => Object.assign(values, items)),
+          remove: vi.fn(async (key: string) => {
+            delete values[key];
+          })
+        }
+      }
+    });
+    await Promise.all([
+      saveReferenceData({
+        ...DEFAULT_REFERENCE_DATA,
+        directoryRoleDefinitions: { reader: { name: "Reader", updatedAt: older } }
+      }),
+      saveReferenceData({
+        ...DEFAULT_REFERENCE_DATA,
+        pimGroups: { "group-2": { name: "New group", updatedAt: newer } }
+      })
+    ]);
+    expect(values[REFERENCE_DATA_KEY]).toMatchObject({
+      directoryRoleDefinitions: { reader: { name: "Reader" } },
+      pimGroups: { "group-2": { name: "New group" } }
+    });
   });
 });

@@ -5,6 +5,7 @@ import { DATA_CACHE_KEY } from "../src/lib/cache";
 import { buildTargetCacheKey } from "../src/lib/access";
 import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
+import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 import type { ActivationItem } from "../src/lib/types";
 
 afterEach(() => {
@@ -112,7 +113,12 @@ describe("popup loading UI", () => {
     expect(document.body.textContent).toContain("Step");
     expect(document.body.textContent).toContain("This can take up to 15 seconds");
     expect(document.body.textContent).not.toContain("Loading access data (this can take up to 15 seconds)");
-    expect(document.querySelector(".progress-track")).toBeTruthy();
+    const progressTrack = document.querySelector<HTMLElement>('[role="progressbar"]');
+    expect(progressTrack).toBeTruthy();
+    const firstPercent = Number(progressTrack?.getAttribute("aria-valuenow"));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const laterPercent = Number(progressTrack?.getAttribute("aria-valuenow"));
+    expect(laterPercent).toBeGreaterThan(firstPercent);
 
     eligible.resolve({ success: true, data: { items: [], errors: [] } });
     active.resolve({ success: true, data: { items: [], errors: [] } });
@@ -315,7 +321,10 @@ describe("popup loading UI", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     await waitFor(() => expect(document.body.textContent).toContain("PIM Groups: Network unavailable"));
-    expect(document.querySelector(".refresh-progress-panel")).toBeFalsy();
+    const failedProgress = document.querySelector(".refresh-progress-panel");
+    expect(failedProgress?.classList.contains("error")).toBe(true);
+    expect(failedProgress?.textContent).toContain("Step 5/5");
+    expect(failedProgress?.textContent).toContain("Refresh completed with an issue");
   });
 });
 
@@ -374,7 +383,7 @@ describe("popup compact controls", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    await waitFor(() => expect(document.body.textContent).toContain("Load your PIM roles"));
     expect(document.body.textContent).not.toContain("Using cached data");
   });
 
@@ -564,6 +573,672 @@ describe("popup compact controls", () => {
     });
     await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
     expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
+  });
+
+  test("opens only the portal pages needed by enabled features from manual refresh", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingTokens = {
+      graph: { hasToken: false },
+      azureManagement: { hasToken: false }
+    };
+    const recoveredTokens = {
+      graph: { hasToken: true, capturedAt: 2 },
+      graphTargets: {
+        pimGroup: {
+          hasToken: true,
+          capturedAt: 2,
+          grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+        }
+      },
+      azureManagement: { hasToken: false }
+    };
+    let recoveryOpened = false;
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const createTab = vi.fn(async (_options: { url: string }) => undefined);
+    const sendMessage = vi.fn(async (message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: recoveryOpened ? recoveredTokens : missingTokens };
+      }
+      if (message.action === "refreshPortalTokens") {
+        return {
+          success: true,
+          data: { tokenStatus: missingTokens, tabsFound: 0, tabsScanned: 0, captured: [] }
+        };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return {
+          success: true,
+          data: {
+            eligible: { items: [], errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] },
+            tokenStatus: recoveredTokens
+          }
+        };
+      }
+      if (message.action === "openPortalRecoveryTabs") {
+        recoveryOpened = true;
+        return {
+          success: true,
+          data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true }
+        };
+      }
+      return { success: true, data: true };
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: createTab }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    const refreshLabel = "Refresh all enabled data and recover missing portal access";
+    await waitFor(() => {
+      const button = document.querySelector<HTMLButtonElement>(`button[aria-label="${refreshLabel}"]`);
+      expect(button?.disabled).toBe(false);
+    });
+    createTab.mockClear();
+    document.querySelector<HTMLButtonElement>(`button[aria-label="${refreshLabel}"]`)?.click();
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "openPortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
+    expect(createTab).not.toHaveBeenCalled();
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "getActivationSnapshot", targets: ["pimGroup"] }), 2500);
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "closePortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
+  });
+
+  test("recovers both enabled Graph features when only cached Azure data is visible", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingGraphTokens = {
+      graph: { hasToken: false },
+      graphTargets: {
+        directoryRole: { hasToken: false },
+        pimGroup: { hasToken: false }
+      },
+      azureManagement: {
+        hasToken: true,
+        capturedAt: 1,
+        tenantId: "tenant-1",
+        principalId: "principal-1"
+      }
+    };
+    const recoveredTokens = {
+      graph: {
+        hasToken: true,
+        capturedAt: 2,
+        tenantId: "tenant-1",
+        principalId: "principal-1"
+      },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          capturedAt: 2,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          grantedScopes: ["RoleAssignmentSchedule.ReadWrite.Directory"]
+        },
+        pimGroup: {
+          hasToken: true,
+          capturedAt: 2,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+        }
+      },
+      azureManagement: missingGraphTokens.azureManagement
+    };
+    const azureItem: ActivationItem = {
+      id: "azureRole:contributor:/subscriptions/sub-1",
+      type: "azureRole",
+      sourceName: "Contributor",
+      displayName: "Contributor",
+      principalId: "principal-1",
+      scopeLabel: "Production",
+      status: "eligible",
+      roleDefinitionId: "contributor",
+      scope: "/subscriptions/sub-1"
+    };
+    let recoveryOpened = false;
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "pimGroup", "azureRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          azureRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(missingGraphTokens, "azureRole"),
+            errors: [],
+            items: [azureItem]
+          }
+        },
+        activeByTarget: {
+          azureRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(missingGraphTokens, "azureRole"),
+            errors: [],
+            items: []
+          }
+        }
+      }
+    };
+    const sendMessage = vi.fn(async (message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: recoveryOpened ? recoveredTokens : missingGraphTokens };
+      }
+      if (message.action === "refreshPortalTokens") {
+        return {
+          success: true,
+          data: {
+            tokenStatus: recoveryOpened ? recoveredTokens : missingGraphTokens,
+            tabsFound: 0,
+            tabsScanned: 0,
+            captured: []
+          }
+        };
+      }
+      if (message.action === "openPortalRecoveryTabs") {
+        recoveryOpened = true;
+        return {
+          success: true,
+          data: { requestedCount: 2, openedCount: 2, reusedCount: 0, managedCount: 2, grouped: true }
+        };
+      }
+      if (message.action === "getActivationSnapshot") {
+        const items = message.targets?.[0] === "azureRole" ? [azureItem] : [];
+        return {
+          success: true,
+          data: {
+            eligible: { items, errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] },
+            tokenStatus: recoveryOpened ? recoveredTokens : missingGraphTokens
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Contributor"));
+    await waitFor(() => {
+      const tabLabels = [...document.querySelectorAll(".tab-button")].map((button) => button.textContent?.trim());
+      expect(tabLabels).toEqual(["Azure Roles", "Bundles"]);
+    });
+    expect(document.body.textContent).toContain("2 role sources need a refresh.");
+    expect(document.body.textContent).toContain("Use Refresh in the top-right.");
+    expect(document.body.textContent).not.toContain("Fix access");
+    sendMessage.mockClear();
+    const refreshLabel = "Refresh all enabled data and recover missing portal access";
+    document.querySelector<HTMLButtonElement>(`button[aria-label="${refreshLabel}"]`)?.click();
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
+      action: "openPortalRecoveryTabs",
+      targets: ["directoryRole", "pimGroup"]
+    }), 2500);
+    expect(sendMessage).not.toHaveBeenCalledWith({
+      action: "openPortalRecoveryTabs",
+      targets: expect.arrayContaining(["azureRole"])
+    });
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
+      action: "closePortalRecoveryTabs",
+      targets: ["directoryRole", "pimGroup"]
+    }), 2500);
+  });
+
+  test("presents first use as one calm refresh step without duplicate access warnings", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingTokens = {
+      graph: { hasToken: false },
+      graphTargets: {
+        directoryRole: { hasToken: false },
+        pimGroup: { hasToken: false }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "pimGroup", "azureRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [POPUP_DRAFT_KEY]: {
+        updatedAt: Date.now(),
+        tab: "bundles",
+        search: "",
+        sortMode: "name",
+        quickFilters: [],
+        selectedIds: [],
+        durationHours: 0.5,
+        justification: "",
+        ticketSystem: "",
+        ticketNumber: "",
+        isActivationReviewOpen: false
+      }
+    };
+    const openedUrls: string[] = [];
+    const recoveryOpen = deferred<{
+      success: true;
+      data: { managedCount: number; grouped: boolean; openedTargets: string[]; reusedTargets: string[] };
+    }>();
+    const sendMessage = vi.fn(async (message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: missingTokens };
+      }
+      if (message.action === "openPortalRecoveryTabs") {
+        return recoveryOpen.promise;
+      }
+      if (message.action === "refreshPortalTokens") {
+        return {
+          success: true,
+          data: { tokenStatus: missingTokens, tabsFound: 0, tabsScanned: 0, captured: [] }
+        };
+      }
+      if (message.action === "getActivationSnapshot") {
+        const error = message.targets?.[0] === "azureRole"
+          ? "Azure Management token is missing."
+          : "Graph token is missing.";
+        return {
+          success: true,
+          data: {
+            eligible: { items: [], errors: [error], diagnostics: [] },
+            active: { items: [], errors: [error], diagnostics: [] },
+            tokenStatus: missingTokens
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: {
+        create: vi.fn(async ({ url }: { url: string }) => {
+          openedUrls.push(url);
+        })
+      }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Load your PIM roles"));
+    expect(document.body.textContent).toContain("Use the highlighted Refresh button above.");
+    expect(document.body.textContent).toContain("Graph access needed");
+    expect(document.body.textContent).toContain("Azure access needed");
+    expect(document.body.textContent).not.toContain("Some QuickPIM++ data is missing or stale.");
+    expect(document.body.textContent).not.toContain("Fix access");
+    expect(document.body.textContent).not.toContain("Graph token is missing.");
+    expect(document.body.textContent).not.toContain("Create role bundles from Settings.");
+    expect(document.querySelectorAll(".tab-button")).toHaveLength(0);
+    expect(document.querySelector(".refresh-button")?.classList.contains("needs-attention")).toBe(true);
+    expect(document.querySelector(".initial-access-arrow")).toBeTruthy();
+    expect(document.querySelector(".initial-access-icon")).toBeFalsy();
+    expect(document.querySelector('button[aria-label^="Open "]')).toBeFalsy();
+    clickButton("Access details");
+    await waitFor(() => expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#access"]));
+
+    document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh all enabled data and recover missing portal access"]'
+    )?.click();
+    await waitFor(() => {
+      const activeTab = document.querySelector<HTMLButtonElement>(".tab-button.active");
+      expect(activeTab?.textContent?.trim()).toBe("Entra Roles");
+    });
+    recoveryOpen.resolve({
+      success: true,
+      data: { managedCount: 0, grouped: false, openedTargets: [], reusedTargets: [] }
+    });
+  });
+
+  test("turns first-run token recovery into a persistent Microsoft sign-in step", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingTokens = {
+      graph: { hasToken: false },
+      graphTargets: { directoryRole: { hasToken: false }, pimGroup: { hasToken: false } },
+      azureManagement: { hasToken: false }
+    };
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      preferences: {
+        ...DEFAULT_SETTINGS.preferences,
+        enabledFeatures: ["directoryRole", "pimGroup", "azureRole"],
+        autoEnabledFeaturesInitialized: true
+      }
+    };
+    let recoveryStatus: Record<string, unknown> = {
+      state: "idle",
+      managedTargets: [],
+      interactionTargets: [],
+      grouped: false
+    };
+    const sendMessage = vi.fn(async (message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") return { success: true, data: missingTokens };
+      if (message.action === "getPortalRecoveryStatus") return { success: true, data: recoveryStatus };
+      if (message.action === "openPortalRecoveryTabs") {
+        recoveryStatus = {
+          state: "interactionRequired",
+          managedTargets: message.targets || [],
+          interactionTargets: message.targets || [],
+          grouped: true,
+          interactionReason: "signIn"
+        };
+        return { success: true, data: { requestedCount: 3, openedCount: 3, reusedCount: 0, managedCount: 3, grouped: true } };
+      }
+      if (message.action === "focusPortalRecoveryTabs") {
+        return { success: true, data: { focused: true, status: recoveryStatus } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return {
+          success: true,
+          data: {
+            eligible: { items: [], errors: ["Graph token is missing."], diagnostics: [] },
+            active: { items: [], errors: ["Graph token is missing."], diagnostics: [] },
+            tokenStatus: missingTokens
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    vi.stubGlobal("chrome", {
+      runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Load your PIM roles"));
+
+    document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh all enabled data and recover missing portal access"]'
+    )?.click();
+
+    await waitFor(() => expect(document.body.textContent).toContain("Microsoft sign-in needed"), 2500);
+    expect(document.body.textContent).toContain("Choose an account or finish signing in");
+    expect(document.querySelector('.message.error')).toBeFalsy();
+    expect(document.querySelector('button[aria-label="Continue Microsoft sign-in"]')).toBeTruthy();
+    clickButton("Continue sign-in");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "focusPortalRecoveryTabs" }));
+  });
+
+  test("restores a pending Microsoft sign-in step when the popup is reopened", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingTokens = {
+      graph: { hasToken: false },
+      graphTargets: { directoryRole: { hasToken: false } },
+      azureManagement: { hasToken: false }
+    };
+    const recoveryStatus = {
+      state: "interactionRequired",
+      managedTargets: ["directoryRole"],
+      interactionTargets: ["directoryRole"],
+      grouped: true,
+      interactionReason: "signIn"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getTokenStatus") return { success: true, data: missingTokens };
+      if (message.action === "getPortalRecoveryStatus") return { success: true, data: recoveryStatus };
+      if (message.action === "getActivationSnapshot") {
+        return {
+          success: true,
+          data: {
+            eligible: { items: [], errors: ["Graph token is missing."], diagnostics: [] },
+            active: { items: [], errors: ["Graph token is missing."], diagnostics: [] },
+            tokenStatus: missingTokens
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", {
+      runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Microsoft sign-in needed"));
+    expect(sendMessage).not.toHaveBeenCalledWith({ action: "openPortalRecoveryTabs", targets: expect.anything() });
+  });
+
+  test("automatically resumes loading roles after Microsoft sign-in completes", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const missingTokens = {
+      graph: { hasToken: false },
+      graphTargets: { directoryRole: { hasToken: false } },
+      azureManagement: { hasToken: false }
+    };
+    const readyTokens = {
+      graph: { hasToken: true, capturedAt: 2, expiresInMinutes: 45 },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          capturedAt: 2,
+          expiresInMinutes: 45,
+          grantedScopes: ["RoleEligibilitySchedule.Read.Directory", "RoleAssignmentSchedule.ReadWrite.Directory"]
+        }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const role: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Global Reader",
+      displayName: "Global Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const interactionStatus = {
+      state: "interactionRequired",
+      managedTargets: ["directoryRole"],
+      interactionTargets: ["directoryRole"],
+      grouped: true,
+      interactionReason: "signIn"
+    };
+    const idleStatus = {
+      state: "idle",
+      managedTargets: [],
+      interactionTargets: [],
+      grouped: false
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    let statusChecks = 0;
+    let tokenChecks = 0;
+    let snapshotChecks = 0;
+    const sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getPortalRecoveryStatus") {
+        statusChecks += 1;
+        return { success: true, data: statusChecks < 3 ? interactionStatus : idleStatus };
+      }
+      if (message.action === "getTokenStatus") {
+        tokenChecks += 1;
+        return { success: true, data: tokenChecks === 1 ? missingTokens : readyTokens };
+      }
+      if (message.action === "refreshPortalTokens") {
+        return { success: true, data: { tokenStatus: missingTokens, tabsFound: 0, tabsScanned: 0, captured: [] } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        snapshotChecks += 1;
+        const hasRole = snapshotChecks > 1;
+        return {
+          success: true,
+          data: {
+            eligible: { items: hasRole ? [role] : [], errors: hasRole ? [] : ["Graph token is missing."], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] },
+            tokenStatus: hasRole ? readyTokens : missingTokens
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", {
+      runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Microsoft sign-in needed"));
+    await waitFor(() => expect(document.body.textContent).toContain("Global Reader"), 3_000);
+    expect(snapshotChecks).toBeGreaterThan(1);
+    expect(document.body.textContent).not.toContain("Load your PIM roles");
+  });
+
+  test("keeps cached roles usable while later token recovery waits for sign-in", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const item: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Global Reader",
+      displayName: "Global Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const missingTokens = {
+      graph: { hasToken: false },
+      graphTargets: { directoryRole: { hasToken: false } },
+      azureManagement: { hasToken: false }
+    };
+    const cacheEntry = {
+      fetchedAt: Date.now(),
+      cacheKey: buildTargetCacheKey(missingTokens, "directoryRole"),
+      errors: [],
+      diagnostics: [],
+      items: [item]
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: { directoryRole: cacheEntry },
+        activeByTarget: { directoryRole: { ...cacheEntry, items: [] } }
+      }
+    };
+    const recoveryStatus = {
+      state: "interactionRequired",
+      managedTargets: ["directoryRole"],
+      interactionTargets: ["directoryRole"],
+      grouped: true,
+      interactionReason: "signIn"
+    };
+    const sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getTokenStatus") return { success: true, data: missingTokens };
+      if (message.action === "getPortalRecoveryStatus") return { success: true, data: recoveryStatus };
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", {
+      runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Global Reader"));
+    expect(document.body.textContent).toContain("Microsoft sign-in is needed to finish refreshing access.");
+    expect(document.body.textContent).toContain("Continue sign-in");
   });
 
   test("renders pending approval rows as readonly and excludes them from eligible count", async () => {
@@ -868,7 +1543,7 @@ describe("popup compact controls", () => {
     expect(tabLabels).toEqual(["Azure Roles", "Bundles"]);
   });
 
-  test("auto-enables only features with eligible items after the first successful fetch", async () => {
+  test("auto-enables features that only return active PIM items after the first successful fetch", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const azureItem: ActivationItem = {
       id: "azureRole:reader:/subscriptions/sub-1",
@@ -877,7 +1552,9 @@ describe("popup compact controls", () => {
       displayName: "Reader",
       principalId: "principal-1",
       scopeLabel: "Production",
-      status: "eligible",
+      status: "active",
+      activeAssignmentType: "activated",
+      assignmentScheduleId: "schedule-1",
       roleDefinitionId: "reader",
       scope: "/subscriptions/sub-1"
     };
@@ -898,10 +1575,10 @@ describe("popup compact controls", () => {
             });
           }
           if (message.action === "getActivationItems") {
-            return Promise.resolve({ success: true, data: { items: [azureItem], errors: [], diagnostics: [] } });
+            return Promise.resolve({ success: true, data: { items: [], errors: [], diagnostics: [] } });
           }
           if (message.action === "getActiveItems") {
-            return Promise.resolve({ success: true, data: { items: [], errors: [], diagnostics: [] } });
+            return Promise.resolve({ success: true, data: { items: [azureItem], errors: [], diagnostics: [] } });
           }
           return Promise.resolve({ success: true, data: true });
         })
@@ -927,6 +1604,57 @@ describe("popup compact controls", () => {
       preferences: expect.objectContaining({
         enabledFeatures: ["azureRole", "bundles"],
         autoEnabledFeaturesInitialized: true
+      })
+    });
+  });
+
+  test("does not auto-hide role sources when one half of the first fetch fails", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const initialSettings = structuredClone(DEFAULT_SETTINGS);
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: initialSettings };
+    const chromeMock = {
+      runtime: {
+        sendMessage: vi.fn((message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                graph: { hasToken: true, capturedAt: 1 },
+                azureManagement: { hasToken: true, capturedAt: 1 }
+              }
+            });
+          }
+          if (message.action === "getActivationItems") {
+            return Promise.resolve({ success: true, data: { items: [], errors: [], diagnostics: [] } });
+          }
+          if (message.action === "getActiveItems") {
+            return Promise.resolve({ success: true, data: { items: [], errors: ["Temporary active-assignment failure"], diagnostics: [] } });
+          }
+          return Promise.resolve({ success: true, data: true });
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(
+      chromeMock.runtime.sendMessage.mock.calls.some(([message]) => message.action === "getActiveItems")
+    ).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(storageData[SETTINGS_KEY]).toMatchObject({
+      preferences: expect.objectContaining({
+        enabledFeatures: ["directoryRole", "pimGroup", "azureRole", "bundles"],
+        autoEnabledFeaturesInitialized: false
       })
     });
   });
@@ -985,8 +1713,32 @@ describe("popup compact controls", () => {
     expect(fetchMessages.map((message) => message.targets)).toEqual([["azureRole"], ["azureRole"]]);
   });
 
-  test("manual popup refresh targets the current role tab through the snapshot endpoint", async () => {
+  test("manual popup refresh targets every enabled role source through the snapshot endpoint", async () => {
     document.body.innerHTML = '<div id="root"></div>';
+    const tokens = {
+      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          grantedScopes: [
+            "RoleEligibilitySchedule.Read.Directory",
+            "RoleAssignmentSchedule.ReadWrite.Directory"
+          ]
+        },
+        pimGroup: {
+          hasToken: true,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          grantedScopes: [
+            "PrivilegedEligibilitySchedule.Read.AzureADGroup",
+            "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"
+          ]
+        }
+      },
+      azureManagement: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" }
+    };
     const eligibleItem: ActivationItem = {
       id: "directoryRole:reader:/",
       type: "directoryRole",
@@ -999,12 +1751,19 @@ describe("popup compact controls", () => {
       directoryScopeId: "/"
     };
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "pimGroup", "azureRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
       [DATA_CACHE_KEY]: {
         eligibleByTarget: {
           directoryRole: {
             fetchedAt: Date.now(),
-            cacheKey: "graphDirectory:missing",
+            cacheKey: buildTargetCacheKey(tokens, "directoryRole"),
             errors: [],
             items: [eligibleItem]
           }
@@ -1012,7 +1771,7 @@ describe("popup compact controls", () => {
         activeByTarget: {
           directoryRole: {
             fetchedAt: Date.now(),
-            cacheKey: "graphDirectory:missing",
+            cacheKey: buildTargetCacheKey(tokens, "directoryRole"),
             errors: [],
             items: []
           }
@@ -1023,10 +1782,7 @@ describe("popup compact controls", () => {
       if (message.action === "getTokenStatus") {
         return Promise.resolve({
           success: true,
-          data: {
-            graph: { hasToken: false },
-            azureManagement: { hasToken: false }
-          }
+          data: tokens
         });
       }
       if (message.action === "getActivationSnapshot") {
@@ -1056,15 +1812,23 @@ describe("popup compact controls", () => {
     await import("../src/popup/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
-    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh Entra Roles data"]')?.click();
+    await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
+    await waitFor(() => expect(document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh all enabled data and recover missing portal access"]'
+    )?.disabled).toBe(false));
+    sendMessage.mockClear();
+    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh all enabled data and recover missing portal access"]')?.click();
 
-    await waitFor(() =>
-      expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-        action: "getActivationSnapshot",
-        targets: ["directoryRole"]
-      }))
-    );
-    await waitFor(() => expect(document.querySelector(".refresh-success-indicator")).toBeTruthy());
+    await waitFor(() => expect(sendMessage).toHaveBeenCalled());
+    await waitFor(() => {
+      const snapshotTargets = sendMessage.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message.action === "getActivationSnapshot")
+        .map((message) => message.targets?.[0])
+        .sort();
+      expect(snapshotTargets).toEqual(["azureRole", "directoryRole", "pimGroup"]);
+    });
+    await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
     expect(document.body.textContent).not.toContain("Refresh completed.");
   });
 
@@ -1233,7 +1997,14 @@ describe("popup compact controls", () => {
   test("opens the Bundles settings section from the Bundles tab", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -1538,7 +2309,7 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     clickButton("Activate 1 selected");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Activation in progress (step 1/3): Sending activation request"));
+    await waitFor(() => expect(document.body.textContent).toContain("Activation in progressStep 1/3Sending activation request"));
     activation.resolve({
       success: true,
       data: {
@@ -1548,7 +2319,7 @@ describe("popup compact controls", () => {
       }
     });
 
-    await waitFor(() => expect(document.body.textContent).toContain("Activation in progress (step 3/3): Refreshing activation status"));
+    await waitFor(() => expect(document.body.textContent).toContain("Activation in progressStep 3/3Refreshing activation status"));
     refreshedEligible.resolve({ success: true, data: { items: [], errors: [] } });
     refreshedActive.resolve({ success: true, data: { items: [{ ...eligibleItem, status: "active" }], errors: [] } });
 
@@ -1632,6 +2403,7 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.querySelector(".required-marker")).toBeTruthy());
     expect(document.querySelector(".required-marker")?.textContent).toBe("*");
     expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
+    expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.maxLength).toBe(MAX_USER_JUSTIFICATION_LENGTH);
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     expect(css.match(/\.required-marker\s*\{[^}]+\}/)?.[0] || "").toContain("color: #dc2626;");
   });
@@ -1928,10 +2700,20 @@ describe("popup compact controls", () => {
       principalId: "principal-1",
       scopeLabel: "Member",
       status: "active",
+      activeAssignmentType: "activated",
       groupId: "group-2",
       accessId: "member",
       assignmentScheduleId: "active-schedule-1",
-      activeUntil: "2026-06-12T16:00:00.000Z"
+      activeUntil: new Date(Date.now() + 2 * 60 * 60_000 + 5 * 60_000 + 30_000).toISOString()
+    };
+    const assignedItem: ActivationItem = {
+      ...activeItem,
+      id: "pimGroup:group-3:member",
+      sourceName: "Assigned Group",
+      displayName: "Assigned Group",
+      groupId: "group-3",
+      activeAssignmentType: "assigned",
+      assignmentScheduleId: "assigned-schedule-1"
     };
     const activeEligibleItem: ActivationItem = {
       ...activeItem,
@@ -1945,6 +2727,7 @@ describe("popup compact controls", () => {
         preferences: {
           ...DEFAULT_SETTINGS.preferences,
           enabledFeatures: ["pimGroup"],
+          showAssignedRoles: true,
           autoEnabledFeaturesInitialized: true
         }
       },
@@ -1962,7 +2745,7 @@ describe("popup compact controls", () => {
             fetchedAt: Date.now(),
             cacheKey: "graphPimGroup:",
             errors: [],
-            items: [activeItem]
+            items: [activeItem, assignedItem]
           }
         }
       }
@@ -2013,12 +2796,23 @@ describe("popup compact controls", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Active Group"));
+    await waitFor(() => expect(document.body.textContent).toContain("Assigned Group"));
     const rows = [...document.querySelectorAll<HTMLElement>(".role-row")];
     const eligibleRow = rows.find((row) => row.textContent?.includes("Eligible Group"))!;
     const activeRow = rows.find((row) => row.textContent?.includes("Active Group"))!;
+    const assignedRow = rows.find((row) => row.textContent?.includes("Assigned Group"))!;
     const eligibleCheckbox = eligibleRow.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
     const activeCheckbox = activeRow.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+
+    expect(activeRow.textContent).toContain("PIM active");
+    const remainingCounter = activeRow.querySelector<HTMLElement>(".remaining-activation-time");
+    expect(remainingCounter?.textContent).toBe("2h 05m");
+    expect(remainingCounter?.getAttribute("aria-label")).toContain("remaining on PIM activation");
+    expect(assignedRow.textContent).toContain("Assigned");
+    expect(assignedRow.classList.contains("assigned-row")).toBe(true);
+    expect(assignedRow.querySelector('input[type="checkbox"]')).toBeNull();
+    expect(assignedRow.querySelector(".remaining-activation-time")).toBeNull();
+    expect(assignedRow.title).toContain("not a PIM activation");
 
     activeCheckbox.click();
     await waitFor(() => expect(document.body.textContent).toContain("Continue"));
@@ -2716,6 +3510,18 @@ describe("popup draft persistence", () => {
     };
   }
 
+  test("shows only the useful quick filters", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS };
+    vi.stubGlobal("chrome", popupChromeMock(storageData));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    const labels = [...document.querySelectorAll<HTMLButtonElement>(".filter-chip")].map((button) => button.textContent?.trim());
+    expect(labels).toEqual(["Favorites", "Eligible", "Active", "Needs reason"]);
+  });
+
   test("restores selection, tab, search, sort, review state, duration, justification, and tickets", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const storageData: Record<string, unknown> = {
@@ -2874,13 +3680,20 @@ describe("popup role row styling", () => {
 
   test("keeps activation review in flow with sticky bottom behavior instead of fixed overlap", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
     const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
     const activationRule = css.match(/\.activation-bar\s*\{[^}]+\}/)?.[0] || "";
 
+    expect(shellRule).toContain("display: flex;");
+    expect(shellRule).toContain("flex-direction: column;");
+    expect(shellRule).toContain("min-height: 600px;");
+    expect(shellRule).not.toContain("min-height: 640px;");
     expect(contentRule).toContain("padding-bottom: 12px;");
     expect(contentRule).not.toContain("padding-bottom: 248px;");
     expect(activationRule).toContain("position: sticky;");
     expect(activationRule).toContain("z-index: 20;");
+    expect(activationRule).toContain("margin-top: auto;");
+    expect(activationRule).toContain("flex-shrink: 0;");
     expect(activationRule).toContain("overflow-y: auto;");
     expect(activationRule).not.toContain("position: fixed;");
   });
@@ -2971,7 +3784,7 @@ describe("popup dark mode", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    await waitFor(() => expect(document.body.textContent).toContain("Load your PIM roles"));
     await waitFor(() => expect(document.body.classList.contains("dark-mode")).toBe(true));
   });
 });

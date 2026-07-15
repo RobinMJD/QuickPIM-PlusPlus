@@ -1,4 +1,4 @@
-import { ENTRA_GRAPH_BOOTSTRAP_URLS, ENTRA_PORTAL_URLS } from "./popupModel";
+import { ENTRA_PORTAL_URLS } from "./popupModel";
 import {
   getMatchedGraphActivationScope,
   getRequiredGraphActivationScopes,
@@ -71,16 +71,7 @@ export function getAccessSetupTargets(items: AccessCapabilityItem[]): AccessSetu
 }
 
 export function getPortalUrlsForTargets(targets: AccessSetupTarget[]): string[] {
-  return [
-    ...new Set(
-      targets.flatMap((target) => {
-        if (target === "directoryRole" || target === "pimGroup") {
-          return [ENTRA_PORTAL_URLS[target], ENTRA_GRAPH_BOOTSTRAP_URLS[target]];
-        }
-        return [ENTRA_PORTAL_URLS[target]];
-      })
-    )
-  ];
+  return [...new Set(targets.map((target) => ENTRA_PORTAL_URLS[target]))];
 }
 
 export function classifyAccessFailure(error: string | undefined): AccessFailureKind {
@@ -103,7 +94,7 @@ export function classifyAccessFailure(error: string | undefined): AccessFailureK
   if (text.includes("forbidden") || text.includes(" 403") || text === "403") {
     return "forbidden";
   }
-  if (text.includes("failed to fetch") || text.includes("network")) {
+  if (text.includes("failed to fetch") || text.includes("network") || text.includes("timed out")) {
     return "network";
   }
   return "unknown";

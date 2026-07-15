@@ -4,6 +4,7 @@ import {
   scanOpenEntraTabs,
   type ChromeTabsLike
 } from "../src/lib/portalTokenRefresh";
+import { buildTargetCacheKey } from "../src/lib/access";
 import type { QuickPimDataCache, TokenStatus } from "../src/lib/types";
 
 const now = Date.parse("2026-07-14T10:00:00.000Z");
@@ -32,6 +33,26 @@ describe("portal token background refresh", () => {
     });
     expect(tabs.sendMessage).toHaveBeenCalledTimes(2);
     expect(tabs.sendMessage).toHaveBeenCalledWith(11, { action: "quickPimScanPortalTokens" });
+  });
+
+  test("bounds portal scanning and prioritizes active and recently used tabs", async () => {
+    const portalTabs = Array.from({ length: 10 }, (_, index) => ({
+      id: index + 1,
+      active: index === 8,
+      lastAccessed: index * 100
+    })) as chrome.tabs.Tab[];
+    const sendMessage = vi.fn(async (_tabId: number, _message: unknown) => ({ success: true, data: { captured: [] } }));
+    const tabs: ChromeTabsLike = {
+      query: vi.fn(async () => portalTabs),
+      sendMessage
+    };
+
+    await expect(scanOpenEntraTabs(tabs, { maxTabs: 3 })).resolves.toEqual({
+      tabsFound: 10,
+      tabsScanned: 3,
+      captured: []
+    });
+    expect(sendMessage.mock.calls.map(([tabId]) => tabId)).toEqual([9, 10, 8]);
   });
 
   test("recovers missing and near-expiry tokens without rescanning healthy targets", () => {
@@ -90,6 +111,43 @@ describe("portal token background refresh", () => {
       enabledTargets: ["pimGroup", "azureRole"],
       staleTargets: [],
       tokenStatus,
+      now
+    })).toEqual([]);
+    expect(getPortalTokenRecoveryTargets({
+      cache,
+      enabledTargets: ["pimGroup", "azureRole"],
+      staleTargets: [],
+      tokenStatus,
+      force: true,
+      now
+    })).toEqual(["pimGroup"]);
+  });
+
+  test("does not rescan healthy ready tokens during a forced data refresh", () => {
+    const tokenStatus = healthyTokenStatus();
+    const readyEntry = {
+      items: [],
+      errors: [],
+      fetchedAt: now,
+      cacheKey: buildTargetCacheKey(tokenStatus, "directoryRole"),
+      diagnostics: [{
+        target: "directoryRole" as const,
+        success: true,
+        checkedAt: new Date(now).toISOString(),
+        operation: "eligible" as const
+      }]
+    };
+    const cache: QuickPimDataCache = {
+      eligibleByTarget: { directoryRole: readyEntry },
+      activeByTarget: { directoryRole: readyEntry }
+    };
+
+    expect(getPortalTokenRecoveryTargets({
+      cache,
+      enabledTargets: ["directoryRole"],
+      staleTargets: ["directoryRole"],
+      tokenStatus,
+      force: true,
       now
     })).toEqual([]);
   });

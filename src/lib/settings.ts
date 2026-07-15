@@ -11,8 +11,12 @@ import type {
   QuickPimSettings,
   SortMode
 } from "./types";
+import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
-import { isGenericJustification } from "./justifications";
+import {
+  isGenericJustification,
+  sanitizeUserJustification
+} from "./justifications";
 import { sanitizeErrorMessage } from "./security";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
@@ -22,13 +26,10 @@ const MAX_ALIASES = 300;
 const MAX_FAVORITES = 300;
 const MAX_ALIAS_LENGTH = 120;
 const MAX_ITEM_ID_LENGTH = 256;
-const MAX_JUSTIFICATION_LENGTH = 1024;
 const MAX_SAVED_JUSTIFICATIONS = 100;
 const MAX_BUNDLES = 50;
 const MAX_BUNDLE_ITEMS = 100;
 const MAX_BUNDLE_NAME_LENGTH = 80;
-const MIN_DURATION_HOURS = 0.5;
-const MAX_DURATION_HOURS = 24;
 export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "pimGroup", "azureRole"];
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 
@@ -48,10 +49,14 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     recentJustificationLimit: 8,
     activityHistoryLimit: 100,
     darkMode: false,
+    showAssignedRoles: false,
+    showRemainingActivationTime: true,
     showActivationCounters: false,
     showEnablementDetails: false,
     showLastEnablementDate: false,
     backgroundPreRefreshEnabled: true,
+    requestNotificationsEnabled: false,
+    expiryReminderMinutes: 15,
     enabledFeatures: ALL_FEATURES,
     autoEnabledFeaturesInitialized: false,
     permissionWarningIgnored: false
@@ -146,7 +151,7 @@ export function sortItems(
 }
 
 export function addRecentJustification(settings: QuickPimSettings, justification: string): QuickPimSettings {
-  const trimmed = justification.trim();
+  const trimmed = sanitizeUserJustification(justification);
   if (!trimmed || isGenericJustification(trimmed)) {
     return settings;
   }
@@ -164,7 +169,7 @@ export function addRecentJustification(settings: QuickPimSettings, justification
 }
 
 export function addSavedJustification(settings: QuickPimSettings, justification: string): QuickPimSettings {
-  const trimmed = justification.trim();
+  const trimmed = sanitizeUserJustification(justification);
   if (!trimmed || isGenericJustification(trimmed)) {
     return settings;
   }
@@ -233,7 +238,7 @@ export function recordActivityResults(
       completedAt: input.completedAt,
       ...(input.durationHours && input.action === "activate" ? { durationHours: input.durationHours } : {}),
       ...(input.bundleName ? { bundleName: input.bundleName } : {}),
-      ...(input.justification?.trim() ? { justification: sanitizeString(input.justification, MAX_JUSTIFICATION_LENGTH) } : {}),
+      ...(sanitizeUserJustification(input.justification) ? { justification: sanitizeUserJustification(input.justification) } : {}),
       ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {})
     };
   });
@@ -349,15 +354,21 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
   const preferences = isRecord(value) ? value : {};
   const ignoredAt = sanitizeString(preferences.permissionWarningIgnoredAt, 64);
   return {
-    defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
+    defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     activityHistoryLimit: clampInteger(preferences.activityHistoryLimit, 10, MAX_ACTIVITY_HISTORY_ENTRIES, DEFAULT_SETTINGS.preferences.activityHistoryLimit),
     darkMode: preferences.darkMode === true,
+    showAssignedRoles: preferences.showAssignedRoles === true,
+    showRemainingActivationTime: typeof preferences.showRemainingActivationTime === "boolean"
+      ? preferences.showRemainingActivationTime
+      : preferences.hideRemainingActivationTime !== true,
     showActivationCounters: preferences.showActivationCounters === true,
     showEnablementDetails: preferences.showEnablementDetails === true,
     showLastEnablementDate: preferences.showLastEnablementDate === true,
     backgroundPreRefreshEnabled: preferences.backgroundPreRefreshEnabled !== false,
+    requestNotificationsEnabled: preferences.requestNotificationsEnabled === true,
+    expiryReminderMinutes: sanitizeExpiryReminderMinutes(preferences.expiryReminderMinutes),
     enabledFeatures: sanitizeEnabledFeatures(preferences.enabledFeatures, preferences.hiddenPopupTabs),
     autoEnabledFeaturesInitialized: preferences.autoEnabledFeaturesInitialized === true,
     permissionWarningIgnored: preferences.permissionWarningIgnored === true,
@@ -377,7 +388,7 @@ export function buildFeatureCacheKey(tokenCacheKey: string, enabledRoleFeatures:
 }
 
 export function getAutoEnabledFeatures(items: ActivationItem[], preserveBundles = true): QuickPimFeature[] {
-  const itemTypes = new Set(items.filter((item) => item.status === "eligible").map((item) => item.type));
+  const itemTypes = new Set(items.map((item) => item.type));
   const enabled: QuickPimFeature[] = ROLE_FEATURES.filter((feature) => itemTypes.has(feature));
   if (preserveBundles) {
     enabled.push("bundles");
@@ -428,13 +439,13 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
     if (!itemIds.length) {
       return [];
     }
-    const defaultJustification = sanitizeString(bundle.defaultJustification, MAX_JUSTIFICATION_LENGTH);
+    const defaultJustification = sanitizeUserJustification(bundle.defaultJustification);
     return [
       {
         id,
         name,
         itemIds,
-        defaultDurationHours: clampNumber(bundle.defaultDurationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
+        defaultDurationHours: clampNumber(bundle.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
         defaultJustification: defaultJustification && !isGenericJustification(defaultJustification) ? defaultJustification : undefined
       }
     ];
@@ -454,7 +465,21 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
 }
 
 function sanitizeJustificationList(value: unknown, limit: number): string[] {
-  return sanitizeStringList(value, limit, MAX_JUSTIFICATION_LENGTH).filter((item) => !isGenericJustification(item));
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of value) {
+    const safeItem = sanitizeUserJustification(item);
+    const key = safeItem.toLowerCase();
+    if (!safeItem || isGenericJustification(safeItem) || seen.has(key)) continue;
+    seen.add(key);
+    result.push(safeItem);
+    if (result.length >= limit) break;
+  }
+  return result;
 }
 
 function sanitizeActivationHistory(value: unknown): ActivationHistoryEntry[] {
@@ -514,7 +539,7 @@ function sanitizeActivityHistory(
     if (!id || !action || !result || !itemId || !itemName || !itemType || !requestedAt) {
       return [];
     }
-    const durationHours = clampOptionalNumber(entry.durationHours, MIN_DURATION_HOURS, MAX_DURATION_HOURS);
+    const durationHours = clampOptionalNumber(entry.durationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS);
     return [
       {
         id,
@@ -528,7 +553,7 @@ function sanitizeActivityHistory(
         ...(sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) ? { scopeLabel: sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) } : {}),
         ...(durationHours ? { durationHours } : {}),
         ...(sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) ? { bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) } : {}),
-        ...(sanitizeString(entry.justification, MAX_JUSTIFICATION_LENGTH) ? { justification: sanitizeString(entry.justification, MAX_JUSTIFICATION_LENGTH) } : {}),
+        ...(sanitizeUserJustification(entry.justification) ? { justification: sanitizeUserJustification(entry.justification) } : {}),
         ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {})
       }
     ];
@@ -599,6 +624,11 @@ function clampOptionalNumber(value: unknown, min: number, max: number): number |
     return undefined;
   }
   return Math.min(max, Math.max(min, numberValue));
+}
+
+function sanitizeExpiryReminderMinutes(value: unknown): number {
+  const minutes = Number(value);
+  return minutes === 5 || minutes === 15 || minutes === 30 || minutes === 60 ? minutes : 15;
 }
 
 function inferItemType(itemId: string): ActivationItem["type"] {

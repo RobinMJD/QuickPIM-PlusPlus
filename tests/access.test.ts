@@ -6,7 +6,7 @@ import {
   getAccessSetupTargets,
   getPortalUrlsForTargets
 } from "../src/lib/access";
-import { ENTRA_GRAPH_BOOTSTRAP_URLS, ENTRA_PORTAL_URLS } from "../src/lib/popupModel";
+import { ENTRA_PORTAL_URLS } from "../src/lib/popupModel";
 import type { QuickPimDataCache, TokenStatus } from "../src/lib/types";
 
 const missingTokens: TokenStatus = {
@@ -57,8 +57,12 @@ describe("portal-driven access setup", () => {
     expect(getAccessSetupTargets(items)).toEqual(["directoryRole", "pimGroup", "azureRole"]);
     expect(getPortalUrlsForTargets(["directoryRole", "azureRole"])).toEqual([
       ENTRA_PORTAL_URLS.directoryRole,
-      ENTRA_GRAPH_BOOTSTRAP_URLS.directoryRole,
       ENTRA_PORTAL_URLS.azureRole
+    ]);
+    expect(getPortalUrlsForTargets(["directoryRole", "pimGroup", "azureRole"])).toEqual([
+      "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadmigratedroles",
+      "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup",
+      "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/azurerbac"
     ]);
   });
 

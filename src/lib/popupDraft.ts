@@ -1,5 +1,7 @@
 import type { PopupRequestMode, PopupTab, SortMode } from "./types";
 import type { QuickFilter } from "./popupModel";
+import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
+import { sanitizeUserJustification } from "./justifications";
 
 export const POPUP_DRAFT_KEY = "quickPimPopupDraft.v1";
 
@@ -7,15 +9,13 @@ const POPUP_DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SELECTED_IDS = 100;
 const MAX_ITEM_ID_LENGTH = 256;
 const MAX_SEARCH_LENGTH = 120;
-const MAX_JUSTIFICATION_LENGTH = 1024;
 const MAX_TICKET_FIELD_LENGTH = 120;
-const MIN_DURATION_HOURS = 0.5;
-const MAX_DURATION_HOURS = 24;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+let popupDraftMutationQueue: Promise<void> = Promise.resolve();
 
 const POPUP_TABS: PopupTab[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
 const SORT_MODES: SortMode[] = ["name", "lastUsed", "activationCount", "type", "scope"];
-const QUICK_FILTERS: QuickFilter[] = ["favorites", "eligible", "active", "requiresApproval", "requiresJustification", "highPrivilege"];
+const QUICK_FILTERS: QuickFilter[] = ["favorites", "eligible", "active", "requiresJustification"];
 
 export interface PopupDraft {
   updatedAt: number;
@@ -41,15 +41,17 @@ export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | und
 
 export async function savePopupDraft(draft: PopupDraftInput, now = Date.now()): Promise<void> {
   const safeDraft = sanitizePopupDraft({ ...draft, updatedAt: now }, now);
-  if (!safeDraft || !hasPopupDraftContent(safeDraft)) {
-    await clearPopupDraft();
-    return;
-  }
-  await chrome.storage.local.set({ [POPUP_DRAFT_KEY]: safeDraft });
+  return enqueuePopupDraftMutation(async () => {
+    if (!safeDraft || !hasPopupDraftContent(safeDraft)) {
+      await chrome.storage.local.remove(POPUP_DRAFT_KEY);
+      return;
+    }
+    await chrome.storage.local.set({ [POPUP_DRAFT_KEY]: safeDraft });
+  });
 }
 
 export async function clearPopupDraft(): Promise<void> {
-  await chrome.storage.local.remove(POPUP_DRAFT_KEY);
+  return enqueuePopupDraftMutation(() => chrome.storage.local.remove(POPUP_DRAFT_KEY));
 }
 
 export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft | undefined {
@@ -71,7 +73,7 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
     quickFilters: sanitizeQuickFilters(value.quickFilters),
     selectedIds,
     durationHours: sanitizeDuration(value.durationHours),
-    justification: sanitizeString(value.justification, MAX_JUSTIFICATION_LENGTH),
+    justification: sanitizeUserJustification(value.justification),
     ticketSystem: sanitizeString(value.ticketSystem, MAX_TICKET_FIELD_LENGTH),
     ticketNumber: sanitizeString(value.ticketNumber, MAX_TICKET_FIELD_LENGTH),
     isActivationReviewOpen: Boolean(value.isActivationReviewOpen && selectedIds.length),
@@ -121,9 +123,18 @@ function sanitizeSelectedIds(value: unknown): string[] {
 function sanitizeDuration(value: unknown): number {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) {
-    return MIN_DURATION_HOURS;
+    return MIN_ACTIVATION_DURATION_HOURS;
   }
-  return Math.min(MAX_DURATION_HOURS, Math.max(MIN_DURATION_HOURS, Math.round(numeric * 2) / 2));
+  return Math.min(
+    MAX_ACTIVATION_DURATION_HOURS,
+    Math.max(MIN_ACTIVATION_DURATION_HOURS, Math.round(numeric * 2) / 2)
+  );
+}
+
+function enqueuePopupDraftMutation(operation: () => Promise<void>): Promise<void> {
+  const result = popupDraftMutationQueue.then(operation);
+  popupDraftMutationQueue = result.catch(() => undefined);
+  return result;
 }
 
 function sanitizeString(value: unknown, maxLength: number): string {

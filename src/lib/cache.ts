@@ -241,7 +241,8 @@ export function updateCacheFromTargetResults(
   targets: AccessSetupTarget[],
   resultsByTarget: Partial<Record<AccessSetupTarget, ActivationDataResult>>,
   fetchedAt: number,
-  cacheKeys: Partial<Record<AccessSetupTarget, string>>
+  cacheKeys: Partial<Record<AccessSetupTarget, string>>,
+  refreshStartedAt = fetchedAt
 ): QuickPimDataCache {
   const mapKey = bucket === "eligible" ? "eligibleByTarget" : "activeByTarget";
   const nextByTarget: TargetActivationCache = { ...(cache[mapKey] || {}) };
@@ -267,6 +268,7 @@ export function updateCacheFromTargetResults(
       errors: result.errors || [],
       diagnostics: result.diagnostics,
       fetchedAt: failed ? 0 : fetchedAt,
+      refreshStartedAt,
       cacheKey: cacheKeys[target]
     };
   }
@@ -360,8 +362,49 @@ function chooseCacheEntry(
   if (!incoming) {
     return current;
   }
-  if (!current || incoming.cacheKey !== current.cacheKey || incoming.fetchedAt >= current.fetchedAt) {
+  if (!current) {
+    return incoming;
+  }
+
+  if (incoming.cacheKey === current.cacheKey) {
+    const currentUsable = isUsableCacheEntry(current);
+    const incomingUsable = isUsableCacheEntry(incoming);
+    if (currentUsable !== incomingUsable) {
+      const successful = currentUsable ? current : incoming;
+      const failed = currentUsable ? incoming : current;
+      const successfulStartedAt = getFiniteTimestamp(successful.refreshStartedAt) ?? 0;
+      const failedStartedAt = getFiniteTimestamp(failed.refreshStartedAt) ?? 0;
+      const refreshStartedAt = Math.max(successfulStartedAt, failedStartedAt);
+      const diagnostics = mergeDiagnostics(successful.diagnostics, failed.diagnostics);
+      return {
+        ...successful,
+        errors: failedStartedAt >= successfulStartedAt ? failed.errors : successful.errors,
+        ...(diagnostics?.length ? { diagnostics } : {}),
+        ...(refreshStartedAt ? { refreshStartedAt } : {})
+      };
+    }
+  }
+
+  const currentRefreshStartedAt = getFiniteTimestamp(current.refreshStartedAt);
+  const incomingRefreshStartedAt = getFiniteTimestamp(incoming.refreshStartedAt);
+  if (currentRefreshStartedAt !== undefined || incomingRefreshStartedAt !== undefined) {
+    if (currentRefreshStartedAt === undefined) return incoming;
+    if (incomingRefreshStartedAt === undefined) return current;
+    if (incomingRefreshStartedAt !== currentRefreshStartedAt) {
+      return incomingRefreshStartedAt > currentRefreshStartedAt ? incoming : current;
+    }
+  }
+
+  if (incoming.cacheKey !== current.cacheKey || incoming.fetchedAt >= current.fetchedAt) {
     return incoming;
   }
   return current;
+}
+
+function isUsableCacheEntry(entry: CachedActivationEntry): boolean {
+  return Number.isFinite(entry.fetchedAt) && entry.fetchedAt > 0;
+}
+
+function getFiniteTimestamp(value: number | undefined): number | undefined {
+  return Number.isFinite(value) && Number(value) >= 0 ? Number(value) : undefined;
 }

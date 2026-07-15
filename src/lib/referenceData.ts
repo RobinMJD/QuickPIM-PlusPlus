@@ -5,6 +5,7 @@ export const REFERENCE_DATA_KEY = "quickPimReferenceData.v1";
 const MAX_REFERENCE_ITEMS = 300;
 const MAX_REFERENCE_KEY_LENGTH = 256;
 const MAX_REFERENCE_NAME_LENGTH = 120;
+let referenceDataMutationQueue: Promise<void> = Promise.resolve();
 
 export const DEFAULT_REFERENCE_DATA: ReferenceDataCache = {
   version: 1,
@@ -22,15 +23,38 @@ export async function loadReferenceData(): Promise<ReferenceDataCache> {
 }
 
 export async function saveReferenceData(referenceData: ReferenceDataCache): Promise<void> {
-  const next = mergeReferenceData(referenceData);
-  const current = await loadReferenceData();
-  if (JSON.stringify(current) !== JSON.stringify(next)) {
-    await chrome.storage.local.set({ [REFERENCE_DATA_KEY]: next });
-  }
+  const incoming = mergeReferenceData(referenceData);
+  const mutation = referenceDataMutationQueue.then(async () => {
+    const current = await loadReferenceData();
+    const next = mergeReferenceDataForSave(current, incoming);
+    if (JSON.stringify(current) !== JSON.stringify(next)) {
+      await chrome.storage.local.set({ [REFERENCE_DATA_KEY]: next });
+    }
+  });
+  referenceDataMutationQueue = mutation.catch(() => undefined);
+  await mutation;
 }
 
 export async function clearReferenceData(): Promise<void> {
-  await chrome.storage.local.remove(REFERENCE_DATA_KEY);
+  const mutation = referenceDataMutationQueue.then(() => chrome.storage.local.remove(REFERENCE_DATA_KEY));
+  referenceDataMutationQueue = mutation.catch(() => undefined);
+  await mutation;
+}
+
+export function mergeReferenceDataForSave(
+  current: ReferenceDataCache,
+  incoming: ReferenceDataCache
+): ReferenceDataCache {
+  const safeCurrent = mergeReferenceData(current);
+  const safeIncoming = mergeReferenceData(incoming);
+  return mergeReferenceData({
+    directoryRoleDefinitions: mergeReferenceMaps(safeCurrent.directoryRoleDefinitions, safeIncoming.directoryRoleDefinitions),
+    pimGroups: mergeReferenceMaps(safeCurrent.pimGroups, safeIncoming.pimGroups),
+    azureRoleDefinitions: mergeReferenceMaps(safeCurrent.azureRoleDefinitions, safeIncoming.azureRoleDefinitions),
+    azureSubscriptions: mergeReferenceMaps(safeCurrent.azureSubscriptions, safeIncoming.azureSubscriptions),
+    scopes: mergeReferenceMaps(safeCurrent.scopes, safeIncoming.scopes),
+    directoryScopes: mergeReferenceMaps(safeCurrent.directoryScopes, safeIncoming.directoryScopes)
+  });
 }
 
 export function mergeReferenceData(input: unknown): ReferenceDataCache {
@@ -158,6 +182,20 @@ function setReference(target: Record<string, ReferenceValue>, key: string | unde
     return;
   }
   target[safeKey] = { name: safeName, updatedAt };
+}
+
+function mergeReferenceMaps(
+  current: Record<string, ReferenceValue>,
+  incoming: Record<string, ReferenceValue>
+): Record<string, ReferenceValue> {
+  const merged = { ...current };
+  for (const [key, value] of Object.entries(incoming)) {
+    const existing = merged[key];
+    if (!existing || Date.parse(value.updatedAt) >= Date.parse(existing.updatedAt)) {
+      merged[key] = value;
+    }
+  }
+  return merged;
 }
 
 function sanitizeReferenceMap(value: unknown): Record<string, ReferenceValue> {

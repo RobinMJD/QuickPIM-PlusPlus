@@ -1,5 +1,6 @@
 export type ActivationItemType = "directoryRole" | "azureRole" | "pimGroup";
 export type ActivationStatus = "eligible" | "active" | "pendingApproval";
+export type ActiveAssignmentType = "activated" | "assigned" | "unknown";
 export type SortMode = "name" | "lastUsed" | "activationCount" | "type" | "scope";
 export type RoleTab = ActivationItemType;
 export type PopupTab = RoleTab | "bundles";
@@ -7,6 +8,8 @@ export type QuickPimFeature = PopupTab;
 export type TokenKind = "graph" | "azureManagement";
 export type AccessSetupTarget = ActivationItemType;
 export type AccessCapabilityStatus = "ready" | "needsPortalRefresh" | "limited";
+export type PortalRecoveryState = "idle" | "waiting" | "interactionRequired";
+export type PortalRecoveryInteractionReason = "signIn" | "microsoftPrompt";
 export type PopupRequestMode = "activate" | "deactivate";
 export type AccessDiagnosticOperation = "eligible" | "active" | "policy" | "nameLookup" | "activation" | "deactivation";
 export type AccessFailureKind = "missingToken" | "expiredToken" | "missingCapability" | "forbidden" | "claimsChallenge" | "network" | "unknown";
@@ -30,6 +33,7 @@ export interface BaseActivationItem {
   scopeLabel: string;
   sourceScopeLabel?: string;
   status: ActivationStatus;
+  activeAssignmentType?: ActiveAssignmentType;
   activeUntil?: string;
   assignmentScheduleId?: string;
   assignmentScheduleInstanceId?: string;
@@ -86,6 +90,17 @@ export interface ActivationHistoryEntry {
 
 export type ActivityAction = "activate" | "deactivate";
 export type ActivityResult = "success" | "failed" | "skipped";
+export type TrackedPimRequestStatus =
+  | "submitted"
+  | "pendingApproval"
+  | "provisioning"
+  | "active"
+  | "completed"
+  | "denied"
+  | "failed"
+  | "canceled"
+  | "expired"
+  | "statusUnavailable";
 
 export interface ActivityHistoryEntry {
   id: string;
@@ -103,16 +118,59 @@ export interface ActivityHistoryEntry {
   error?: string;
 }
 
+export interface TrackedPimRequest {
+  id: string;
+  requestId: string;
+  action: ActivityAction;
+  itemId: string;
+  itemName: string;
+  itemType: ActivationItemType;
+  scopeLabel?: string;
+  principalId: string;
+  tenantId?: string;
+  roleDefinitionId?: string;
+  directoryScopeId?: string;
+  groupId?: string;
+  accessId?: "member" | "owner";
+  azureScope?: string;
+  status: TrackedPimRequestStatus;
+  rawStatus?: string;
+  requestedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  activeUntil?: string;
+  durationHours?: number;
+  justification?: string;
+  bundleName?: string;
+  approvalId?: string;
+  targetScheduleId?: string;
+  lastCheckedAt?: string;
+  nextCheckAt?: string;
+  checkCount: number;
+  lastError?: string;
+  notifiedStatus?: TrackedPimRequestStatus;
+  expiryReminderSentAt?: string;
+}
+
+export interface TrackedPimRequestStore {
+  version: 1;
+  requests: TrackedPimRequest[];
+}
+
 export interface QuickPimPreferences {
   defaultDurationHours: number;
   defaultSort: SortMode;
   recentJustificationLimit: number;
   activityHistoryLimit: number;
   darkMode: boolean;
+  showAssignedRoles: boolean;
+  showRemainingActivationTime: boolean;
   showActivationCounters: boolean;
   showEnablementDetails: boolean;
   showLastEnablementDate: boolean;
   backgroundPreRefreshEnabled: boolean;
+  requestNotificationsEnabled: boolean;
+  expiryReminderMinutes: number;
   enabledFeatures: QuickPimFeature[];
   autoEnabledFeaturesInitialized?: boolean;
   hiddenPopupTabs?: PopupTab[];
@@ -124,6 +182,7 @@ export interface CachedActivationEntry {
   items: ActivationItem[];
   errors: string[];
   fetchedAt: number;
+  refreshStartedAt?: number;
   cacheKey?: string;
   diagnostics?: AccessDiagnostic[];
 }
@@ -200,6 +259,27 @@ export interface PortalTokenRefreshResult {
   tabsFound: number;
   tabsScanned: number;
   captured: TokenKind[];
+}
+
+export interface PortalRecoveryOpenResult {
+  requestedCount: number;
+  openedCount: number;
+  reusedCount: number;
+  managedCount: number;
+  grouped: boolean;
+}
+
+export interface PortalRecoveryStatus {
+  state: PortalRecoveryState;
+  managedTargets: AccessSetupTarget[];
+  interactionTargets: AccessSetupTarget[];
+  grouped: boolean;
+  interactionReason?: PortalRecoveryInteractionReason;
+}
+
+export interface PortalRecoveryFocusResult {
+  focused: boolean;
+  status: PortalRecoveryStatus;
 }
 
 export interface ActivationDataResult {

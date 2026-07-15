@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.8.1**
+Current version: **v2.10.8**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -29,14 +29,20 @@ The extension does not create a separate OAuth app registration and does not ask
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
-- Use quick filter chips for favorites, eligible items, active items, approval, reason, and high-privilege roles.
+- Use quick filter chips for favorites, eligible items, active items, and roles that require a reason.
 - Review compact row policy details such as maximum duration, approval, ticket, required reason, active-until date, and disable availability.
 - Preflight bundle activation to show actionable, skipped, pending, and blocked entries before sending requests.
 - Track local activation and deactivation activity with searchable Settings history.
+- Follow requests submitted by QuickPIM++ from pending approval through provisioning, activation, completion, denial, or failure.
+- Click a tracked request to inspect its Microsoft request ID, status, dates, duration, scope, reason, and sanitized error details.
+- Prepare a failed request for retry or an active request for early disable directly from its details without sending anything automatically.
+- Show the number of unresolved QuickPIM++ requests on the toolbar badge.
+- Optionally notify when a request changes state or an activation is close to expiry; notification access is disabled by default.
 - Keep captured Microsoft portal tokens in session-only browser storage while preserving non-sensitive settings and caches locally.
 - Background-refresh portal tokens and stale role data every 10 minutes when an existing Entra tab can provide them, with a setting to disable it.
 - Use richer Access Setup diagnostics for feature-specific success, failure, stale, and limited states.
 - Hide activation counters and last enablement dates by default, with preferences to show them when useful.
+- See a live remaining-time counter on PIM-activated roles, with an option to hide it.
 - Enable only the feature areas you use, skip disabled feature fetches, and automatically omit empty role-type tabs.
 - Use dark mode from settings.
 - Import and export local settings as JSON.
@@ -84,6 +90,7 @@ Settings are organized around setup, configuration, and local data:
 
 - **Home** - brief product overview, quick links, and dynamically loaded GitHub changelog.
 - **Access Setup** - guided portal refresh flow for missing or limited feature areas.
+- **Activity** - request lifecycle details plus searchable local activation/deactivation history.
 - **Aliases** - local display-name overrides for roles, groups, and scopes.
 - **Justifications** - saved justification templates and recent history controls.
 - **Bundles** - create, edit, duplicate, and remove role/group bundles.
@@ -97,13 +104,13 @@ Settings are organized around setup, configuration, and local data:
 
 QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Access Setup** and choose **Open missing portal pages**.
 
-The popup, background alarm, and guided setup share one bounded scan of already-open Entra admin center tabs for fresh portal tokens. Concurrent scans are deduplicated, and a renewed token with the same tenant, user, and API scopes keeps compatible cached role data. Access Setup opens only the Microsoft portal pages still needed for enabled feature areas that remain missing or limited:
+The popup, background alarm, and guided setup share one bounded scan of already-open Entra admin center tabs for fresh portal tokens. Concurrent scans are deduplicated, and a renewed token with the same tenant, user, and API scopes keeps compatible cached role data. Access Setup opens only the Microsoft portal pages still needed for enabled feature areas that remain missing or limited. Recovery pages open inactive in a collapsed **QuickPIM++ access refresh** tab group, so the popup or Settings page stays in place:
 
 - Entra roles
 - PIM groups
 - Azure roles
 
-If the opened portal page asks you to sign in, refresh, or load PIM data, complete that step in the portal tab and return to QuickPIM++. The extension then rechecks captured portal access and refreshes eligible data.
+QuickPIM++ closes temporary recovery pages after a newer usable token is captured or the matching feature API refresh succeeds. When all tracked targets finish together, their tab IDs are removed as one batch and the empty group disappears. A ten-minute safety timeout cleans up an abandoned recovery group. If Microsoft requires sign-in, tenant selection, or another prompt, QuickPIM++ keeps that recovery state available after the popup closes and offers a **Continue sign-in** action that expands the temporary group. Role loading resumes automatically after access is captured. A recovery tab moved outside its managed group is left open and untracked.
 
 ![QuickPIM++ Access Setup showing feature-specific access checks](docs/images/screenshot-02-access-setup-1280x800.png)
 
@@ -113,9 +120,11 @@ QuickPIM++ is local-first:
 
 - Tokens are stored only in session storage for the current local browser session and are cleared when that session ends.
 - Settings, aliases, learned names, favorites, bundles, and justification history are local Chrome storage data.
+- Tracked request identifiers, status, bounded diagnostics, and activity history stay in local Chrome storage; raw API responses and tokens are not retained there.
 - The extension only calls Microsoft Graph and Azure Management for PIM operations.
 - Disabled role features are skipped during refreshes and Access Setup checks.
 - Existing Entra admin center tabs are scanned before Access Setup opens more portal pages.
+- Temporary recovery pages are inactive, grouped, and closed after token recovery or a successful matching API refresh, with a ten-minute cleanup fallback.
 - QuickPIM++ does not request browser cookie access. Microsoft session cookies can help an open portal renew its own session, while the extension captures only validated Graph or Azure bearer tokens that the portal makes available.
 - The settings home page calls the public GitHub API only to show repository changelog entries.
 - Runtime messages, imported settings, activation inputs, JWTs, and API URLs are validated before privileged background actions run.
@@ -226,6 +235,115 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.10.8
+
+- Preserves successful feature data when one concurrent cache writer fails, keeps active-only role types discoverable, and waits for both eligible and active first-load results before hiding an enabled role tab.
+- Prevents duplicate activation or deactivation submissions for the same logical role, enforces the Microsoft justification limit including the QuickPIM++ audit suffix, and rejects malformed paginated API responses.
+- Recovers cleanly when a temporary portal-recovery window was closed, serializes cross-section Settings saves, and keeps successful Azure subscriptions available when another subscription request fails.
+
+### v2.10.7
+
+- Keeps separate, identity-coherent Microsoft Graph tokens for Entra roles and PIM Groups instead of discarding one scoped token when several MSAL candidates are available.
+- Prevents passive background portal tabs from switching the active QuickPIM++ account and prevents an older refresh from overwriting newer account cache data.
+- Continues the bounded portal storage watch after an initial token appears so capability-specific tokens written later during page load are still captured.
+- Validates token audience, expiry, tenant, and principal before request-status polling, and calculates delayed approval expiry from Microsoft's effective activation start time.
+- Enforces the outbound justification limit after adding the QuickPIM++ audit marker and expands bounded portal-token scanning beyond the first 20 storage entries.
+
+### v2.10.6
+
+- Treats Microsoft activation requests in accepted, evaluation, provisioning, and schedule-creation states as pending so the same role cannot be submitted twice while Microsoft finishes processing it.
+- Reconciles eligible and active roles with case-insensitive canonical identities and prefers a real PIM activation when Microsoft also reports permanent assigned access for the same role.
+- Prevents expired PIM activations from remaining selectable or displaying a stale zero countdown while an open popup waits for refresh.
+- Serializes popup-draft and learned-name writes, merges concurrent learned references by timestamp, and retries transient preference autosave failures.
+- Enforces the 30-minute to 24-hour duration range, tenant policy maximums, and logical item uniqueness again in the background message boundary before any Microsoft request is sent.
+
+### v2.10.5
+
+- Detects when a temporary Microsoft recovery page is waiting at account selection, sign-in, tenant selection, or another interactive prompt instead of silently timing out.
+- Persists that recovery state in session storage, so reopening the popup or Access Setup shows a clear continuation action rather than returning to first-run guidance.
+- Expands and focuses the existing QuickPIM++ recovery group only when user interaction is required, without adding cookie access or broader Microsoft login host permissions.
+- Automatically resumes role loading after Microsoft access is captured and keeps previously cached roles usable while sign-in is pending.
+- Keeps temporary recovery tabs tracked through Microsoft authentication redirects and preserves the existing automatic completion and timeout cleanup.
+
+### v2.10.4
+
+- Replaces equal step jumps with a live, weighted progress bar based on the expected duration of local work, portal recovery, API refreshes, and persistence.
+- Advances smoothly within each real phase, stops at phase boundaries when work takes longer, and jumps forward when work finishes early without ever moving backward.
+- Keeps parallel role-source progress in one honest fetch phase while showing each source as it completes.
+- Preserves failed progress in red with the current step, operation detail, and sanitized error instead of removing the progress context.
+- Applies the same progress behavior to popup activation/deactivation and Settings refresh operations.
+
+### v2.10.3
+
+- Adds a live remaining activation counter beneath `PIM active` badges without adding API calls or changing role selection behavior.
+- Shows hours and minutes above one hour, then minutes and seconds for the final hour.
+- Adds an autosaved **Show remaining activation time** display preference, enabled by default.
+- Keeps countdowns off assigned and unclassified active access and updates only when the displayed value changes.
+
+### v2.10.2
+
+- Distinguishes Microsoft assignments reported as `Activated` from those reported as `Assigned` across Entra roles, PIM Groups, and Azure roles.
+- Labels temporary self-activations as `PIM active` and direct active assignments as `Assigned` with separate visual treatment and explanations.
+- Prevents assigned or unknown active access from being selected or submitted for self-deactivation, while preserving compatibility with previously cached PIM activations.
+- Hides assigned and unclassified active access by default so the popup stays focused on PIM-eligible and PIM-activated access; the display option can reveal them, while legacy cached PIM activations remain visible when schedule metadata identifies them as self-activations.
+
+### v2.10.1
+
+- Replaces the decorative first-use refresh symbol with a directional arrow that clearly points users to the real highlighted Refresh button.
+- Removes the duplicate button-like affordance while preserving the calm first-use guidance and secondary access details.
+- Selects the leftmost enabled role tab when the first access refresh starts instead of leaving Bundles active.
+
+### v2.10.0
+
+- Saves preference changes automatically with serialized, debounced writes so rapid edits cannot overwrite newer choices.
+- Flushes valid pending preference changes when leaving Settings and preserves concurrent changes made by other extension views.
+- Replaces the manual save button and large success banner with compact, accessible autosave status feedback.
+- Aligns popup defaults, advanced controls, and enabled-feature options into balanced responsive grids.
+- Improves dark-mode section borders, toggle spacing, disabled controls, and invalid-value feedback.
+
+### v2.9.0
+
+- Adds a local My PIM Requests center under Settings > Activity for requests submitted through QuickPIM++.
+- Tracks pending approval, provisioning, active, completed, denied, failed, canceled, expired, and unavailable states with clickable request details.
+- Adds safe retry and early-disable preparation actions that restore the popup draft without automatically sending another Microsoft request.
+- Adds a toolbar badge for unresolved requests and optional status/expiry notifications, disabled by default.
+- Keeps request tracking off the popup startup path and limits background work to unresolved requests, bounded batches, capped concurrency, exponential backoff, and a 24-hour automatic stop.
+- Hardens local request diagnostics with count/length limits, token redaction, tenant/principal matching, API allowlists, and no-op alarm/storage-loop prevention.
+
+### v2.8.5
+
+- Replaces the crowded first-use popup with one calm access-loading state centered on the real header Refresh control.
+- Highlights Refresh when access needs attention and teaches the same recovery action users can reuse later.
+- Removes the competing Fix access action; partial-access sessions now show a compact notice with secondary Details and Dismiss controls.
+- Rewords technical missing-token pills as access or refresh guidance and hides duplicate token errors, empty tabs, and unavailable portal actions during first use.
+
+### v2.8.4
+
+- Makes the popup refresh button refresh every enabled role feature instead of narrowing recovery to the currently visible tab.
+- Recovers both Entra Roles and PIM Groups when Graph access is missing even if cached Azure data is the only role tab currently visible.
+- Keeps healthy feature targets out of portal recovery, so an Azure-ready session opens only the missing Microsoft Graph PIM blades.
+- Removes the low-value Approval and High privilege quick filters while retaining policy details and Microsoft-derived privilege indicators on role rows.
+- Hardens managed recovery-group cleanup after token capture or successful API refresh, including capture-during-open races and abandoned-group cleanup.
+
+### v2.8.3
+
+- Makes the popup refresh button recover missing or limited portal access instead of only retrying calls with the same unusable token state.
+- Opens exactly one tested Microsoft PIM blade for each currently selected or enabled role feature that needs portal access.
+- Opens recovery pages inactive in a collapsed QuickPIM++ tab group and closes each extension-created page after its matching token is ready.
+- Reconciles tokens captured during tab creation, explicitly closes completed recovery tabs after successful API refresh, and removes all completed group tabs in one batch.
+- Adds a ten-minute safety cleanup for abandoned groups while leaving tabs moved outside Microsoft Entra open and untracked.
+- Preserves the popup draft before opening recovery pages, so selections and activation inputs survive the portal round trip.
+- Keeps healthy-token refreshes on the existing targeted API path without opening unnecessary tabs.
+
+### v2.8.2
+
+- Prevents manual role-data refreshes from rescanning Microsoft portal tabs when the current token is already healthy and capable.
+- Caps and prioritizes existing Entra tab scans so large browser sessions cannot keep the popup waiting for minutes.
+- Stops Access Setup from scheduling duplicate API refreshes for token writes produced by its own portal scan.
+- Adds hard deadlines to Microsoft API reads, per-feature snapshots, and extension runtime refresh messages; cached data remains available after a timeout.
+- Ensures popup and Settings loading states always finish with a clear retryable error instead of remaining stuck.
+- Removes no-op session token timestamp writes when a portal scan finds the exact token already stored.
 
 ### v2.8.1
 

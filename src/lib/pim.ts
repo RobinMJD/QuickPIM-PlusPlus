@@ -1,4 +1,5 @@
 import type {
+  ActiveAssignmentType,
   ActivationItem,
   ActivationRequest,
   AzureRoleApi,
@@ -14,11 +15,23 @@ import type {
   TicketInfo
 } from "./types";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./apiUrls";
-import { formatJustificationForActivationRequest, getGenericJustificationWarning } from "./justifications";
+import {
+  MAX_MICROSOFT_JUSTIFICATION_LENGTH,
+  formatJustificationForActivationRequest,
+  getGenericJustificationWarning
+} from "./justifications";
+import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 
-const MAX_DURATION_HOURS = 24;
-const MAX_JUSTIFICATION_LENGTH = 1024;
+const MAX_JUSTIFICATION_LENGTH = MAX_MICROSOFT_JUSTIFICATION_LENGTH;
 const MAX_TICKET_FIELD_LENGTH = 128;
+
+export function normalizeActiveAssignmentType(value: string | undefined): ActiveAssignmentType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "activated" || normalized === "assigned") {
+    return normalized;
+  }
+  return "unknown";
+}
 
 export function durationHoursToIso(durationHours: number): string {
   return `PT${Math.round(durationHours * 60)}M`;
@@ -519,13 +532,24 @@ function validateActivationInput(
   justification: string,
   ticketInfo: TicketInfo
 ): void {
-  if (!Number.isFinite(durationHours) || durationHours <= 0 || durationHours > MAX_DURATION_HOURS) {
-    throw new Error(`Activation duration must be between 0 and ${MAX_DURATION_HOURS} hours.`);
+  if (
+    !Number.isFinite(durationHours)
+    || durationHours < MIN_ACTIVATION_DURATION_HOURS
+    || durationHours > MAX_ACTIVATION_DURATION_HOURS
+  ) {
+    throw new Error(
+      `Activation duration must be between ${MIN_ACTIVATION_DURATION_HOURS} and ${MAX_ACTIVATION_DURATION_HOURS} hours.`
+    );
+  }
+  const policyMaximum = item.activationRequirements?.maxDurationHours;
+  if (Number.isFinite(policyMaximum) && durationHours > Number(policyMaximum)) {
+    throw new Error(`Activation duration exceeds this item's ${policyMaximum}-hour policy maximum.`);
   }
 
   if (typeof justification !== "string" || justification.length > MAX_JUSTIFICATION_LENGTH) {
     throw new Error(`Activation justification must be ${MAX_JUSTIFICATION_LENGTH} characters or fewer.`);
   }
+  assertOutboundJustificationFits(justification, "Activation");
   const genericJustificationWarning = getGenericJustificationWarning(justification);
   if (genericJustificationWarning) {
     throw new Error(`Generic activation justification is not allowed. ${genericJustificationWarning}`);
@@ -575,6 +599,9 @@ function validateDeactivationInput(
   if (typeof justification !== "string" || justification.length > MAX_JUSTIFICATION_LENGTH) {
     throw new Error(`Deactivation justification must be ${MAX_JUSTIFICATION_LENGTH} characters or fewer.`);
   }
+  if (justification.trim()) {
+    assertOutboundJustificationFits(justification, "Deactivation");
+  }
   const genericJustificationWarning = getGenericJustificationWarning(justification);
   if (genericJustificationWarning) {
     throw new Error(`Generic deactivation justification is not allowed. ${genericJustificationWarning}`);
@@ -590,6 +617,15 @@ function validateDeactivationInput(
 
   if (item.status !== "active") {
     throw new Error("Only active items can be deactivated.");
+  }
+
+  const activeUntil = item.activeUntil ? Date.parse(item.activeUntil) : Number.NaN;
+  if (Number.isFinite(activeUntil) && activeUntil <= Date.now()) {
+    throw new Error("This PIM activation has already expired. Refresh roles before trying again.");
+  }
+
+  if (item.activeAssignmentType && item.activeAssignmentType !== "activated") {
+    throw new Error("Only roles activated through PIM can be disabled from QuickPIM++.");
   }
 
   if (!item.id || !item.displayName || !item.principalId) {
@@ -626,6 +662,14 @@ function validateDeactivationInput(
 
 function formatOptionalJustification(justification: string): string | undefined {
   return justification.trim() ? formatJustificationForActivationRequest(justification) : undefined;
+}
+
+function assertOutboundJustificationFits(justification: string, operation: "Activation" | "Deactivation"): void {
+  if (formatJustificationForActivationRequest(justification).length > MAX_JUSTIFICATION_LENGTH) {
+    throw new Error(
+      `${operation} justification must be shorter so it remains within ${MAX_JUSTIFICATION_LENGTH} characters including the QuickPIM++ audit marker.`
+    );
+  }
 }
 
 function isSafeAzureScope(scope: string): boolean {

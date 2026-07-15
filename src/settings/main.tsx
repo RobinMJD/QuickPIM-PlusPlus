@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
-import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, getPortalUrlsForTargets, hasRequiredPortalToken } from "../lib/access";
+import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, hasRequiredPortalToken } from "../lib/access";
 import { formatDateOnly } from "../lib/dateFormat";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
@@ -15,7 +15,7 @@ import {
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../lib/cache";
-import { DEFAULT_DURATION_OPTIONS, coerceDurationForItems, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
+import { DEFAULT_DURATION_OPTIONS, ENTRA_PORTAL_URLS, coerceDurationForItems, formatLoadMessages, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -35,10 +35,32 @@ import {
   loadReferenceData,
   saveReferenceData
 } from "../lib/referenceData";
-import { getGenericJustificationWarning } from "../lib/justifications";
+import { MAX_USER_JUSTIFICATION_LENGTH, getGenericJustificationWarning } from "../lib/justifications";
 import { APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus } from "../lib/types";
+import { isOperationTimeoutError } from "../lib/async";
+import { sendRuntimeMessage } from "../lib/runtimeMessaging";
+import { savePopupDraft } from "../lib/popupDraft";
+import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
+import { SmartProgressPanel } from "../components/SmartProgressPanel";
+import {
+  advanceOperationProgress,
+  completeOperationProgress,
+  createOperationProgress,
+  failOperationProgress,
+  type OperationProgress,
+  type ProgressStepDefinition
+} from "../lib/progress";
+import {
+  REQUEST_TRACKING_KEY,
+  clearTrackedRequests,
+  getEffectiveTrackedRequestStatus,
+  getPendingTrackedRequestCount,
+  loadTrackedRequests,
+  sanitizeTrackedRequestStore,
+  trackedRequestStatusLabel
+} from "../lib/requestTracking";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore } from "../lib/types";
 
 type SettingsTab = "home" | "access" | "activity" | "justifications" | "bundles" | "aliases" | "preferences" | "data" | "diagnostics" | "about";
 
@@ -51,6 +73,19 @@ const CHANGELOG_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 const PORTAL_TOKEN_WAIT_TIMEOUT_MS = 12_000;
 const PORTAL_TOKEN_POLL_INTERVAL_MS = 1500;
+const TOKEN_STATUS_TIMEOUT_MS = 8_000;
+const PORTAL_TOKEN_REFRESH_TIMEOUT_MS = 17_000;
+const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
+const SETTINGS_REFRESH_STEPS: readonly ProgressStepDefinition[] = [
+  { id: "local", label: "Reading settings and local data", weight: 2, expectedDurationMs: 2_000 },
+  { id: "sources", label: "Refreshing enabled role sources", weight: 15, expectedDurationMs: 15_000 },
+  { id: "save", label: "Saving role data and learned names", weight: 3, expectedDurationMs: 3_000 }
+];
+const ACCESS_REFRESH_STEPS: readonly ProgressStepDefinition[] = [
+  { id: "local", label: "Reading local access state", weight: 2, expectedDurationMs: 2_000 },
+  { id: "sources", label: "Checking enabled Microsoft role sources", weight: 15, expectedDurationMs: 15_000 },
+  { id: "save", label: "Saving access diagnostics and learned names", weight: 3, expectedDurationMs: 3_000 }
+];
 
 const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Overview", tabs: ["home"] },
@@ -74,12 +109,6 @@ interface ChangelogCache {
   items: ChangelogItem[];
 }
 
-interface MessageResponse<T> {
-  success: boolean;
-  data?: T;
-  error?: string;
-}
-
 interface AccessRefreshOptions {
   skipTargetsWithCurrentTokenCache?: boolean;
   completionMessage?: string;
@@ -92,11 +121,14 @@ function SettingsApp() {
   const [tokenStatus, setTokenStatus] = useState<TokenStatus | null>(null);
   const [dataCache, setDataCache] = useState<QuickPimDataCache>({});
   const [referenceData, setReferenceData] = useState<ReferenceDataCache | undefined>();
+  const [trackedRequests, setTrackedRequests] = useState<TrackedPimRequestStore>({ version: 1, requests: [] });
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [exportText, setExportText] = useState("");
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
+  const [eligibleRefreshProgress, setEligibleRefreshProgress] = useState<OperationProgress | null>(null);
+  const [accessRefreshProgress, setAccessRefreshProgress] = useState<OperationProgress | null>(null);
   const [isSettingsReady, setIsSettingsReady] = useState(false);
   const [sessionTokenRevision, setSessionTokenRevision] = useState(0);
   const exportTextDirty = useRef(false);
@@ -104,6 +136,11 @@ function SettingsApp() {
   const pendingAccessRefreshes = useRef(0);
   const pendingSessionTokenTargets = useRef(new Set<AccessSetupTarget>());
   const suppressSessionTokenRefreshUntil = useRef(0);
+  const explicitPortalScanDepth = useRef(0);
+  const settingsProgressRunId = useRef(0);
+  const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   function replaceExportText(value: string, dirty = false) {
     exportTextDirty.current = dirty;
@@ -114,6 +151,15 @@ function SettingsApp() {
     void refresh();
   }, []);
 
+  useEffect(() => () => {
+    if (eligibleProgressClearTimer.current) {
+      clearTimeout(eligibleProgressClearTimer.current);
+    }
+    if (accessProgressClearTimer.current) {
+      clearTimeout(accessProgressClearTimer.current);
+    }
+  }, []);
+
   useEffect(() => {
     const storageChangeEvent = chrome.storage?.onChanged;
     if (!storageChangeEvent) {
@@ -121,7 +167,7 @@ function SettingsApp() {
     }
     function handleStorageChange(changes: Record<string, chrome.storage.StorageChange>, areaName: string) {
       if (areaName === "session") {
-        if (Date.now() < suppressSessionTokenRefreshUntil.current) {
+        if (explicitPortalScanDepth.current > 0 || Date.now() < suppressSessionTokenRefreshUntil.current) {
           return;
         }
         const targets = getTargetsForTokenStorageChanges(changes);
@@ -131,7 +177,13 @@ function SettingsApp() {
         }
         return;
       }
-      if (areaName !== "local" || !changes[SETTINGS_KEY]) {
+      if (areaName !== "local") {
+        return;
+      }
+      if (changes[REQUEST_TRACKING_KEY]) {
+        setTrackedRequests(sanitizeTrackedRequestStore(changes[REQUEST_TRACKING_KEY].newValue));
+      }
+      if (!changes[SETTINGS_KEY]) {
         return;
       }
       const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
@@ -181,9 +233,30 @@ function SettingsApp() {
   }, []);
 
   async function refresh(options: { showProgress?: boolean } = {}) {
+    const refreshStartedAt = Date.now();
+    let progress: OperationProgress | null = null;
+    let progressCompleted = false;
+    let refreshIssues: string[] = [];
+    const showProgressStep = (current: number, label?: string) => {
+      if (!progress) {
+        return;
+      }
+      progress = advanceOperationProgress(progress, current, { label });
+      setEligibleRefreshProgress(progress);
+    };
     if (options.showProgress) {
       setIsRefreshingEligible(true);
-      setMessage("Refreshing eligible items...");
+      setMessage("");
+      setAccessRefreshProgress(null);
+      if (eligibleProgressClearTimer.current) {
+        clearTimeout(eligibleProgressClearTimer.current);
+        eligibleProgressClearTimer.current = undefined;
+      }
+      progress = createOperationProgress(
+        `settings-eligible-${++settingsProgressRunId.current}`,
+        SETTINGS_REFRESH_STEPS
+      );
+      setEligibleRefreshProgress(progress);
     }
     setError("");
     try {
@@ -193,11 +266,16 @@ function SettingsApp() {
         replaceExportText(JSON.stringify(loadedSettings, null, 2));
       }
       setIsSettingsReady(true);
-      const [loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
-        sendMessage<TokenStatus>({ action: "getTokenStatus" }),
+      const [loadedTokens, loadedCache, loadedReferenceData, loadedTrackedRequests] = await Promise.all([
+        sendMessage<TokenStatus>(
+          { action: "getTokenStatus" },
+          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Saved settings and cached data remain available." }
+        ),
         loadDataCache(),
-        loadReferenceData()
+        loadReferenceData(),
+        loadTrackedRequests()
       ]);
+      setTrackedRequests(loadedTrackedRequests);
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
       let effectiveTokenStatus = loadedTokens;
@@ -205,7 +283,12 @@ function SettingsApp() {
       let legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
       let nextCache = loadedCache;
       if (options.showProgress && enabledRoleFeatures.length) {
+        showProgressStep(2);
         const snapshot = await fetchActivationSnapshot(enabledRoleFeatures);
+        refreshIssues = formatLoadMessages([
+          ...(snapshot.eligible.errors || []),
+          ...(snapshot.active.errors || [])
+        ]);
         const fetchedAt = Date.now();
         effectiveTokenStatus = snapshot.tokenStatus || loadedTokens;
         const snapshotTargetCacheKeys = buildTargetCacheKeys(effectiveTokenStatus, enabledRoleFeatures);
@@ -217,7 +300,8 @@ function SettingsApp() {
           enabledRoleFeatures,
           snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, enabledRoleFeatures),
           fetchedAt,
-          snapshotTargetCacheKeys
+          snapshotTargetCacheKeys,
+          refreshStartedAt
         );
         nextCache = updateCacheFromTargetResults(
           nextCache,
@@ -225,8 +309,10 @@ function SettingsApp() {
           enabledRoleFeatures,
           snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, enabledRoleFeatures),
           fetchedAt,
-          snapshotTargetCacheKeys
+          snapshotTargetCacheKeys,
+          refreshStartedAt
         );
+        showProgressStep(3);
         await saveDataCache(nextCache);
       }
 
@@ -239,26 +325,45 @@ function SettingsApp() {
       });
       const eligible = mergeTargetEntries(enabledRoleFeatures.map((target) => eligibleCache[target]?.entry), now, legacyCacheKey);
       const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, eligible.items);
+      showProgressStep(3);
       await saveReferenceData(nextReferenceData);
       setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
       setTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       if (options.showProgress) {
+        if (refreshIssues.length) {
+          throw new Error(refreshIssues.join("\n"));
+        }
         setMessage(
           eligible.items.length
             ? `Eligible items refreshed from ${formatCacheAge(eligible.fetchedAt)}.`
             : "Eligible items refreshed."
         );
+        if (progress) {
+          progress = completeOperationProgress(progress, "Eligible items refreshed");
+          progressCompleted = true;
+          setEligibleRefreshProgress(progress);
+        }
       }
     } catch (loadError) {
-      if (options.showProgress) {
-        setMessage("");
+      const detail = loadError instanceof Error ? loadError.message : String(loadError);
+      setMessage("");
+      setError(detail);
+      if (progress) {
+        progress = failOperationProgress(progress, detail, "Eligible-item refresh stopped at this step");
+        setEligibleRefreshProgress(progress);
       }
-      setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       if (options.showProgress) {
         setIsRefreshingEligible(false);
+        if (progressCompleted && progress) {
+          const operationId = progress.operationId;
+          eligibleProgressClearTimer.current = setTimeout(() => {
+            setEligibleRefreshProgress((current) => current?.operationId === operationId ? null : current);
+            eligibleProgressClearTimer.current = undefined;
+          }, 350);
+        }
       }
     }
   }
@@ -268,21 +373,54 @@ function SettingsApp() {
     targets?: AccessSetupTarget[],
     options: AccessRefreshOptions = {}
   ): Promise<void> {
+    if (accessProgressClearTimer.current) {
+      clearTimeout(accessProgressClearTimer.current);
+      accessProgressClearTimer.current = undefined;
+    }
+    let progress = createOperationProgress(
+      `settings-access-${++settingsProgressRunId.current}`,
+      ACCESS_REFRESH_STEPS,
+      { label: pendingAccessRefreshes.current ? "Waiting for the current access refresh" : undefined }
+    );
+    let progressCompleted = false;
+    const showProgressStep = (current: number, label?: string) => {
+      progress = advanceOperationProgress(progress, current, { label });
+      setAccessRefreshProgress(progress);
+    };
     pendingAccessRefreshes.current += 1;
     setIsRefreshingAccess(true);
+    setEligibleRefreshProgress(null);
+    setAccessRefreshProgress(progress);
     setError("");
-    setMessage("Refreshing access data...");
+    setMessage("");
 
-    const refreshRun = accessRefreshQueue.current.then(() => performAccessDataRefresh(tokens, targets, options));
+    const refreshRun = accessRefreshQueue.current.then(() => {
+      showProgressStep(1, "Reading local access state");
+      return performAccessDataRefresh(tokens, targets, options, showProgressStep);
+    });
     accessRefreshQueue.current = refreshRun.then(() => undefined, () => undefined);
 
-    return refreshRun.catch((refreshError) => {
+    return refreshRun.then(() => {
+      progress = completeOperationProgress(progress, "Access data refreshed");
+      progressCompleted = true;
+      setAccessRefreshProgress(progress);
+    }).catch((refreshError) => {
+      const detail = refreshError instanceof Error ? refreshError.message : String(refreshError);
       setMessage("");
-      setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+      setError(detail);
+      progress = failOperationProgress(progress, detail, "Access refresh stopped at this step");
+      setAccessRefreshProgress(progress);
     }).finally(() => {
       pendingAccessRefreshes.current -= 1;
       if (!pendingAccessRefreshes.current) {
         setIsRefreshingAccess(false);
+      }
+      if (progressCompleted) {
+        const operationId = progress.operationId;
+        accessProgressClearTimer.current = setTimeout(() => {
+          setAccessRefreshProgress((current) => current?.operationId === operationId ? null : current);
+          accessProgressClearTimer.current = undefined;
+        }, 350);
       }
     });
   }
@@ -290,13 +428,20 @@ function SettingsApp() {
   async function performAccessDataRefresh(
     tokens: TokenStatus | undefined,
     targets: AccessSetupTarget[] | undefined,
-    options: AccessRefreshOptions
+    options: AccessRefreshOptions,
+    onProgress: (current: number, label?: string) => void
   ): Promise<void> {
+    const refreshStartedAt = Date.now();
     const [loadedSettings, currentCache, currentReferenceData, loadedTokens] = await Promise.all([
       loadSettings(),
       loadDataCache(),
       loadReferenceData(),
-      tokens ? Promise.resolve(tokens) : sendMessage<TokenStatus>({ action: "getTokenStatus" })
+      tokens
+        ? Promise.resolve(tokens)
+        : sendMessage<TokenStatus>(
+          { action: "getTokenStatus" },
+          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Cached access data remains available." }
+        )
     ]);
     const latestTokens = loadedTokens;
     const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
@@ -304,11 +449,18 @@ function SettingsApp() {
     if (options.skipTargetsWithCurrentTokenCache) {
       refreshTargets = refreshTargets.filter((target) => !isTargetCacheCurrentForToken(currentCache, latestTokens, target));
     }
+    onProgress(
+      2,
+      refreshTargets.length
+        ? `Refreshing ${refreshTargets.length} enabled role source${refreshTargets.length === 1 ? "" : "s"}`
+        : "Enabled role sources are already current"
+    );
 
     setSettings(loadedSettings);
     setTokenStatus(latestTokens);
     setDataCache(currentCache);
     if (!refreshTargets.length) {
+      onProgress(3, "Finalizing current access data");
       setMessage(options.completionMessage || "Access data is already current.");
       return;
     }
@@ -318,22 +470,27 @@ function SettingsApp() {
     const snapshotTokenStatus = snapshot.tokenStatus || latestTokens;
     const snapshotTargetCacheKeys = buildTargetCacheKeys(snapshotTokenStatus, enabledRoleFeatures);
     const legacyCacheKey = buildFeatureCacheKey(buildTokenCacheKey(snapshotTokenStatus), enabledRoleFeatures);
+    const eligibleResultsByTarget = snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, refreshTargets);
+    const activeResultsByTarget = snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, refreshTargets);
     let nextCache = updateCacheFromTargetResults(
       currentCache,
       "eligible",
       refreshTargets,
-      snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, refreshTargets),
+      eligibleResultsByTarget,
       fetchedAt,
-      snapshotTargetCacheKeys
+      snapshotTargetCacheKeys,
+      refreshStartedAt
     );
     nextCache = updateCacheFromTargetResults(
       nextCache,
       "active",
       refreshTargets,
-      snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, refreshTargets),
+      activeResultsByTarget,
       fetchedAt,
-      snapshotTargetCacheKeys
+      snapshotTargetCacheKeys,
+      refreshStartedAt
     );
+    onProgress(3, "Saving access diagnostics and learned names");
     await saveDataCache(nextCache);
     const eligibleCache = getTargetEntriesFromCache(nextCache, "eligible", enabledRoleFeatures, snapshotTargetCacheKeys, {
       legacyCacheKey,
@@ -354,8 +511,28 @@ function SettingsApp() {
     setDataCache(nextCache);
     setReferenceData(nextReferenceData);
     setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
-    const limitedAreas = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures).filter((item) => item.status !== "ready").length;
+    const accessCapabilities = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures);
+    const limitedAreas = accessCapabilities.filter((item) => item.status !== "ready").length;
+    const refreshErrors = formatLoadMessages(refreshTargets.flatMap((target) => [
+      ...(eligibleResultsByTarget[target]?.errors || []),
+      ...(activeResultsByTarget[target]?.errors || [])
+    ]));
+    const completedRecoveryTargets = refreshTargets.filter((target) => {
+      const eligibleResult = eligibleResultsByTarget[target];
+      const activeResult = activeResultsByTarget[target];
+      return Boolean(eligibleResult && activeResult && !eligibleResult.errors.length && !activeResult.errors.length);
+    });
+    if (completedRecoveryTargets.length) {
+      try {
+        await sendMessage<AccessSetupTarget[]>({ action: "closePortalRecoveryTabs", targets: completedRecoveryTargets });
+      } catch {
+        // Access data remains valid even if the browser rejects optional temporary-tab cleanup.
+      }
+    }
     const completionPrefix = options.completionMessage || "Access data refreshed.";
+    if (refreshErrors.length) {
+      throw new Error(refreshErrors.join("\n"));
+    }
     setMessage(
       limitedAreas
         ? `${completionPrefix} ${limitedAreas} area(s) still need portal access or are limited by the captured portal token.`
@@ -363,36 +540,60 @@ function SettingsApp() {
     );
   }
 
+  async function scanPortalTabsForTokens(): Promise<TokenStatus> {
+    explicitPortalScanDepth.current += 1;
+    try {
+      const result = await sendMessage<PortalTokenRefreshResult>(
+        { action: "refreshPortalTokens" },
+        { timeoutMs: PORTAL_TOKEN_REFRESH_TIMEOUT_MS, timeoutMessage: "Portal token scan timed out. Continuing with the currently captured tokens." }
+      );
+      return result.tokenStatus;
+    } catch (scanError) {
+      setError(scanError instanceof Error ? scanError.message : String(scanError));
+      return tokenStatus || {
+        graph: { hasToken: false },
+        azureManagement: { hasToken: false }
+      };
+    } finally {
+      explicitPortalScanDepth.current = Math.max(0, explicitPortalScanDepth.current - 1);
+      suppressSessionTokenRefreshUntil.current = Date.now() + 2_000;
+    }
+  }
+
   async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
     if (!isSettingsReady) {
       setError("Wait for saved settings to finish loading before making changes.");
       return false;
     }
-    try {
-      const latest = await loadSettings();
-      const mergedInput: QuickPimSettings = { ...latest };
-      for (const key of [
-        "aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles",
-        "usageStatsByItemId", "activityHistory", "activationHistory", "preferences"
-      ] as const) {
-        if (JSON.stringify(next[key]) !== JSON.stringify(settings[key])) {
+    const changedSections = [
+      "aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles",
+      "usageStatsByItemId", "activityHistory", "activationHistory", "preferences"
+    ] as const;
+    const sectionsToSave = changedSections.filter((key) => JSON.stringify(next[key]) !== JSON.stringify(settings[key]));
+    const operation = settingsMutationQueue.current.then(async () => {
+      try {
+        const latest = await loadSettings();
+        const mergedInput: QuickPimSettings = { ...latest };
+        for (const key of sectionsToSave) {
           (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
         }
+        const merged = mergeSettings(mergedInput);
+        await saveSettings(merged);
+        setSettings(merged);
+        if (!exportTextDirty.current) {
+          replaceExportText(JSON.stringify(merged, null, 2));
+        }
+        setError("");
+        setMessage(successMessage);
+        return true;
+      } catch (saveError) {
+        setMessage("");
+        setError(saveError instanceof Error ? saveError.message : String(saveError));
+        return false;
       }
-      const merged = mergeSettings(mergedInput);
-      await saveSettings(merged);
-      setSettings(merged);
-      if (!exportTextDirty.current) {
-        replaceExportText(JSON.stringify(merged, null, 2));
-      }
-      setError("");
-      setMessage(successMessage);
-      return true;
-    } catch (saveError) {
-      setMessage("");
-      setError(saveError instanceof Error ? saveError.message : String(saveError));
-      return false;
-    }
+    });
+    settingsMutationQueue.current = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   async function clearCapturedTokens() {
@@ -441,7 +642,7 @@ function SettingsApp() {
             <p>Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.</p>
           </div>
         </div>
-        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible}>
+        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible || isRefreshingAccess}>
           {isRefreshingEligible ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
@@ -454,8 +655,24 @@ function SettingsApp() {
       </header>
 
       <section className="settings-content">
-        {error ? <p className="message error" role="alert">{error}</p> : null}
+        {error && eligibleRefreshProgress?.status !== "error" && accessRefreshProgress?.status !== "error" ? (
+          <p className="message error" role="alert">{error}</p>
+        ) : null}
         {message ? <p className={message === "Settings saved." ? "message success" : "message"} role="status">{message}</p> : null}
+        {eligibleRefreshProgress ? (
+          <SmartProgressPanel
+            key={eligibleRefreshProgress.operationId}
+            title="Refreshing eligible items"
+            progress={eligibleRefreshProgress}
+          />
+        ) : null}
+        {accessRefreshProgress ? (
+          <SmartProgressPanel
+            key={accessRefreshProgress.operationId}
+            title="Refreshing access data"
+            progress={accessRefreshProgress}
+          />
+        ) : null}
         <div className={`settings-layout ${isSettingsReady ? "" : "settings-loading"}`} aria-busy={!isSettingsReady}>
           <nav className="settings-nav" aria-label="Settings sections">
             {NAV_SECTIONS.map((section) => (
@@ -479,12 +696,21 @@ function SettingsApp() {
                 tokenStatus={tokenStatus}
                 dataCache={dataCache}
                 isRefreshingAccess={isRefreshingAccess}
+                isRefreshingEligible={isRefreshingEligible}
                 onSave={persist}
                 onRefreshAccessData={forceRefreshAccessData}
+                onScanPortalTabsForTokens={scanPortalTabsForTokens}
                 onClearReferenceData={clearLearnedReferences}
               />
             ) : null}
-            {tab === "activity" ? <ActivityPanel settings={settings} onSave={persist} /> : null}
+            {tab === "activity" ? (
+              <ActivityPanel
+                settings={settings}
+                trackedRequests={trackedRequests}
+                onTrackedRequestsChange={setTrackedRequests}
+                onSave={persist}
+              />
+            ) : null}
             {tab === "aliases" ? <AliasesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
             {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
             {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
@@ -688,24 +914,49 @@ function AccessSetupPanel({
   tokenStatus,
   dataCache,
   isRefreshingAccess,
+  isRefreshingEligible,
   onSave,
   onRefreshAccessData,
+  onScanPortalTabsForTokens,
   onClearReferenceData
 }: {
   settings: QuickPimSettings;
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
   isRefreshingAccess: boolean;
+  isRefreshingEligible: boolean;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
   onRefreshAccessData: (tokens?: TokenStatus, targets?: AccessSetupTarget[], options?: AccessRefreshOptions) => Promise<void>;
+  onScanPortalTabsForTokens: () => Promise<TokenStatus>;
   onClearReferenceData: () => Promise<void>;
 }) {
   const [isRunningSetup, setIsRunningSetup] = useState(false);
   const [isRecheckingPortalTabs, setIsRecheckingPortalTabs] = useState(false);
+  const [portalRecoveryStatus, setPortalRecoveryStatus] = useState<PortalRecoveryStatus>(() => emptyPortalRecoveryStatus());
+  const [portalRecoveryError, setPortalRecoveryError] = useState("");
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
   const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
   const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
+
+  useEffect(() => {
+    let active = true;
+    const updateStatus = async () => {
+      const next = await readPortalRecoveryStatus();
+      if (active) {
+        setPortalRecoveryStatus(next);
+      }
+    };
+    void updateStatus();
+    if (portalRecoveryStatus.state === "idle") {
+      return () => { active = false; };
+    }
+    const timer = window.setInterval(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [portalRecoveryStatus.state]);
 
   async function setIgnored(ignored: boolean) {
     await onSave(
@@ -722,34 +973,35 @@ function AccessSetupPanel({
   }
 
   async function runPortalSetup() {
+    if (portalRecoveryStatus.state === "interactionRequired") {
+      await continueMicrosoftSignIn();
+      return;
+    }
     const initialTargets = setupTargets;
     setIsRunningSetup(true);
+    setPortalRecoveryError("");
     try {
-      const scannedTokens = await scanExistingPortalTabsForTokens();
+      const scannedTokens = await onScanPortalTabsForTokens();
       const remainingTargets = getAccessSetupTargets(
         buildAccessCapabilityItems(scannedTokens, dataCache, enabledRoleFeatures)
       ).filter((target) => initialTargets.includes(target));
-      const urls = getPortalUrlsForTargets(remainingTargets);
-      await Promise.all(urls.map(async (url) => {
-        if (chrome.tabs?.create) {
-          try {
-            await chrome.tabs.create({ url });
-            return;
-          } catch {
-            // Fall back to a normal extension-page navigation if tab creation is unavailable.
-          }
-        }
-        safeOpenUrl(url);
-      }));
+      if (remainingTargets.length) {
+        await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
+        setPortalRecoveryStatus(await readPortalRecoveryStatus());
+      }
 
       if (!remainingTargets.length) {
         await onRefreshAccessData(scannedTokens, initialTargets, { skipTargetsWithCurrentTokenCache: true });
         return;
       }
 
-      const tokenRefresh = await waitForPortalTokens(remainingTargets, scannedTokens);
+      const tokenRefresh = await waitForPortalTokens(remainingTargets, scannedTokens, onScanPortalTabsForTokens);
+      setPortalRecoveryStatus(tokenRefresh.recoveryStatus);
       if (tokenRefresh.changedTargets.length) {
         await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, { skipTargetsWithCurrentTokenCache: true });
+      }
+      if (tokenRefresh.recoveryStatus.state === "interactionRequired") {
+        return;
       }
       const unchangedTargets = remainingTargets.filter((target) => !tokenRefresh.changedTargets.includes(target));
       if (unchangedTargets.length) {
@@ -757,13 +1009,32 @@ function AccessSetupPanel({
       }
     } finally {
       setIsRunningSetup(false);
+      setPortalRecoveryStatus(await readPortalRecoveryStatus());
+    }
+  }
+
+  async function continueMicrosoftSignIn() {
+    setPortalRecoveryError("");
+    try {
+      const result = await sendMessage<PortalRecoveryFocusResult>({ action: "focusPortalRecoveryTabs" });
+      setPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
+      if (!result?.focused) {
+        setPortalRecoveryError("The Microsoft sign-in tab is no longer available. Open the missing portal pages again.");
+      }
+    } catch (focusError) {
+      setPortalRecoveryError(focusError instanceof Error ? focusError.message : String(focusError));
     }
   }
 
   async function recheckPortalAccess() {
     setIsRecheckingPortalTabs(true);
     try {
-      const scannedTokens = await scanExistingPortalTabsForTokens();
+      const scannedTokens = await onScanPortalTabsForTokens();
+      const recoveryStatus = await readPortalRecoveryStatus();
+      setPortalRecoveryStatus(recoveryStatus);
+      if (recoveryStatus.state === "interactionRequired") {
+        return;
+      }
       await onRefreshAccessData(scannedTokens, setupTargets.length ? setupTargets : enabledRoleFeatures);
     } finally {
       setIsRecheckingPortalTabs(false);
@@ -789,22 +1060,22 @@ function AccessSetupPanel({
       </div>
 
       <div className="button-row settings-action-lead">
-        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || !setupTargets.length}>
+        <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible || (!setupTargets.length && portalRecoveryStatus.state === "idle")}>
           {isRunningSetup ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
               <span>Checking portal access...</span>
             </span>
           ) : (
-            "Open missing portal pages"
+            portalRecoveryStatus.state === "interactionRequired" ? "Continue Microsoft sign-in" : "Open missing portal pages"
           )}
         </button>
         <button
           className="btn"
           onClick={() => void recheckPortalAccess()}
-          disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess}
+          disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible}
         >
-          {isRecheckingPortalTabs || isRefreshingAccess ? (
+          {isRecheckingPortalTabs && !isRefreshingAccess ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
               <span>{isRecheckingPortalTabs ? "Scanning portal tabs..." : "Rechecking access..."}</span>
@@ -813,25 +1084,36 @@ function AccessSetupPanel({
             "Recheck now"
           )}
         </button>
-        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess}>
+        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible}>
           Clear learned names
         </button>
       </div>
-      {isRunningSetup ? (
+      {portalRecoveryStatus.state === "interactionRequired" ? (
+        <section className="portal-interaction-panel" role="status">
+          <span className="portal-interaction-icon" aria-hidden="true">!</span>
+          <div>
+            <strong>
+              {portalRecoveryStatus.interactionReason === "signIn"
+                ? "Microsoft sign-in needed"
+                : "Microsoft needs your attention"}
+            </strong>
+            <p>
+              {portalRecoveryStatus.interactionReason === "signIn"
+                ? "Choose an account or finish signing in from the QuickPIM++ access refresh tab. Access checks resume automatically afterward."
+                : "Complete the Microsoft prompt in the QuickPIM++ access refresh tab. Access checks resume automatically afterward."}
+            </p>
+          </div>
+        </section>
+      ) : (isRunningSetup || portalRecoveryStatus.state === "waiting") && !isRefreshingAccess ? (
         <section className="loading-panel" aria-live="polite">
           <span className="spinner large" aria-hidden="true" />
-          <span>Waiting for Microsoft portal token capture...</span>
+          <span>Waiting for Microsoft portal access...</span>
         </section>
       ) : null}
-      {isRefreshingAccess ? (
-        <section className="loading-panel" aria-live="polite">
-          <span className="spinner large" aria-hidden="true" />
-          <span>Refreshing access data...</span>
-        </section>
-      ) : null}
+      {portalRecoveryError ? <p className="message error" role="alert">{portalRecoveryError}</p> : null}
       <p className="muted">
-        QuickPIM++ only uses tokens captured from Microsoft portal pages. If a page asks you to sign in or load PIM data, complete that
-        step in the opened tab, then return here.
+        QuickPIM++ only uses tokens captured from Microsoft portal pages. Recovery pages open in a collapsed background group and close
+        automatically when access is ready. Expand the group only if Microsoft requires sign-in, tenant selection, or another prompt.
       </p>
 
       <div className="permission-list">
@@ -844,8 +1126,8 @@ function AccessSetupPanel({
       <div className="panel">
         <h3>Quick Tutorial</h3>
         <ol className="tutorial-list">
-          <li>Use Open missing portal pages to open the Microsoft pages that normally request the needed Graph or Azure tokens.</li>
-          <li>Let the portal pages finish loading. Switch to them if sign-in, tenant selection, or page consent is required.</li>
+          <li>Use Open missing portal pages to load the required Microsoft pages in a collapsed background tab group.</li>
+          <li>QuickPIM++ closes its temporary pages after access is captured. Expand the group only if Microsoft requires interaction.</li>
           <li>Return to QuickPIM++ and use Recheck now if the automatic refresh has not picked up the new portal token yet.</li>
           <li>QuickPIM++ keeps learned role, group, subscription, and scope names locally so old friendly names can still be displayed later.</li>
         </ol>
@@ -906,27 +1188,50 @@ function statusLabel(status: ReturnType<typeof buildAccessCapabilityItems>[numbe
   return "Needs portal refresh";
 }
 
-async function scanExistingPortalTabsForTokens(): Promise<TokenStatus> {
-  const result = await sendMessage<PortalTokenRefreshResult>({ action: "refreshPortalTokens" });
-  return result.tokenStatus;
+function emptyPortalRecoveryStatus(): PortalRecoveryStatus {
+  return sanitizePortalRecoveryStatus(undefined);
+}
+
+async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
+  try {
+    return sanitizePortalRecoveryStatus(
+      await sendMessage<PortalRecoveryStatus>(
+        { action: "getPortalRecoveryStatus" },
+        { timeoutMs: 2_500, timeoutMessage: "Microsoft sign-in status check timed out." }
+      )
+    );
+  } catch {
+    return emptyPortalRecoveryStatus();
+  }
 }
 
 async function waitForPortalTokens(
   targets: AccessSetupTarget[],
-  baselineTokens: TokenStatus
-): Promise<{ tokens: TokenStatus; changedTargets: AccessSetupTarget[] }> {
+  baselineTokens: TokenStatus,
+  scanPortalTabsForTokens: () => Promise<TokenStatus>
+): Promise<{ tokens: TokenStatus; changedTargets: AccessSetupTarget[]; recoveryStatus: PortalRecoveryStatus }> {
   let latestTokens = baselineTokens;
   let changedTargets: AccessSetupTarget[] = [];
+  let recoveryStatus = emptyPortalRecoveryStatus();
   const deadline = Date.now() + PORTAL_TOKEN_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    latestTokens = await scanExistingPortalTabsForTokens();
+    [latestTokens, recoveryStatus] = await Promise.all([
+      scanPortalTabsForTokens(),
+      readPortalRecoveryStatus()
+    ]);
     changedTargets = targets.filter((target) => hasTargetPortalTokenChanged(target, baselineTokens, latestTokens));
     if (changedTargets.length === targets.length) {
       break;
     }
+    if (recoveryStatus.state === "interactionRequired") {
+      break;
+    }
     await delay(Math.min(PORTAL_TOKEN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
   }
-  return { tokens: latestTokens, changedTargets };
+  if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
+    recoveryStatus = await readPortalRecoveryStatus();
+  }
+  return { tokens: latestTokens, changedTargets, recoveryStatus };
 }
 
 function hasTargetPortalTokenChanged(target: AccessSetupTarget, before: TokenStatus, after: TokenStatus): boolean {
@@ -995,15 +1300,38 @@ function delay(ms: number): Promise<void> {
 
 function ActivityPanel({
   settings,
+  trackedRequests,
+  onTrackedRequestsChange,
   onSave
 }: {
   settings: QuickPimSettings;
+  trackedRequests: TrackedPimRequestStore;
+  onTrackedRequestsChange: (store: TrackedPimRequestStore) => void;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
+  const [view, setView] = useState<"requests" | "history">("requests");
+  const [requestSearch, setRequestSearch] = useState("");
+  const [requestStatusFilter, setRequestStatusFilter] = useState<"all" | "pending" | "active" | "attention" | "finished">("all");
+  const [selectedRequestId, setSelectedRequestId] = useState<string>();
+  const [isRefreshingRequests, setIsRefreshingRequests] = useState(false);
+  const [requestMessage, setRequestMessage] = useState("");
+  const [requestError, setRequestError] = useState("");
   const [search, setSearch] = useState("");
   const [actionFilter, setActionFilter] = useState<ActivityAction | "all">("all");
   const [resultFilter, setResultFilter] = useState<ActivityResult | "all">("all");
   const [typeFilter, setTypeFilter] = useState<ActivationItem["type"] | "all">("all");
+  const now = Date.now();
+  const selectedRequest = trackedRequests.requests.find((request) => request.id === selectedRequestId);
+  const filteredRequests = useMemo(() => {
+    const term = requestSearch.trim().toLowerCase();
+    return trackedRequests.requests.filter((request) => {
+      const status = getEffectiveTrackedRequestStatus(request);
+      if (!matchesTrackedRequestFilter(status, requestStatusFilter)) return false;
+      if (!term) return true;
+      return [request.itemName, request.scopeLabel, request.bundleName, request.justification, request.requestId, trackedRequestStatusLabel(status)]
+        .some((value) => value?.toLowerCase().includes(term));
+    });
+  }, [requestSearch, requestStatusFilter, trackedRequests.requests]);
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     return settings.activityHistory.filter((entry) => {
@@ -1017,60 +1345,259 @@ function ActivityPanel({
     });
   }, [actionFilter, resultFilter, search, settings.activityHistory, typeFilter]);
 
+  useEffect(() => {
+    if (selectedRequestId && !trackedRequests.requests.some((request) => request.id === selectedRequestId)) {
+      setSelectedRequestId(undefined);
+    }
+  }, [selectedRequestId, trackedRequests.requests]);
+
+  async function refreshRequestStatuses(requestIds?: string[]) {
+    setIsRefreshingRequests(true);
+    setRequestMessage("");
+    setRequestError("");
+    try {
+      const nextStore = await sendMessage<TrackedPimRequestStore>(
+        { action: "refreshTrackedRequests", ...(requestIds?.length ? { requestIds } : {}) },
+        { timeoutMs: 30_000, timeoutMessage: "Microsoft request status refresh timed out. Saved request details remain available." }
+      );
+      onTrackedRequestsChange(sanitizeTrackedRequestStore(nextStore));
+      setRequestMessage("Request status checked.");
+    } catch (refreshError) {
+      setRequestError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+    } finally {
+      setIsRefreshingRequests(false);
+    }
+  }
+
+  async function clearRequests() {
+    await clearTrackedRequests();
+    onTrackedRequestsChange({ version: 1, requests: [] });
+    setSelectedRequestId(undefined);
+    setRequestError("");
+    setRequestMessage("Tracked requests cleared.");
+  }
+
+  async function prepareRequestInPopup(request: TrackedPimRequest, requestMode: "activate" | "deactivate") {
+    setRequestError("");
+    setRequestMessage("");
+    await savePopupDraft({
+      tab: request.itemType,
+      search: "",
+      sortMode: settings.preferences.defaultSort,
+      selectedIds: [request.itemId],
+      durationHours: request.durationHours || settings.preferences.defaultDurationHours,
+      justification: request.justification || "",
+      ticketSystem: "",
+      ticketNumber: "",
+      isActivationReviewOpen: true,
+      requestMode
+    });
+    try {
+      if (!chrome.action?.openPopup) {
+        throw new Error("Popup opening is not supported by this browser version.");
+      }
+      await chrome.action.openPopup();
+    } catch {
+      setRequestMessage(`The ${requestMode === "activate" ? "activation" : "deactivation"} is prepared. Open QuickPIM++ from the toolbar to review it.`);
+    }
+  }
+
+  function openMatchingPortal(request: TrackedPimRequest) {
+    void chrome.tabs.create({ url: ENTRA_PORTAL_URLS[request.itemType] });
+  }
+
   return (
     <section className="panel">
       <div className="panel-title-row">
         <div>
           <h2>Activity</h2>
-          <p className="muted">Local activation and deactivation outcomes for troubleshooting and audit context.</p>
+          <p className="muted">Follow requests submitted by QuickPIM++ and review local activation history.</p>
         </div>
-        <button className="btn danger" onClick={() => void onSave({ ...settings, activityHistory: [] }, "Activity history cleared.")}>
-          Clear activity
+        {view === "requests" ? (
+          <button className="btn danger" disabled={!trackedRequests.requests.length} onClick={() => void clearRequests()}>
+            Clear requests
+          </button>
+        ) : (
+          <button className="btn danger" disabled={!settings.activityHistory.length} onClick={() => void onSave({ ...settings, activityHistory: [] }, "Activity history cleared.")}>
+            Clear history
+          </button>
+        )}
+      </div>
+      <div className="segmented-control activity-view-switch" role="tablist" aria-label="Activity view">
+        <button className={view === "requests" ? "active" : ""} role="tab" aria-selected={view === "requests"} onClick={() => setView("requests")}>
+          Requests
+          {getPendingTrackedRequestCount(trackedRequests) ? <span className="request-count">{getPendingTrackedRequestCount(trackedRequests)}</span> : null}
+        </button>
+        <button className={view === "history" ? "active" : ""} role="tab" aria-selected={view === "history"} onClick={() => setView("history")}>
+          History
         </button>
       </div>
-      <div className="toolbar settings-section-gap activity-toolbar">
-        <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search activity" aria-label="Search activity" />
-        <select className="select" value={actionFilter} onChange={(event) => setActionFilter(event.target.value as ActivityAction | "all")} aria-label="Filter activity action">
-          <option value="all">All actions</option>
-          <option value="activate">Activations</option>
-          <option value="deactivate">Deactivations</option>
-        </select>
-        <select className="select" value={resultFilter} onChange={(event) => setResultFilter(event.target.value as ActivityResult | "all")} aria-label="Filter activity result">
-          <option value="all">All results</option>
-          <option value="success">Success</option>
-          <option value="failed">Failed</option>
-          <option value="skipped">Skipped</option>
-        </select>
-        <select className="select" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as ActivationItem["type"] | "all")} aria-label="Filter activity type">
-          <option value="all">All types</option>
-          <option value="directoryRole">Entra Roles</option>
-          <option value="pimGroup">PIM Groups</option>
-          <option value="azureRole">Azure Roles</option>
-        </select>
-      </div>
-      <div className="activity-list">
-        {filtered.map((entry) => (
-          <article className={`activity-row ${entry.result}`} key={entry.id}>
-            <div>
-              <strong>{entry.itemName}</strong>
-              <p className="muted">
-                {entry.action} / {entry.result} / {popupTabLabel(entry.itemType)}
-                {entry.scopeLabel ? ` / ${entry.scopeLabel}` : ""}
-              </p>
-              {entry.justification ? <p>{entry.justification}</p> : null}
-              {entry.error ? <p className="message error settings-inline-message">{entry.error}</p> : null}
+      {view === "requests" ? (
+        <>
+          <div className="toolbar settings-section-gap request-toolbar">
+            <input className="input" value={requestSearch} onChange={(event) => setRequestSearch(event.target.value)} placeholder="Search requests" aria-label="Search requests" />
+            <select className="select" value={requestStatusFilter} onChange={(event) => setRequestStatusFilter(event.target.value as typeof requestStatusFilter)} aria-label="Filter request status">
+              <option value="all">All statuses</option>
+              <option value="pending">In progress</option>
+              <option value="active">Active</option>
+              <option value="attention">Needs attention</option>
+              <option value="finished">Finished</option>
+            </select>
+            <button className="btn" disabled={isRefreshingRequests || !trackedRequests.requests.length} onClick={() => void refreshRequestStatuses()}>
+              {isRefreshingRequests ? <span className="loading-inline"><span className="spinner" aria-hidden="true" /> Checking...</span> : "Check status"}
+            </button>
+          </div>
+          {requestError ? <p className="message error settings-inline-message" role="alert">{requestError}</p> : null}
+          {requestMessage ? <p className="message success settings-inline-message" role="status">{requestMessage}</p> : null}
+          <div className={`request-center ${selectedRequest ? "has-details" : ""}`}>
+            <div className="request-list" aria-label="Tracked PIM requests">
+              {filteredRequests.map((request) => {
+                const status = getEffectiveTrackedRequestStatus(request, now);
+                return (
+                  <button
+                    className={`request-row ${selectedRequestId === request.id ? "selected" : ""}`}
+                    key={request.id}
+                    onClick={() => setSelectedRequestId(request.id)}
+                    aria-expanded={selectedRequestId === request.id}
+                  >
+                    <span className="request-row-main">
+                      <strong>{request.itemName}</strong>
+                      <span className="muted">{request.action === "activate" ? "Enable" : "Disable"} / {popupTabLabel(request.itemType)}{request.scopeLabel ? ` / ${request.scopeLabel}` : ""}</span>
+                    </span>
+                    <span className="request-row-side">
+                      <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
+                      <span className="muted">{formatDateOnly(request.requestedAt) || request.requestedAt}</span>
+                    </span>
+                  </button>
+                );
+              })}
+              {!filteredRequests.length ? <p className="muted request-empty">No tracked requests match the current filters.</p> : null}
             </div>
-            <div className="activity-time">
-              <span>{formatDateOnly(entry.completedAt || entry.requestedAt) || entry.completedAt || entry.requestedAt}</span>
-              {entry.durationHours ? <span>{entry.durationHours}h</span> : null}
-              {entry.bundleName ? <span>{entry.bundleName}</span> : null}
-            </div>
-          </article>
-        ))}
-        {!filtered.length ? <p className="muted">No activity matches the current filters.</p> : null}
-      </div>
+            {selectedRequest ? (
+              <TrackedRequestDetails
+                request={selectedRequest}
+                isRefreshing={isRefreshingRequests}
+                onRefresh={() => void refreshRequestStatuses([selectedRequest.id])}
+                onOpenPortal={() => openMatchingPortal(selectedRequest)}
+                onPrepare={(mode) => void prepareRequestInPopup(selectedRequest, mode)}
+                onClose={() => setSelectedRequestId(undefined)}
+              />
+            ) : null}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="toolbar settings-section-gap activity-toolbar">
+            <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search history" aria-label="Search activity" />
+            <select className="select" value={actionFilter} onChange={(event) => setActionFilter(event.target.value as ActivityAction | "all")} aria-label="Filter activity action">
+              <option value="all">All actions</option>
+              <option value="activate">Activations</option>
+              <option value="deactivate">Deactivations</option>
+            </select>
+            <select className="select" value={resultFilter} onChange={(event) => setResultFilter(event.target.value as ActivityResult | "all")} aria-label="Filter activity result">
+              <option value="all">All results</option>
+              <option value="success">Success</option>
+              <option value="failed">Failed</option>
+              <option value="skipped">Skipped</option>
+            </select>
+            <select className="select" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value as ActivationItem["type"] | "all")} aria-label="Filter activity type">
+              <option value="all">All types</option>
+              <option value="directoryRole">Entra Roles</option>
+              <option value="pimGroup">PIM Groups</option>
+              <option value="azureRole">Azure Roles</option>
+            </select>
+          </div>
+          <div className="activity-list">
+            {filtered.map((entry) => (
+              <article className={`activity-row ${entry.result}`} key={entry.id}>
+                <div>
+                  <strong>{entry.itemName}</strong>
+                  <p className="muted">
+                    {entry.action} / {entry.result} / {popupTabLabel(entry.itemType)}
+                    {entry.scopeLabel ? ` / ${entry.scopeLabel}` : ""}
+                  </p>
+                  {entry.justification ? <p>{entry.justification}</p> : null}
+                  {entry.error ? <p className="message error settings-inline-message">{entry.error}</p> : null}
+                </div>
+                <div className="activity-time">
+                  <span>{formatDateOnly(entry.completedAt || entry.requestedAt) || entry.completedAt || entry.requestedAt}</span>
+                  {entry.durationHours ? <span>{entry.durationHours}h</span> : null}
+                  {entry.bundleName ? <span>{entry.bundleName}</span> : null}
+                </div>
+              </article>
+            ))}
+            {!filtered.length ? <p className="muted">No activity matches the current filters.</p> : null}
+          </div>
+        </>
+      )}
     </section>
   );
+}
+
+function TrackedRequestDetails({
+  request,
+  isRefreshing,
+  onRefresh,
+  onOpenPortal,
+  onPrepare,
+  onClose
+}: {
+  request: TrackedPimRequest;
+  isRefreshing: boolean;
+  onRefresh: () => void;
+  onOpenPortal: () => void;
+  onPrepare: (mode: "activate" | "deactivate") => void;
+  onClose: () => void;
+}) {
+  const status = getEffectiveTrackedRequestStatus(request);
+  const canRetry = ["denied", "failed", "canceled", "statusUnavailable"].includes(status);
+  const canPrepareDisable = request.action === "activate" && status === "active";
+  return (
+    <aside className="request-details" aria-label={`${request.itemName} request details`}>
+      <div className="panel-title-row compact">
+        <div>
+          <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
+          <h3>{request.itemName}</h3>
+          <p className="muted">{request.action === "activate" ? "Enable request" : "Disable request"} / {popupTabLabel(request.itemType)}</p>
+        </div>
+        <button className="icon-btn request-details-close" onClick={onClose} title="Close request details" aria-label="Close request details">×</button>
+      </div>
+      <dl className="request-detail-grid">
+        <div><dt>Requested</dt><dd>{formatDateOnly(request.requestedAt) || request.requestedAt}</dd></div>
+        <div><dt>Last checked</dt><dd>{formatDateOnly(request.lastCheckedAt || request.updatedAt) || request.lastCheckedAt || request.updatedAt}</dd></div>
+        {request.scopeLabel ? <div><dt>Scope</dt><dd>{request.scopeLabel}</dd></div> : null}
+        {request.durationHours ? <div><dt>Duration</dt><dd>{request.durationHours} hours</dd></div> : null}
+        {request.activeUntil ? <div><dt>Active until</dt><dd>{formatDateOnly(request.activeUntil) || request.activeUntil}</dd></div> : null}
+        {request.bundleName ? <div><dt>Bundle</dt><dd>{request.bundleName}</dd></div> : null}
+        {request.rawStatus ? <div><dt>Microsoft status</dt><dd>{request.rawStatus}</dd></div> : null}
+        <div className="request-detail-wide"><dt>Request ID</dt><dd className="monospace wrap-anywhere">{request.requestId}</dd></div>
+        {request.approvalId ? <div className="request-detail-wide"><dt>Approval ID</dt><dd className="monospace wrap-anywhere">{request.approvalId}</dd></div> : null}
+        {request.justification ? <div className="request-detail-wide"><dt>Justification</dt><dd>{request.justification}</dd></div> : null}
+      </dl>
+      {request.lastError ? <p className="message error settings-inline-message">{request.lastError}</p> : null}
+      <div className="button-row request-detail-actions">
+        <button className="btn" onClick={onRefresh} disabled={isRefreshing}>Check status</button>
+        <button className="btn" onClick={onOpenPortal}>Open Microsoft PIM</button>
+        {canRetry ? (
+          <button className="btn primary" onClick={() => onPrepare(request.action)}>
+            Retry {request.action === "activate" ? "activation" : "deactivation"}
+          </button>
+        ) : null}
+        {canPrepareDisable ? <button className="btn danger" onClick={() => onPrepare("deactivate")}>Prepare disable</button> : null}
+      </div>
+    </aside>
+  );
+}
+
+function matchesTrackedRequestFilter(
+  status: TrackedPimRequestStatus,
+  filter: "all" | "pending" | "active" | "attention" | "finished"
+): boolean {
+  if (filter === "all") return true;
+  if (filter === "pending") return status === "submitted" || status === "pendingApproval" || status === "provisioning";
+  if (filter === "active") return status === "active";
+  if (filter === "attention") return status === "denied" || status === "failed" || status === "canceled" || status === "statusUnavailable";
+  return status === "completed" || status === "expired";
 }
 
 function DiagnosticsPanel({
@@ -1121,17 +1648,6 @@ function DiagnosticsPanel({
       </div>
     </section>
   );
-}
-
-function safeOpenUrl(url: string): void {
-  if (isTestRuntime()) {
-    return;
-  }
-  try {
-    window.open(url, "_blank", "noopener");
-  } catch {
-    // Some test and restricted browser contexts expose window.open but block it.
-  }
 }
 
 function AliasesPanel({
@@ -1268,6 +1784,7 @@ function JustificationsPanel({
         <input
           className="input"
           value={value}
+          maxLength={MAX_USER_JUSTIFICATION_LENGTH}
           onChange={(event) => {
             setValue(event.target.value);
             if (validationWarning) setValidationWarning("");
@@ -1483,6 +2000,7 @@ function BundlesPanel({
         <textarea
           className="textarea justification-textarea"
           rows={2}
+          maxLength={MAX_USER_JUSTIFICATION_LENGTH}
           value={justification}
           onChange={(event) => {
             setJustification(event.target.value);
@@ -1545,6 +2063,76 @@ function BundlesPanel({
   );
 }
 
+const PREFERENCE_AUTOSAVE_DELAY_MS = 300;
+const PREFERENCE_AUTOSAVE_RETRY_DELAY_MS = 750;
+const PREFERENCE_AUTOSAVE_MAX_RETRIES = 2;
+const PREFERENCE_FEATURES: QuickPimFeature[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
+
+type PreferenceSaveState = "idle" | "pending" | "saving" | "saved" | "invalid" | "error";
+
+interface PreferenceDraft {
+  defaultDurationHours: number;
+  defaultSort: SortMode;
+  recentJustificationLimit: number;
+  activityHistoryLimit: number;
+  darkMode: boolean;
+  showAssignedRoles: boolean;
+  showRemainingActivationTime: boolean;
+  showActivationCounters: boolean;
+  showEnablementDetails: boolean;
+  showLastEnablementDate: boolean;
+  backgroundPreRefreshEnabled: boolean;
+  requestNotificationsEnabled: boolean;
+  expiryReminderMinutes: number;
+  enabledFeatures: QuickPimFeature[];
+}
+
+function createPreferenceDraft(settings: QuickPimSettings): PreferenceDraft {
+  return {
+    defaultDurationHours: settings.preferences.defaultDurationHours,
+    defaultSort: settings.preferences.defaultSort,
+    recentJustificationLimit: settings.preferences.recentJustificationLimit,
+    activityHistoryLimit: settings.preferences.activityHistoryLimit,
+    darkMode: settings.preferences.darkMode,
+    showAssignedRoles: settings.preferences.showAssignedRoles,
+    showRemainingActivationTime: settings.preferences.showRemainingActivationTime,
+    showActivationCounters: settings.preferences.showActivationCounters,
+    showEnablementDetails: settings.preferences.showEnablementDetails,
+    showLastEnablementDate: settings.preferences.showLastEnablementDate,
+    backgroundPreRefreshEnabled: settings.preferences.backgroundPreRefreshEnabled,
+    requestNotificationsEnabled: settings.preferences.requestNotificationsEnabled,
+    expiryReminderMinutes: settings.preferences.expiryReminderMinutes,
+    enabledFeatures: PREFERENCE_FEATURES.filter((feature) => settings.preferences.enabledFeatures.includes(feature))
+  };
+}
+
+function isPreferenceDraftValid(draft: PreferenceDraft): boolean {
+  return Number.isFinite(draft.recentJustificationLimit)
+    && draft.recentJustificationLimit >= 1
+    && draft.recentJustificationLimit <= 20
+    && Number.isFinite(draft.activityHistoryLimit)
+    && draft.activityHistoryLimit >= 10
+    && draft.activityHistoryLimit <= 200;
+}
+
+function PreferenceSaveIndicator({ state }: { state: PreferenceSaveState }) {
+  const labels: Record<PreferenceSaveState, string> = {
+    idle: "Autosave on",
+    pending: "Changes pending",
+    saving: "Saving...",
+    saved: "Saved",
+    invalid: "Check values",
+    error: "Save failed"
+  };
+  return (
+    <span className={`autosave-status ${state}`} role="status" aria-live="polite">
+      {state === "saving" ? <span className="spinner" aria-hidden="true" /> : null}
+      {state === "saved" ? <span className="autosave-check" aria-hidden="true">✓</span> : null}
+      <span>{labels[state]}</span>
+    </span>
+  );
+}
+
 function PreferencesPanel({
   settings,
   onSave
@@ -1552,85 +2140,200 @@ function PreferencesPanel({
   settings: QuickPimSettings;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
-  const [defaultDurationHours, setDefaultDurationHours] = useState(settings.preferences.defaultDurationHours);
-  const [defaultSort, setDefaultSort] = useState<SortMode>(settings.preferences.defaultSort);
-  const [recentJustificationLimit, setRecentJustificationLimit] = useState(settings.preferences.recentJustificationLimit);
-  const [activityHistoryLimit, setActivityHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
-  const [darkMode, setDarkMode] = useState(settings.preferences.darkMode);
-  const [showActivationCounters, setShowActivationCounters] = useState(settings.preferences.showActivationCounters);
-  const [showEnablementDetails, setShowEnablementDetails] = useState(settings.preferences.showEnablementDetails);
-  const [showLastEnablementDate, setShowLastEnablementDate] = useState(settings.preferences.showLastEnablementDate);
-  const [backgroundPreRefreshEnabled, setBackgroundPreRefreshEnabled] = useState(settings.preferences.backgroundPreRefreshEnabled);
-  const [enabledFeatures, setEnabledFeatures] = useState<Set<QuickPimFeature>>(new Set(settings.preferences.enabledFeatures));
-  const [isDirty, setIsDirty] = useState(false);
+  const [draft, setDraft] = useState<PreferenceDraft>(() => createPreferenceDraft(settings));
+  const [saveState, setSaveState] = useState<PreferenceSaveState>("idle");
+  const [notificationPermissionError, setNotificationPermissionError] = useState("");
+  const [isRequestingNotificationPermission, setIsRequestingNotificationPermission] = useState(false);
+  const settingsRef = useRef(settings);
+  const onSaveRef = useRef(onSave);
+  const draftRef = useRef(draft);
+  const revisionRef = useRef(0);
+  const queuedRevisionRef = useRef(0);
+  const savedRevisionRef = useRef(0);
+  const autosaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const autosaveRetryTimerRef = useRef<number | undefined>(undefined);
+  const autosaveRetryCountRef = useRef(0);
+  const isMountedRef = useRef(true);
+  const lastSavedNotificationsRef = useRef(settings.preferences.requestNotificationsEnabled);
+  const notificationPermissionGrantedRef = useRef(false);
+
+  settingsRef.current = settings;
+  onSaveRef.current = onSave;
+  draftRef.current = draft;
 
   useEffect(() => {
-    if (isDirty) {
+    if (revisionRef.current !== savedRevisionRef.current) {
       return;
     }
-    setDefaultDurationHours(settings.preferences.defaultDurationHours);
-    setDefaultSort(settings.preferences.defaultSort);
-    setRecentJustificationLimit(settings.preferences.recentJustificationLimit);
-    setActivityHistoryLimit(settings.preferences.activityHistoryLimit);
-    setDarkMode(settings.preferences.darkMode);
-    setShowActivationCounters(settings.preferences.showActivationCounters);
-    setShowEnablementDetails(settings.preferences.showEnablementDetails);
-    setShowLastEnablementDate(settings.preferences.showLastEnablementDate);
-    setBackgroundPreRefreshEnabled(settings.preferences.backgroundPreRefreshEnabled);
-    setEnabledFeatures(new Set(settings.preferences.enabledFeatures));
-  }, [
-    settings.preferences.activityHistoryLimit,
-    settings.preferences.backgroundPreRefreshEnabled,
-    settings.preferences.darkMode,
-    settings.preferences.defaultDurationHours,
-    settings.preferences.defaultSort,
-    settings.preferences.enabledFeatures,
-    settings.preferences.recentJustificationLimit,
-    settings.preferences.showActivationCounters,
-    settings.preferences.showEnablementDetails,
-    settings.preferences.showLastEnablementDate,
-    isDirty
-  ]);
+    const nextDraft = createPreferenceDraft(settings);
+    draftRef.current = nextDraft;
+    lastSavedNotificationsRef.current = settings.preferences.requestNotificationsEnabled;
+    setDraft(nextDraft);
+  }, [settings]);
 
-  async function save() {
-    const saved = await onSave({
-      ...settings,
-      preferences: {
-        ...settings.preferences,
-        defaultDurationHours,
-        defaultSort,
-        recentJustificationLimit,
-        activityHistoryLimit,
-        darkMode,
-        showActivationCounters,
-        showEnablementDetails,
-        showLastEnablementDate,
-        backgroundPreRefreshEnabled,
-        enabledFeatures: [...enabledFeatures],
-        autoEnabledFeaturesInitialized: true
+  useEffect(() => {
+    const revision = revisionRef.current;
+    if (revision <= savedRevisionRef.current || revision <= queuedRevisionRef.current) {
+      return;
+    }
+    if (!isPreferenceDraftValid(draft)) {
+      setSaveState("invalid");
+      return;
+    }
+    setSaveState("pending");
+    const timer = window.setTimeout(() => {
+      queueAutosave(draftRef.current, revisionRef.current);
+    }, PREFERENCE_AUTOSAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [draft]);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    function flushPendingPreferences() {
+      queueAutosave(draftRef.current, revisionRef.current);
+    }
+    window.addEventListener("pagehide", flushPendingPreferences);
+    return () => {
+      window.removeEventListener("pagehide", flushPendingPreferences);
+      if (autosaveRetryTimerRef.current !== undefined) {
+        window.clearTimeout(autosaveRetryTimerRef.current);
+        autosaveRetryTimerRef.current = undefined;
       }
+      flushPendingPreferences();
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  function updateDraft(patch: Partial<PreferenceDraft>) {
+    if (autosaveRetryTimerRef.current !== undefined) {
+      window.clearTimeout(autosaveRetryTimerRef.current);
+      autosaveRetryTimerRef.current = undefined;
+    }
+    autosaveRetryCountRef.current = 0;
+    const next = { ...draftRef.current, ...patch };
+    revisionRef.current += 1;
+    draftRef.current = next;
+    setDraft(next);
+    setSaveState(isPreferenceDraftValid(next) ? "pending" : "invalid");
+  }
+
+  function flushAutosave() {
+    queueAutosave(draftRef.current, revisionRef.current);
+  }
+
+  function queueAutosave(snapshot: PreferenceDraft, revision: number) {
+    if (
+      revision <= savedRevisionRef.current
+      || revision <= queuedRevisionRef.current
+      || !isPreferenceDraftValid(snapshot)
+    ) {
+      return;
+    }
+    queuedRevisionRef.current = revision;
+    autosaveQueueRef.current = autosaveQueueRef.current.then(async () => {
+      if (isMountedRef.current) {
+        setSaveState("saving");
+      }
+      const current = settingsRef.current;
+      const saved = await onSaveRef.current({
+        ...current,
+        preferences: {
+          ...current.preferences,
+          ...snapshot,
+          enabledFeatures: [...snapshot.enabledFeatures],
+          autoEnabledFeaturesInitialized: true
+        }
+      }, "");
+      if (!saved) {
+        handleAutosaveFailure(snapshot, revision);
+        return;
+      }
+
+      if (
+        !snapshot.requestNotificationsEnabled
+        && (lastSavedNotificationsRef.current || notificationPermissionGrantedRef.current)
+      ) {
+        try {
+          await chrome.permissions.remove({ permissions: ["notifications"] });
+        } catch {
+          // The preference remains disabled even if this browser retains the optional permission.
+        }
+        notificationPermissionGrantedRef.current = false;
+      }
+      lastSavedNotificationsRef.current = snapshot.requestNotificationsEnabled;
+      savedRevisionRef.current = Math.max(savedRevisionRef.current, revision);
+      autosaveRetryCountRef.current = 0;
+      if (isMountedRef.current && revision === revisionRef.current) {
+        setSaveState("saved");
+      }
+    }).catch(() => {
+      handleAutosaveFailure(snapshot, revision);
     });
-    if (saved) {
-      setIsDirty(false);
+  }
+
+  function handleAutosaveFailure(snapshot: PreferenceDraft, revision: number) {
+    if (queuedRevisionRef.current === revision) {
+      queuedRevisionRef.current = savedRevisionRef.current;
+    }
+    if (!isMountedRef.current || revision !== revisionRef.current) {
+      return;
+    }
+    setSaveState("error");
+    if (autosaveRetryCountRef.current >= PREFERENCE_AUTOSAVE_MAX_RETRIES) {
+      return;
+    }
+    autosaveRetryCountRef.current += 1;
+    const retryDelay = PREFERENCE_AUTOSAVE_RETRY_DELAY_MS * autosaveRetryCountRef.current;
+    autosaveRetryTimerRef.current = window.setTimeout(() => {
+      autosaveRetryTimerRef.current = undefined;
+      queueAutosave(snapshot, revision);
+    }, retryDelay);
+  }
+
+  async function toggleRequestNotifications(enabled: boolean) {
+    setNotificationPermissionError("");
+    if (!enabled) {
+      updateDraft({ requestNotificationsEnabled: false });
+      return;
+    }
+    setIsRequestingNotificationPermission(true);
+    try {
+      const granted = await chrome.permissions.request({ permissions: ["notifications"] });
+      if (!granted) {
+        setNotificationPermissionError("Notification permission was not granted. Request tracking still works in Settings > Activity.");
+        return;
+      }
+      notificationPermissionGrantedRef.current = true;
+      updateDraft({ requestNotificationsEnabled: true });
+    } catch {
+      setNotificationPermissionError("This browser could not enable request notifications. Request tracking still works in Settings > Activity.");
+    } finally {
+      setIsRequestingNotificationPermission(false);
     }
   }
 
   function toggleFeature(feature: QuickPimFeature, enabled: boolean) {
-    setIsDirty(true);
-    setEnabledFeatures((current) => {
-      const next = new Set(current);
-      if (enabled) {
-        next.add(feature);
-      } else {
-        next.delete(feature);
-      }
-      return next;
-    });
+    const nextFeatures = new Set(draftRef.current.enabledFeatures);
+    if (enabled) {
+      nextFeatures.add(feature);
+    } else {
+      nextFeatures.delete(feature);
+    }
+    updateDraft({ enabledFeatures: PREFERENCE_FEATURES.filter((item) => nextFeatures.has(item)) });
   }
 
+  const recentLimitValid = draft.recentJustificationLimit >= 1 && draft.recentJustificationLimit <= 20;
+  const activityLimitValid = draft.activityHistoryLimit >= 10 && draft.activityHistoryLimit <= 200;
+
   return (
-    <section className="panel">
-      <h2>Preferences</h2>
+    <section className="preferences-panel">
+      <div className="preferences-title-row">
+        <div>
+          <h2>Preferences</h2>
+          <p className="muted">Changes on this page are saved automatically.</p>
+        </div>
+        <PreferenceSaveIndicator state={saveState} />
+      </div>
       <div className="preference-section">
         <h3>Popup defaults</h3>
         <p className="muted">These values are preselected when the popup opens. Role policies can still cap duration choices.</p>
@@ -1639,11 +2342,8 @@ function PreferencesPanel({
             <label>Default activation duration</label>
             <select
               className="select"
-              value={String(defaultDurationHours)}
-              onChange={(event) => {
-                setDefaultDurationHours(Number(event.target.value));
-                setIsDirty(true);
-              }}
+              value={String(draft.defaultDurationHours)}
+              onChange={(event) => updateDraft({ defaultDurationHours: Number(event.target.value) })}
               aria-label="Default activation duration"
             >
               {DEFAULT_DURATION_OPTIONS.map((option) => (
@@ -1656,10 +2356,11 @@ function PreferencesPanel({
           </div>
           <div className="field">
             <label>Default sort order</label>
-            <select className="select" value={defaultSort} onChange={(event) => {
-              setDefaultSort(event.target.value as SortMode);
-              setIsDirty(true);
-            }}>
+            <select
+              className="select"
+              value={draft.defaultSort}
+              onChange={(event) => updateDraft({ defaultSort: event.target.value as SortMode })}
+            >
               <option value="name">Name</option>
               <option value="lastUsed">Last use</option>
               <option value="activationCount">Activation count</option>
@@ -1670,120 +2371,170 @@ function PreferencesPanel({
           </div>
           <div className="field">
             <label>Recent justification history limit</label>
-            <input className="input" type="number" min="1" max="20" value={recentJustificationLimit} onChange={(event) => {
-              setRecentJustificationLimit(Number(event.target.value));
-              setIsDirty(true);
-            }} />
+            <input
+              className="input"
+              type="number"
+              min="1"
+              max="20"
+              value={draft.recentJustificationLimit}
+              aria-invalid={!recentLimitValid}
+              onChange={(event) => updateDraft({ recentJustificationLimit: Number(event.target.value) })}
+              onBlur={flushAutosave}
+            />
             <p className="muted">How many recent reasons the picker keeps.</p>
           </div>
         </div>
       </div>
       <div className="preference-section">
         <h3>Display</h3>
-        <label className="checkbox-option preference-toggle">
-          <input type="checkbox" checked={darkMode} onChange={(event) => {
-            setDarkMode(event.target.checked);
-            setIsDirty(true);
-          }} aria-label="Dark mode" />
-          <span>
-            <strong>Dark mode</strong>
-            <br />
-            <span className="muted">Use dark surfaces in the popup and settings.</span>
-          </span>
-        </label>
+        <div className="preference-toggle-list">
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.darkMode}
+              onChange={(event) => updateDraft({ darkMode: event.target.checked })}
+              aria-label="Dark mode"
+            />
+            <span>
+              <strong>Dark mode</strong>
+              <span className="muted">Use dark surfaces in the popup and settings.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.showRemainingActivationTime}
+              onChange={(event) => updateDraft({ showRemainingActivationTime: event.target.checked })}
+              aria-label="Show remaining activation time in popup"
+            />
+            <span>
+              <strong>Show remaining activation time</strong>
+              <span className="muted">Display a live countdown under PIM-active roles. Enabled by default.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.showAssignedRoles}
+              onChange={(event) => updateDraft({ showAssignedRoles: event.target.checked })}
+              aria-label="Show assigned active roles in popup"
+            />
+            <span>
+              <strong>Show assigned active roles</strong>
+              <span className="muted">Include direct active assignments that were not activated through PIM. Hidden by default.</span>
+            </span>
+          </label>
+        </div>
       </div>
       <div className="preference-section">
         <h3>Advanced settings</h3>
         <p className="muted">Optional detail, usage, and cache controls for users who want more visibility.</p>
-        <label className="checkbox-option preference-toggle">
-          <input
-            type="checkbox"
-            checked={showActivationCounters}
-            onChange={(event) => {
-              setShowActivationCounters(event.target.checked);
-              setIsDirty(true);
-            }}
-            aria-label="Show activation counters in popup"
-          />
-          <span>
-            <strong>Show activation counters</strong>
-            <br />
-            <span className="muted">Display the compact usage number on each popup row.</span>
-          </span>
-        </label>
-        <label className="checkbox-option preference-toggle">
-          <input
-            type="checkbox"
-            checked={showEnablementDetails}
-            onChange={(event) => {
-              setShowEnablementDetails(event.target.checked);
-              setIsDirty(true);
-            }}
-            aria-label="Show enablement details in popup"
-          />
-          <span>
-            <strong>Show enablement details</strong>
-            <br />
-            <span className="muted">Display per-row policy details such as max duration, required reason, ticket, and approval.</span>
-          </span>
-        </label>
-        <label className="checkbox-option preference-toggle">
-          <input
-            type="checkbox"
-            checked={showLastEnablementDate}
-            onChange={(event) => {
-              setShowLastEnablementDate(event.target.checked);
-              setIsDirty(true);
-            }}
-            aria-label="Show last enablement date in popup"
-          />
-          <span>
-            <strong>Show last enablement date</strong>
-            <br />
-            <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
-          </span>
-        </label>
-        <label className="checkbox-option preference-toggle">
-          <input
-            type="checkbox"
-            checked={backgroundPreRefreshEnabled}
-            onChange={(event) => {
-              setBackgroundPreRefreshEnabled(event.target.checked);
-              setIsDirty(true);
-            }}
-            aria-label="Enable background pre-refresh"
-          />
-          <span>
-            <strong>Background pre-refresh</strong>
-            <br />
-            <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
-          </span>
-        </label>
-        <div className="field settings-field-gap">
-          <label>Activity history limit</label>
-          <input
-            className="input"
-            type="number"
-            min="10"
-            max="200"
-            value={activityHistoryLimit}
-            onChange={(event) => {
-              setActivityHistoryLimit(Number(event.target.value));
-              setIsDirty(true);
-            }}
-          />
-          <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
+        <div className="preference-toggle-list">
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.showActivationCounters}
+              onChange={(event) => updateDraft({ showActivationCounters: event.target.checked })}
+              aria-label="Show activation counters in popup"
+            />
+            <span>
+              <strong>Show activation counters</strong>
+              <span className="muted">Display the compact usage number on each popup row.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.showEnablementDetails}
+              onChange={(event) => updateDraft({ showEnablementDetails: event.target.checked })}
+              aria-label="Show enablement details in popup"
+            />
+            <span>
+              <strong>Show enablement details</strong>
+              <span className="muted">Display per-row policy details such as max duration, required reason, ticket, and approval.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.showLastEnablementDate}
+              onChange={(event) => updateDraft({ showLastEnablementDate: event.target.checked })}
+              aria-label="Show last enablement date in popup"
+            />
+            <span>
+              <strong>Show last enablement date</strong>
+              <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.backgroundPreRefreshEnabled}
+              onChange={(event) => updateDraft({ backgroundPreRefreshEnabled: event.target.checked })}
+              aria-label="Enable background pre-refresh"
+            />
+            <span>
+              <strong>Background pre-refresh</strong>
+              <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
+            </span>
+          </label>
+          <label className="checkbox-option preference-toggle">
+            <input
+              type="checkbox"
+              checked={draft.requestNotificationsEnabled}
+              disabled={isRequestingNotificationPermission}
+              onChange={(event) => void toggleRequestNotifications(event.target.checked)}
+              aria-label="Notify me about request updates"
+            />
+            <span>
+              <strong>Request status notifications</strong>
+              <span className="muted">Notify when a QuickPIM++ request is approved, denied, completed, or close to expiry. Disabled by default.</span>
+            </span>
+          </label>
         </div>
+        <div className="advanced-preference-fields">
+          <div className="field">
+            <label>Expiry reminder</label>
+            <select
+              className="select"
+              value={draft.expiryReminderMinutes}
+              disabled={!draft.requestNotificationsEnabled}
+              onChange={(event) => updateDraft({ expiryReminderMinutes: Number(event.target.value) })}
+              aria-label="Request expiry reminder"
+            >
+              <option value={5}>5 minutes before</option>
+              <option value={15}>15 minutes before</option>
+              <option value={30}>30 minutes before</option>
+              <option value={60}>1 hour before</option>
+            </select>
+            <p className="muted">Applies only when Microsoft returns an activation end time.</p>
+          </div>
+          <div className="field">
+            <label>Activity history limit</label>
+            <input
+              className="input"
+              type="number"
+              min="10"
+              max="200"
+              value={draft.activityHistoryLimit}
+              aria-invalid={!activityLimitValid}
+              onChange={(event) => updateDraft({ activityHistoryLimit: Number(event.target.value) })}
+              onBlur={flushAutosave}
+            />
+            <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
+          </div>
+        </div>
+        {notificationPermissionError ? <p className="message error settings-inline-message" role="alert">{notificationPermissionError}</p> : null}
       </div>
       <div className="preference-section">
         <h3>Enabled features</h3>
         <p className="muted">Only enabled role features are fetched, shown in the popup, and checked by Access Setup. Empty enabled role tabs are still hidden automatically.</p>
-        <div className="checkbox-grid compact settings-section-gap">
-          {(["directoryRole", "pimGroup", "azureRole", "bundles"] as QuickPimFeature[]).map((feature) => (
+        <div className="checkbox-grid compact settings-section-gap enabled-features-grid">
+          {PREFERENCE_FEATURES.map((feature) => (
             <label className="checkbox-option" key={feature}>
               <input
                 type="checkbox"
-                checked={enabledFeatures.has(feature)}
+                checked={draft.enabledFeatures.includes(feature)}
                 onChange={(event) => toggleFeature(feature, event.target.checked)}
                 aria-label={`Enable ${popupTabLabel(feature)} feature`}
               />
@@ -1792,12 +2543,7 @@ function PreferencesPanel({
           ))}
         </div>
       </div>
-      <div className="button-row settings-form-actions">
-        <button className="btn primary" onClick={() => void save()}>
-          Save preferences
-        </button>
-      </div>
-      <div className="panel">
+      <div className="panel preferences-usage-panel">
         <h3>Usage counters</h3>
         {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
           <div className="settings-row" key={id}>
@@ -2138,26 +2884,32 @@ function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatur
 
 async function fetchActivationSnapshot(targets: AccessSetupTarget[]): Promise<ActivationSnapshot> {
   try {
-    const snapshot = await sendMessage<ActivationSnapshot>({
-      action: "getActivationSnapshot",
-      targets
-    });
+    const snapshot = await sendMessage<ActivationSnapshot>(
+      {
+        action: "getActivationSnapshot",
+        targets
+      },
+      { timeoutMs: ACTIVATION_SNAPSHOT_TIMEOUT_MS, timeoutMessage: `${targets.map(popupTabLabel).join(", ")} refresh timed out. Cached data remains available.` }
+    );
     if (isActivationSnapshot(snapshot)) {
       return snapshot;
     }
-  } catch {
+  } catch (error) {
+    if (isOperationTimeoutError(error)) {
+      throw error;
+    }
     // Fall through to the legacy paired calls for compatibility with older/background test runtimes.
   }
 
   const [eligible, active] = await Promise.all([
-    sendMessage<ActivationSnapshot["eligible"]>({
-      action: "getActivationItems",
-      targets
-    }),
-    sendMessage<ActivationSnapshot["active"]>({
-      action: "getActiveItems",
-      targets
-    })
+    sendMessage<ActivationSnapshot["eligible"]>(
+      { action: "getActivationItems", targets },
+      { timeoutMs: ACTIVATION_SNAPSHOT_TIMEOUT_MS, timeoutMessage: "Eligible assignment refresh timed out. Cached data remains available." }
+    ),
+    sendMessage<ActivationSnapshot["active"]>(
+      { action: "getActiveItems", targets },
+      { timeoutMs: ACTIVATION_SNAPSHOT_TIMEOUT_MS, timeoutMessage: "Active assignment refresh timed out. Cached data remains available." }
+    )
   ]);
   return {
     eligible,
@@ -2179,12 +2931,11 @@ function isActivationDataResult(value: unknown): value is ActivationSnapshot["el
   return Boolean(value && typeof value === "object" && !Array.isArray(value) && Array.isArray((value as Record<string, unknown>).items));
 }
 
-async function sendMessage<T>(message: Record<string, unknown>): Promise<T> {
-  const response = (await chrome.runtime.sendMessage(message)) as MessageResponse<T>;
-  if (!response?.success) {
-    throw new Error(response?.error || "QuickPIM++ background request failed.");
-  }
-  return response.data as T;
+function sendMessage<T>(
+  message: Record<string, unknown>,
+  options?: { timeoutMs?: number; timeoutMessage?: string }
+): Promise<T> {
+  return sendRuntimeMessage<T>(message, options);
 }
 
 function isTestRuntime() {

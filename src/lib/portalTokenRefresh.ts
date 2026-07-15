@@ -5,6 +5,7 @@ import {
   getTargetCacheStatus
 } from "./cache";
 import { mapWithConcurrencySettled } from "./concurrency";
+import { withTimeout } from "./async";
 import type {
   AccessSetupTarget,
   QuickPimDataCache,
@@ -17,6 +18,8 @@ export const ENTRA_PORTAL_TAB_PATTERN = "https://entra.microsoft.com/*";
 export const PORTAL_TOKEN_RECOVERY_WINDOW_MINUTES = 10;
 export const PORTAL_TAB_SCAN_TIMEOUT_MS = 6_500;
 export const PORTAL_TAB_SCAN_CONCURRENCY = 4;
+export const PORTAL_TAB_QUERY_TIMEOUT_MS = 2_000;
+export const PORTAL_TAB_SCAN_MAX_TABS = 8;
 
 export interface ChromeTabsLike {
   query(queryInfo: chrome.tabs.QueryInfo): Promise<chrome.tabs.Tab[]>;
@@ -31,26 +34,35 @@ export interface PortalTabScanResult {
 
 export async function scanOpenEntraTabs(
   tabs: ChromeTabsLike,
-  options: { timeoutMs?: number; concurrency?: number } = {}
+  options: { timeoutMs?: number; concurrency?: number; maxTabs?: number } = {}
 ): Promise<PortalTabScanResult> {
   let portalTabs: chrome.tabs.Tab[];
   try {
-    portalTabs = await tabs.query({ url: ENTRA_PORTAL_TAB_PATTERN });
+    portalTabs = await withTimeout(
+      tabs.query({ url: ENTRA_PORTAL_TAB_PATTERN }),
+      PORTAL_TAB_QUERY_TIMEOUT_MS,
+      "Portal tab lookup timed out."
+    );
   } catch {
     return { tabsFound: 0, tabsScanned: 0, captured: [] };
   }
 
-  const tabIds = [...new Set(
+  const uniqueTabs = [...new Map(
     portalTabs
-      .map((tab) => tab.id)
-      .filter((tabId): tabId is number => typeof tabId === "number")
-  )];
+      .filter((tab): tab is chrome.tabs.Tab & { id: number } => typeof tab.id === "number")
+      .map((tab) => [tab.id, tab])
+  ).values()];
+  const tabIds = uniqueTabs
+    .sort((a, b) => Number(Boolean(b.active)) - Number(Boolean(a.active)) || (b.lastAccessed || 0) - (a.lastAccessed || 0))
+    .slice(0, options.maxTabs ?? PORTAL_TAB_SCAN_MAX_TABS)
+    .map((tab) => tab.id);
   const settled = await mapWithConcurrencySettled(
     tabIds,
     options.concurrency ?? PORTAL_TAB_SCAN_CONCURRENCY,
     (tabId) => withTimeout(
       tabs.sendMessage(tabId, { action: "quickPimScanPortalTokens" }),
-      options.timeoutMs ?? PORTAL_TAB_SCAN_TIMEOUT_MS
+      options.timeoutMs ?? PORTAL_TAB_SCAN_TIMEOUT_MS,
+      "Portal token scan timed out."
     )
   );
 
@@ -69,7 +81,7 @@ export async function scanOpenEntraTabs(
   }
 
   return {
-    tabsFound: tabIds.length,
+    tabsFound: uniqueTabs.length,
     tabsScanned,
     captured: [...captured]
   };
@@ -113,10 +125,6 @@ export function getPortalTokenRecoveryTargets(options: {
   now?: number;
   refreshWindowMinutes?: number;
 }): AccessSetupTarget[] {
-  if (options.force) {
-    return [...options.enabledTargets];
-  }
-
   const staleTargets = new Set(options.staleTargets);
   const nonReadyTargets = new Set(
     buildAccessCapabilityItems(options.tokenStatus, options.cache, options.enabledTargets)
@@ -133,7 +141,7 @@ export function getPortalTokenRecoveryTargets(options: {
     )) {
       return true;
     }
-    return staleTargets.has(target) && nonReadyTargets.has(target);
+    return nonReadyTargets.has(target) && (Boolean(options.force) || staleTargets.has(target));
   });
 }
 
@@ -163,20 +171,4 @@ function isSuccessfulScanResponse(value: unknown): value is {
   data?: { captured?: TokenKind[] };
 } {
   return Boolean(value && typeof value === "object" && (value as { success?: unknown }).success === true);
-}
-
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Portal token scan timed out.")), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      }
-    );
-  });
 }

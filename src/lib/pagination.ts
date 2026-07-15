@@ -24,12 +24,22 @@ export async function collectPaginatedValues<T>(
     }
     seen.add(nextUrl);
     const data = await fetchPage(nextUrl);
-    const pageValues = data.value || [];
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("Microsoft API pagination response was malformed.");
+    }
+    const pageValues = data.value === undefined ? [] : data.value;
+    if (!Array.isArray(pageValues)) {
+      throw new Error("Microsoft API pagination response was malformed.");
+    }
     if (values.length + pageValues.length > maxItems) {
       throw new Error(`Microsoft API pagination exceeded ${maxItems} items.`);
     }
     values.push(...pageValues);
-    nextUrl = data["@odata.nextLink"] || data.nextLink;
+    const candidateNextUrl = data["@odata.nextLink"] ?? data.nextLink;
+    if (candidateNextUrl !== undefined && typeof candidateNextUrl !== "string") {
+      throw new Error("Microsoft API pagination response was malformed.");
+    }
+    nextUrl = candidateNextUrl || undefined;
   }
 
   return values;

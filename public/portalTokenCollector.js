@@ -1,7 +1,9 @@
 (() => {
   const JWT_PATTERN = /\b[A-Za-z0-9_-]{1,2000}\.[A-Za-z0-9_-]{1,8000}\.[A-Za-z0-9_-]{1,2000}\b/g;
   const MAX_STORAGE_VALUE_LENGTH = 300000;
-  const MAX_TOKENS = 20;
+  // MSAL can retain several scoped tokens per account. Keep enough candidates for
+  // the background selector to choose coherent Entra, PIM Group, and Azure tokens.
+  const MAX_TOKENS = 100;
   const MAX_JSON_DEPTH = 5;
   const MAX_ATTEMPTS = 45;
   const MAX_INDEXED_DB_DATABASES = 12;
@@ -43,9 +45,6 @@
     const result = await submitTokens(tokens);
     if (result.delivered) {
       lastTokenFingerprint = fingerprint;
-      if (result.captured.length && interval !== undefined) {
-        clearInterval(interval);
-      }
     }
     return { tokenCount: tokens.length, captured: result.captured };
   }

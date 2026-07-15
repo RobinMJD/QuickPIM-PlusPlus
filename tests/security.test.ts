@@ -143,20 +143,83 @@ describe("runtime message validation", () => {
   test("rejects unsupported and malformed privileged messages", () => {
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
     expect(validateQuickPimMessage({ action: "refreshPortalTokens" })).toEqual({ action: "refreshPortalTokens" });
+    expect(validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: ["pimGroup", "pimGroup", "azureRole"] })).toEqual({
+      action: "openPortalRecoveryTabs",
+      targets: ["pimGroup", "azureRole"]
+    });
+    expect(validateQuickPimMessage({ action: "closePortalRecoveryTabs", targets: ["directoryRole"] })).toEqual({
+      action: "closePortalRecoveryTabs",
+      targets: ["directoryRole"]
+    });
+    expect(validateQuickPimMessage({ action: "getPortalRecoveryStatus" })).toEqual({ action: "getPortalRecoveryStatus" });
+    expect(validateQuickPimMessage({ action: "focusPortalRecoveryTabs" })).toEqual({ action: "focusPortalRecoveryTabs" });
     expect(validateQuickPimMessage({ action: "getActivationSnapshot", targets: ["directoryRole", "directoryRole", "azureRole"] })).toEqual({
       action: "getActivationSnapshot",
       targets: ["directoryRole", "azureRole"]
+    });
+    expect(validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: ["request-1", "request-1", " request-2 "] })).toEqual({
+      action: "refreshTrackedRequests",
+      requestIds: ["request-1", "request-2"]
     });
     expect(validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["a.b.c"], source: "entra" })).toEqual({
       action: "capturePortalTokens",
       tokens: ["a.b.c"],
       source: "entra"
     });
+    const scopedTokens = Array.from({ length: 25 }, (_, index) => `header.payload${index}.signature`);
+    expect(validateQuickPimMessage({
+      action: "capturePortalTokens",
+      tokens: [scopedTokens[0], ...scopedTokens, scopedTokens[0]]
+    })).toMatchObject({
+      action: "capturePortalTokens",
+      tokens: scopedTokens
+    });
     expect(() => validateQuickPimMessage({ action: "manualSetToken", token: "abc" })).toThrow(/unsupported/i);
+    expect(() => validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: [] })).toThrow(/must not be empty/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
+    expect(() => validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: "request-1" })).toThrow(/identifiers/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: "not-array" })).toThrow(/items/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(/between 1 and 100/i);
+    const duplicateRole = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      principalId: "user",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [duplicateRole, { ...duplicateRole, id: "different-client-id", roleDefinitionId: "READER" }],
+      durationHours: 1,
+      justification: "Investigate production issue"
+    })).toThrow(/duplicate/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [duplicateRole],
+      durationHours: 0.25,
+      justification: "Investigate production issue"
+    })).toThrow(/between 0.5 and 24/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [{ ...duplicateRole, activationRequirements: { maxDurationHours: 2 } }],
+      durationHours: 4,
+      justification: "Investigate production issue"
+    })).toThrow(/policy maximum/i);
+    expect(() => validateQuickPimMessage({
+      action: "deactivateItems",
+      items: [{
+        id: "directoryRole:reader:/",
+        type: "directoryRole",
+        principalId: "user",
+        status: "active",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/",
+        activeAssignmentType: "assigned",
+        assignmentScheduleId: "assigned-schedule"
+      }]
+    })).toThrow(/activated through PIM/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
       items: [{ id: "x", type: "unknown", principalId: "user", status: "eligible" }],
@@ -189,7 +252,13 @@ describe("activation request validation", () => {
   };
 
   test("rejects invalid activation duration, oversized strings, and unsafe Azure scopes", () => {
+    expect(() => buildActivationRequest(directoryRole, 0.25, "Need production access")).toThrow(/duration/i);
     expect(() => buildActivationRequest(directoryRole, 25, "Need access")).toThrow(/duration/i);
+    expect(() => buildActivationRequest(
+      { ...directoryRole, activationRequirements: { maxDurationHours: 2 } },
+      4,
+      "Need production access"
+    )).toThrow(/policy maximum/i);
     expect(() => buildActivationRequest(directoryRole, 1, "x".repeat(1025))).toThrow(/justification/i);
     expect(() => buildActivationRequest(directoryRole, 1, "BAU")).toThrow(/generic/i);
     expect(() =>

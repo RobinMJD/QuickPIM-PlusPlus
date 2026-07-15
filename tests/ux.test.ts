@@ -126,6 +126,94 @@ describe("popup cache helpers", () => {
     expect(mergeDataCachesForSave({ eligible: current }, { eligible: incoming }).eligible).toEqual(incoming);
   });
 
+  test("does not let an older refresh overwrite a newer account cache after completing late", () => {
+    const current = {
+      items: [],
+      errors: ["Missing token"],
+      fetchedAt: 0,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-b:user-b"
+    };
+    const incoming = {
+      items: [directoryRole],
+      errors: [],
+      fetchedAt: 400,
+      refreshStartedAt: 100,
+      cacheKey: "tenant-a:user-a"
+    };
+
+    expect(mergeDataCachesForSave({ eligible: current }, { eligible: incoming }).eligible).toEqual(current);
+  });
+
+  test("lets a newer account refresh invalidate an older successful cache", () => {
+    const current = {
+      items: [directoryRole],
+      errors: [],
+      fetchedAt: 400,
+      refreshStartedAt: 100,
+      cacheKey: "tenant-a:user-a"
+    };
+    const incoming = {
+      items: [],
+      errors: ["Missing token"],
+      fetchedAt: 0,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-b:user-b"
+    };
+
+    expect(mergeDataCachesForSave({ eligible: current }, { eligible: incoming }).eligible).toEqual(incoming);
+  });
+
+  test("does not let a concurrent same-account failure discard successful cached data", () => {
+    const successful = {
+      items: [directoryRole],
+      errors: [],
+      fetchedAt: 400,
+      refreshStartedAt: 100,
+      cacheKey: "tenant-a:user-a"
+    };
+    const newerFailure = {
+      items: [],
+      errors: ["Graph request timed out"],
+      fetchedAt: 0,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-a:user-a"
+    };
+
+    expect(mergeDataCachesForSave({ eligible: successful }, { eligible: newerFailure }).eligible).toMatchObject({
+      items: [directoryRole],
+      errors: ["Graph request timed out"],
+      fetchedAt: 400,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-a:user-a"
+    });
+  });
+
+  test("keeps a late same-account success even if a newer refresh already failed", () => {
+    const newerFailure = {
+      items: [],
+      errors: ["Graph request timed out"],
+      fetchedAt: 0,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-a:user-a"
+    };
+    const lateSuccess = {
+      items: [directoryRole],
+      errors: [],
+      fetchedAt: 400,
+      refreshStartedAt: 100,
+      cacheKey: "tenant-a:user-a"
+    };
+
+    expect(mergeDataCachesForSave({ eligible: newerFailure }, { eligible: lateSuccess }).eligible).toMatchObject({
+      items: [directoryRole],
+      errors: ["Graph request timed out"],
+      fetchedAt: 400,
+      refreshStartedAt: 300,
+      cacheKey: "tenant-a:user-a"
+    });
+  });
+
   test("does not copy one feature failure into unrelated target results", () => {
     const split = splitActivationResultByTarget(
       {
@@ -322,7 +410,16 @@ describe("popup cache helpers", () => {
 describe("popup model helpers", () => {
   test("shows readable token status instead of raw minute badges", () => {
     expect(tokenStatusText("Graph", { hasToken: true, tokenAge: 1, isExpired: false })).toBe("Graph ready (1 min ago)");
-    expect(tokenStatusText("Azure", { hasToken: false })).toBe("Azure token missing");
+    expect(tokenStatusText("Azure", { hasToken: false })).toBe("Azure access needed");
+    expect(tokenStatusText("Graph", { hasToken: true, isExpired: true })).toBe("Graph refresh needed");
+  });
+
+  test("explains Microsoft's five-minute deactivation minimum", () => {
+    expect(formatLoadMessages([
+      "The Active duration is too short. Miniumum Required is 5 minutes."
+    ])).toEqual([
+      "Microsoft requires an activation to remain active for at least 5 minutes before it can be disabled. Retry after the five-minute minimum."
+    ]);
   });
 
   test("uses JWT expiry instead of capture age for token status", () => {
@@ -343,7 +440,7 @@ describe("popup model helpers", () => {
       expiresInMinutes: 10
     });
     expect(tokenStatusText("Graph", makeTokenStatus(expiredToken, capturedAt, "portal", now))).toBe(
-      "Graph expired. Refresh in portal."
+      "Graph refresh needed"
     );
   });
 
@@ -423,7 +520,10 @@ describe("popup model helpers", () => {
       activeOnlyRole,
       activeOnlyPimGroup
     ]);
-    expect(getDeactivatableItems([directoryRole, activeOnlyRole, { ...directoryRole, status: "pendingApproval" }])).toEqual([activeOnlyRole]);
+    expect(getDeactivatableItems(
+      [directoryRole, activeOnlyRole, { ...directoryRole, status: "pendingApproval" }],
+      Date.parse("2026-05-18T12:00:00.000Z")
+    )).toEqual([activeOnlyRole]);
   });
 
   test("identifies high privilege rows from Microsoft-provided role metadata", () => {

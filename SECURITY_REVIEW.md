@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.8.1.
+Reviewed for v2.10.8.
 
 ## Threat Model
 
@@ -21,6 +21,8 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 
 - Host permissions are limited to `https://graph.microsoft.com/*`, `https://management.azure.com/*`, `https://entra.microsoft.com/*`, and `https://api.github.com/*` for public changelog metadata.
 - The `alarms` permission is used only to schedule local background pre-refresh. When a token is missing or near expiry, the alarm first asks already-open Entra tabs to rescan their bounded MSAL storage; it skips API work if no usable token is then available and never displays UI messages.
+- Request-status alarms are one-shot and exist only while a QuickPIM++ request is unresolved or an enabled expiry reminder is pending. Checks are capped per run, use bounded concurrency and exponential backoff, and stop automatically after 24 hours.
+- The `tabGroups` permission is used only to label and collapse temporary portal-recovery tabs created by QuickPIM++. Those tabs open inactive, are tracked in session storage, and close after a matching newer usable token or successful API refresh. Extension-created tabs remain tracked through a hidden Microsoft authentication redirect so account selection can be completed without granting QuickPIM++ access to Microsoft login pages. Moving a tab out of the managed group or navigating it to another visible site untracks it without closing it; a ten-minute alarm removes abandoned managed tabs.
 - Entra content-script token messages are accepted only from the `entra.microsoft.com` origin and still pass the same token validation before storage. The content script runs in matching frames only and limits scanned databases, stores, records, value length, recursion depth, and token count.
 - Popup refresh, background pre-refresh, and Access Setup share a bounded, timed, single-flight scan of already-open Entra tabs before opening new setup pages; the extension does not request Chrome cookie access and cannot exchange Microsoft session cookies directly for API tokens.
 - Extension pages use an explicit MV3 content security policy.
@@ -31,8 +33,13 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 
 - Imported settings are normalized through length, type, range, and count limits.
 - Popup activation drafts are bounded, stored locally, expire after 24 hours, and are cleared when the in-progress selection is no longer useful.
+- Popup draft mutations and learned reference-name mutations are serialized; learned names are merged by timestamp so concurrent refresh completion cannot restore stale data.
 - Saved justifications, aliases, learned names, bundles, activity history, usage history, popup drafts, cached role data, and preferences remain local to the browser profile.
+- Tracked request records keep only bounded request identifiers, item metadata, lifecycle state, local justification text, and sanitized diagnostics. Tokens and raw Microsoft API payloads are never persisted in request history.
+- Request records are matched to the captured tenant and principal before status calls are made. Microsoft API URLs remain constrained to the existing Graph and Azure Management allowlists.
+- Browser notifications require an optional permission requested only when the user enables request notifications; the feature is disabled by default and request tracking remains usable without it.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.
+- Activation messages reject duplicate logical role targets, durations outside 30 minutes to 24 hours, and durations above the strictest known tenant policy before a Microsoft write is attempted.
 - Cached role data is keyed by tenant, principal, and token capability so one signed-in identity cannot reuse another identity's PIM snapshot while a same-capability token renewal can keep fresh cached data.
 
 ## Dependency And Repository Hygiene

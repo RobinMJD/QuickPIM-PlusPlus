@@ -6,6 +6,7 @@ import {
   buildActivationRequest,
   getActiveUntilFromScheduleInfo,
   getRoleDefinitionLookupKeys,
+  normalizeActiveAssignmentType,
   normalizeAzureRole,
   normalizeDirectoryRole,
   normalizePimGroup
@@ -14,6 +15,8 @@ import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrl
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./lib/apiErrors";
 import { mapWithConcurrency, mapWithConcurrencySettled } from "./lib/concurrency";
 import { collectPaginatedValues } from "./lib/pagination";
+import { withTimeout } from "./lib/async";
+import { runWithActivationItemLock } from "./lib/requestGate";
 import { getEnabledRoleFeatures, loadSettings, SETTINGS_KEY } from "./lib/settings";
 import {
   loadReferenceData,
@@ -37,10 +40,41 @@ import {
   syncPreRefreshAlarm
 } from "./lib/preRefresh";
 import {
+  REQUEST_TRACKING_ALARM_NAME,
+  REQUEST_TRACKING_AZURE_CONCURRENCY,
+  REQUEST_TRACKING_GRAPH_CONCURRENCY,
+  createTrackedPimRequest,
+  getDueTrackedRequests,
+  getActivationRequestItemStatus,
+  getEffectiveTrackedRequestStatus,
+  getPendingTrackedRequestCount,
+  getRequestTrackingMaintenanceTime,
+  isTrackedRequestPending,
+  loadTrackedRequests,
+  markTrackedRequestCheckFailure,
+  mutateTrackedRequests,
+  trackedRequestMatchesValidatedToken,
+  trackedRequestStatusLabel,
+  updateTrackedRequestFromPayload,
+  upsertTrackedRequests,
+  REQUEST_TRACKING_KEY
+} from "./lib/requestTracking";
+import {
   getPortalTokenRecoveryTargets,
   getStaleCacheTargets,
   scanOpenEntraTabs
 } from "./lib/portalTokenRefresh";
+import {
+  PORTAL_RECOVERY_CLEANUP_ALARM_NAME,
+  PORTAL_RECOVERY_SESSION_TTL_MS,
+  closeCompletedPortalRecoveryTabs,
+  closeExpiredPortalRecoveryTabs,
+  closePortalRecoveryTabsForTargets,
+  focusPortalRecoveryTabs,
+  getPortalRecoveryStatus,
+  openPortalRecoveryTabsAndReconcile,
+  type PortalRecoveryApis
+} from "./lib/portalRecoveryTabs";
 import {
   getRequiredGraphActivationScopes,
   getGraphTokenAuthStrengthScore,
@@ -60,6 +94,7 @@ import {
   validateCapturedToken
 } from "./lib/security";
 import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
+import { selectPortalTokenCandidates } from "./lib/tokenCandidates";
 import {
   clearStoredTokens,
   getStoredTokensFromSession,
@@ -86,7 +121,10 @@ import type {
   RoleManagementPolicyAssignmentApi,
   TicketInfo,
   TokenKind,
-  TokenStatus
+  TokenStatus,
+  TrackedPimRequest,
+  TrackedPimRequestStatus,
+  TrackedPimRequestStore
 } from "./lib/types";
 
 type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
@@ -106,8 +144,13 @@ interface AzureRoleDefinitionInfo {
 }
 
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
-const TOKEN_KINDS: TokenKind[] = ["graph", "azureManagement"];
+const MICROSOFT_API_READ_TIMEOUT_MS = 12_000;
+const MICROSOFT_API_WRITE_TIMEOUT_MS = 45_000;
+const TARGET_SNAPSHOT_TIMEOUT_MS = 22_000;
 let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
+let requestTrackingMaintenanceInFlight: Promise<TrackedPimRequestStore> | undefined;
+const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
+const REQUEST_TRACKING_STORAGE_TIMEOUT_MS = 750;
 
 const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
   directoryRole: {
@@ -134,22 +177,40 @@ void initializeBackgroundRefresh();
 
 chrome.runtime.onInstalled?.addListener(() => {
   void initializeBackgroundRefresh();
+  void initializeRequestTracking();
 });
 
 chrome.runtime.onStartup?.addListener(() => {
   void initializeBackgroundRefresh().then(() => runBackgroundPreRefresh());
+  void initializeRequestTracking();
 });
 
 chrome.storage.onChanged?.addListener((changes, areaName) => {
   if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
     void initializeBackgroundRefresh();
+    void initializeRequestTracking();
+  }
+  if (areaName === "local" && changes[REQUEST_TRACKING_KEY]) {
+    void initializeRequestTracking();
   }
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (alarm.name === PRE_REFRESH_ALARM_NAME) {
     void runBackgroundPreRefresh();
+  } else if (alarm.name === REQUEST_TRACKING_ALARM_NAME) {
+    void runTrackedRequestMaintenance();
+  } else if (alarm.name === PORTAL_RECOVERY_CLEANUP_ALARM_NAME) {
+    void closeExpiredPortalRecoveryTabs(getPortalRecoveryApis());
   }
+});
+
+chrome.notifications?.onClicked?.addListener((notificationId) => {
+  if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
+    return;
+  }
+  void chrome.tabs.create({ url: chrome.runtime.getURL("settings.html#activity") });
+  void chrome.notifications.clear(notificationId);
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -187,7 +248,376 @@ async function initializeBackgroundRefresh(): Promise<void> {
   }
 }
 
+async function initializeRequestTracking(): Promise<void> {
+  try {
+    const [store, settings] = await Promise.all([loadTrackedRequests(), loadSettings()]);
+    await Promise.all([
+      updateTrackedRequestBadge(store),
+      scheduleTrackedRequestMaintenance(store, settings)
+    ]);
+  } catch {
+    // Tracking is optional and must never interfere with activation or browser startup.
+  }
+}
+
+async function runTrackedRequestMaintenance(
+  requestIds?: string[],
+  force = false
+): Promise<TrackedPimRequestStore> {
+  if (requestTrackingMaintenanceInFlight) {
+    const current = await requestTrackingMaintenanceInFlight;
+    if (!force) {
+      return current;
+    }
+  }
+
+  const maintenance = performTrackedRequestMaintenance(requestIds, force);
+  requestTrackingMaintenanceInFlight = maintenance.finally(() => {
+    requestTrackingMaintenanceInFlight = undefined;
+  });
+  return requestTrackingMaintenanceInFlight;
+}
+
+async function performTrackedRequestMaintenance(
+  requestIds: string[] | undefined,
+  force: boolean
+): Promise<TrackedPimRequestStore> {
+  const now = Date.now();
+  const [initialStore, settings] = await Promise.all([loadTrackedRequests(), loadSettings()]);
+  const forcedIds = force
+    ? requestIds?.length
+      ? requestIds
+      : initialStore.requests
+        .filter((request) => isTrackedRequestPending(request) || request.status === "statusUnavailable")
+        .map((request) => request.id)
+    : requestIds;
+  const dueRequests = getDueTrackedRequests(initialStore, now, forcedIds);
+  const updates = new Map<string, TrackedPimRequest>();
+
+  if (dueRequests.length) {
+    const tokens = await getStoredTokens();
+    const directoryRequests = dueRequests.filter((request) => request.itemType === "directoryRole");
+    const pimGroupRequests = dueRequests.filter((request) => request.itemType === "pimGroup");
+    const azureRequests = dueRequests.filter((request) => request.itemType === "azureRole");
+    await Promise.all([
+      pollDirectoryTrackedRequests(directoryRequests, tokens, updates, now),
+      pollPimGroupTrackedRequests(pimGroupRequests, tokens, updates, now),
+      pollAzureTrackedRequests(azureRequests, tokens, updates, now)
+    ]);
+  }
+
+  const hasEffectiveStatusChanges = initialStore.requests.some(
+    (request) => getEffectiveTrackedRequestStatus(request, now) !== request.status
+  );
+  const updatedStore = updates.size || hasEffectiveStatusChanges
+    ? await mutateTrackedRequests((current) => ({
+      version: 1,
+      requests: current.requests.map((request) => {
+        const update = updates.get(request.id);
+        if (update) {
+          return { ...request, ...update };
+        }
+        const effectiveStatus = getEffectiveTrackedRequestStatus(request, now);
+        return effectiveStatus === request.status
+          ? request
+          : { ...request, status: effectiveStatus, updatedAt: new Date(now).toISOString(), nextCheckAt: undefined };
+      })
+    }))
+    : initialStore;
+  const notifiedStore = await notifyTrackedRequestChanges(initialStore, updatedStore, settings, now);
+  await Promise.all([
+    updateTrackedRequestBadge(notifiedStore),
+    scheduleTrackedRequestMaintenance(notifiedStore, settings)
+  ]);
+  return notifiedStore;
+}
+
+async function pollDirectoryTrackedRequests(
+  requests: TrackedPimRequest[],
+  tokens: StoredTokens,
+  updates: Map<string, TrackedPimRequest>,
+  now: number
+): Promise<void> {
+  if (!requests.length) return;
+  const token = getGraphTokenForTarget(tokens, "directoryRole");
+  const trackable = markRequestsWaitingForMatchingToken(requests, token, updates, now);
+  if (!token || !trackable.length) return;
+
+  try {
+    const payloads = await fetchAllPages<Record<string, unknown>>(
+      graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
+      token
+    );
+    updateRequestsFromPayloadCollection(trackable, payloads, updates, now);
+  } catch (error) {
+    for (const request of trackable) {
+      updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
+    }
+  }
+}
+
+async function pollPimGroupTrackedRequests(
+  requests: TrackedPimRequest[],
+  tokens: StoredTokens,
+  updates: Map<string, TrackedPimRequest>,
+  now: number
+): Promise<void> {
+  if (!requests.length) return;
+  const token = getGraphTokenForTarget(tokens, "pimGroup");
+  const trackable = markRequestsWaitingForMatchingToken(requests, token, updates, now);
+  if (!token || !trackable.length) return;
+
+  const byPrincipal = new Map<string, TrackedPimRequest[]>();
+  for (const request of trackable) {
+    const group = byPrincipal.get(request.principalId) || [];
+    group.push(request);
+    byPrincipal.set(request.principalId, group);
+  }
+  await mapWithConcurrency([...byPrincipal.entries()], REQUEST_TRACKING_GRAPH_CONCURRENCY, async ([principalId, principalRequests]) => {
+    try {
+      const filter = new URLSearchParams({ "$filter": `principalId eq '${escapeODataString(principalId)}'` });
+      const payloads = await fetchAllPages<Record<string, unknown>>(
+        graphApiUrl(`/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests?${filter.toString()}`),
+        token
+      );
+      updateRequestsFromPayloadCollection(principalRequests, payloads, updates, now);
+    } catch (error) {
+      for (const request of principalRequests) {
+        updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
+      }
+    }
+  });
+}
+
+async function pollAzureTrackedRequests(
+  requests: TrackedPimRequest[],
+  tokens: StoredTokens,
+  updates: Map<string, TrackedPimRequest>,
+  now: number
+): Promise<void> {
+  if (!requests.length) return;
+  const token = tokens.azureManagementToken;
+  const trackable = markRequestsWaitingForMatchingToken(requests, token, updates, now);
+  if (!token || !trackable.length) return;
+
+  await mapWithConcurrency(trackable, REQUEST_TRACKING_AZURE_CONCURRENCY, async (request) => {
+    try {
+      const scope = getSafeTrackedAzureScope(request.azureScope);
+      const endpoint = azureManagementUrl(
+        `${scope}/providers/Microsoft.Authorization/roleAssignmentScheduleRequests/${encodePathSegment(request.requestId)}?api-version=2020-10-01`
+      );
+      const payload = await fetchJson<Record<string, unknown>>(endpoint, token);
+      updates.set(request.id, updateTrackedRequestFromPayload(request, payload, now));
+    } catch (error) {
+      updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
+    }
+  });
+}
+
+function markRequestsWaitingForMatchingToken(
+  requests: TrackedPimRequest[],
+  token: string | undefined,
+  updates: Map<string, TrackedPimRequest>,
+  now: number
+): TrackedPimRequest[] {
+  const trackable: TrackedPimRequest[] = [];
+  for (const request of requests) {
+    if (token && trackedRequestMatchesValidatedToken(request, token, now)) {
+      trackable.push(request);
+    } else {
+      updates.set(request.id, markTrackedRequestCheckFailure(
+        request,
+        "Waiting for matching Microsoft portal access.",
+        now,
+        { waitingForAccess: true }
+      ));
+    }
+  }
+  return trackable;
+}
+
+function updateRequestsFromPayloadCollection(
+  requests: TrackedPimRequest[],
+  payloads: Record<string, unknown>[],
+  updates: Map<string, TrackedPimRequest>,
+  now: number
+): void {
+  const byId = new Map(payloads.flatMap((payload) => {
+    const id = getResponseIdentifier(payload);
+    return id ? [[id.toLowerCase(), payload] as const] : [];
+  }));
+  for (const request of requests) {
+    const payload = byId.get(request.requestId.toLowerCase());
+    updates.set(
+      request.id,
+      payload
+        ? updateTrackedRequestFromPayload(request, payload, now)
+        : markTrackedRequestCheckFailure(request, "Microsoft has not exposed this request status yet.", now)
+    );
+  }
+}
+
+async function notifyTrackedRequestChanges(
+  previousStore: TrackedPimRequestStore,
+  nextStore: TrackedPimRequestStore,
+  settings: Awaited<ReturnType<typeof loadSettings>>,
+  now: number
+): Promise<TrackedPimRequestStore> {
+  if (!settings.preferences.requestNotificationsEnabled || !(await hasNotificationPermission())) {
+    return nextStore;
+  }
+
+  const previousById = new Map(previousStore.requests.map((request) => [request.id, request]));
+  const patches = new Map<string, Partial<TrackedPimRequest>>();
+  const reminderMinutes = settings.preferences.expiryReminderMinutes;
+  for (const request of nextStore.requests) {
+    const previous = previousById.get(request.id);
+    const status = getEffectiveTrackedRequestStatus(request, now);
+    if (previous && previous.status !== status && isNotifiableRequestStatus(status) && request.notifiedStatus !== status) {
+      const shown = await showTrackedRequestNotification(request, status);
+      if (shown) {
+        patches.set(request.id, { notifiedStatus: status });
+      }
+    }
+
+    if (status === "active" && request.activeUntil && !request.expiryReminderSentAt) {
+      const expiresAt = Date.parse(request.activeUntil);
+      const reminderAt = expiresAt - reminderMinutes * 60_000;
+      if (Number.isFinite(expiresAt) && now >= reminderAt && now < expiresAt) {
+        const shown = await showExpiryReminderNotification(request, reminderMinutes);
+        if (shown) {
+          patches.set(request.id, {
+            ...patches.get(request.id),
+            expiryReminderSentAt: new Date(now).toISOString()
+          });
+        }
+      }
+    }
+  }
+
+  if (!patches.size) {
+    return nextStore;
+  }
+  return mutateTrackedRequests((current) => ({
+    version: 1,
+    requests: current.requests.map((request) => ({ ...request, ...patches.get(request.id) }))
+  }));
+}
+
+async function showTrackedRequestNotification(
+  request: TrackedPimRequest,
+  status: TrackedPimRequestStatus
+): Promise<boolean> {
+  const action = request.action === "activate" ? "activation" : "deactivation";
+  const message = status === "active"
+    ? `${request.itemName} is now active.`
+    : status === "completed"
+      ? `${request.itemName} deactivation completed.`
+      : `${request.itemName} ${action} was ${trackedRequestStatusLabel(status).toLowerCase()}.`;
+  return createRequestNotification(request, `Request ${trackedRequestStatusLabel(status).toLowerCase()}`, message, status);
+}
+
+async function showExpiryReminderNotification(request: TrackedPimRequest, reminderMinutes: number): Promise<boolean> {
+  return createRequestNotification(
+    request,
+    "PIM access expiring soon",
+    `${request.itemName} expires in about ${reminderMinutes} minutes.`,
+    "active",
+    "expiry"
+  );
+}
+
+async function createRequestNotification(
+  request: TrackedPimRequest,
+  title: string,
+  message: string,
+  status: TrackedPimRequestStatus,
+  suffix = "status"
+): Promise<boolean> {
+  try {
+    await chrome.notifications.create(
+      `${REQUEST_TRACKING_NOTIFICATION_PREFIX}${request.itemType}:${request.requestId.slice(0, 128)}:${status}:${suffix}`,
+      {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
+        title,
+        message,
+        contextMessage: "Click to open request details."
+      }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function hasNotificationPermission(): Promise<boolean> {
+  if (!chrome.notifications || !chrome.permissions?.contains) {
+    return false;
+  }
+  try {
+    return await chrome.permissions.contains({ permissions: ["notifications"] });
+  } catch {
+    return false;
+  }
+}
+
+async function updateTrackedRequestBadge(store: TrackedPimRequestStore): Promise<void> {
+  if (!chrome.action?.setBadgeText) return;
+  const count = getPendingTrackedRequestCount(store);
+  const text = count > 99 ? "99+" : count ? String(count) : "";
+  await chrome.action.setBadgeText({ text });
+  if (text && chrome.action.setBadgeBackgroundColor) {
+    await chrome.action.setBadgeBackgroundColor({ color: "#2563eb" });
+  }
+}
+
+async function scheduleTrackedRequestMaintenance(
+  store: TrackedPimRequestStore,
+  settings: Awaited<ReturnType<typeof loadSettings>>
+): Promise<void> {
+  if (!chrome.alarms) return;
+  const notificationsEnabled = settings.preferences.requestNotificationsEnabled && await hasNotificationPermission();
+  const when = getRequestTrackingMaintenanceTime(store, {
+    notificationsEnabled,
+    expiryReminderMinutes: settings.preferences.expiryReminderMinutes
+  });
+  if (!when) {
+    await chrome.alarms.clear(REQUEST_TRACKING_ALARM_NAME);
+    return;
+  }
+  const existing = await chrome.alarms.get(REQUEST_TRACKING_ALARM_NAME);
+  if (existing && Math.abs(existing.scheduledTime - when) < 1_000) {
+    return;
+  }
+  await chrome.alarms.create(REQUEST_TRACKING_ALARM_NAME, { when });
+}
+
+function isNotifiableRequestStatus(status: TrackedPimRequestStatus): boolean {
+  return status === "active" || status === "completed" || status === "denied" || status === "failed" || status === "canceled";
+}
+
+function getSafeTrackedAzureScope(value: string | undefined): string {
+  if (
+    !value
+    || !value.startsWith("/")
+    || value.includes("?")
+    || value.includes("#")
+    || value.includes("\\")
+    || value.split("/").includes("..")
+    || !(/^\/subscriptions\/[^/]+(?:\/.*)?$/i.test(value) || /^\/providers\/Microsoft\.Management\/managementGroups\/[^/]+(?:\/.*)?$/i.test(value))
+  ) {
+    throw new Error("Tracked Azure request scope is invalid.");
+  }
+  return value.replace(/\/$/, "");
+}
+
+function escapeODataString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 async function runBackgroundPreRefresh(): Promise<void> {
+  const refreshStartedAt = Date.now();
   const settings = await loadSettings();
   if (!settings.preferences.backgroundPreRefreshEnabled) {
     await syncPreRefreshAlarm(chrome.alarms, false);
@@ -233,7 +663,8 @@ async function runBackgroundPreRefresh(): Promise<void> {
     targets,
     snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, targets),
     fetchedAt,
-    targetCacheKeys
+    targetCacheKeys,
+    refreshStartedAt
   );
   nextCache = updateCacheFromTargetResults(
     nextCache,
@@ -241,7 +672,8 @@ async function runBackgroundPreRefresh(): Promise<void> {
     targets,
     snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, targets),
     fetchedAt,
-    targetCacheKeys
+    targetCacheKeys,
+    refreshStartedAt
   );
 
   await saveDataCache(nextCache);
@@ -255,6 +687,14 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getTokenStatus();
     case "refreshPortalTokens":
       return refreshPortalTokensFromOpenTabs();
+    case "getPortalRecoveryStatus":
+      return getPortalRecoveryStatus(getPortalRecoveryApis());
+    case "focusPortalRecoveryTabs":
+      return focusPortalRecoveryTabs(getPortalRecoveryApis());
+    case "openPortalRecoveryTabs":
+      return openManagedPortalRecoveryTabs(message.targets);
+    case "closePortalRecoveryTabs":
+      return closePortalRecoveryTabsForTargets(message.targets, getPortalRecoveryApis());
     case "clearToken":
       await clearTokens();
       return true;
@@ -264,10 +704,12 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getActiveItems(message.targets);
     case "getActivationSnapshot":
       return getActivationSnapshot(message.targets);
+    case "refreshTrackedRequests":
+      return runTrackedRequestMaintenance(message.requestIds, true);
     case "capturePortalTokens":
       return capturePortalTokens(message.tokens, message.source, sender);
     case "activateItems":
-      return activateItems(message.items, message.durationHours, message.justification, message.ticketInfo || {});
+      return activateItems(message.items, message.durationHours, message.justification, message.ticketInfo || {}, message.bundleName);
     case "deactivateItems":
       return deactivateItems(message.items, message.justification || "", message.ticketInfo || {});
     default:
@@ -282,8 +724,10 @@ function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
 
   const refresh = (async (): Promise<PortalTokenRefreshResult> => {
     const scanResult = await scanOpenEntraTabs(chrome.tabs);
+    const tokenStatus = await getTokenStatus();
+    await closeCompletedRecoveryTabs(tokenStatus);
     return {
-      tokenStatus: await getTokenStatus(),
+      tokenStatus,
       ...scanResult
     };
   })();
@@ -316,7 +760,13 @@ function captureToken(details: chrome.webRequest.WebRequestHeadersDetails): void
     return;
   }
 
-  void storeCapturedToken(tokenKind, token, portalSource || "https://entra.microsoft.com/");
+  void storeCapturedToken(tokenKind, token, portalSource || "https://entra.microsoft.com/")
+    .then(async (stored) => {
+      if (stored) {
+        await closeCompletedRecoveryTabs(await getTokenStatus());
+      }
+    })
+    .catch(() => undefined);
 }
 
 async function capturePortalTokens(
@@ -329,32 +779,78 @@ async function capturePortalTokens(
     throw new Error("Portal token capture is only allowed from Microsoft Entra pages.");
   }
 
-  const candidates = new Map<TokenKind, { token: string; score: number }>();
-  for (const token of tokens) {
-    for (const tokenKind of TOKEN_KINDS) {
-      const validation = validateCapturedToken(token, tokenKind);
-      if (!validation.ok) {
-        continue;
-      }
-      const score = getTokenCaptureScore(validation.decoded, tokenKind);
-      const current = candidates.get(tokenKind);
-      if (!current || score > current.score) {
-        candidates.set(tokenKind, { token, score });
-      }
-    }
-  }
-
-  const captured: TokenKind[] = [];
-  for (const [tokenKind, candidate] of candidates) {
-    const stored = await storeCapturedToken(tokenKind, candidate.token, source || sourceUrl || "entra.microsoft.com storage");
+  const storedTokens = await getStoredTokens();
+  const candidates = selectPortalTokenCandidates(tokens, {
+    preferredIdentity: sender.tab?.active === true
+      ? undefined
+      : getFirstValidStoredTokenIdentity(storedTokens)
+  });
+  const captured = new Set<TokenKind>();
+  for (const candidate of candidates) {
+    const stored = await storeCapturedToken(
+      candidate.tokenKind,
+      candidate.token,
+      source || sourceUrl || "entra.microsoft.com storage",
+      Date.now(),
+      { allowIdentityChange: sender.tab?.active === true }
+    );
     if (stored) {
-      captured.push(tokenKind);
+      captured.add(candidate.tokenKind);
     }
   }
-  return { captured };
+  if (captured.size) {
+    await closeCompletedRecoveryTabs(await getTokenStatus());
+  }
+  return { captured: [...captured] };
 }
 
-async function storeCapturedToken(tokenKind: TokenKind, token: string, source: string, timestamp = Date.now()): Promise<boolean> {
+function getFirstValidStoredTokenIdentity(tokens: StoredTokens, now = Date.now()): string | undefined {
+  const candidates: Array<[string | undefined, TokenKind]> = [
+    [tokens.graphToken, "graph"],
+    [tokens.graphDirectoryRoleToken, "graph"],
+    [tokens.graphPimGroupToken, "graph"],
+    [tokens.azureManagementToken, "azureManagement"]
+  ];
+  for (const [token, tokenKind] of candidates) {
+    if (!token) continue;
+    const validation = validateCapturedToken(token, tokenKind, now);
+    if (!validation.ok) continue;
+    const identity = getTokenIdentity(validation.decoded);
+    if (identity) return identity;
+  }
+  return undefined;
+}
+
+function getPortalRecoveryApis(): PortalRecoveryApis {
+  return {
+    tabs: chrome.tabs,
+    tabGroups: chrome.tabGroups,
+    storage: chrome.storage.session,
+    windows: chrome.windows
+  };
+}
+
+async function openManagedPortalRecoveryTabs(targets: AccessSetupTarget[]) {
+  const result = await openPortalRecoveryTabsAndReconcile(targets, getTokenStatus, getPortalRecoveryApis());
+  if (result.managedCount) {
+    await chrome.alarms.create(PORTAL_RECOVERY_CLEANUP_ALARM_NAME, {
+      when: Date.now() + PORTAL_RECOVERY_SESSION_TTL_MS
+    });
+  }
+  return result;
+}
+
+async function closeCompletedRecoveryTabs(tokenStatus: TokenStatus): Promise<void> {
+  await closeCompletedPortalRecoveryTabs(tokenStatus, getPortalRecoveryApis());
+}
+
+async function storeCapturedToken(
+  tokenKind: TokenKind,
+  token: string,
+  source: string,
+  timestamp = Date.now(),
+  options: { allowIdentityChange?: boolean } = { allowIdentityChange: true }
+): Promise<boolean> {
   const validation = validateCapturedToken(token, tokenKind, timestamp);
   if (!validation.ok) {
     return false;
@@ -362,6 +858,9 @@ async function storeCapturedToken(tokenKind: TokenKind, token: string, source: s
   await getStoredTokens();
   return updateStoredTokensInSession((storedTokens) => {
     const identityChanged = hasStoredTokenForAnotherIdentity(storedTokens, validation.decoded, timestamp);
+    if (identityChanged && options.allowIdentityChange === false) {
+      return { result: false };
+    }
     const tokens = identityChanged ? {} : storedTokens;
     const remove = identityChanged ? TOKEN_STORAGE_KEYS : undefined;
 
@@ -439,7 +938,7 @@ function getCapturedGraphTokenUpdate(
   }
 
   for (const target of getGraphTokenTargets(decoded)) {
-    if (shouldStoreTargetGraphToken(tokens, target, decoded, timestamp)) {
+    if (shouldStoreTargetGraphToken(tokens, target, token, decoded, timestamp)) {
       Object.assign(updates, getGraphTokenStorageUpdate(target, token, source, timestamp));
     }
   }
@@ -458,12 +957,16 @@ function shouldStoreGenericGraphToken(currentToken: string | undefined, incoming
 function shouldStoreTargetGraphToken(
   tokens: StoredTokens,
   target: GraphTokenTarget,
+  incomingToken: string,
   incoming: Record<string, unknown>,
   timestamp: number
 ): boolean {
   const currentToken = getStoredGraphTokenForTarget(tokens, target);
   if (!currentToken) {
     return true;
+  }
+  if (currentToken === incomingToken) {
+    return false;
   }
 
   const currentValidation = validateCapturedToken(currentToken, "graph", timestamp);
@@ -708,6 +1211,15 @@ async function getActiveItems(targets: AccessSetupTarget[] = ["directoryRole", "
   };
 }
 
+function makeFailedTargetSnapshot(target: AccessSetupTarget, error: unknown): TargetSnapshotResult {
+  const message = sanitizeErrorMessage(error);
+  return {
+    target,
+    eligible: makeSnapshotData(target, [], message, "eligible"),
+    active: makeSnapshotData(target, [], message, "active")
+  };
+}
+
 interface TargetSnapshotResult {
   target: AccessSetupTarget;
   eligible: ActivationDataResult;
@@ -745,7 +1257,17 @@ async function getActivationSnapshot(targets: AccessSetupTarget[] = ["directoryR
         getActivePimGroups
       )
   };
-  const results = await Promise.all(targets.map((target) => fetchers[target]()));
+  const results = await Promise.all(targets.map(async (target) => {
+    try {
+      return await withTimeout(
+        fetchers[target](),
+        TARGET_SNAPSHOT_TIMEOUT_MS,
+        `${ENDPOINT_LABELS[target].eligible} refresh timed out. Cached data remains available.`
+      );
+    } catch (error) {
+      return makeFailedTargetSnapshot(target, error);
+    }
+  }));
   return {
     eligible: combineSnapshotResults(results, "eligible"),
     active: combineSnapshotResults(results, "active"),
@@ -954,7 +1476,8 @@ function getDirectoryRoleActiveInstanceItems(
     .map((role) => {
       const namedRole = withDirectoryRoleScopeName(withDirectoryRoleDefinitionName(role, definitions), scopeNames);
       const item = normalizeDirectoryRole(namedRole);
-      const isSelfActivated = role.assignmentType?.toLowerCase() === "activated";
+      const activeAssignmentType = normalizeActiveAssignmentType(role.assignmentType);
+      const isSelfActivated = activeAssignmentType === "activated";
       return {
         ...applyActivationRequirements(
           item,
@@ -963,6 +1486,7 @@ function getDirectoryRoleActiveInstanceItems(
             policyRequirements[(namedRole.roleDefinition?.templateId || "").toLowerCase()]
         ),
         status: "active" as const,
+        activeAssignmentType,
         ...(role.endDateTime ? { activeUntil: new Date(role.endDateTime).toISOString() } : {}),
         ...(isSelfActivated && role.roleAssignmentScheduleId ? { assignmentScheduleId: role.roleAssignmentScheduleId } : {}),
         ...(isSelfActivated && role.id ? { assignmentScheduleInstanceId: role.id } : {})
@@ -1003,31 +1527,11 @@ function getScheduleRequestActivationStatus(request: { action?: string; status?:
   if (!isSelfActivateRequest(request)) {
     return undefined;
   }
-  if (isActiveRequestStatus(request.status)) {
-    return "active";
-  }
-  if (isPendingApprovalRequestStatus(request.status)) {
-    return "pendingApproval";
-  }
-  return undefined;
+  return getActivationRequestItemStatus(request.status);
 }
 
 function isSelfActivateRequest(request: { action?: string }): boolean {
   return request.action?.replace(/\s+/g, "").toLowerCase() === "selfactivate";
-}
-
-function isActiveRequestStatus(status: string | undefined): boolean {
-  const normalized = normalizeRequestStatus(status);
-  return normalized === "provisioned" || normalized === "granted";
-}
-
-function isPendingApprovalRequestStatus(status: string | undefined): boolean {
-  const normalized = normalizeRequestStatus(status);
-  return Boolean(normalized) && normalized.includes("pending") && (normalized.includes("approval") || normalized.includes("admin"));
-}
-
-function normalizeRequestStatus(status: string | undefined): string {
-  return (status || "").replace(/[\s_-]+/g, "").toLowerCase();
 }
 
 interface DirectoryRoleDefinitionInfo {
@@ -1261,10 +1765,12 @@ function getActivePimGroupInstanceItems(
       const normalized = normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]);
       const groupPolicy = policyRequirements[normalized.groupId];
       const item = applyActivationRequirements(normalized, groupPolicy?.[normalized.accessId] || groupPolicy?.default);
-      const isSelfActivated = schedule.assignmentType?.toLowerCase() === "activated";
+      const activeAssignmentType = normalizeActiveAssignmentType(schedule.assignmentType);
+      const isSelfActivated = activeAssignmentType === "activated";
       return {
         ...item,
         status: "active" as const,
+        activeAssignmentType,
         assignmentScheduleId: isSelfActivated ? schedule.assignmentScheduleId : undefined,
         assignmentScheduleInstanceId: isSelfActivated ? schedule.id : undefined,
         ...(activeUntil ? { activeUntil: new Date(activeUntil).toISOString() } : {})
@@ -1382,7 +1888,7 @@ async function getAzureRolesForSubscriptions(
     }
   );
 
-  assertAllSubscriptionsSucceeded(roleGroups, "eligible Azure roles");
+  assertAtLeastOneSubscriptionSucceeded(roleGroups, "eligible Azure roles");
   const items = roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []));
   const itemsWithPolicies = await applyAzureRolePolicyRequirements(items, azureManagementToken);
   return applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken);
@@ -1479,10 +1985,12 @@ async function getActiveAzureRolesForSubscriptions(
             subscriptionId: subscription.subscriptionId,
             subscriptionName: subscription.displayName
           });
-          const isSelfActivated = role.properties?.assignmentType?.toLowerCase() === "activated";
+          const activeAssignmentType = normalizeActiveAssignmentType(role.properties?.assignmentType);
+          const isSelfActivated = activeAssignmentType === "activated";
           return {
             ...item,
             status: "active" as const,
+            activeAssignmentType,
             assignmentScheduleId: isSelfActivated ? item.assignmentScheduleId : undefined,
             assignmentScheduleInstanceId: isSelfActivated ? item.assignmentScheduleInstanceId : undefined,
             ...(role.properties?.endDateTime ? { activeUntil: new Date(role.properties.endDateTime).toISOString() } : {})
@@ -1491,20 +1999,20 @@ async function getActiveAzureRolesForSubscriptions(
     }
   );
 
-  assertAllSubscriptionsSucceeded(roleGroups, "active Azure roles");
+  assertAtLeastOneSubscriptionSucceeded(roleGroups, "active Azure roles");
   return applyAzureRoleDefinitionMetadata(
     roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])),
     azureManagementToken
   );
 }
 
-function assertAllSubscriptionsSucceeded<T>(
+function assertAtLeastOneSubscriptionSucceeded<T>(
   results: Array<PromiseSettledResult<T>>,
   operation: string
 ): void {
-  if (results.some((result) => result.status === "rejected")) {
+  if (results.length && results.every((result) => result.status === "rejected")) {
     const firstError = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
-    throw new Error(`Unable to load complete ${operation} data across subscriptions. ${sanitizeErrorMessage(firstError)}`.trim());
+    throw new Error(`Unable to load ${operation} data from any subscription. ${sanitizeErrorMessage(firstError)}`.trim());
   }
 }
 
@@ -1593,7 +2101,8 @@ async function activateItems(
   items: ActivationItem[],
   durationHours: number,
   justification: string,
-  ticketInfo: TicketInfo
+  ticketInfo: TicketInfo,
+  bundleName?: string
 ): Promise<ActivationResponse> {
   if (!items.length) {
     throw new Error("Select at least one item to activate.");
@@ -1608,41 +2117,66 @@ async function activateItems(
 
   const tokens = await getStoredTokens();
   const startDateTime = new Date().toISOString();
-  const results = await mapWithConcurrency(
+  const executions = await mapWithConcurrency(
     items,
     4,
     async (item) => {
       try {
-        const request = buildActivationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
-        assertAllowedApiUrl(request.endpoint, request.tokenKind);
-        const token = getTokenForActivation(tokens, item, request.tokenKind);
-        if (!token) {
-          throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
-        }
-        assertTokenCanActivate(item, token, request.tokenKind);
+        return await runWithActivationItemLock(item, async () => {
+          const request = buildActivationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
+          assertAllowedApiUrl(request.endpoint, request.tokenKind);
+          const token = getTokenForActivation(tokens, item, request.tokenKind);
+          if (!token) {
+            throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
+          }
+          assertTokenCanActivate(item, token, request.tokenKind);
 
-        const validationRequest = buildActivationValidationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
-        if (validationRequest) {
-          assertAllowedApiUrl(validationRequest.endpoint, validationRequest.tokenKind);
-          await sendActivationRequest(validationRequest, token);
-        }
+          const validationRequest = buildActivationValidationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
+          if (validationRequest) {
+            assertAllowedApiUrl(validationRequest.endpoint, validationRequest.tokenKind);
+            await sendActivationRequest(validationRequest, token);
+          }
 
-        const data = await sendActivationRequest(request, token);
-        return {
-          itemId: item.id,
-          itemName: item.displayName,
-          success: true,
-          requestId: getResponseIdentifier(data)
-        };
+          const data = await sendActivationRequest(request, token);
+          const requestId = getResponseIdentifier(data, request);
+          return {
+            result: {
+              itemId: item.id,
+              itemName: item.displayName,
+              success: true,
+              requestId
+            },
+            trackedRequest: requestId
+              ? createTrackedPimRequest({
+                item,
+                action: "activate",
+                requestId,
+                payload: data,
+                requestedAt: startDateTime,
+                durationHours,
+                justification: justification.trim(),
+                bundleName,
+                tenantId: getTokenTenantId(token)
+              })
+              : undefined
+          };
+        });
       } catch (error) {
         return {
-          itemId: item.id,
-          itemName: item.displayName,
-          success: false,
-          error: sanitizeErrorMessage(error)
+          result: {
+            itemId: item.id,
+            itemName: item.displayName,
+            success: false,
+            error: sanitizeErrorMessage(error)
+          },
+          trackedRequest: undefined
         };
       }
     }
+  );
+  const results = executions.map((execution) => execution.result);
+  await persistTrackedSubmissionsBestEffort(
+    executions.flatMap((execution) => execution.trackedRequest ? [execution.trackedRequest] : [])
   );
 
   const errors = results.filter((result) => !result.success);
@@ -1654,14 +2188,14 @@ async function activateItems(
 }
 
 async function sendActivationRequest(request: ActivationRequest, token: string): Promise<unknown> {
-  const response = await fetch(request.endpoint, {
+  const response = await fetchMicrosoftApi(request.endpoint, {
     method: request.method,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(request.body)
-  });
+  }, MICROSOFT_API_WRITE_TIMEOUT_MS);
 
   if (!response.ok) {
     const errorData = await safeJson(response);
@@ -1682,49 +2216,57 @@ async function deactivateItems(
 
   const tokens = await getStoredTokens();
   const startDateTime = new Date().toISOString();
-  const results = await mapWithConcurrency(
+  const executions = await mapWithConcurrency(
     items,
     4,
     async (item) => {
       try {
-        const request = buildDeactivationRequest(item, justification.trim(), ticketInfo, startDateTime);
-        assertAllowedApiUrl(request.endpoint, request.tokenKind);
-        const token = getTokenForActivation(tokens, item, request.tokenKind);
-        if (!token) {
-          throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
-        }
-        assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
-
-        const response = await fetch(request.endpoint, {
-          method: request.method,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(request.body)
+        return await runWithActivationItemLock(item, async () => {
+          const request = buildDeactivationRequest(item, justification.trim(), ticketInfo, startDateTime);
+          assertAllowedApiUrl(request.endpoint, request.tokenKind);
+          const token = getTokenForActivation(tokens, item, request.tokenKind);
+          if (!token) {
+            throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
+          }
+          assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
+          const data = await sendActivationRequest(request, token);
+          const requestId = getResponseIdentifier(data, request);
+          return {
+            result: {
+              itemId: item.id,
+              itemName: item.displayName,
+              success: true,
+              requestId
+            },
+            trackedRequest: requestId
+              ? createTrackedPimRequest({
+                item,
+                action: "deactivate",
+                requestId,
+                payload: data,
+                requestedAt: startDateTime,
+                justification: justification.trim(),
+                tenantId: getTokenTenantId(token)
+              })
+              : undefined
+          };
         });
-
-        if (!response.ok) {
-          const errorData = await safeJson(response);
-          throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
-        }
-
-        const data = await safeJson(response);
-        return {
-          itemId: item.id,
-          itemName: item.displayName,
-          success: true,
-          requestId: getResponseIdentifier(data)
-        };
       } catch (error) {
         return {
-          itemId: item.id,
-          itemName: item.displayName,
-          success: false,
-          error: sanitizeErrorMessage(error)
+          result: {
+            itemId: item.id,
+            itemName: item.displayName,
+            success: false,
+            error: sanitizeErrorMessage(error)
+          },
+          trackedRequest: undefined
         };
       }
     }
+  );
+  const results = executions.map((execution) => execution.result);
+  await persistTrackedSubmissionsBestEffort(
+    executions.flatMap((execution) => execution.trackedRequest ? [execution.trackedRequest] : [])
   );
 
   const errors = results.filter((result) => !result.success);
@@ -1774,12 +2316,12 @@ async function fetchAllPages<T>(url: string, token: string): Promise<T[]> {
 
 async function fetchJson<T>(url: string, token: string): Promise<T> {
   assertAllowedApiUrl(url);
-  const response = await fetch(url, {
+  const response = await fetchMicrosoftApi(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     }
-  });
+  }, MICROSOFT_API_READ_TIMEOUT_MS);
 
   if (!response.ok) {
     const errorData = await safeJson(response);
@@ -1787,6 +2329,21 @@ async function fetchJson<T>(url: string, token: string): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`Microsoft API request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function safeJson(response: Response): Promise<unknown> {
@@ -1821,10 +2378,43 @@ function getApiErrorMessage(payload: unknown, response?: Response): string | und
   return isClaimsChallengeMessage(message) ? CLAIMS_CHALLENGE_MESSAGE : message;
 }
 
-function getResponseIdentifier(payload: unknown): string | undefined {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return undefined;
+async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]): Promise<void> {
+  if (!requests.length) {
+    return;
   }
-  const record = payload as Record<string, unknown>;
-  return typeof record.id === "string" ? record.id : typeof record.name === "string" ? record.name : undefined;
+  try {
+    await withTimeout((async () => {
+      const store = await mutateTrackedRequests((current) => upsertTrackedRequests(current, requests));
+      const settings = await loadSettings();
+      await Promise.all([
+        updateTrackedRequestBadge(store),
+        scheduleTrackedRequestMaintenance(store, settings)
+      ]);
+    })(), REQUEST_TRACKING_STORAGE_TIMEOUT_MS, "Request tracking storage timed out.");
+  } catch {
+    // Microsoft already accepted the request. Tracking must not alter that result.
+  }
+}
+
+function getTokenTenantId(token: string): string | undefined {
+  const decoded = decodeToken(token);
+  return typeof decoded?.tid === "string" ? decoded.tid : undefined;
+}
+
+function getResponseIdentifier(payload: unknown, request?: ActivationRequest): string | undefined {
+  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+    const record = payload as Record<string, unknown>;
+    const identifier = typeof record.id === "string" ? record.id : typeof record.name === "string" ? record.name : undefined;
+    if (identifier) {
+      return identifier;
+    }
+  }
+  if (request?.method === "PUT") {
+    try {
+      return decodeURIComponent(new URL(request.endpoint).pathname.split("/").filter(Boolean).at(-1) || "") || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }

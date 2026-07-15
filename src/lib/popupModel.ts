@@ -1,21 +1,15 @@
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
+import { getActivationItemIdentity } from "./activationIdentity";
 import type { ActivationItem, ActivationResult, ActivationStatus, PopupRequestMode, PopupTab, QuickPimBundle, RoleTab, TokenStatusEntry } from "./types";
 export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
   directoryRole:
-    "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadmigratedroles/provider/azurerbac",
+    "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadmigratedroles",
   pimGroup:
-    "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup/provider/azurerbac",
+    "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup",
   azureRole:
-    "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/azurerbac/provider/azurerbac"
-};
-
-export const ENTRA_GRAPH_BOOTSTRAP_URLS: Record<Exclude<RoleTab, "azureRole">, string> = {
-  directoryRole:
-    "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_AAD_UsersAndTenants/UserManagementMenuBlade/~/AllUsers",
-  pimGroup:
-    "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_AAD_IAM/GroupsManagementMenuBlade/~/AllGroups"
+    "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/azurerbac"
 };
 
 export function getPortalUrlForTab(tab: PopupTab): string | undefined {
@@ -27,11 +21,11 @@ export function getPortalUrlForTab(tab: PopupTab): string | undefined {
 
 export function tokenStatusText(label: string, status: TokenStatusEntry | undefined): string {
   if (!status?.hasToken) {
-    return `${label} token missing`;
+    return `${label} access needed`;
   }
 
   if (status.isExpired) {
-    return `${label} expired. Refresh in portal.`;
+    return `${label} refresh needed`;
   }
 
   const age = status.tokenAge ?? 0;
@@ -137,13 +131,14 @@ export function mergeEligibleWithActive(
 ): ActivationItem[] {
   const activeById = new Map<string, ActivationItem>();
   for (const item of activeItems) {
-    const current = activeById.get(item.id);
-    if (!current || item.status === "active" || current.status !== "active") {
-      activeById.set(item.id, item);
+    const identity = getActivationItemIdentity(item);
+    const current = activeById.get(identity);
+    if (!current || isPreferredActiveOverlay(item, current)) {
+      activeById.set(identity, item);
     }
   }
   const merged = eligibleItems.map((item) => {
-    const activeItem = activeById.get(item.id);
+    const activeItem = activeById.get(getActivationItemIdentity(item));
     const activationRequirements = {
       ...item.activationRequirements,
       ...activeItem?.activationRequirements
@@ -152,6 +147,7 @@ export function mergeEligibleWithActive(
       ? {
           ...item,
           status: activeItem.status,
+          activeAssignmentType: activeItem.activeAssignmentType || item.activeAssignmentType,
           activeUntil: activeItem.activeUntil || item.activeUntil,
           assignmentScheduleId: activeItem.assignmentScheduleId || item.assignmentScheduleId,
           assignmentScheduleInstanceId: activeItem.assignmentScheduleInstanceId || item.assignmentScheduleInstanceId,
@@ -164,20 +160,56 @@ export function mergeEligibleWithActive(
     return merged;
   }
 
-  const mergedIds = new Set(merged.map((item) => item.id));
-  const activeOnlyItems = activeItems.filter((item) => !mergedIds.has(item.id));
+  const mergedIds = new Set(merged.map(getActivationItemIdentity));
+  const activeOnlyItems = [...activeById.entries()]
+    .filter(([identity]) => !mergedIds.has(identity))
+    .map(([, item]) => item);
   return [...merged, ...activeOnlyItems];
+}
+
+function isPreferredActiveOverlay(candidate: ActivationItem, current: ActivationItem): boolean {
+  const candidatePriority = getActiveOverlayPriority(candidate);
+  const currentPriority = getActiveOverlayPriority(current);
+  if (candidatePriority !== currentPriority) {
+    return candidatePriority > currentPriority;
+  }
+  const candidateEnd = candidate.activeUntil ? Date.parse(candidate.activeUntil) : 0;
+  const currentEnd = current.activeUntil ? Date.parse(current.activeUntil) : 0;
+  return (Number.isFinite(candidateEnd) ? candidateEnd : 0) > (Number.isFinite(currentEnd) ? currentEnd : 0);
+}
+
+function getActiveOverlayPriority(item: ActivationItem): number {
+  if (item.status !== "active") {
+    return 0;
+  }
+  const assignmentType = getEffectiveActiveAssignmentType(item);
+  if (assignmentType === "activated") {
+    return 3;
+  }
+  if (assignmentType === "assigned") {
+    return 2;
+  }
+  return 1;
 }
 
 export function getActivatableItems(items: ActivationItem[]): ActivationItem[] {
   return items.filter((item) => item.status === "eligible");
 }
 
-export function getDeactivatableItems(items: ActivationItem[]): ActivationItem[] {
-  return items.filter((item) => getRowActionState(item).selectable && getRowActionState(item).mode === "deactivate");
+export function filterAssignedActiveItems(items: ActivationItem[], showAssignedRoles: boolean): ActivationItem[] {
+  return showAssignedRoles
+    ? items
+    : items.filter((item) => item.status !== "active" || getEffectiveActiveAssignmentType(item) === "activated");
 }
 
-export type QuickFilter = "favorites" | "eligible" | "active" | "requiresApproval" | "requiresJustification" | "highPrivilege";
+export function getDeactivatableItems(items: ActivationItem[], now = Date.now()): ActivationItem[] {
+  return items.filter((item) => {
+    const actionState = getRowActionState(item, now);
+    return actionState.selectable && actionState.mode === "deactivate";
+  });
+}
+
+export type QuickFilter = "favorites" | "eligible" | "active" | "requiresJustification";
 
 export interface RowActionState {
   mode?: PopupRequestMode;
@@ -201,7 +233,7 @@ export interface BundlePreflight {
   blockedReason?: string;
 }
 
-export function getRowActionState(item: ActivationItem | undefined): RowActionState {
+export function getRowActionState(item: ActivationItem | undefined, now = Date.now()): RowActionState {
   if (!item) {
     return { selectable: false, reason: "Item is not available." };
   }
@@ -212,6 +244,29 @@ export function getRowActionState(item: ActivationItem | undefined): RowActionSt
     return { selectable: false, reason: "This request is pending approval." };
   }
   if (item.status === "active") {
+    const activeUntil = item.activeUntil ? Date.parse(item.activeUntil) : Number.NaN;
+    if (Number.isFinite(activeUntil) && activeUntil <= now) {
+      return {
+        mode: "deactivate",
+        selectable: false,
+        reason: "This PIM activation has expired. Refresh roles to update its status."
+      };
+    }
+    const activeAssignmentType = getEffectiveActiveAssignmentType(item);
+    if (activeAssignmentType === "assigned") {
+      return {
+        mode: "deactivate",
+        selectable: false,
+        reason: "This role is active through an assigned access grant, not a PIM activation, so it cannot be disabled from QuickPIM++."
+      };
+    }
+    if (activeAssignmentType === "unknown") {
+      return {
+        mode: "deactivate",
+        selectable: false,
+        reason: "Microsoft did not identify this assignment as a PIM activation, so QuickPIM++ will not try to disable it."
+      };
+    }
     const hasDisableTarget = item.type === "azureRole"
       ? Boolean(item.assignmentScheduleId || item.assignmentScheduleInstanceId)
       : Boolean(item.assignmentScheduleId);
@@ -253,9 +308,7 @@ export function applyQuickFilters(
     if (filterSet.has("favorites") && !favoriteIds.has(item.id)) return false;
     if (filterSet.has("eligible") && item.status !== "eligible") return false;
     if (filterSet.has("active") && item.status !== "active") return false;
-    if (filterSet.has("requiresApproval") && item.activationRequirements?.approval !== true) return false;
     if (filterSet.has("requiresJustification") && item.activationRequirements?.justification === false) return false;
-    if (filterSet.has("highPrivilege") && !isHighPrivilegeItem(item)) return false;
     return true;
   });
 }
@@ -341,13 +394,97 @@ export function getActiveStatusTitle(item: ActivationItem, now = Date.now()): st
   return remaining ? `Active until ${activeUntil} (${remaining} remaining)` : `Active until ${activeUntil}`;
 }
 
+export function formatRemainingActivationTime(activeUntil: string | undefined, now = Date.now()): string | undefined {
+  if (!activeUntil) {
+    return undefined;
+  }
+  const activeUntilMs = Date.parse(activeUntil);
+  if (!Number.isFinite(activeUntilMs)) {
+    return undefined;
+  }
+  if (activeUntilMs <= now) {
+    return undefined;
+  }
+  const totalSeconds = Math.ceil((activeUntilMs - now) / 1000);
+  if (totalSeconds > 3600) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+export function getRemainingActivationTimeUpdateDelay(activeUntil: string | undefined, now = Date.now()): number | undefined {
+  if (!activeUntil) {
+    return undefined;
+  }
+  const activeUntilMs = Date.parse(activeUntil);
+  const remainingMs = activeUntilMs - now;
+  if (!Number.isFinite(activeUntilMs) || remainingMs <= 0) {
+    return undefined;
+  }
+
+  const totalSeconds = Math.ceil(remainingMs / 1000);
+  let nextDisplayedSecond: number;
+  if (totalSeconds <= 3600) {
+    nextDisplayedSecond = totalSeconds - 1;
+  } else {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    nextDisplayedSecond = hours === 1 && minutes === 0
+      ? 3600
+      : hours * 3600 + minutes * 60 - 1;
+  }
+  return Math.max(50, remainingMs - nextDisplayedSecond * 1000 + 20);
+}
+
 export function getActivationStatusTitle(item: ActivationItem, now = Date.now()): string | undefined {
   if (item.status === "pendingApproval") {
     return item.activationRequirements?.approval
       ? "Activation request is waiting for approval."
       : "Activation request is pending.";
   }
+  const activeAssignmentType = getEffectiveActiveAssignmentType(item);
+  if (activeAssignmentType === "assigned") {
+    return "Assigned access is active without a PIM activation and cannot be disabled from QuickPIM++.";
+  }
+  if (activeAssignmentType === "unknown") {
+    return "Active assignment type was not identified by Microsoft; disabling is unavailable.";
+  }
   return getActiveStatusTitle(item, now);
+}
+
+export function formatActivationItemStatusLabel(item: ActivationItem): string {
+  const activeAssignmentType = getEffectiveActiveAssignmentType(item);
+  if (activeAssignmentType === "activated") {
+    return "PIM active";
+  }
+  if (activeAssignmentType === "assigned") {
+    return "Assigned";
+  }
+  return formatActivationStatusLabel(item.status);
+}
+
+export function getEffectiveActiveAssignmentType(item: ActivationItem): ActivationItem["activeAssignmentType"] | undefined {
+  if (item.status !== "active") {
+    return undefined;
+  }
+  if (item.activeAssignmentType) {
+    return item.activeAssignmentType;
+  }
+  return item.assignmentScheduleId || item.assignmentScheduleInstanceId ? "activated" : "unknown";
+}
+
+export function shouldShowRemainingActivationTime(
+  item: ActivationItem,
+  showRemainingActivationTime: boolean,
+  now = Date.now()
+): boolean {
+  return showRemainingActivationTime
+    && getEffectiveActiveAssignmentType(item) === "activated"
+    && formatRemainingActivationTime(item.activeUntil, now) !== undefined;
 }
 
 export function formatActivationStatusLabel(status: ActivationStatus): string {
@@ -392,6 +529,10 @@ function formatLoadMessage(message: string): string {
     return "Captured token expired. Refresh in portal.";
   }
 
+  if (isMinimumActiveDurationMessage(messageText) || isMinimumActiveDurationMessage(trimmed)) {
+    return "Microsoft requires an activation to remain active for at least 5 minutes before it can be disabled. Retry after the five-minute minimum.";
+  }
+
   if (missingScopes || errorCode === "PermissionScopeNotGranted" || trimmed.includes("PermissionScopeNotGranted")) {
     return formatPermissionMessage(missingScopes);
   }
@@ -405,6 +546,10 @@ function formatLoadMessage(message: string): string {
 
 function isTokenExpiryMessage(message: string): boolean {
   return /access token expiry UTC time/i.test(message) || /token (has )?expired/i.test(message);
+}
+
+function isMinimumActiveDurationMessage(message: string): boolean {
+  return /active duration is too short/i.test(message) && /min(?:i?mum|iumum) required is 5 minutes/i.test(message);
 }
 
 function formatPermissionMessage(missingScopes: string | undefined): string {

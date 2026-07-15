@@ -4,6 +4,7 @@ import {
   addRecentJustification,
   createActivationHistoryEntries,
   expandBundle,
+  getAutoEnabledFeatures,
   getDisplayName,
   mergeImportedSettings,
   mergeSettings,
@@ -18,10 +19,15 @@ import {
   extractActivationRequirementsFromPolicyRules,
   durationHoursToIso,
   getActiveUntilFromScheduleInfo,
+  normalizeActiveAssignmentType,
   normalizeAzureRole,
   normalizeDirectoryRole,
   normalizePimGroup
 } from "../src/lib/pim";
+import {
+  MAX_USER_JUSTIFICATION_LENGTH,
+  formatJustificationForActivationRequest
+} from "../src/lib/justifications";
 import type { ActivationItem, QuickPimBundle, QuickPimSettings } from "../src/lib/types";
 
 const baseSettings: QuickPimSettings = {
@@ -42,6 +48,13 @@ const baseSettings: QuickPimSettings = {
 };
 
 describe("PIM item normalization", () => {
+  test("normalizes Microsoft active assignment types without guessing", () => {
+    expect(normalizeActiveAssignmentType("Activated")).toBe("activated");
+    expect(normalizeActiveAssignmentType("assigned")).toBe("assigned");
+    expect(normalizeActiveAssignmentType(undefined)).toBe("unknown");
+    expect(normalizeActiveAssignmentType("futureValue")).toBe("unknown");
+  });
+
   test("normalizes directory roles with alias-ready stable ids", () => {
     const item = normalizeDirectoryRole({
       roleDefinitionId: "reader",
@@ -208,6 +221,37 @@ describe("PIM item normalization", () => {
   });
 });
 
+describe("automatic feature discovery", () => {
+  test("keeps role sources visible when they only return active or pending items", () => {
+    const activeGroup: ActivationItem = {
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Emergency operators",
+      displayName: "Emergency operators",
+      principalId: "user-1",
+      groupId: "group-1",
+      accessId: "member",
+      scopeLabel: "Member",
+      status: "active",
+      activeAssignmentType: "activated",
+      assignmentScheduleId: "schedule-1"
+    };
+    const pendingAzureRole: ActivationItem = {
+      id: "azureRole:reader:/subscriptions/sub-1",
+      type: "azureRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "user-1",
+      roleDefinitionId: "/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/reader",
+      scope: "/subscriptions/sub-1",
+      scopeLabel: "Production",
+      status: "pendingApproval"
+    };
+
+    expect(getAutoEnabledFeatures([activeGroup, pendingAzureRole])).toEqual(["pimGroup", "azureRole", "bundles"]);
+  });
+});
+
 describe("settings helpers", () => {
   const items: ActivationItem[] = [
     {
@@ -370,10 +414,14 @@ describe("settings helpers", () => {
         recentJustificationLimit: 99,
         activityHistoryLimit: 999,
         darkMode: true,
+        showAssignedRoles: true,
+        showRemainingActivationTime: false,
         showActivationCounters: true,
         showEnablementDetails: true,
         showLastEnablementDate: true,
         backgroundPreRefreshEnabled: false,
+        requestNotificationsEnabled: true,
+        expiryReminderMinutes: 999,
         enabledFeatures: ["directoryRole", "pimGroup", "unknown" as any, "directoryRole"]
       }
     });
@@ -381,13 +429,14 @@ describe("settings helpers", () => {
     expect(imported.aliasesByItemId["directoryRole:reader:/"]).toHaveLength(120);
     expect(imported.aliasesByItemId).not.toHaveProperty("bad-key".repeat(80));
     expect(imported.savedJustifications).toHaveLength(2);
-    expect(imported.savedJustifications[1]).toHaveLength(1024);
-    expect(imported.recentJustifications[1]).toHaveLength(1024);
+    expect(imported.savedJustifications[1]).toHaveLength(MAX_USER_JUSTIFICATION_LENGTH);
+    expect(imported.recentJustifications[1]).toHaveLength(MAX_USER_JUSTIFICATION_LENGTH);
     expect(imported.favoriteItemIds).toEqual(["directoryRole:reader:/"]);
     expect(imported.bundles[0].name).toHaveLength(80);
     expect(imported.bundles[0].itemIds).toHaveLength(100);
     expect(imported.bundles[0].defaultDurationHours).toBe(24);
-    expect(imported.bundles[0].defaultJustification).toHaveLength(1024);
+    expect(imported.bundles[0].defaultJustification).toHaveLength(MAX_USER_JUSTIFICATION_LENGTH);
+    expect(formatJustificationForActivationRequest(imported.savedJustifications[1])).toHaveLength(1024);
     expect(imported.bundles[0]).not.toHaveProperty("defaultTicketSystem");
     expect(imported.bundles[0]).not.toHaveProperty("defaultTicketNumber");
     expect(imported.preferences).toMatchObject({
@@ -396,10 +445,14 @@ describe("settings helpers", () => {
       recentJustificationLimit: 20,
       activityHistoryLimit: 200,
       darkMode: true,
+      showAssignedRoles: true,
+      showRemainingActivationTime: false,
       showActivationCounters: true,
       showEnablementDetails: true,
       showLastEnablementDate: true,
       backgroundPreRefreshEnabled: false,
+      requestNotificationsEnabled: true,
+      expiryReminderMinutes: 15,
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
     expect(imported.preferences).not.toHaveProperty("showAdvancedSettings");
@@ -437,6 +490,10 @@ describe("settings helpers", () => {
     expect(DEFAULT_SETTINGS.preferences.showActivationCounters).toBe(false);
     expect(DEFAULT_SETTINGS.preferences.showEnablementDetails).toBe(false);
     expect(DEFAULT_SETTINGS.preferences.showLastEnablementDate).toBe(false);
+    expect(DEFAULT_SETTINGS.preferences.showAssignedRoles).toBe(false);
+    expect(DEFAULT_SETTINGS.preferences.showRemainingActivationTime).toBe(true);
+    expect(mergeSettings({ preferences: { showAssignedRoles: true } as QuickPimSettings["preferences"] }).preferences.showAssignedRoles).toBe(true);
+    expect(mergeSettings({ preferences: { showRemainingActivationTime: false } as QuickPimSettings["preferences"] }).preferences.showRemainingActivationTime).toBe(false);
     expect(mergeSettings({ preferences: { showActivationCounters: true } as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(true);
     expect(mergeSettings({ preferences: { showEnablementDetails: true } as QuickPimSettings["preferences"] }).preferences.showEnablementDetails).toBe(true);
     expect(mergeSettings({ preferences: { showLastEnablementDate: true } as unknown as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(true);
@@ -444,6 +501,9 @@ describe("settings helpers", () => {
     expect(mergeSettings({ preferences: { showActivationCounters: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showActivationCounters).toBe(false);
     expect(mergeSettings({ preferences: { showEnablementDetails: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showEnablementDetails).toBe(false);
     expect(mergeSettings({ preferences: { showLastEnablementDate: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showLastEnablementDate).toBe(false);
+    expect(mergeSettings({ preferences: { showAssignedRoles: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showAssignedRoles).toBe(false);
+    expect(mergeSettings({ preferences: { showRemainingActivationTime: "yes" } as unknown as QuickPimSettings["preferences"] }).preferences.showRemainingActivationTime).toBe(true);
+    expect(mergeSettings({ preferences: { hideRemainingActivationTime: true } as unknown as QuickPimSettings["preferences"] }).preferences.showRemainingActivationTime).toBe(false);
   });
 });
 
@@ -789,6 +849,19 @@ describe("activation request builders", () => {
     expect(() => buildDeactivationRequest({ ...baseRole, status: "active" }, "")).toThrow(
       "Deactivation item is missing the active assignment schedule."
     );
+    expect(() => buildDeactivationRequest({
+      ...baseRole,
+      status: "active",
+      activeAssignmentType: "assigned",
+      assignmentScheduleId: "assigned-schedule"
+    }, "")).toThrow("Only roles activated through PIM can be disabled from QuickPIM++.");
+    expect(() => buildDeactivationRequest({
+      ...baseRole,
+      status: "active",
+      activeAssignmentType: "activated",
+      assignmentScheduleId: "expired-schedule",
+      activeUntil: "2000-01-01T00:00:00.000Z"
+    }, "")).toThrow("This PIM activation has already expired. Refresh roles before trying again.");
   });
 
   test("appends the QuickPIM++ marker only to outbound activation payload justifications", () => {
@@ -847,6 +920,30 @@ describe("activation request builders", () => {
     expect(groupRequest.body).toMatchObject({
       justification: "Need access {Activated using QuickPIM++}"
     });
+  });
+
+  test("rejects justification text that exceeds the outbound limit after adding the audit marker", () => {
+    const item: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Global Reader",
+      displayName: "Global Reader",
+      principalId: "user-1",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      scopeLabel: "Tenant",
+      status: "eligible"
+    };
+
+    expect(() => buildActivationRequest(item, 1, "x".repeat(1024))).toThrow(
+      "including the QuickPIM++ audit marker"
+    );
+    expect(() => buildDeactivationRequest({
+      ...item,
+      status: "active",
+      activeAssignmentType: "activated",
+      assignmentScheduleId: "schedule-1"
+    }, "x".repeat(1024))).toThrow("including the QuickPIM++ audit marker");
   });
 
   test("allows Azure management group scopes for activation payloads", () => {
