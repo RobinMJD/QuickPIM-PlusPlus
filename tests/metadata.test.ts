@@ -15,7 +15,7 @@ describe("versioning and extension manifest", () => {
     expect(packageLockJson.packages[""].name).toBe("quickpim-plusplus");
   });
 
-  test("keeps package, lockfile, and manifest versions in sync at v2.10.12", () => {
+  test("keeps package, lockfile, and manifest versions in sync at v2.10.13", () => {
     expect(packageJson.version).toBe(APP_VERSION);
     expect(packageLockJson.packages[""].version).toBe(APP_VERSION);
     expect(packageLockJson.version).toBe(APP_VERSION);
@@ -72,7 +72,7 @@ describe("versioning and extension manifest", () => {
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
     expect(readme).toContain("Original author: Daniel Bradley");
-    expect(readme).toContain("v2.10.12");
+    expect(readme).toContain("v2.10.13");
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");
