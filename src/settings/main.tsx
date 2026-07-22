@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "rea
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, hasRequiredPortalToken } from "../lib/access";
-import { formatDateOnly } from "../lib/dateFormat";
+import { formatDateOnly, formatUtcDateTime } from "../lib/dateFormat";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
@@ -36,7 +36,7 @@ import {
   saveReferenceData
 } from "../lib/referenceData";
 import { MAX_USER_JUSTIFICATION_LENGTH, getGenericJustificationWarning } from "../lib/justifications";
-import { APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
+import { APP_BUILD_TIMESTAMP, APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
@@ -876,6 +876,7 @@ function AboutPanel({
       <div>
         <h2>{appName} {APP_VERSION}</h2>
         <p className="muted">Quick activation for Microsoft Entra roles, Azure roles, and PIM groups.</p>
+        <p className="muted">Build: {formatUtcDateTime(APP_BUILD_TIMESTAMP)}</p>
       </div>
       <div className="about-grid">
         <div>

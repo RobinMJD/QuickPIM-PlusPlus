@@ -13,6 +13,12 @@ export interface SelectedPortalTokenCandidate {
   identity: string;
 }
 
+export interface StoredGraphTokenCandidate {
+  token?: string;
+  timestamp?: number;
+  source?: string;
+}
+
 interface ValidatedCandidate extends SelectedPortalTokenCandidate {
   decoded: Record<string, unknown>;
   index: number;
@@ -57,6 +63,26 @@ export function selectPortalTokenCandidates(
     ? selections.find((selection) => selection.identity === preferredIdentity)
     : undefined;
   return (preferred || selections.sort(compareIdentitySelections)[0]).candidates;
+}
+
+export function selectBestStoredGraphTokenForTarget(
+  candidates: StoredGraphTokenCandidate[],
+  target: GraphTokenTarget,
+  now = Date.now()
+): StoredGraphTokenCandidate | undefined {
+  return candidates
+    .flatMap((candidate, index) => {
+      if (!candidate.token) return [];
+      const validation = validateCapturedToken(candidate.token, "graph", now);
+      return validation.ok ? [{ candidate, decoded: validation.decoded, index }] : [];
+    })
+    .sort((left, right) =>
+      getGraphTokenTargetScore(right.decoded, target) - getGraphTokenTargetScore(left.decoded, target)
+      || getGraphTokenAuthStrengthScore(right.decoded) - getGraphTokenAuthStrengthScore(left.decoded)
+      || (Number(right.decoded.exp) || 0) - (Number(left.decoded.exp) || 0)
+      || (right.candidate.timestamp || 0) - (left.candidate.timestamp || 0)
+      || left.index - right.index
+    )[0]?.candidate;
 }
 
 function buildIdentitySelection(identity: string, candidates: ValidatedCandidate[]): IdentitySelection {

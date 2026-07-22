@@ -268,6 +268,10 @@ button {
   padding-left: 34px;
 }
 
+.filter-field .input {
+  padding-right: 38px;
+}
+
 .field-icon {
   position: absolute;
   left: 11px;
@@ -291,6 +295,39 @@ button {
   stroke-width: 2.2;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.field-clear-button {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.field-clear-button:hover,
+.field-clear-button:focus-visible {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+body.dark-mode .field-clear-button {
+  color: #94a3b8;
+}
+
+body.dark-mode .field-clear-button:hover,
+body.dark-mode .field-clear-button:focus-visible {
+  background: #334155;
+  color: #f8fafc;
 }
 
 .input,

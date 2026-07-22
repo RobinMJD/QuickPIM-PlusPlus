@@ -5,3 +5,4 @@ preview/
 .tools/
 .DS_Store
 /AI_HANDOVER.md
+/SessionExport*.txt

@@ -141,6 +141,7 @@ describe("Graph token capability detection", () => {
 
 describe("runtime message validation", () => {
   test("rejects unsupported and malformed privileged messages", () => {
+    const operationId = "request_security_test";
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
     expect(validateQuickPimMessage({ action: "refreshPortalTokens" })).toEqual({ action: "refreshPortalTokens" });
     expect(validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: ["pimGroup", "pimGroup", "azureRole"] })).toEqual({
@@ -193,19 +194,22 @@ describe("runtime message validation", () => {
       action: "activateItems",
       items: [duplicateRole, { ...duplicateRole, id: "different-client-id", roleDefinitionId: "READER" }],
       durationHours: 1,
-      justification: "Investigate production issue"
+      justification: "Investigate production issue",
+      operationId
     })).toThrow(/duplicate/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
       items: [duplicateRole],
       durationHours: 0.25,
-      justification: "Investigate production issue"
+      justification: "Investigate production issue",
+      operationId
     })).toThrow(/between 0.5 and 24/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
       items: [{ ...duplicateRole, activationRequirements: { maxDurationHours: 2 } }],
       durationHours: 4,
-      justification: "Investigate production issue"
+      justification: "Investigate production issue",
+      operationId
     })).toThrow(/policy maximum/i);
     expect(() => validateQuickPimMessage({
       action: "deactivateItems",
@@ -218,13 +222,15 @@ describe("runtime message validation", () => {
         directoryScopeId: "/",
         activeAssignmentType: "assigned",
         assignmentScheduleId: "assigned-schedule"
-      }]
+      }],
+      operationId
     })).toThrow(/activated through PIM/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
       items: [{ id: "x", type: "unknown", principalId: "user", status: "eligible" }],
       durationHours: 1,
-      justification: "Need access"
+      justification: "Need access",
+      operationId
     })).toThrow(/unsupported/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
@@ -233,8 +239,20 @@ describe("runtime message validation", () => {
         roleDefinitionId: "reader", directoryScopeId: "/"
       })),
       durationHours: 1,
-      justification: "Need access"
+      justification: "Need access",
+      operationId
     })).toThrow(/100/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [duplicateRole],
+      durationHours: 1,
+      justification: "Investigate production issue"
+    })).toThrow(/operation id/i);
+    expect(validateQuickPimMessage({ action: "getRequestOperations" })).toEqual({ action: "getRequestOperations" });
+    expect(validateQuickPimMessage({
+      action: "dismissRequestOperations",
+      operationIds: [operationId, operationId]
+    })).toEqual({ action: "dismissRequestOperations", operationIds: [operationId] });
   });
 });
 

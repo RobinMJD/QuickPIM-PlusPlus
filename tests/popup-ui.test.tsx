@@ -6,7 +6,7 @@ import { buildTargetCacheKey } from "../src/lib/access";
 import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
-import type { ActivationItem } from "../src/lib/types";
+import type { ActivationItem, RequestOperationRecord } from "../src/lib/types";
 
 afterEach(() => {
   const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
@@ -1560,6 +1560,16 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.querySelector(".filter-field .field-icon")).toBeTruthy();
     expect(document.querySelector(".sort-field .field-icon")).toBeTruthy();
+    expect(document.querySelector('[aria-label="Clear search"]')).toBeNull();
+
+    const searchInput = document.querySelector<HTMLInputElement>('[aria-label="Filter roles"]')!;
+    setFieldValue(searchInput, "missing");
+    await waitFor(() => expect(document.querySelector('[aria-label="Clear search"]')).toBeTruthy());
+    expect(document.body.textContent).not.toContain("Reader");
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Clear search"]')?.click();
+    await waitFor(() => expect(searchInput.value).toBe(""));
+    expect(document.body.textContent).toContain("Reader");
   });
 
   test("hides empty role tabs while keeping populated role tabs visible", async () => {
@@ -2396,6 +2406,15 @@ describe("popup compact controls", () => {
     clickButton("Activate 1 selected");
 
     await waitFor(() => expect(document.body.textContent).toContain("Activation in progressStep 1/3Sending activation request"));
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({
+      selectedIds: [eligibleItem.id],
+      isActivationReviewOpen: true,
+      requestMode: "activate"
+    }));
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      action: "activateItems",
+      operationId: expect.stringMatching(/^[a-zA-Z0-9_-]{8,80}$/)
+    }));
     activation.resolve({
       success: true,
       data: {
@@ -2411,6 +2430,125 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Activation request submitted for 1 item."));
     expect(document.body.textContent).not.toContain("Forced refresh completed.");
+  });
+
+  test("reconnects to a background activation after the popup is reopened", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const eligibleItem: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationRequirements: { justification: false, ticket: false }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: [eligibleItem]
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      },
+      [POPUP_DRAFT_KEY]: {
+        version: 1,
+        updatedAt: Date.now(),
+        tab: "directoryRole",
+        search: "",
+        sortMode: "name",
+        quickFilters: [],
+        selectedIds: [eligibleItem.id],
+        durationHours: 0.5,
+        justification: "",
+        ticketSystem: "",
+        ticketNumber: "",
+        isActivationReviewOpen: true,
+        requestMode: "activate"
+      }
+    };
+    let operations: RequestOperationRecord[] = [{
+      id: "request_background_test",
+      action: "activate",
+      itemIds: [eligibleItem.id],
+      targets: ["directoryRole"],
+      state: "running",
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      durationHours: 0.5
+    }];
+    const sendMessage = vi.fn((message: { action: string; operationIds?: string[] }) => {
+      if (message.action === "getRequestOperations") {
+        return Promise.resolve({ success: true, data: operations });
+      }
+      if (message.action === "dismissRequestOperations") {
+        operations = operations.filter((operation) => !message.operationIds?.includes(operation.id));
+        return Promise.resolve({ success: true, data: true });
+      }
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: { graph: { hasToken: false }, azureManagement: { hasToken: false } }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            eligible: { items: [], errors: [] },
+            active: { items: [{ ...eligibleItem, status: "active" }], errors: [] }
+          }
+        });
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async (key: string) => {
+            delete storageData[key];
+          })
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Request continues in the background"), 3_000);
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "activateItems" }));
+
+    operations = [{
+      ...operations[0],
+      state: "complete",
+      updatedAt: Date.now(),
+      response: {
+        success: true,
+        results: [{ itemId: eligibleItem.id, itemName: "Reader", success: true }],
+        errors: []
+      }
+    }];
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activation request submitted for 1 item."), 4_000);
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      action: "dismissRequestOperations",
+      operationIds: ["request_background_test"]
+    }));
+    expect(storageData).not.toHaveProperty(POPUP_DRAFT_KEY);
   });
 
   test("marks required justification with a red asterisk", async () => {

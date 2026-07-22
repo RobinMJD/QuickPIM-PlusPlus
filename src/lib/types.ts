@@ -309,12 +309,31 @@ export interface ActivationResult {
   success: boolean;
   requestId?: string;
   error?: string;
+  accessRecoveryTarget?: AccessSetupTarget;
 }
 
 export interface ActivationResponse {
   success: boolean;
   results: ActivationResult[];
   errors: ActivationResult[];
+}
+
+export type RequestOperationAction = "activate" | "deactivate";
+export type RequestOperationState = "running" | "complete" | "error";
+
+export interface RequestOperationRecord {
+  id: string;
+  action: RequestOperationAction;
+  itemIds: string[];
+  targets: AccessSetupTarget[];
+  state: RequestOperationState;
+  startedAt: number;
+  updatedAt: number;
+  durationHours?: number;
+  justification?: string;
+  bundleName?: string;
+  response?: ActivationResponse;
+  error?: string;
 }
 
 export interface BundleExpansion {

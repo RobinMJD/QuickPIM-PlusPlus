@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.10.11.
+Reviewed for v2.10.12.
 
 ## Threat Model
 
@@ -16,6 +16,8 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Token capture, migration, replacement, and cleanup mutations are serialized. Cleanup removes an invalid token only if the stored value still matches the validated stale snapshot, so it cannot delete a token captured concurrently.
 - Expired or invalid stored tokens are cleared when detected.
 - Errors are redacted before being displayed or returned from the background worker.
+- Activation and deactivation operations are journaled in session storage without bearer tokens. The background worker owns the Microsoft request, so closing the popup does not cancel it; reopening the popup reconnects to its progress and result.
+- Automatic portal recovery retries only failures identified before an activation or deactivation write was sent. Ambiguous network timeouts and server responses are never replayed automatically, preventing duplicate privileged-access requests.
 
 ## Access And Messaging
 

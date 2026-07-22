@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
-import { selectPortalTokenCandidates } from "../src/lib/tokenCandidates";
+import {
+  selectBestStoredGraphTokenForTarget,
+  selectPortalTokenCandidates
+} from "../src/lib/tokenCandidates";
 
 const NOW = Date.parse("2026-07-15T10:00:00.000Z");
 
@@ -99,6 +102,30 @@ describe("portal token candidate selection", () => {
     const selected = selectPortalTokenCandidates([olderAccountToken, activeAccountToken], { now: NOW });
 
     expect(new Set(selected.map((candidate) => candidate.identity))).toEqual(new Set(["tenant-b:user-b"]));
+  });
+
+  test("does not let a target-specific read token shadow a generic write-capable token", () => {
+    const readOnlyGroupToken = createToken({
+      aud: "https://graph.microsoft.com",
+      tid: "tenant-1",
+      oid: "user-1",
+      scp: "PrivilegedEligibilitySchedule.Read.AzureADGroup PrivilegedAssignmentSchedule.Read.AzureADGroup",
+      exp: Math.floor((NOW + 90 * 60_000) / 1000)
+    });
+    const writeCapableGroupToken = createToken({
+      aud: "https://graph.microsoft.com",
+      tid: "tenant-1",
+      oid: "user-1",
+      scp: "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup",
+      exp: Math.floor((NOW + 60 * 60_000) / 1000)
+    });
+
+    const selected = selectBestStoredGraphTokenForTarget([
+      { token: readOnlyGroupToken, timestamp: NOW + 1_000, source: "PIM list" },
+      { token: writeCapableGroupToken, timestamp: NOW, source: "PIM activation" }
+    ], "pimGroup", NOW);
+
+    expect(selected?.token).toBe(writeCapableGroupToken);
   });
 });
 

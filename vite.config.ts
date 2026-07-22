@@ -5,6 +5,9 @@ const entry = (path: string) => new URL(path, import.meta.url).pathname;
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    __QUICKPIM_BUILD_TIMESTAMP__: JSON.stringify(new Date().toISOString())
+  },
   build: {
     target: "chrome102",
     outDir: "dist",

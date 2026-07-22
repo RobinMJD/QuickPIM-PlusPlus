@@ -19,6 +19,7 @@ import {
   buildTokenCacheKey,
   buildTargetCacheKeys,
   getAccessSetupTargets,
+  hasRequiredPortalToken,
   type AccessCapabilityItem
 } from "../lib/access";
 import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
@@ -82,6 +83,11 @@ import {
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
+import {
+  getAccessRecoveryTargets,
+  mergeRetriedActivationResponse,
+  replaceAccessRecoveryErrors
+} from "../lib/requestRecovery";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -107,6 +113,7 @@ import type {
   QuickPimFeature,
   QuickPimDataCache,
   ReferenceDataCache,
+  RequestOperationRecord,
   QuickPimSettings,
   PopupRequestMode,
   PortalRecoveryFocusResult,
@@ -169,7 +176,16 @@ const PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 15_000;
 const PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
 const PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS = 1_000;
 const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
-const ACTIVATION_REQUEST_TIMEOUT_MS = 120_000;
+const ACTIVATION_REQUEST_TIMEOUT_MS = 180_000;
+const REQUEST_TOKEN_MIN_VALIDITY_MS = 5 * 60_000;
+const REQUEST_OPERATION_POLL_INTERVAL_MS = 750;
+
+function createRequestOperationId(): string {
+  if (typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `request_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+}
 
 function buildRefreshProgressSteps(includePortalRecovery: boolean): readonly ProgressStepDefinition[] {
   return includePortalRecovery
@@ -277,6 +293,17 @@ function inferRoleTabFromItemId(itemId: string): RoleTab | undefined {
   return undefined;
 }
 
+function hasRequestReadyPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus, now = Date.now()): boolean {
+  if (!hasRequiredPortalToken(target, tokenStatus)) {
+    return false;
+  }
+  const token = target === "azureRole"
+    ? tokenStatus.azureManagement
+    : tokenStatus.graphTargets?.[target] || tokenStatus.graph;
+  const expiresAt = token.expiresAt ? Date.parse(token.expiresAt) : Number.NaN;
+  return !Number.isFinite(expiresAt) || expiresAt > now + REQUEST_TOKEN_MIN_VALIDITY_MS;
+}
+
 function PopupApp() {
   const [tab, setTab] = useState<PopupTab>("directoryRole");
   const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
@@ -316,6 +343,8 @@ function PopupApp() {
   const activeRefreshRunId = useRef<number | undefined>(undefined);
   const requestProgressRunId = useRef(0);
   const activationRequestInFlight = useRef(false);
+  const ownedRequestOperationIds = useRef(new Set<string>());
+  const reconciledRequestOperationIds = useRef(new Set<string>());
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
 
@@ -550,6 +579,91 @@ function PopupApp() {
       window.removeEventListener("beforeunload", saveLatestDraft);
     };
   }, [isPopupDraftReady]);
+
+  useEffect(() => {
+    if (!isPopupDraftReady) {
+      return;
+    }
+
+    let active = true;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (active) {
+        timer = window.setTimeout(() => void poll(), REQUEST_OPERATION_POLL_INTERVAL_MS);
+      }
+    };
+    const poll = async () => {
+      try {
+        const operations = await sendMessage<RequestOperationRecord[]>(
+          { action: "getRequestOperations" },
+          { timeoutMs: 3_000, timeoutMessage: "Background request status check timed out." }
+        );
+        if (!active) {
+          return;
+        }
+        if (!Array.isArray(operations)) {
+          return;
+        }
+        const operation = operations.find((item) =>
+          !ownedRequestOperationIds.current.has(item.id)
+          && !reconciledRequestOperationIds.current.has(item.id)
+        );
+        if (!operation) {
+          return;
+        }
+
+        if (operation.state === "running") {
+          activationRequestInFlight.current = true;
+          setIsActivating(true);
+          setRequestMode(operation.action);
+          setIsActivationReviewOpen(true);
+          if (operation.durationHours !== undefined) {
+            setDurationHours(operation.durationHours);
+          }
+          if (operation.justification !== undefined) {
+            setJustification(operation.justification);
+          }
+          setSelectedIds((current) => {
+            const next = new Set(current);
+            operation.itemIds.forEach((id) => {
+              const item = getItemByPersistedId(itemsById, id);
+              if (item) next.add(item.id);
+            });
+            return setsEqual(current, next) ? current : next;
+          });
+          setActivationProgress((current) => {
+            const progressId = `background-${operation.id}`;
+            if (current?.operationId === progressId) {
+              return current;
+            }
+            const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
+            return advanceOperationProgress(createOperationProgress(progressId, steps), 1, {
+              label: "Request continues in the background"
+            });
+          });
+          return;
+        }
+
+        if (!hasActivationDataLoaded) {
+          return;
+        }
+        reconciledRequestOperationIds.current.add(operation.id);
+        await reconcileDetachedRequestOperation(operation);
+      } catch {
+        // A short-lived service-worker wake-up must not disturb the current popup state.
+      } finally {
+        schedule();
+      }
+    };
+
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [hasActivationDataLoaded, isPopupDraftReady, itemsById]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -1154,6 +1268,257 @@ function PopupApp() {
     }
   }
 
+  async function recoverRequestPortalAccess(
+    targets: AccessSetupTarget[],
+    onProgress: (label: string) => void
+  ): Promise<{ ready: boolean; error?: string }> {
+    const applyTokenStatus = (nextTokens: TokenStatus) => {
+      setTokenStatus(nextTokens);
+      setAccessCapabilities(buildAccessCapabilityItems(nextTokens, undefined, enabledRoleFeatures));
+    };
+    const missingTargets = (status: TokenStatus) => targets.filter((target) => !hasRequestReadyPortalToken(target, status));
+    let currentTokens = await sendMessage<TokenStatus>(
+      { action: "getTokenStatus" },
+      { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Microsoft portal access check timed out." }
+    );
+    applyTokenStatus(currentTokens);
+    let remainingTargets = missingTargets(currentTokens);
+    if (!remainingTargets.length) {
+      return { ready: true };
+    }
+
+    onProgress("Checking existing Microsoft portal tabs for activation access");
+    try {
+      const refreshed = await sendMessage<PortalTokenRefreshResult>(
+        { action: "refreshPortalTokens" },
+        { timeoutMs: PORTAL_TOKEN_REFRESH_TIMEOUT_MS, timeoutMessage: "Existing Microsoft portal tab scan timed out." }
+      );
+      currentTokens = refreshed.tokenStatus;
+      applyTokenStatus(currentTokens);
+      remainingTargets = missingTargets(currentTokens);
+    } catch {
+      // Opening a dedicated background page remains available when existing tabs cannot be scanned.
+    }
+    if (!remainingTargets.length) {
+      return { ready: true };
+    }
+
+    onProgress(`Preparing ${remainingTargets.map(tabLabel).join(" and ")} activation access`);
+    const recovery = await openPortalPagesForTargets(remainingTargets);
+    currentTokens = await sendMessage<TokenStatus>(
+      { action: "getTokenStatus" },
+      { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Microsoft portal access check timed out." }
+    );
+    applyTokenStatus(currentTokens);
+    remainingTargets = missingTargets(currentTokens);
+    if (!remainingTargets.length) {
+      return { ready: true };
+    }
+    if (!recovery.managedCount) {
+      return {
+        ready: false,
+        error: "QuickPIM++ could not open the Microsoft portal page needed for this request. Your selection and inputs are saved; use Refresh and retry."
+      };
+    }
+
+    setPortalRecoveryStatus(await readPortalRecoveryStatus());
+    onProgress(`Waiting for ${remainingTargets.map(tabLabel).join(" and ")} activation access`);
+    const recovered = await waitForManagedPortalRecovery(
+      remainingTargets,
+      currentTokens,
+      () => activationRequestInFlight.current
+    );
+    currentTokens = recovered.tokens;
+    applyTokenStatus(currentTokens);
+    setPortalRecoveryStatus(recovered.recoveryStatus);
+    remainingTargets = missingTargets(currentTokens);
+    if (!remainingTargets.length) {
+      return { ready: true };
+    }
+    if (recovered.recoveryStatus.state === "interactionRequired") {
+      return {
+        ready: false,
+        error: "Microsoft sign-in is required before this request can continue. Use the highlighted Refresh button to continue sign-in, then retry; your selection and inputs are saved."
+      };
+    }
+    return {
+      ready: false,
+      error: `QuickPIM++ could not capture ${remainingTargets.map(tabLabel).join(" and ")} activation access in time. Your selection and inputs are saved; use Refresh and retry.`
+    };
+  }
+
+  async function retryAfterPortalAccessRecovery(
+    initialResponse: ActivationResponse,
+    requestItems: ActivationItem[],
+    operation: "activation" | "deactivation",
+    onProgress: (label: string) => void,
+    retry: (items: ActivationItem[]) => Promise<ActivationResponse>
+  ): Promise<ActivationResponse> {
+    const recoveryTargets = getAccessRecoveryTargets(initialResponse);
+    if (!recoveryTargets.length) {
+      return initialResponse;
+    }
+    const retryItemIds = new Set(
+      initialResponse.errors
+        .filter((result) => result.accessRecoveryTarget)
+        .map((result) => result.itemId)
+    );
+    const retryItems = requestItems.filter((item) => retryItemIds.has(item.id));
+    if (!retryItems.length) {
+      return initialResponse;
+    }
+
+    try {
+      const recovery = await recoverRequestPortalAccess(recoveryTargets, onProgress);
+      if (!recovery.ready) {
+        return replaceAccessRecoveryErrors(initialResponse, recovery.error || "Microsoft portal access could not be refreshed automatically.");
+      }
+      onProgress(`Retrying ${operation} with refreshed Microsoft portal access`);
+      return mergeRetriedActivationResponse(initialResponse, await retry(retryItems));
+    } catch (recoveryError) {
+      const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
+      return replaceAccessRecoveryErrors(
+        initialResponse,
+        `QuickPIM++ could not refresh Microsoft portal access automatically: ${detail}. Your selection and inputs are saved.`
+      );
+    }
+  }
+
+  async function reconcileDetachedRequestOperation(operation: RequestOperationRecord): Promise<void> {
+    const operationLabel = operation.action === "activate" ? "activation" : "deactivation";
+    const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
+    let requestProgress = advanceOperationProgress(
+      createOperationProgress(`background-${operation.id}`, steps),
+      2,
+      { label: "Background request completed" }
+    );
+    activationRequestInFlight.current = false;
+    setIsActivating(false);
+    setActivationProgress(requestProgress);
+    if (operation.durationHours !== undefined) {
+      setDurationHours(operation.durationHours);
+    }
+    if (operation.justification !== undefined) {
+      setJustification(operation.justification);
+    }
+
+    try {
+      if (operation.state === "error" || !operation.response) {
+        const detail = operation.error || "The background request stopped before a result was available.";
+        const restorableIds = operation.itemIds.flatMap((id) => {
+          const item = getItemByPersistedId(itemsById, id);
+          return item ? [item.id] : [];
+        });
+        setActivationFailureNotice(null);
+        setError(detail);
+        setSelectedIds(new Set(restorableIds));
+        setRequestMode(operation.action);
+        setIsActivationReviewOpen(true);
+        await flushPopupDraft({
+          selectedIds: restorableIds,
+          durationHours: operation.durationHours ?? durationHours,
+          justification: operation.justification ?? justification,
+          isActivationReviewOpen: true,
+          requestMode: operation.action
+        });
+        requestProgress = failOperationProgress(
+          requestProgress,
+          detail,
+          `${operationLabel === "activation" ? "Activation" : "Deactivation"} stopped in the background`
+        );
+        setActivationProgress(requestProgress);
+        return;
+      }
+
+      const response = operation.response;
+      const operationItems = operation.itemIds
+        .map((id) => getItemByPersistedId(itemsById, id))
+        .filter((item): item is ActivationItem => Boolean(item));
+      const successfulIds = new Set(response.results.filter((result) => result.success).map((result) => result.itemId));
+      const failedIds = new Set(response.errors.map((result) => result.itemId));
+      const failedSelectionIds = operation.itemIds.flatMap((id) => {
+        const item = getItemByPersistedId(itemsById, id);
+        return item && failedIds.has(id) ? [item.id] : [];
+      });
+      const successCount = successfulIds.size;
+      const failureNotice = response.errors.length
+        ? buildActivationFailureNotice(response.errors, operationItems)
+        : null;
+
+      setError("");
+      setActivationFailureNotice(failureNotice);
+      setSelectedIds((current) => {
+        const next = new Set(
+          [...current].filter((id) => !successfulIds.has(id))
+        );
+        failedSelectionIds.forEach((id) => next.add(id));
+        return next;
+      });
+      setMessage(formatRequestConfirmation(operationLabel, successCount, response.errors.length));
+
+      if (failedSelectionIds.length) {
+        setRequestMode(operation.action);
+        setIsActivationReviewOpen(true);
+        await flushPopupDraft({
+          selectedIds: failedSelectionIds,
+          durationHours: operation.durationHours ?? durationHours,
+          justification: operation.justification ?? justification,
+          isActivationReviewOpen: true,
+          requestMode: operation.action
+        });
+      } else {
+        setRequestMode(undefined);
+        setIsActivationReviewOpen(false);
+        latestPopupDraft.current = undefined;
+        await clearPopupDraft();
+      }
+
+      if (successCount) {
+        await refresh({
+          force: true,
+          showLoading: false,
+          suppressMessage: true,
+          targets: operation.targets
+        });
+      }
+
+      if (failureNotice) {
+        requestProgress = failOperationProgress(
+          requestProgress,
+          failureNotice.errors.join("\n"),
+          `${operationLabel === "activation" ? "Activation" : "Deactivation"} completed with an issue`
+        );
+      } else {
+        requestProgress = completeOperationProgress(
+          requestProgress,
+          `${operationLabel === "activation" ? "Activation" : "Deactivation"} complete`
+        );
+        requestProgressClearTimer.current = setTimeout(() => {
+          setActivationProgress(null);
+          requestProgressClearTimer.current = undefined;
+        }, 350);
+      }
+      setActivationProgress(requestProgress);
+    } finally {
+      await acknowledgeRequestOperations([operation.id]);
+    }
+  }
+
+  async function acknowledgeRequestOperations(operationIds: string[]): Promise<void> {
+    if (!operationIds.length) {
+      return;
+    }
+    try {
+      await sendMessage<boolean>(
+        { action: "dismissRequestOperations", operationIds },
+        { timeoutMs: 3_000, timeoutMessage: "Background request cleanup timed out." }
+      );
+      operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
+    } catch {
+      // Keeping the local ownership marker prevents duplicate reconciliation in this popup.
+    }
+  }
+
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
     if (activationRequestInFlight.current) {
       return;
@@ -1205,6 +1570,7 @@ function PopupApp() {
       ACTIVATION_STEPS
     );
     let requestCompleted = false;
+    let requestContinuesInBackground = false;
     activationRequestInFlight.current = true;
     setIsActivating(true);
     setActivationProgress(requestProgress);
@@ -1212,18 +1578,52 @@ function PopupApp() {
     setError("");
     setActivationFailureNotice(null);
     setMessage("");
-    try {
-      const requestedAt = new Date().toISOString();
-      const response = await sendMessage<ActivationResponse>(
+    const operationIds: string[] = [];
+    const sendActivationOperation = (
+      requestItems: ActivationItem[],
+      timeoutMessage: string
+    ) => {
+      const operationId = createRequestOperationId();
+      operationIds.push(operationId);
+      ownedRequestOperationIds.current.add(operationId);
+      return sendMessage<ActivationResponse>(
         {
           action: "activateItems",
-          items: activatableItems,
+          items: requestItems,
           durationHours: effectiveDuration,
           justification: effectiveJustification,
           ticketInfo: effectiveTicketInfo,
-          bundleName: bundle?.name
+          bundleName: bundle?.name,
+          operationId
         },
-        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage: "The activation request timed out. Check Microsoft PIM before retrying to avoid a duplicate request." }
+        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage }
+      );
+    };
+    try {
+      await flushPopupDraft({
+        selectedIds: activatableItems.map((item) => item.id),
+        durationHours: effectiveDuration,
+        justification: effectiveJustification,
+        isActivationReviewOpen: true,
+        requestMode: "activate"
+      }).catch(() => undefined);
+      const requestedAt = new Date().toISOString();
+      let response = await sendActivationOperation(
+        activatableItems,
+        "The activation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
+      );
+      response = await retryAfterPortalAccessRecovery(
+        response,
+        activatableItems,
+        "activation",
+        (label) => {
+          requestProgress = advanceOperationProgress(requestProgress, 1, { label });
+          setActivationProgress(requestProgress);
+        },
+        (retryItems) => sendActivationOperation(
+          retryItems,
+          "The retried activation request timed out. QuickPIM++ will keep checking it in the background; do not submit another request."
+        )
       );
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
@@ -1286,15 +1686,24 @@ function PopupApp() {
         requestCompleted = true;
         setActivationProgress(requestProgress);
       }
+      await acknowledgeRequestOperations(operationIds);
     } catch (activationError) {
       const detail = activationError instanceof Error ? activationError.message : String(activationError);
       setActivationFailureNotice(null);
       setError(detail);
       requestProgress = failOperationProgress(requestProgress, detail, "Activation stopped at this step");
       setActivationProgress(requestProgress);
+      if (isOperationTimeoutError(activationError)) {
+        requestContinuesInBackground = true;
+        operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
+      } else {
+        await acknowledgeRequestOperations(operationIds);
+      }
     } finally {
-      activationRequestInFlight.current = false;
-      setIsActivating(false);
+      if (!requestContinuesInBackground) {
+        activationRequestInFlight.current = false;
+        setIsActivating(false);
+      }
       if (requestCompleted) {
         requestProgressClearTimer.current = setTimeout(() => {
           setActivationProgress(null);
@@ -1329,6 +1738,7 @@ function PopupApp() {
       DEACTIVATION_STEPS
     );
     let requestCompleted = false;
+    let requestContinuesInBackground = false;
     activationRequestInFlight.current = true;
     setIsActivating(true);
     setActivationProgress(requestProgress);
@@ -1336,16 +1746,49 @@ function PopupApp() {
     setError("");
     setActivationFailureNotice(null);
     setMessage("");
-    try {
-      const requestedAt = new Date().toISOString();
-      const response = await sendMessage<ActivationResponse>(
+    const operationIds: string[] = [];
+    const sendDeactivationOperation = (
+      requestItems: ActivationItem[],
+      timeoutMessage: string
+    ) => {
+      const operationId = createRequestOperationId();
+      operationIds.push(operationId);
+      ownedRequestOperationIds.current.add(operationId);
+      return sendMessage<ActivationResponse>(
         {
           action: "deactivateItems",
-          items: deactivatableItems,
+          items: requestItems,
           justification,
-          ticketInfo: {}
+          ticketInfo: {},
+          operationId
         },
-        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage: "The deactivation request timed out. Check Microsoft PIM before retrying to avoid a duplicate request." }
+        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage }
+      );
+    };
+    try {
+      await flushPopupDraft({
+        selectedIds: deactivatableItems.map((item) => item.id),
+        justification,
+        isActivationReviewOpen: true,
+        requestMode: "deactivate"
+      }).catch(() => undefined);
+      const requestedAt = new Date().toISOString();
+      let response = await sendDeactivationOperation(
+        deactivatableItems,
+        "The deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
+      );
+      response = await retryAfterPortalAccessRecovery(
+        response,
+        deactivatableItems,
+        "deactivation",
+        (label) => {
+          requestProgress = advanceOperationProgress(requestProgress, 1, { label });
+          setActivationProgress(requestProgress);
+        },
+        (retryItems) => sendDeactivationOperation(
+          retryItems,
+          "The retried deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit another request."
+        )
       );
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
@@ -1416,15 +1859,24 @@ function PopupApp() {
         requestCompleted = true;
         setActivationProgress(requestProgress);
       }
+      await acknowledgeRequestOperations(operationIds);
     } catch (activationError) {
       const detail = activationError instanceof Error ? activationError.message : String(activationError);
       setActivationFailureNotice(null);
       setError(detail);
       requestProgress = failOperationProgress(requestProgress, detail, "Deactivation stopped at this step");
       setActivationProgress(requestProgress);
+      if (isOperationTimeoutError(activationError)) {
+        requestContinuesInBackground = true;
+        operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
+      } else {
+        await acknowledgeRequestOperations(operationIds);
+      }
     } finally {
-      activationRequestInFlight.current = false;
-      setIsActivating(false);
+      if (!requestContinuesInBackground) {
+        activationRequestInFlight.current = false;
+        setIsActivating(false);
+      }
       if (requestCompleted) {
         requestProgressClearTimer.current = setTimeout(() => {
           setActivationProgress(null);
@@ -1670,6 +2122,17 @@ function PopupApp() {
                 <FilterIcon />
               </span>
               <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search name or scope" aria-label="Filter roles" />
+              {search ? (
+                <button
+                  type="button"
+                  className="field-clear-button"
+                  onClick={() => setSearch("")}
+                  title="Clear search"
+                  aria-label="Clear search"
+                >
+                  <ClearIcon />
+                </button>
+              ) : null}
             </div>
             <div className="control-with-icon sort-field">
               <span className="field-icon" aria-hidden="true">
@@ -2392,6 +2855,15 @@ function SortIcon() {
       <path d="M4 7l3-3 3 3" />
       <path d="M17 20V4" />
       <path d="M14 17l3 3 3-3" />
+    </svg>
+  );
+}
+
+function ClearIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="field-icon-svg">
+      <path d="m7 7 10 10" />
+      <path d="m17 7-10 10" />
     </svg>
   );
 }

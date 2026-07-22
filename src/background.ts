@@ -31,7 +31,8 @@ import {
 } from "./lib/cache";
 import {
   buildTargetCacheKeys,
-  classifyAccessFailure
+  classifyAccessFailure,
+  hasRequiredPortalToken
 } from "./lib/access";
 import {
   PRE_REFRESH_ALARM_NAME,
@@ -94,7 +95,19 @@ import {
   validateCapturedToken
 } from "./lib/security";
 import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
-import { selectPortalTokenCandidates } from "./lib/tokenCandidates";
+import { selectBestStoredGraphTokenForTarget, selectPortalTokenCandidates } from "./lib/tokenCandidates";
+import {
+  beginRequestOperation,
+  completeRequestOperation,
+  dismissRequestOperations,
+  failRequestOperation,
+  loadRequestOperations
+} from "./lib/requestOperations";
+import {
+  getAccessRecoveryTargets,
+  mergeRetriedActivationResponse,
+  replaceAccessRecoveryErrors
+} from "./lib/requestRecovery";
 import {
   clearStoredTokens,
   getStoredTokensFromSession,
@@ -118,6 +131,7 @@ import type {
   GroupInfo,
   PimGroupApi,
   PortalTokenRefreshResult,
+  RequestOperationRecord,
   RoleManagementPolicyAssignmentApi,
   TicketInfo,
   TokenKind,
@@ -146,9 +160,13 @@ interface AzureRoleDefinitionInfo {
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
 const MICROSOFT_API_READ_TIMEOUT_MS = 12_000;
 const MICROSOFT_API_WRITE_TIMEOUT_MS = 45_000;
+const MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS = 5 * 60_000;
+const REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 90_000;
+const REQUEST_PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
 const TARGET_SNAPSHOT_TIMEOUT_MS = 22_000;
 let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
 let requestTrackingMaintenanceInFlight: Promise<TrackedPimRequestStore> | undefined;
+const requestOperationTasks = new Map<string, Promise<ActivationResponse>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
 const REQUEST_TRACKING_STORAGE_TIMEOUT_MS = 750;
 
@@ -706,15 +724,250 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getActivationSnapshot(message.targets);
     case "refreshTrackedRequests":
       return runTrackedRequestMaintenance(message.requestIds, true);
+    case "getRequestOperations":
+      return loadRequestOperationsForPopup();
+    case "dismissRequestOperations":
+      await dismissRequestOperations(message.operationIds);
+      return true;
     case "capturePortalTokens":
       return capturePortalTokens(message.tokens, message.source, sender);
     case "activateItems":
-      return activateItems(message.items, message.durationHours, message.justification, message.ticketInfo || {}, message.bundleName);
+      return runDurableRequestOperation(
+        {
+          id: message.operationId,
+          action: "activate",
+          itemIds: message.items.map((item) => item.id),
+          targets: uniqueAccessTargets(message.items.map((item) => item.type)),
+          startedAt: Date.now(),
+          durationHours: message.durationHours,
+          justification: message.justification,
+          bundleName: message.bundleName
+        },
+        () => activateItemsWithPortalRecovery(
+          message.items,
+          message.durationHours,
+          message.justification,
+          message.ticketInfo || {},
+          message.bundleName
+        )
+      );
     case "deactivateItems":
-      return deactivateItems(message.items, message.justification || "", message.ticketInfo || {});
+      return runDurableRequestOperation(
+        {
+          id: message.operationId,
+          action: "deactivate",
+          itemIds: message.items.map((item) => item.id),
+          targets: uniqueAccessTargets(message.items.map((item) => item.type)),
+          startedAt: Date.now(),
+          justification: message.justification
+        },
+        () => deactivateItemsWithPortalRecovery(
+          message.items,
+          message.justification || "",
+          message.ticketInfo || {}
+        )
+      );
     default:
       throw new Error("Unsupported QuickPIM++ message");
   }
+}
+
+async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]> {
+  const operations = await loadRequestOperations();
+  const orphaned = operations.filter((operation) =>
+    operation.state === "running" && !requestOperationTasks.has(operation.id)
+  );
+  if (!orphaned.length) {
+    return operations;
+  }
+
+  const error = "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request.";
+  await Promise.all(orphaned.map((operation) => failRequestOperation(operation.id, error)));
+  return loadRequestOperations();
+}
+
+function runDurableRequestOperation(
+  operation: Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets" | "startedAt"> &
+    Partial<Pick<RequestOperationRecord, "durationHours" | "justification" | "bundleName">>,
+  execute: () => Promise<ActivationResponse>
+): Promise<ActivationResponse> {
+  const existingTask = requestOperationTasks.get(operation.id);
+  if (existingTask) {
+    return existingTask;
+  }
+
+  const task = (async () => {
+    const stored = (await loadRequestOperations()).find((item) => item.id === operation.id);
+    if (stored?.state === "complete" && stored.response) {
+      return stored.response;
+    }
+    if (stored?.state === "error") {
+      throw new Error(stored.error || "The previous QuickPIM++ request failed.");
+    }
+    if (stored?.state === "running") {
+      const error = "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request.";
+      await failRequestOperation(operation.id, error);
+      throw new Error(error);
+    }
+
+    await beginRequestOperation(operation);
+    try {
+      const response = await execute();
+      await completeRequestOperation(operation.id, response);
+      return response;
+    } catch (error) {
+      const detail = sanitizeErrorMessage(error);
+      await failRequestOperation(operation.id, detail);
+      throw error;
+    }
+  })();
+
+  requestOperationTasks.set(operation.id, task);
+  void task.then(
+    () => requestOperationTasks.delete(operation.id),
+    () => requestOperationTasks.delete(operation.id)
+  );
+  return task;
+}
+
+async function activateItemsWithPortalRecovery(
+  items: ActivationItem[],
+  durationHours: number,
+  justification: string,
+  ticketInfo: TicketInfo,
+  bundleName?: string
+): Promise<ActivationResponse> {
+  return executeWithPortalAccessRecovery(
+    items,
+    "activation",
+    (retryItems) => activateItems(retryItems, durationHours, justification, ticketInfo, bundleName)
+  );
+}
+
+async function deactivateItemsWithPortalRecovery(
+  items: ActivationItem[],
+  justification: string,
+  ticketInfo: TicketInfo
+): Promise<ActivationResponse> {
+  return executeWithPortalAccessRecovery(
+    items,
+    "deactivation",
+    (retryItems) => deactivateItems(retryItems, justification, ticketInfo)
+  );
+}
+
+async function executeWithPortalAccessRecovery(
+  items: ActivationItem[],
+  operation: "activation" | "deactivation",
+  execute: (items: ActivationItem[]) => Promise<ActivationResponse>
+): Promise<ActivationResponse> {
+  const initialResponse = await execute(items);
+  const recoveryTargets = getAccessRecoveryTargets(initialResponse);
+  if (!recoveryTargets.length) {
+    return initialResponse;
+  }
+
+  const retryIds = new Set(
+    initialResponse.errors
+      .filter((result) => result.accessRecoveryTarget)
+      .map((result) => result.itemId)
+  );
+  const retryItems = items.filter((item) => retryIds.has(item.id));
+  if (!retryItems.length) {
+    return initialResponse;
+  }
+
+  const recovery = await recoverPortalAccessForRequest(recoveryTargets);
+  if (!recovery.ready) {
+    return replaceAccessRecoveryErrors(
+      initialResponse,
+      recovery.error || `Microsoft portal access required for ${operation} could not be refreshed automatically.`
+    );
+  }
+
+  return mergeRetriedActivationResponse(initialResponse, await execute(retryItems));
+}
+
+async function recoverPortalAccessForRequest(
+  targets: AccessSetupTarget[]
+): Promise<{ ready: boolean; error?: string }> {
+  try {
+    await refreshPortalTokensFromOpenTabs();
+  } catch {
+    // Dedicated background tabs remain available if passive tab scanning fails.
+  }
+
+  let tokenStatus = await getTokenStatus();
+  let remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus);
+  if (!remainingTargets.length) {
+    return { ready: true };
+  }
+
+  const opened = await openManagedPortalRecoveryTabs(remainingTargets);
+  if (!opened.managedCount) {
+    return {
+      ready: false,
+      error: "QuickPIM++ could not open the Microsoft portal page needed for this request. Your selection and inputs remain saved."
+    };
+  }
+
+  const deadline = Date.now() + REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS;
+  let passiveScanAt = 0;
+  while (Date.now() < deadline) {
+    await delay(REQUEST_PORTAL_RECOVERY_POLL_INTERVAL_MS);
+    if (Date.now() - passiveScanAt >= 3_000) {
+      passiveScanAt = Date.now();
+      try {
+        tokenStatus = (await refreshPortalTokensFromOpenTabs()).tokenStatus;
+      } catch {
+        tokenStatus = await getTokenStatus();
+      }
+    } else {
+      tokenStatus = await getTokenStatus();
+    }
+    remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus);
+    if (!remainingTargets.length) {
+      await closeCompletedRecoveryTabs(tokenStatus);
+      return { ready: true };
+    }
+  }
+
+  const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis());
+  const interactionRequired = recoveryStatus.state === "interactionRequired";
+  return {
+    ready: false,
+    error: interactionRequired
+      ? "Microsoft sign-in or another portal prompt must be completed before this request can continue. Your selection and inputs remain saved."
+      : `QuickPIM++ could not capture ${remainingTargets.map(accessTargetLabel).join(" and ")} request access in time. Your selection and inputs remain saved.`
+  };
+}
+
+function getRequestMissingAccessTargets(targets: AccessSetupTarget[], tokenStatus: TokenStatus): AccessSetupTarget[] {
+  const now = Date.now();
+  return targets.filter((target) => {
+    if (!hasRequiredPortalToken(target, tokenStatus)) {
+      return true;
+    }
+    const token = target === "azureRole"
+      ? tokenStatus.azureManagement
+      : tokenStatus.graphTargets?.[target] || tokenStatus.graph;
+    const expiresAt = token.expiresAt ? Date.parse(token.expiresAt) : Number.NaN;
+    return Number.isFinite(expiresAt) && expiresAt <= now + MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS;
+  });
+}
+
+function uniqueAccessTargets(targets: AccessSetupTarget[]): AccessSetupTarget[] {
+  const requested = new Set(targets);
+  return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
+    .filter((target) => requested.has(target));
+}
+
+function accessTargetLabel(target: AccessSetupTarget): string {
+  return target === "directoryRole" ? "Entra role" : target === "pimGroup" ? "PIM group" : "Azure role";
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
@@ -1137,7 +1390,10 @@ function selectGraphTokenForTargetStatus(tokens: StoredTokens, target: GraphToke
       }
       : undefined;
   const genericCandidate = { token: tokens.graphToken, timestamp: tokens.tokenTimestamp, source: tokens.tokenSource };
-  return [targetCandidate, genericCandidate].find((candidate) => candidate?.token && validateCapturedToken(candidate.token, "graph").ok);
+  return selectBestStoredGraphTokenForTarget(
+    [targetCandidate || {}, genericCandidate],
+    target
+  );
 }
 
 function selectGraphTokenForStatus(tokens: StoredTokens): { token?: string; timestamp?: number; source?: string } | undefined {
@@ -2127,8 +2383,9 @@ async function activateItems(
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
           if (!token) {
-            throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
+            throw createPortalAccessRequiredError(item, request.tokenKind, "activation");
           }
+          assertRequestTokenReady(item, token, request.tokenKind, "activation");
           assertTokenCanActivate(item, token, request.tokenKind);
 
           const validationRequest = buildActivationValidationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
@@ -2162,12 +2419,14 @@ async function activateItems(
           };
         });
       } catch (error) {
+        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error);
         return {
           result: {
             itemId: item.id,
             itemName: item.displayName,
             success: false,
-            error: sanitizeErrorMessage(error)
+            error: sanitizeErrorMessage(error),
+            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {})
           },
           trackedRequest: undefined
         };
@@ -2226,8 +2485,9 @@ async function deactivateItems(
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
           if (!token) {
-            throw new Error(request.tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.");
+            throw createPortalAccessRequiredError(item, request.tokenKind, "deactivation");
           }
+          assertRequestTokenReady(item, token, request.tokenKind, "deactivation");
           assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
           const data = await sendActivationRequest(request, token);
           const requestId = getResponseIdentifier(data, request);
@@ -2252,12 +2512,14 @@ async function deactivateItems(
           };
         });
       } catch (error) {
+        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error);
         return {
           result: {
             itemId: item.id,
             itemName: item.displayName,
             success: false,
-            error: sanitizeErrorMessage(error)
+            error: sanitizeErrorMessage(error),
+            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {})
           },
           trackedRequest: undefined
         };
@@ -2290,7 +2552,57 @@ function assertTokenCanActivate(item: ActivationItem, token: string, tokenKind: 
 
   const label = target === "pimGroup" ? "PIM group" : "Entra role";
   const requiredScopes = getRequiredGraphActivationScopes(target).join(" or ");
-  throw new Error(`${label} ${operation} needs a captured Graph token with ${requiredScopes}. Run Access Setup and reload the matching Microsoft portal page.`);
+  throw new PortalAccessRequiredError(
+    target,
+    `${label} ${operation} needs a stronger Microsoft Graph portal token with ${requiredScopes}.`
+  );
+}
+
+function assertRequestTokenReady(
+  item: ActivationItem,
+  token: string,
+  tokenKind: TokenKind,
+  operation: "activation" | "deactivation"
+): void {
+  try {
+    assertFreshToken(token, tokenKind, Date.now() + MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS);
+  } catch {
+    throw createPortalAccessRequiredError(item, tokenKind, operation);
+  }
+
+  const principalId = decodeToken(token)?.oid;
+  if (typeof principalId === "string" && principalId.toLowerCase() !== item.principalId.toLowerCase()) {
+    throw new Error("The selected role belongs to another signed-in account. Refresh role data before retrying.");
+  }
+}
+
+class PortalAccessRequiredError extends Error {
+  constructor(
+    readonly target: AccessSetupTarget,
+    message: string
+  ) {
+    super(message);
+    this.name = "PortalAccessRequiredError";
+  }
+}
+
+function createPortalAccessRequiredError(
+  item: ActivationItem,
+  tokenKind: TokenKind,
+  operation: "activation" | "deactivation"
+): PortalAccessRequiredError {
+  const target: AccessSetupTarget = tokenKind === "azureManagement"
+    ? "azureRole"
+    : item.type === "pimGroup"
+      ? "pimGroup"
+      : "directoryRole";
+  const label = target === "azureRole" ? "Azure role" : target === "pimGroup" ? "PIM group" : "Entra role";
+  const tokenLabel = target === "azureRole" ? "Azure Management" : "Microsoft Graph";
+  return new PortalAccessRequiredError(target, `${label} ${operation} needs a fresh ${tokenLabel} portal token.`);
+}
+
+function getPortalAccessRecoveryTarget(error: unknown): AccessSetupTarget | undefined {
+  return error instanceof PortalAccessRequiredError ? error.target : undefined;
 }
 
 function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, tokenKind: TokenKind): string | undefined {

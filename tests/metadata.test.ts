@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { APP_NAME, APP_VERSION } from "../src/lib/appMetadata";
+import { APP_BUILD_TIMESTAMP, APP_NAME, APP_VERSION } from "../src/lib/appMetadata";
 
 const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
 const packageLockJson = JSON.parse(readFileSync(resolve("package-lock.json"), "utf8"));
@@ -15,11 +15,12 @@ describe("versioning and extension manifest", () => {
     expect(packageLockJson.packages[""].name).toBe("quickpim-plusplus");
   });
 
-  test("keeps package, lockfile, and manifest versions in sync at v2.10.11", () => {
+  test("keeps package, lockfile, and manifest versions in sync at v2.10.12", () => {
     expect(packageJson.version).toBe(APP_VERSION);
     expect(packageLockJson.packages[""].version).toBe(APP_VERSION);
     expect(packageLockJson.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
+    expect(Number.isFinite(Date.parse(APP_BUILD_TIMESTAMP))).toBe(true);
   });
 
   test("uses only required host permissions and an explicit extension CSP", () => {
@@ -71,7 +72,7 @@ describe("versioning and extension manifest", () => {
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
     expect(readme).toContain("Original author: Daniel Bradley");
-    expect(readme).toContain("v2.10.11");
+    expect(readme).toContain("v2.10.12");
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");

@@ -15,6 +15,8 @@ export type QuickPimMessage =
   | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
   | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[] }
   | { action: "refreshTrackedRequests"; requestIds?: string[] }
+  | { action: "getRequestOperations" }
+  | { action: "dismissRequestOperations"; operationIds: string[] }
   | { action: "capturePortalTokens"; tokens: string[]; source?: string }
   | {
       action: "activateItems";
@@ -23,12 +25,14 @@ export type QuickPimMessage =
       justification: string;
       ticketInfo?: TicketInfo;
       bundleName?: string;
+      operationId: string;
     }
   | {
       action: "deactivateItems";
       items: ActivationItem[];
       justification?: string;
       ticketInfo?: TicketInfo;
+      operationId: string;
     };
 
 const SIMPLE_ACTIONS = new Set([
@@ -36,7 +40,8 @@ const SIMPLE_ACTIONS = new Set([
   "refreshPortalTokens",
   "getPortalRecoveryStatus",
   "focusPortalRecoveryTabs",
-  "clearToken"
+  "clearToken",
+  "getRequestOperations"
 ]);
 const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", "getActivationSnapshot"]);
 const MAX_PORTAL_TOKEN_INPUTS = 200;
@@ -98,6 +103,14 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     };
   }
 
+  if (message.action === "dismissRequestOperations") {
+    const operationIds = sanitizeOperationIds(message.operationIds);
+    if (!operationIds.length) {
+      throw new Error("Request operation ids must not be empty.");
+    }
+    return { action: "dismissRequestOperations", operationIds };
+  }
+
   if (message.action !== "activateItems" && message.action !== "deactivateItems") {
     throw new Error("Unsupported QuickPIM++ message.");
   }
@@ -111,6 +124,7 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   const expectedStatus = message.action === "activateItems" ? "eligible" : "active";
   const items = message.items.map((item) => validateActivationItem(item, expectedStatus));
   assertUniqueActivationItems(items);
+  const operationId = sanitizeOperationId(message.operationId);
 
   if (message.action === "deactivateItems") {
     if (items.some((item) => item.activeAssignmentType && item.activeAssignmentType !== "activated")) {
@@ -124,7 +138,8 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
       action: "deactivateItems",
       items,
       justification: typeof message.justification === "string" ? message.justification : undefined,
-      ticketInfo: validateTicketInfo(message.ticketInfo)
+      ticketInfo: validateTicketInfo(message.ticketInfo),
+      operationId
     };
   }
 
@@ -159,8 +174,21 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     durationHours,
     justification: message.justification,
     ticketInfo: validateTicketInfo(message.ticketInfo),
-    bundleName: typeof message.bundleName === "string" ? message.bundleName.trim().slice(0, MAX_BUNDLE_NAME_LENGTH) || undefined : undefined
+    bundleName: typeof message.bundleName === "string" ? message.bundleName.trim().slice(0, MAX_BUNDLE_NAME_LENGTH) || undefined : undefined,
+    operationId
   };
+}
+
+function sanitizeOperationIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map(sanitizeOperationId))].slice(0, 20);
+}
+
+function sanitizeOperationId(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-zA-Z0-9_-]{8,80}$/.test(value)) {
+    throw new Error("Request operation id is invalid.");
+  }
+  return value;
 }
 
 function assertUniqueActivationItems(items: ActivationItem[]): void {
