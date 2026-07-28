@@ -1,9 +1,11 @@
 import { describe, expect, test } from "vitest";
 import {
   getAccessRecoveryTargets,
+  getFreshAccessRecoveryTargets,
   mergeRetriedActivationResponse,
   replaceAccessRecoveryErrors
 } from "../src/lib/requestRecovery";
+import { CLAIMS_CHALLENGE_MESSAGE } from "../src/lib/apiErrors";
 import type { ActivationResponse } from "../src/lib/types";
 
 describe("activation portal access recovery", () => {
@@ -37,6 +39,32 @@ describe("activation portal access recovery", () => {
       results: [{ itemId: "role-3", itemName: "Owner", success: false, error: "Request timed out" }],
       errors: [{ itemId: "role-3", itemName: "Owner", success: false, error: "Request timed out" }]
     })).toEqual([]);
+  });
+
+  test("requires a newly captured token for Microsoft claims challenges", () => {
+    const response: ActivationResponse = {
+      success: false,
+      results: [
+        {
+          itemId: "directory-role-1",
+          itemName: "Hybrid Identity Administrator",
+          success: false,
+          error: CLAIMS_CHALLENGE_MESSAGE,
+          accessRecoveryTarget: "directoryRole"
+        },
+        {
+          itemId: "group-1",
+          itemName: "Intune operators",
+          success: false,
+          error: "PIM group activation needs a stronger token.",
+          accessRecoveryTarget: "pimGroup"
+        }
+      ],
+      errors: []
+    };
+    response.errors = response.results;
+
+    expect(getFreshAccessRecoveryTargets(response)).toEqual(["directoryRole"]);
   });
 
   test("replaces only retried item outcomes and preserves earlier successes", () => {

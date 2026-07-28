@@ -1,3 +1,4 @@
+import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
 import type { AccessSetupTarget, ActivationResponse } from "./types";
 
 export function getAccessRecoveryTargets(response: ActivationResponse): AccessSetupTarget[] {
@@ -6,6 +7,23 @@ export function getAccessRecoveryTargets(response: ActivationResponse): AccessSe
   );
   return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
     .filter((target) => requested.has(target));
+}
+
+export function getFreshAccessRecoveryTargets(response: ActivationResponse): AccessSetupTarget[] {
+  const requested = new Set(
+    response.errors.flatMap((result) =>
+      result.accessRecoveryTarget && isFreshPortalTokenRequired(result.error)
+        ? [result.accessRecoveryTarget]
+        : []
+    )
+  );
+  return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
+    .filter((target) => requested.has(target));
+}
+
+export function isFreshPortalTokenRequired(error: string | undefined): boolean {
+  const message = error || "";
+  return message === CLAIMS_CHALLENGE_MESSAGE || isClaimsChallengeMessage(message);
 }
 
 export function mergeRetriedActivationResponse(

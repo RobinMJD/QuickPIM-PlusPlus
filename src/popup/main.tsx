@@ -19,7 +19,6 @@ import {
   buildTokenCacheKey,
   buildTargetCacheKeys,
   getAccessSetupTargets,
-  hasRequiredPortalToken,
   type AccessCapabilityItem
 } from "../lib/access";
 import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
@@ -83,11 +82,6 @@ import {
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
-import {
-  getAccessRecoveryTargets,
-  mergeRetriedActivationResponse,
-  replaceAccessRecoveryErrors
-} from "../lib/requestRecovery";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -127,7 +121,7 @@ import type {
 
 interface ActivationFailureNotice {
   errors: string[];
-  claimsChallengeTargets: RoleTab[];
+  recoveryTargets: RoleTab[];
 }
 
 const ACTIVATION_STEPS: readonly ProgressStepDefinition[] = [
@@ -177,7 +171,6 @@ const PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
 const PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS = 1_000;
 const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
 const ACTIVATION_REQUEST_TIMEOUT_MS = 180_000;
-const REQUEST_TOKEN_MIN_VALIDITY_MS = 5 * 60_000;
 const REQUEST_OPERATION_POLL_INTERVAL_MS = 750;
 
 function createRequestOperationId(): string {
@@ -260,28 +253,37 @@ function buildActivationFailureNotice(
   activatableItems: ActivationItem[]
 ): ActivationFailureNotice {
   const itemsById = new Map(activatableItems.map((item) => [item.id, item.type]));
-  const claimsChallengeTargets = new Set<RoleTab>();
+  const recoveryTargets = new Set<RoleTab>();
   const formattedErrors = errors.map((errorItem) => {
     const rawError = errorItem.error || "";
     const formatted = formatActivationError(errorItem);
-    if (formatLoadMessages([rawError]).includes(CLAIMS_CHALLENGE_MESSAGE)) {
-      const target = itemsById.get(errorItem.itemId) || inferRoleTabFromItemId(errorItem.itemId);
-      if (target) {
-        claimsChallengeTargets.add(target);
-      }
+    const target = errorItem.accessRecoveryTarget
+      || itemsById.get(errorItem.itemId)
+      || inferRoleTabFromItemId(errorItem.itemId);
+    if (
+      target
+      && (
+        errorItem.accessRecoveryTarget
+        || formatLoadMessages([rawError]).includes(CLAIMS_CHALLENGE_MESSAGE)
+      )
+    ) {
+      recoveryTargets.add(target);
     }
     return formatted;
   });
 
   return {
-    errors: formattedErrors,
-    claimsChallengeTargets: [...claimsChallengeTargets]
+    errors: [...new Set(formattedErrors)],
+    recoveryTargets: [...recoveryTargets]
   };
 }
 
 function formatActivationError(item: ActivationResponse["errors"][number]): string {
   const error = item.error || "Activation failed.";
   const formatted = formatLoadMessages([error])[0] || error;
+  if (formatted === CLAIMS_CHALLENGE_MESSAGE) {
+    return `${item.itemName}: Microsoft requires an additional sign-in or MFA challenge before this request can continue.`;
+  }
   return `${item.itemName}: ${formatted}`;
 }
 
@@ -291,17 +293,6 @@ function inferRoleTabFromItemId(itemId: string): RoleTab | undefined {
     return prefix;
   }
   return undefined;
-}
-
-function hasRequestReadyPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus, now = Date.now()): boolean {
-  if (!hasRequiredPortalToken(target, tokenStatus)) {
-    return false;
-  }
-  const token = target === "azureRole"
-    ? tokenStatus.azureManagement
-    : tokenStatus.graphTargets?.[target] || tokenStatus.graph;
-  const expiresAt = token.expiresAt ? Date.parse(token.expiresAt) : Number.NaN;
-  return !Number.isFinite(expiresAt) || expiresAt > now + REQUEST_TOKEN_MIN_VALIDITY_MS;
 }
 
 function PopupApp() {
@@ -708,7 +699,7 @@ function PopupApp() {
       }
     } finally {
       setIsPopupDraftReady(true);
-      void refresh({ force: false });
+      void refresh({ force: false, quietWhenCached: true });
     }
   }
 
@@ -766,6 +757,7 @@ function PopupApp() {
     suppressMessage?: boolean;
     targets?: AccessSetupTarget[];
     recoverMissingPortalAccess?: boolean;
+    quietWhenCached?: boolean;
   }) {
     const refreshStartedAt = Date.now();
     const runId = ++refreshRunId.current;
@@ -773,39 +765,20 @@ function PopupApp() {
     const isCurrentRun = () => refreshRunId.current === runId;
     const showBlockingLoading = options.showLoading !== false;
     const shouldShowProgress = !options.suppressMessage;
+    const preferQuietCachedRefresh = options.quietWhenCached === true && !options.force;
     let refreshSteps = buildRefreshProgressSteps(false);
     let liveProgress: OperationProgress | null = null;
     let refreshCompleted = false;
+    let progressVisible = false;
+    let surfaceRefreshErrors = !preferQuietCachedRefresh;
+    let cacheDecisionMade = false;
+    let canShowCachedData = false;
 
-    const showProgressStep = (
-      current: number,
-      label: string,
-      steps: readonly ProgressStepDefinition[] = refreshSteps
-    ) => {
-      if (!shouldShowProgress || !liveProgress) {
+    const revealProgress = () => {
+      if (!shouldShowProgress || progressVisible || !liveProgress) {
         return;
       }
-      refreshSteps = steps;
-      liveProgress = advanceOperationProgress(liveProgress, current, { label, steps });
-      setRefreshProgress(liveProgress);
-    };
-    const showProgressError = (detail: string, label?: string) => {
-      setError(detail);
-      setMessage("");
-      if (shouldShowProgress && liveProgress) {
-        liveProgress = failOperationProgress(liveProgress, detail, label);
-        setRefreshProgress(liveProgress);
-      }
-    };
-    const showProgressComplete = (label: string) => {
-      refreshCompleted = true;
-      if (shouldShowProgress && liveProgress) {
-        liveProgress = completeOperationProgress(liveProgress, label);
-        setRefreshProgress(liveProgress);
-      }
-    };
-
-    if (shouldShowProgress) {
+      progressVisible = true;
       setError("");
       setActivationFailureNotice(null);
       setActivationProgress(null);
@@ -818,10 +791,51 @@ function PopupApp() {
         clearTimeout(refreshSuccessTimer.current);
         refreshSuccessTimer.current = undefined;
       }
+      setRefreshProgress(liveProgress);
+    };
+
+    const showProgressStep = (
+      current: number,
+      label: string,
+      steps: readonly ProgressStepDefinition[] = refreshSteps
+    ) => {
+      if (!shouldShowProgress || !liveProgress) {
+        return;
+      }
+      refreshSteps = steps;
+      liveProgress = advanceOperationProgress(liveProgress, current, { label, steps });
+      if (progressVisible) {
+        setRefreshProgress(liveProgress);
+      }
+    };
+    const showProgressError = (detail: string, label?: string) => {
+      if (surfaceRefreshErrors) {
+        revealProgress();
+        setError(detail);
+        setMessage("");
+      }
+      if (shouldShowProgress && liveProgress && progressVisible) {
+        liveProgress = failOperationProgress(liveProgress, detail, label);
+        setRefreshProgress(liveProgress);
+      }
+    };
+    const showProgressComplete = (label: string) => {
+      refreshCompleted = true;
+      if (shouldShowProgress && liveProgress) {
+        liveProgress = completeOperationProgress(liveProgress, label);
+        if (progressVisible) {
+          setRefreshProgress(liveProgress);
+        }
+      }
+    };
+
+    if (shouldShowProgress) {
       liveProgress = createOperationProgress(`refresh-${runId}`, refreshSteps, {
         label: showBlockingLoading ? "Reading local state" : "Checking local data"
       });
-      setRefreshProgress(liveProgress);
+      if (!preferQuietCachedRefresh) {
+        revealProgress();
+      }
     }
     try {
       const [
@@ -860,9 +874,15 @@ function PopupApp() {
         loadedReferenceData,
         [...initialCacheView.eligible.items, ...initialCacheView.active.items]
       );
-      const canShowCachedData = !options.force && (
-        initialCacheView.eligible.items.length > 0 || initialCacheView.active.items.length > 0
+      canShowCachedData = !options.force && enabledRoleFeatures.some((target) =>
+        initialCacheView.eligibleCache[target]?.isUsable
+        || initialCacheView.activeCache[target]?.isUsable
       );
+      cacheDecisionMade = true;
+      if (!canShowCachedData) {
+        surfaceRefreshErrors = true;
+        revealProgress();
+      }
 
       if (canShowCachedData) {
         renderLoadedActivationData(
@@ -994,7 +1014,7 @@ function PopupApp() {
           );
         }
         setHasActivationDataLoaded(true);
-        if (!options.suppressMessage) {
+        if (!options.suppressMessage && surfaceRefreshErrors) {
           setMessage("");
         }
         showProgressStep(saveProgressStep, "Finalizing current data");
@@ -1003,7 +1023,7 @@ function PopupApp() {
       }
 
       setIsRefreshing(true);
-      if (!options.suppressMessage) {
+      if (!options.suppressMessage && surfaceRefreshErrors) {
         setMessage("");
       }
 
@@ -1171,8 +1191,10 @@ function PopupApp() {
       if (formattedLoadErrors.length && !isInitialAccessRequired) {
         showProgressError(formattedLoadErrors.join("\n"), "Refresh completed with an issue");
       } else {
-        setError("");
-        if (!options.suppressMessage) {
+        if (surfaceRefreshErrors) {
+          setError("");
+        }
+        if (!options.suppressMessage && surfaceRefreshErrors) {
           setMessage("");
         }
         showProgressComplete(remainingAccessTargets.length ? "Available role data loaded" : "Refresh complete");
@@ -1185,7 +1207,11 @@ function PopupApp() {
         }
       }
     } catch (loadError) {
-      setActivationFailureNotice(null);
+      if (!cacheDecisionMade || !canShowCachedData) {
+        surfaceRefreshErrors = true;
+        revealProgress();
+        setActivationFailureNotice(null);
+      }
       showProgressError(
         loadError instanceof Error ? loadError.message : String(loadError),
         "Refresh stopped at this step"
@@ -1197,14 +1223,14 @@ function PopupApp() {
       if (isCurrentRun()) {
         setIsLoading(false);
         setIsRefreshing(false);
-        if (shouldShowProgress && refreshCompleted) {
+        if (progressVisible && refreshCompleted) {
           refreshProgressClearTimer.current = setTimeout(() => {
             if (refreshRunId.current === runId) {
               setRefreshProgress(null);
             }
             refreshProgressClearTimer.current = undefined;
           }, 350);
-        } else if (shouldShowProgress && liveProgress?.status !== "error") {
+        } else if (progressVisible && liveProgress?.status !== "error") {
           setRefreshProgress(null);
         }
       }
@@ -1265,122 +1291,6 @@ function PopupApp() {
     } catch (saveError) {
       setActivationFailureNotice(null);
       setError(saveError instanceof Error ? saveError.message : String(saveError));
-    }
-  }
-
-  async function recoverRequestPortalAccess(
-    targets: AccessSetupTarget[],
-    onProgress: (label: string) => void
-  ): Promise<{ ready: boolean; error?: string }> {
-    const applyTokenStatus = (nextTokens: TokenStatus) => {
-      setTokenStatus(nextTokens);
-      setAccessCapabilities(buildAccessCapabilityItems(nextTokens, undefined, enabledRoleFeatures));
-    };
-    const missingTargets = (status: TokenStatus) => targets.filter((target) => !hasRequestReadyPortalToken(target, status));
-    let currentTokens = await sendMessage<TokenStatus>(
-      { action: "getTokenStatus" },
-      { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Microsoft portal access check timed out." }
-    );
-    applyTokenStatus(currentTokens);
-    let remainingTargets = missingTargets(currentTokens);
-    if (!remainingTargets.length) {
-      return { ready: true };
-    }
-
-    onProgress("Checking existing Microsoft portal tabs for activation access");
-    try {
-      const refreshed = await sendMessage<PortalTokenRefreshResult>(
-        { action: "refreshPortalTokens" },
-        { timeoutMs: PORTAL_TOKEN_REFRESH_TIMEOUT_MS, timeoutMessage: "Existing Microsoft portal tab scan timed out." }
-      );
-      currentTokens = refreshed.tokenStatus;
-      applyTokenStatus(currentTokens);
-      remainingTargets = missingTargets(currentTokens);
-    } catch {
-      // Opening a dedicated background page remains available when existing tabs cannot be scanned.
-    }
-    if (!remainingTargets.length) {
-      return { ready: true };
-    }
-
-    onProgress(`Preparing ${remainingTargets.map(tabLabel).join(" and ")} activation access`);
-    const recovery = await openPortalPagesForTargets(remainingTargets);
-    currentTokens = await sendMessage<TokenStatus>(
-      { action: "getTokenStatus" },
-      { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Microsoft portal access check timed out." }
-    );
-    applyTokenStatus(currentTokens);
-    remainingTargets = missingTargets(currentTokens);
-    if (!remainingTargets.length) {
-      return { ready: true };
-    }
-    if (!recovery.managedCount) {
-      return {
-        ready: false,
-        error: "QuickPIM++ could not open the Microsoft portal page needed for this request. Your selection and inputs are saved; use Refresh and retry."
-      };
-    }
-
-    setPortalRecoveryStatus(await readPortalRecoveryStatus());
-    onProgress(`Waiting for ${remainingTargets.map(tabLabel).join(" and ")} activation access`);
-    const recovered = await waitForManagedPortalRecovery(
-      remainingTargets,
-      currentTokens,
-      () => activationRequestInFlight.current
-    );
-    currentTokens = recovered.tokens;
-    applyTokenStatus(currentTokens);
-    setPortalRecoveryStatus(recovered.recoveryStatus);
-    remainingTargets = missingTargets(currentTokens);
-    if (!remainingTargets.length) {
-      return { ready: true };
-    }
-    if (recovered.recoveryStatus.state === "interactionRequired") {
-      return {
-        ready: false,
-        error: "Microsoft sign-in is required before this request can continue. Use the highlighted Refresh button to continue sign-in, then retry; your selection and inputs are saved."
-      };
-    }
-    return {
-      ready: false,
-      error: `QuickPIM++ could not capture ${remainingTargets.map(tabLabel).join(" and ")} activation access in time. Your selection and inputs are saved; use Refresh and retry.`
-    };
-  }
-
-  async function retryAfterPortalAccessRecovery(
-    initialResponse: ActivationResponse,
-    requestItems: ActivationItem[],
-    operation: "activation" | "deactivation",
-    onProgress: (label: string) => void,
-    retry: (items: ActivationItem[]) => Promise<ActivationResponse>
-  ): Promise<ActivationResponse> {
-    const recoveryTargets = getAccessRecoveryTargets(initialResponse);
-    if (!recoveryTargets.length) {
-      return initialResponse;
-    }
-    const retryItemIds = new Set(
-      initialResponse.errors
-        .filter((result) => result.accessRecoveryTarget)
-        .map((result) => result.itemId)
-    );
-    const retryItems = requestItems.filter((item) => retryItemIds.has(item.id));
-    if (!retryItems.length) {
-      return initialResponse;
-    }
-
-    try {
-      const recovery = await recoverRequestPortalAccess(recoveryTargets, onProgress);
-      if (!recovery.ready) {
-        return replaceAccessRecoveryErrors(initialResponse, recovery.error || "Microsoft portal access could not be refreshed automatically.");
-      }
-      onProgress(`Retrying ${operation} with refreshed Microsoft portal access`);
-      return mergeRetriedActivationResponse(initialResponse, await retry(retryItems));
-    } catch (recoveryError) {
-      const detail = recoveryError instanceof Error ? recoveryError.message : String(recoveryError);
-      return replaceAccessRecoveryErrors(
-        initialResponse,
-        `QuickPIM++ could not refresh Microsoft portal access automatically: ${detail}. Your selection and inputs are saved.`
-      );
     }
   }
 
@@ -1608,22 +1518,9 @@ function PopupApp() {
         requestMode: "activate"
       }).catch(() => undefined);
       const requestedAt = new Date().toISOString();
-      let response = await sendActivationOperation(
+      const response = await sendActivationOperation(
         activatableItems,
         "The activation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      );
-      response = await retryAfterPortalAccessRecovery(
-        response,
-        activatableItems,
-        "activation",
-        (label) => {
-          requestProgress = advanceOperationProgress(requestProgress, 1, { label });
-          setActivationProgress(requestProgress);
-        },
-        (retryItems) => sendActivationOperation(
-          retryItems,
-          "The retried activation request timed out. QuickPIM++ will keep checking it in the background; do not submit another request."
-        )
       );
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
@@ -1675,12 +1572,7 @@ function PopupApp() {
       }
       setMessage(formatRequestConfirmation("activation", successItems.length, response.errors.length));
       if (failureNotice) {
-        requestProgress = failOperationProgress(
-          requestProgress,
-          failureNotice.errors.join("\n"),
-          "Activation completed with an issue"
-        );
-        setActivationProgress(requestProgress);
+        setActivationProgress(null);
       } else {
         requestProgress = completeOperationProgress(requestProgress, "Activation complete");
         requestCompleted = true;
@@ -1773,22 +1665,9 @@ function PopupApp() {
         requestMode: "deactivate"
       }).catch(() => undefined);
       const requestedAt = new Date().toISOString();
-      let response = await sendDeactivationOperation(
+      const response = await sendDeactivationOperation(
         deactivatableItems,
         "The deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      );
-      response = await retryAfterPortalAccessRecovery(
-        response,
-        deactivatableItems,
-        "deactivation",
-        (label) => {
-          requestProgress = advanceOperationProgress(requestProgress, 1, { label });
-          setActivationProgress(requestProgress);
-        },
-        (retryItems) => sendDeactivationOperation(
-          retryItems,
-          "The retried deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit another request."
-        )
       );
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
@@ -1848,12 +1727,7 @@ function PopupApp() {
       }
       setMessage(formatRequestConfirmation("deactivation", successItems.length, response.errors.length));
       if (failureNotice) {
-        requestProgress = failOperationProgress(
-          requestProgress,
-          failureNotice.errors.join("\n"),
-          "Deactivation completed with an issue"
-        );
-        setActivationProgress(requestProgress);
+        setActivationProgress(null);
       } else {
         requestProgress = completeOperationProgress(requestProgress, "Deactivation complete");
         requestCompleted = true;
@@ -2080,7 +1954,7 @@ function PopupApp() {
       ) : error && refreshProgress?.status !== "error" && activationProgress?.status !== "error" ? (
         <p className="message error">{error}</p>
       ) : null}
-      {message && !(showInitialAccessState && isMissingAccessSummary(message)) ? <p className="message">{message}</p> : null}
+      {message && !activationFailureNotice && !(showInitialAccessState && isMissingAccessSummary(message)) ? <p className="message">{message}</p> : null}
       {isLoading ? (
         refreshProgress ? (
           <SmartProgressPanel
@@ -2098,7 +1972,7 @@ function PopupApp() {
           progress={refreshProgress}
         />
       ) : null}
-      {activationProgress ? (
+      {activationProgress && !activationFailureNotice ? (
         <SmartProgressPanel
           key={activationProgress.operationId}
           title={`${requestMode === "deactivate" ? "Deactivation" : "Activation"} in progress`}
@@ -2378,7 +2252,7 @@ function ActivationFailureBanner({
   onOpenPortal: (target: RoleTab) => void;
   onOpenAccessSetup: () => void;
 }) {
-  const hasClaimsChallenge = notice.claimsChallengeTargets.length > 0;
+  const hasRecoveryAction = notice.recoveryTargets.length > 0;
   return (
     <section className="message error activation-error-panel" role="alert" aria-live="assertive">
       <div className="activation-error-list">
@@ -2386,13 +2260,13 @@ function ActivationFailureBanner({
           <p key={`${index}:${errorMessage}`}>{errorMessage}</p>
         ))}
       </div>
-      {hasClaimsChallenge ? (
+      {hasRecoveryAction ? (
         <>
           <p className="activation-error-help">
-            Complete the Microsoft prompt in the matching portal page, then retry the still-selected item.
+            QuickPIM++ already tried to refresh access in the background. Complete the Microsoft prompt, then retry the still-selected item.
           </p>
           <div className="button-row activation-error-actions">
-            {notice.claimsChallengeTargets.map((target) => (
+            {notice.recoveryTargets.map((target) => (
               <button className="btn primary" type="button" key={target} onClick={() => onOpenPortal(target)}>
                 Open {tabLabel(target)} portal
               </button>

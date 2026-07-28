@@ -44,6 +44,9 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("runDurableRequestOperation");
     expect(background).toContain("executeWithPortalAccessRecovery");
     expect(background).toContain("result.accessRecoveryTarget");
+    expect(background).toContain("getFreshAccessRecoveryTargets");
+    expect(background).toContain("getPortalRecoveryTokenSignature");
+    expect(background).toContain("focusPortalRecoveryTabs");
     expect(background).toContain("Check Microsoft PIM before retrying to avoid a duplicate request");
     expect(background).not.toContain("catch (error) {\n        return await activateItems");
   });

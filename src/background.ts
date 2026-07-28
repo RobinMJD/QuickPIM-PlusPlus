@@ -72,6 +72,7 @@ import {
   closeExpiredPortalRecoveryTabs,
   closePortalRecoveryTabsForTargets,
   focusPortalRecoveryTabs,
+  getPortalRecoveryTokenSignature,
   getPortalRecoveryStatus,
   openPortalRecoveryTabsAndReconcile,
   type PortalRecoveryApis
@@ -105,6 +106,8 @@ import {
 } from "./lib/requestOperations";
 import {
   getAccessRecoveryTargets,
+  getFreshAccessRecoveryTargets,
+  isFreshPortalTokenRequired,
   mergeRetriedActivationResponse,
   replaceAccessRecoveryErrors
 } from "./lib/requestRecovery";
@@ -877,7 +880,10 @@ async function executeWithPortalAccessRecovery(
     return initialResponse;
   }
 
-  const recovery = await recoverPortalAccessForRequest(recoveryTargets);
+  const recovery = await recoverPortalAccessForRequest(
+    recoveryTargets,
+    getFreshAccessRecoveryTargets(initialResponse)
+  );
   if (!recovery.ready) {
     return replaceAccessRecoveryErrors(
       initialResponse,
@@ -889,8 +895,14 @@ async function executeWithPortalAccessRecovery(
 }
 
 async function recoverPortalAccessForRequest(
-  targets: AccessSetupTarget[]
+  targets: AccessSetupTarget[],
+  freshTokenTargets: AccessSetupTarget[] = []
 ): Promise<{ ready: boolean; error?: string }> {
+  const initialTokenStatus = await getTokenStatus();
+  const freshTokenBaselines = Object.fromEntries(
+    freshTokenTargets.map((target) => [target, getPortalRecoveryTokenSignature(initialTokenStatus, target)])
+  ) as Partial<Record<AccessSetupTarget, string>>;
+
   try {
     await refreshPortalTokensFromOpenTabs();
   } catch {
@@ -898,11 +910,19 @@ async function recoverPortalAccessForRequest(
   }
 
   let tokenStatus = await getTokenStatus();
-  let remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus);
+  let remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus, freshTokenBaselines);
   if (!remainingTargets.length) {
     return { ready: true };
   }
 
+  const managedFreshTargets = remainingTargets.filter((target) => freshTokenTargets.includes(target));
+  if (managedFreshTargets.length) {
+    try {
+      await closePortalRecoveryTabsForTargets(managedFreshTargets, getPortalRecoveryApis());
+    } catch {
+      // A stale managed-tab record must not block opening a fresh recovery page.
+    }
+  }
   const opened = await openManagedPortalRecoveryTabs(remainingTargets);
   if (!opened.managedCount) {
     return {
@@ -913,6 +933,7 @@ async function recoverPortalAccessForRequest(
 
   const deadline = Date.now() + REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS;
   let passiveScanAt = 0;
+  let interactionWasFocused = false;
   while (Date.now() < deadline) {
     await delay(REQUEST_PORTAL_RECOVERY_POLL_INTERVAL_MS);
     if (Date.now() - passiveScanAt >= 3_000) {
@@ -925,10 +946,17 @@ async function recoverPortalAccessForRequest(
     } else {
       tokenStatus = await getTokenStatus();
     }
-    remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus);
+    remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus, freshTokenBaselines);
     if (!remainingTargets.length) {
       await closeCompletedRecoveryTabs(tokenStatus);
       return { ready: true };
+    }
+    if (!interactionWasFocused) {
+      const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis());
+      if (recoveryStatus.state === "interactionRequired") {
+        interactionWasFocused = true;
+        await focusPortalRecoveryTabs(getPortalRecoveryApis());
+      }
     }
   }
 
@@ -942,7 +970,11 @@ async function recoverPortalAccessForRequest(
   };
 }
 
-function getRequestMissingAccessTargets(targets: AccessSetupTarget[], tokenStatus: TokenStatus): AccessSetupTarget[] {
+function getRequestMissingAccessTargets(
+  targets: AccessSetupTarget[],
+  tokenStatus: TokenStatus,
+  freshTokenBaselines: Partial<Record<AccessSetupTarget, string>> = {}
+): AccessSetupTarget[] {
   const now = Date.now();
   return targets.filter((target) => {
     if (!hasRequiredPortalToken(target, tokenStatus)) {
@@ -952,7 +984,11 @@ function getRequestMissingAccessTargets(targets: AccessSetupTarget[], tokenStatu
       ? tokenStatus.azureManagement
       : tokenStatus.graphTargets?.[target] || tokenStatus.graph;
     const expiresAt = token.expiresAt ? Date.parse(token.expiresAt) : Number.NaN;
-    return Number.isFinite(expiresAt) && expiresAt <= now + MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS;
+    if (Number.isFinite(expiresAt) && expiresAt <= now + MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS) {
+      return true;
+    }
+    const baseline = freshTokenBaselines[target];
+    return baseline !== undefined && getPortalRecoveryTokenSignature(tokenStatus, target) === baseline;
   });
 }
 
@@ -2419,7 +2455,7 @@ async function activateItems(
           };
         });
       } catch (error) {
-        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error);
+        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         return {
           result: {
             itemId: item.id,
@@ -2512,7 +2548,7 @@ async function deactivateItems(
           };
         });
       } catch (error) {
-        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error);
+        const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         return {
           result: {
             itemId: item.id,
@@ -2601,8 +2637,17 @@ function createPortalAccessRequiredError(
   return new PortalAccessRequiredError(target, `${label} ${operation} needs a fresh ${tokenLabel} portal token.`);
 }
 
-function getPortalAccessRecoveryTarget(error: unknown): AccessSetupTarget | undefined {
-  return error instanceof PortalAccessRequiredError ? error.target : undefined;
+function getPortalAccessRecoveryTarget(
+  error: unknown,
+  item: ActivationItem
+): AccessSetupTarget | undefined {
+  if (error instanceof PortalAccessRequiredError) {
+    return error.target;
+  }
+  if (!isFreshPortalTokenRequired(sanitizeErrorMessage(error))) {
+    return undefined;
+  }
+  return item.type;
 }
 
 function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, tokenKind: TokenKind): string | undefined {

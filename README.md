@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.10.13**
+Current version: **v2.10.14**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -235,6 +235,13 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.10.14
+
+- Keeps cached popup data visible while stale sources refresh quietly through the spinning header icon, including valid caches with zero items.
+- Moves activation access recovery fully into the durable background operation, captures a newly issued portal token after Microsoft claims or MFA challenges, and retries only requests known not to have reached the write endpoint.
+- Replaces duplicate activation error surfaces with one concise, actionable recovery notice while preserving the selected item and form inputs.
+- Updates patched build dependencies and ignores local request-trace exports so cookies and bearer tokens cannot enter a release.
 
 ### v2.10.13
 

@@ -1405,7 +1405,7 @@ describe("popup compact controls", () => {
     expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')).toBeNull();
   });
 
-  test("shows stale eligible cache immediately while refreshing in the background", async () => {
+  test("keeps stale cached data visible while refreshing quietly in the background", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const staleItem: ActivationItem = {
       id: "directoryRole:reader:/",
@@ -1479,11 +1479,9 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.body.textContent).not.toContain("Loading access data");
-    await waitFor(() => expect(document.body.textContent).toContain("Fetching latest data"));
-    const refreshText = document.querySelector(".refresh-progress-panel")?.textContent || "";
-    expect(refreshText).toContain("Refreshing access data");
-    expect(refreshText).not.toMatch(/Refreshing access data.*Refreshing .*access data/i);
-    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" }));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" })));
+    expect(document.querySelector(".refresh-progress-panel")).toBeFalsy();
+    expect(document.querySelector(".refresh-button")?.classList.contains("spinning")).toBe(true);
 
     snapshot.resolve({
       success: true,
@@ -1493,6 +1491,86 @@ describe("popup compact controls", () => {
       }
     });
     await waitFor(() => expect(document.body.textContent).toContain("Admin"));
+    await waitFor(() => expect(document.querySelector(".refresh-button")?.classList.contains("spinning")).toBe(false));
+  });
+
+  test("treats a valid empty cache as displayable and refreshes it quietly", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const snapshot = deferred<{ success: true; data: { eligible: { items: []; errors: []; diagnostics: [] }; active: { items: []; errors: []; diagnostics: [] } } }>();
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledRoleFeatures: {
+            directoryRole: true,
+            pimGroup: false,
+            azureRole: false
+          }
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          directoryRole: {
+            fetchedAt: Date.now() - 40 * 60 * 1000,
+            cacheKey: "graphDirectory:missing",
+            errors: [],
+            items: []
+          }
+        },
+        activeByTarget: {
+          directoryRole: {
+            fetchedAt: Date.now(),
+            cacheKey: "graphDirectory:missing",
+            errors: [],
+            items: []
+          }
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: false },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return snapshot.promise;
+      }
+      return Promise.resolve({ success: true, data: { items: [], errors: [] } });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "getActivationSnapshot" })));
+    expect(document.body.textContent).not.toContain("Loading access data");
+    expect(document.querySelector(".refresh-progress-panel")).toBeFalsy();
+    expect(document.querySelector(".refresh-button")?.classList.contains("spinning")).toBe(true);
+
+    snapshot.resolve({
+      success: true,
+      data: {
+        eligible: { items: [], errors: [], diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] }
+      }
+    });
+    await waitFor(() => expect(document.querySelector(".refresh-button")?.classList.contains("spinning")).toBe(false));
   });
 
   test("renders filter and sort icons next to their toolbar fields", async () => {
@@ -2894,7 +2972,7 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     clickButton("Activate 1 selected");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
+    await waitFor(() => expect(document.body.textContent).toContain("Cybersec PIM Group: PIM Groups access is limited"));
     expect(document.body.textContent).toContain("Cybersec PIM Group: PIM Groups access is limited in the captured portal token.");
     expect(document.body.textContent).not.toContain("PermissionScopeNotGranted");
   });
@@ -3327,12 +3405,16 @@ describe("popup compact controls", () => {
     setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "Needed to resolve helpdesk escalation.");
     clickButton("Activate 1 selected");
 
-    await waitFor(() => expect(document.body.textContent).toContain("Activation failed for 1 item."));
+    await waitFor(() => expect(document.body.textContent).toContain("User Administrator: Microsoft requires an additional sign-in or MFA challenge"));
     expect(document.body.textContent).toContain("User Administrator: Microsoft requires an additional sign-in or MFA challenge");
-    expect(document.body.textContent).toContain("Complete the Microsoft prompt in the matching portal page");
+    expect(document.body.textContent).toContain("QuickPIM++ already tried to refresh access in the background");
+    expect(document.body.textContent).toContain("Complete the Microsoft prompt, then retry the still-selected item");
     expect(document.body.textContent).toContain("Activate 1 selected");
     expect(document.body.textContent).not.toContain(claims);
     expect(document.body.textContent).not.toContain("claims=");
+    expect(document.querySelectorAll(".activation-error-panel")).toHaveLength(1);
+    expect(document.querySelector(".smart-progress-panel")).toBeFalsy();
+    expect((document.body.textContent?.match(/User Administrator: Microsoft requires an additional sign-in or MFA challenge/g) || [])).toHaveLength(1);
 
     clickButton("Open Entra Roles portal");
     await waitFor(() => expect(createTab).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining("aadmigratedroles") })));
