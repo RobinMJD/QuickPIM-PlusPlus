@@ -12,6 +12,7 @@ import {
   markTrackedRequestCheckFailure,
   mutateTrackedRequests,
   normalizeTrackedRequestStatus,
+  reconcileTrackedExtensionSources,
   sanitizeTrackedRequestStore,
   trackedRequestMatchesValidatedToken,
   trackedRequestMatchesTokenIdentity,
@@ -232,6 +233,61 @@ describe("tracked PIM requests", () => {
     );
 
     expect(active.activeUntil).toBe("2026-07-14T16:00:00.000Z");
+  });
+
+  test("keeps a future accepted continuation scheduled until its exact start", () => {
+    const scheduled = createTrackedPimRequest({
+      item: directoryRole,
+      action: "activate",
+      requestId: "future-request",
+      payload: { status: "Provisioned" },
+      requestedAt: "2026-07-14T10:00:00.000Z",
+      scheduledStartAt: "2026-07-14T12:00:01.000Z",
+      durationHours: 1,
+      justification: "Continue production maintenance",
+      continuationOfRequestId: "request-1",
+      now: NOW
+    });
+    if (!scheduled) throw new Error("Scheduled request could not be created.");
+
+    expect(scheduled).toMatchObject({
+      status: "scheduled",
+      activeFrom: "2026-07-14T12:00:01.000Z",
+      activeUntil: "2026-07-14T13:00:01.000Z",
+      continuationOfRequestId: "request-1"
+    });
+    expect(getEffectiveTrackedRequestStatus(scheduled, Date.parse("2026-07-14T12:00:00.000Z"))).toBe("scheduled");
+    expect(getEffectiveTrackedRequestStatus(scheduled, Date.parse("2026-07-14T12:00:01.000Z"))).toBe("active");
+    expect(getRequestTrackingMaintenanceTime(
+      { version: 1, requests: [scheduled] },
+      { notificationsEnabled: false, expiryReminderMinutes: 15, now: NOW }
+    )).toBe(Date.parse("2026-07-14T12:00:01.000Z"));
+    expect(trackedRequestStatusLabel("scheduled")).toBe("Scheduled");
+  });
+
+  test("allows a new continuation after the previous one is denied", () => {
+    const source = createRequest({
+      status: "active",
+      activeUntil: "2026-07-14T14:00:00.000Z",
+      extensionAttemptState: "queued",
+      extensionRequestId: "extension-1"
+    });
+    const continuation = createRequest({
+      id: "directoryRole:extension-1",
+      requestId: "extension-1",
+      status: "denied",
+      continuationOfRequestId: source.requestId
+    });
+
+    const reconciled = reconcileTrackedExtensionSources(
+      { version: 1, requests: [source, continuation] },
+      NOW
+    );
+    expect(reconciled.requests[0]).toMatchObject({
+      extensionAttemptState: undefined,
+      extensionRequestId: undefined,
+      extensionLastError: "The previous extension request was not completed."
+    });
   });
 
   test("sanitizes imported records, redacts token-like errors, and caps the store", () => {

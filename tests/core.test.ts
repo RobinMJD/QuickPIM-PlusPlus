@@ -410,6 +410,7 @@ describe("settings helpers", () => {
       ],
       preferences: {
         defaultDurationHours: 99,
+        defaultExtensionDurationHours: 3,
         defaultSort: "invalid" as any,
         recentJustificationLimit: 99,
         activityHistoryLimit: 999,
@@ -441,6 +442,7 @@ describe("settings helpers", () => {
     expect(imported.bundles[0]).not.toHaveProperty("defaultTicketNumber");
     expect(imported.preferences).toMatchObject({
       defaultDurationHours: 24,
+      defaultExtensionDurationHours: 0.5,
       defaultSort: "name",
       recentJustificationLimit: 20,
       activityHistoryLimit: 200,

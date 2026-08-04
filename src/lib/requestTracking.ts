@@ -23,6 +23,7 @@ const MAX_SCOPE_LENGTH = 512;
 const MAX_JUSTIFICATION_LENGTH = 1024;
 const MAX_ERROR_LENGTH = 260;
 const MAX_BUNDLE_NAME_LENGTH = 80;
+const MAX_TICKET_FIELD_LENGTH = 128;
 const MAX_CHECK_COUNT = 30;
 const ACCESS_RETRY_DELAY_MS = 10 * 60 * 1000;
 const POLL_DELAYS_MS = [30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000] as const;
@@ -42,8 +43,11 @@ interface CreateTrackedRequestInput {
   requestedAt: string;
   durationHours?: number;
   justification?: string;
+  ticketInfo?: { ticketSystem?: string; ticketNumber?: string };
   bundleName?: string;
   tenantId?: string;
+  scheduledStartAt?: string;
+  continuationOfRequestId?: string;
   now?: number;
 }
 
@@ -91,7 +95,14 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
   }
 
   const now = input.now ?? Date.now();
-  const details = getRequestPayloadDetails(input.payload, input.action, requestedAt, input.durationHours, now);
+  const details = getRequestPayloadDetails(
+    input.payload,
+    input.action,
+    requestedAt,
+    input.durationHours,
+    now,
+    input.scheduledStartAt
+  );
   const base: TrackedPimRequest = {
     id: `${input.item.type}:${requestId}`,
     requestId,
@@ -108,9 +119,14 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
     updatedAt: new Date(now).toISOString(),
     completedAt: details.completedAt,
     activeUntil: details.activeUntil,
+    activeFrom: details.activeFrom,
     durationHours: normalizeDuration(input.durationHours),
     justification: input.justification,
+    ticketSystem: input.ticketInfo?.ticketSystem,
+    ticketNumber: input.ticketInfo?.ticketNumber,
     bundleName: input.bundleName,
+    activationRequirements: input.item.activationRequirements,
+    continuationOfRequestId: input.continuationOfRequestId,
     approvalId: details.approvalId,
     targetScheduleId: details.targetScheduleId,
     checkCount: 0,
@@ -128,6 +144,7 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
   } else {
     base.roleDefinitionId = input.item.roleDefinitionId;
     base.azureScope = input.item.scope;
+    base.roleEligibilityScheduleId = input.item.roleEligibilityScheduleId;
   }
 
   return sanitizeTrackedRequest(base);
@@ -153,7 +170,14 @@ export function updateTrackedRequestFromPayload(
   payload: unknown,
   now = Date.now()
 ): TrackedPimRequest {
-  const details = getRequestPayloadDetails(payload, request.action, request.requestedAt, request.durationHours, now);
+  const details = getRequestPayloadDetails(
+    payload,
+    request.action,
+    request.requestedAt,
+    request.durationHours,
+    now,
+    request.activeFrom
+  );
   const checkCount = request.checkCount + 1;
   const status = details.status;
   const canContinue = isTrackedRequestPendingStatus(status)
@@ -166,6 +190,7 @@ export function updateTrackedRequestFromPayload(
     updatedAt: new Date(now).toISOString(),
     completedAt: details.completedAt || request.completedAt,
     activeUntil: details.activeUntil || request.activeUntil,
+    activeFrom: details.activeFrom || request.activeFrom,
     approvalId: details.approvalId || request.approvalId,
     targetScheduleId: details.targetScheduleId || request.targetScheduleId,
     lastCheckedAt: new Date(now).toISOString(),
@@ -238,6 +263,12 @@ export function getRequestTrackingMaintenanceTime(
         candidates.push(activeUntil - normalizeReminderMinutes(options.expiryReminderMinutes) * 60_000);
       }
     }
+    if (request.status === "scheduled" && request.activeFrom) {
+      const activeFrom = Date.parse(request.activeFrom);
+      if (Number.isFinite(activeFrom) && activeFrom > now) {
+        candidates.push(activeFrom);
+      }
+    }
   }
   if (!candidates.length) {
     return undefined;
@@ -246,7 +277,43 @@ export function getRequestTrackingMaintenanceTime(
 }
 
 export function getPendingTrackedRequestCount(store: TrackedPimRequestStore): number {
-  return store.requests.filter(isTrackedRequestPending).length;
+  return store.requests.filter((request) =>
+    isTrackedRequestPending(request) || getEffectiveTrackedRequestStatus(request) === "scheduled"
+  ).length;
+}
+
+export function reconcileTrackedExtensionSources(
+  store: TrackedPimRequestStore,
+  now = Date.now()
+): TrackedPimRequestStore {
+  const retryableSourceIds = new Set(
+    store.requests.flatMap((request) => {
+      if (!request.continuationOfRequestId) return [];
+      const status = getEffectiveTrackedRequestStatus(request, now);
+      return status === "denied" || status === "failed" || status === "canceled"
+        ? [request.continuationOfRequestId]
+        : [];
+    })
+  );
+  if (!retryableSourceIds.size) {
+    return store;
+  }
+
+  let changed = false;
+  const requests = store.requests.map((request) => {
+    if (request.extensionAttemptState !== "queued" || !retryableSourceIds.has(request.requestId)) {
+      return request;
+    }
+    changed = true;
+    return {
+      ...request,
+      extensionAttemptState: undefined,
+      extensionRequestId: undefined,
+      extensionLastError: "The previous extension request was not completed.",
+      updatedAt: new Date(now).toISOString()
+    };
+  });
+  return changed ? { version: 1, requests } : store;
 }
 
 export function trackedRequestMatchesTokenIdentity(
@@ -290,8 +357,19 @@ export function getEffectiveTrackedRequestStatus(
   request: TrackedPimRequest,
   now = Date.now()
 ): TrackedPimRequestStatus {
+  const activeFrom = request.activeFrom ? Date.parse(request.activeFrom) : Number.NaN;
+  if (request.status === "scheduled") {
+    if (Number.isFinite(activeFrom) && activeFrom > now) {
+      return "scheduled";
+    }
+    const activeUntil = request.activeUntil ? Date.parse(request.activeUntil) : Number.NaN;
+    return Number.isFinite(activeUntil) && activeUntil <= now ? "expired" : "active";
+  }
   if (request.status !== "active" || !request.activeUntil) {
     return request.status;
+  }
+  if (Number.isFinite(activeFrom) && activeFrom > now) {
+    return "scheduled";
   }
   const activeUntil = Date.parse(request.activeUntil);
   return Number.isFinite(activeUntil) && activeUntil <= now ? "expired" : request.status;
@@ -301,6 +379,7 @@ export function trackedRequestStatusLabel(status: TrackedPimRequestStatus): stri
   switch (status) {
     case "pendingApproval": return "Pending approval";
     case "provisioning": return "Provisioning";
+    case "scheduled": return "Scheduled";
     case "active": return "Active";
     case "completed": return "Completed";
     case "denied": return "Denied";
@@ -316,7 +395,8 @@ export function normalizeTrackedRequestStatus(
   rawStatus: string | undefined,
   action: ActivityAction,
   activeUntil?: string,
-  now = Date.now()
+  now = Date.now(),
+  activeFrom?: string
 ): TrackedPimRequestStatus {
   const normalized = rawStatus?.replace(/[^a-z]/gi, "").toLowerCase();
   let status: TrackedPimRequestStatus;
@@ -353,8 +433,13 @@ export function normalizeTrackedRequestStatus(
     status = "submitted";
   }
 
-  if (status === "active" && activeUntil && Date.parse(activeUntil) <= now) {
-    return "expired";
+  if (status === "active") {
+    if (activeUntil && Date.parse(activeUntil) <= now) {
+      return "expired";
+    }
+    if (activeFrom && Date.parse(activeFrom) > now) {
+      return "scheduled";
+    }
   }
   return status;
 }
@@ -433,9 +518,23 @@ function sanitizeTrackedRequest(value: unknown): TrackedPimRequest | undefined {
     updatedAt,
     completedAt: sanitizeTimestamp(value.completedAt),
     activeUntil: sanitizeTimestamp(value.activeUntil),
+    activeFrom: sanitizeTimestamp(value.activeFrom),
     durationHours: normalizeDuration(value.durationHours),
     justification: sanitizeString(value.justification, MAX_JUSTIFICATION_LENGTH),
+    ticketSystem: sanitizeString(value.ticketSystem, MAX_TICKET_FIELD_LENGTH),
+    ticketNumber: sanitizeString(value.ticketNumber, MAX_TICKET_FIELD_LENGTH),
     bundleName: sanitizeString(value.bundleName, MAX_BUNDLE_NAME_LENGTH),
+    roleEligibilityScheduleId: sanitizeString(value.roleEligibilityScheduleId, MAX_SCOPE_LENGTH),
+    activationRequirements: sanitizeActivationRequirements(value.activationRequirements),
+    continuationOfRequestId: sanitizeString(value.continuationOfRequestId, MAX_ID_LENGTH),
+    extensionAttemptState: value.extensionAttemptState === "submitting" || value.extensionAttemptState === "queued" || value.extensionAttemptState === "uncertain"
+      ? value.extensionAttemptState
+      : undefined,
+    extensionRequestedAt: sanitizeTimestamp(value.extensionRequestedAt),
+    extensionRequestId: sanitizeString(value.extensionRequestId, MAX_ID_LENGTH),
+    extensionLastError: typeof value.extensionLastError === "string"
+      ? sanitizeErrorMessage(value.extensionLastError, MAX_ERROR_LENGTH) || undefined
+      : undefined,
     approvalId: sanitizeString(value.approvalId, MAX_ID_LENGTH),
     targetScheduleId: sanitizeString(value.targetScheduleId, MAX_ID_LENGTH),
     lastCheckedAt: sanitizeTimestamp(value.lastCheckedAt),
@@ -454,12 +553,14 @@ function getRequestPayloadDetails(
   action: ActivityAction,
   requestedAt: string,
   durationHours: number | undefined,
-  now: number
+  now: number,
+  scheduledStartAt?: string
 ): {
   status: TrackedPimRequestStatus;
   rawStatus?: string;
   completedAt?: string;
   activeUntil?: string;
+  activeFrom?: string;
   approvalId?: string;
   targetScheduleId?: string;
 } {
@@ -475,7 +576,8 @@ function getRequestPayloadDetails(
   const effectiveStart = firstTimestamp(
     scheduleInfo.startDateTime,
     root.startDateTime,
-    properties.startDateTime
+    properties.startDateTime,
+    scheduledStartAt
   ) || requestedAt;
   const activeUntil = firstTimestamp(
     root.endDateTime,
@@ -483,10 +585,11 @@ function getRequestPayloadDetails(
     expiration.endDateTime
   ) || getDurationEndDate(effectiveStart, stringValue(expiration.duration), durationHours);
   return {
-    status: normalizeTrackedRequestStatus(rawStatus, action, activeUntil, now),
+    status: normalizeTrackedRequestStatus(rawStatus, action, activeUntil, now, effectiveStart),
     rawStatus,
     completedAt: firstTimestamp(root.completedDateTime, properties.completedDateTime, properties.updatedOn),
     activeUntil,
+    activeFrom: effectiveStart,
     approvalId: sanitizeString(root.approvalId || properties.approvalId, MAX_ID_LENGTH),
     targetScheduleId: sanitizeString(
       root.targetScheduleId
@@ -556,10 +659,25 @@ function clampInteger(value: unknown, min: number, max: number, fallback: number
   return Math.min(max, Math.max(min, Math.round(number)));
 }
 
+function sanitizeActivationRequirements(value: unknown): ActivationItem["activationRequirements"] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const maxDurationHours = normalizeDuration(value.maxDurationHours);
+  const requirements: NonNullable<ActivationItem["activationRequirements"]> = {
+    ...(typeof value.justification === "boolean" ? { justification: value.justification } : {}),
+    ...(typeof value.ticket === "boolean" ? { ticket: value.ticket } : {}),
+    ...(typeof value.approval === "boolean" ? { approval: value.approval } : {}),
+    ...(maxDurationHours ? { maxDurationHours } : {})
+  };
+  return Object.keys(requirements).length ? requirements : undefined;
+}
+
 function isTrackedStatus(value: unknown): value is TrackedPimRequestStatus {
   return value === "submitted"
     || value === "pendingApproval"
     || value === "provisioning"
+    || value === "scheduled"
     || value === "active"
     || value === "completed"
     || value === "denied"

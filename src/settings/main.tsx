@@ -42,6 +42,7 @@ import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { savePopupDraft } from "../lib/popupDraft";
 import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
+import { EXTENSION_DURATION_OPTIONS, buildTrackedRequestExtensionPlan, formatExtensionDuration } from "../lib/requestExtension";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -60,7 +61,7 @@ import {
   sanitizeTrackedRequestStore,
   trackedRequestStatusLabel
 } from "../lib/requestTracking";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore } from "../lib/types";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore, TrackedRequestExtensionResult } from "../lib/types";
 
 type SettingsTab = "home" | "access" | "activity" | "justifications" | "bundles" | "aliases" | "preferences" | "data" | "diagnostics" | "about";
 
@@ -1323,6 +1324,7 @@ function ActivityPanel({
   const [requestStatusFilter, setRequestStatusFilter] = useState<"all" | "pending" | "active" | "attention" | "finished">("all");
   const [selectedRequestId, setSelectedRequestId] = useState<string>();
   const [isRefreshingRequests, setIsRefreshingRequests] = useState(false);
+  const [extendingRequestId, setExtendingRequestId] = useState<string>();
   const [requestMessage, setRequestMessage] = useState("");
   const [requestError, setRequestError] = useState("");
   const [search, setSearch] = useState("");
@@ -1411,6 +1413,28 @@ function ActivityPanel({
     }
   }
 
+  async function extendRequest(request: TrackedPimRequest) {
+    setRequestError("");
+    setRequestMessage("");
+    setExtendingRequestId(request.id);
+    try {
+      const result = await sendMessage<TrackedRequestExtensionResult>(
+        { action: "extendTrackedRequest", requestId: request.id },
+        { timeoutMs: 110_000, timeoutMessage: "The extension request is still being checked. Review Microsoft PIM before retrying." }
+      );
+      if (result.success) {
+        setRequestMessage(result.message);
+      } else {
+        setRequestError(result.message);
+      }
+      onTrackedRequestsChange(await loadTrackedRequests());
+    } catch (extensionError) {
+      setRequestError(extensionError instanceof Error ? extensionError.message : String(extensionError));
+    } finally {
+      setExtendingRequestId(undefined);
+    }
+  }
+
   function openMatchingPortal(request: TrackedPimRequest) {
     void chrome.tabs.create({ url: ENTRA_PORTAL_URLS[request.itemType] });
   }
@@ -1471,7 +1495,7 @@ function ActivityPanel({
                   >
                     <span className="request-row-main">
                       <strong>{request.itemName}</strong>
-                      <span className="muted">{request.action === "activate" ? "Enable" : "Disable"} / {popupTabLabel(request.itemType)}{request.scopeLabel ? ` / ${request.scopeLabel}` : ""}</span>
+                      <span className="muted">{request.continuationOfRequestId ? "Extend" : request.action === "activate" ? "Enable" : "Disable"} / {popupTabLabel(request.itemType)}{request.scopeLabel ? ` / ${request.scopeLabel}` : ""}</span>
                     </span>
                     <span className="request-row-side">
                       <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
@@ -1486,9 +1510,12 @@ function ActivityPanel({
               <TrackedRequestDetails
                 request={selectedRequest}
                 isRefreshing={isRefreshingRequests}
+                isExtending={extendingRequestId === selectedRequest.id}
+                preferredExtensionDurationHours={settings.preferences.defaultExtensionDurationHours}
                 onRefresh={() => void refreshRequestStatuses([selectedRequest.id])}
                 onOpenPortal={() => openMatchingPortal(selectedRequest)}
                 onPrepare={(mode) => void prepareRequestInPopup(selectedRequest, mode)}
+                onExtend={() => void extendRequest(selectedRequest)}
                 onClose={() => setSelectedRequestId(undefined)}
               />
             ) : null}
@@ -1546,28 +1573,42 @@ function ActivityPanel({
 function TrackedRequestDetails({
   request,
   isRefreshing,
+  isExtending,
+  preferredExtensionDurationHours,
   onRefresh,
   onOpenPortal,
   onPrepare,
+  onExtend,
   onClose
 }: {
   request: TrackedPimRequest;
   isRefreshing: boolean;
+  isExtending: boolean;
+  preferredExtensionDurationHours: number;
   onRefresh: () => void;
   onOpenPortal: () => void;
   onPrepare: (mode: "activate" | "deactivate") => void;
+  onExtend: () => void;
   onClose: () => void;
 }) {
   const status = getEffectiveTrackedRequestStatus(request);
   const canRetry = ["denied", "failed", "canceled", "statusUnavailable"].includes(status);
   const canPrepareDisable = request.action === "activate" && status === "active";
+  let extensionDurationHours: number | undefined;
+  if (canPrepareDisable) {
+    try {
+      extensionDurationHours = buildTrackedRequestExtensionPlan(request, preferredExtensionDurationHours).durationHours;
+    } catch {
+      // Legacy and incomplete tracked requests remain viewable without offering an unreliable action.
+    }
+  }
   return (
     <aside className="request-details" aria-label={`${request.itemName} request details`}>
       <div className="panel-title-row compact">
         <div>
           <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
           <h3>{request.itemName}</h3>
-          <p className="muted">{request.action === "activate" ? "Enable request" : "Disable request"} / {popupTabLabel(request.itemType)}</p>
+          <p className="muted">{request.continuationOfRequestId ? "Extension request" : request.action === "activate" ? "Enable request" : "Disable request"} / {popupTabLabel(request.itemType)}</p>
         </div>
         <button className="icon-btn request-details-close" onClick={onClose} title="Close request details" aria-label="Close request details">×</button>
       </div>
@@ -1575,8 +1616,11 @@ function TrackedRequestDetails({
         <div><dt>Requested</dt><dd>{formatDateOnly(request.requestedAt) || request.requestedAt}</dd></div>
         <div><dt>Last checked</dt><dd>{formatDateOnly(request.lastCheckedAt || request.updatedAt) || request.lastCheckedAt || request.updatedAt}</dd></div>
         {request.scopeLabel ? <div><dt>Scope</dt><dd>{request.scopeLabel}</dd></div> : null}
-        {request.durationHours ? <div><dt>Duration</dt><dd>{request.durationHours} hours</dd></div> : null}
+        {request.durationHours ? <div><dt>Duration</dt><dd>{formatExtensionDuration(request.durationHours)}</dd></div> : null}
+        {request.activeFrom ? <div><dt>Starts</dt><dd>{formatUtcDateTime(request.activeFrom)}</dd></div> : null}
         {request.activeUntil ? <div><dt>Active until</dt><dd>{formatDateOnly(request.activeUntil) || request.activeUntil}</dd></div> : null}
+        {request.continuationOfRequestId ? <div className="request-detail-wide"><dt>Continuation of</dt><dd className="monospace wrap-anywhere">{request.continuationOfRequestId}</dd></div> : null}
+        {request.extensionAttemptState ? <div><dt>Extension</dt><dd>{request.extensionAttemptState === "queued" ? "Queued" : request.extensionAttemptState === "uncertain" ? "Outcome unknown" : "Submitting"}</dd></div> : null}
         {request.bundleName ? <div><dt>Bundle</dt><dd>{request.bundleName}</dd></div> : null}
         {request.rawStatus ? <div><dt>Microsoft status</dt><dd>{request.rawStatus}</dd></div> : null}
         <div className="request-detail-wide"><dt>Request ID</dt><dd className="monospace wrap-anywhere">{request.requestId}</dd></div>
@@ -1587,6 +1631,7 @@ function TrackedRequestDetails({
       <div className="button-row request-detail-actions">
         <button className="btn" onClick={onRefresh} disabled={isRefreshing}>Check status</button>
         <button className="btn" onClick={onOpenPortal}>Open Microsoft PIM</button>
+        {extensionDurationHours ? <button className="btn primary" onClick={onExtend} disabled={isExtending}>{isExtending ? "Queuing..." : `Extend ${formatExtensionDuration(extensionDurationHours)}`}</button> : null}
         {canRetry ? (
           <button className="btn primary" onClick={() => onPrepare(request.action)}>
             Retry {request.action === "activate" ? "activation" : "deactivation"}
@@ -1603,7 +1648,7 @@ function matchesTrackedRequestFilter(
   filter: "all" | "pending" | "active" | "attention" | "finished"
 ): boolean {
   if (filter === "all") return true;
-  if (filter === "pending") return status === "submitted" || status === "pendingApproval" || status === "provisioning";
+  if (filter === "pending") return status === "submitted" || status === "pendingApproval" || status === "provisioning" || status === "scheduled";
   if (filter === "active") return status === "active";
   if (filter === "attention") return status === "denied" || status === "failed" || status === "canceled" || status === "statusUnavailable";
   return status === "completed" || status === "expired";
@@ -2081,6 +2126,7 @@ type PreferenceSaveState = "idle" | "pending" | "saving" | "saved" | "invalid" |
 
 interface PreferenceDraft {
   defaultDurationHours: number;
+  defaultExtensionDurationHours: number;
   defaultSort: SortMode;
   recentJustificationLimit: number;
   activityHistoryLimit: number;
@@ -2099,6 +2145,7 @@ interface PreferenceDraft {
 function createPreferenceDraft(settings: QuickPimSettings): PreferenceDraft {
   return {
     defaultDurationHours: settings.preferences.defaultDurationHours,
+    defaultExtensionDurationHours: settings.preferences.defaultExtensionDurationHours,
     defaultSort: settings.preferences.defaultSort,
     recentJustificationLimit: settings.preferences.recentJustificationLimit,
     activityHistoryLimit: settings.preferences.activityHistoryLimit,
@@ -2530,6 +2577,20 @@ function PreferencesPanel({
               <option value={60}>1 hour before</option>
             </select>
             <p className="muted">Applies only when Microsoft returns an activation end time.</p>
+          </div>
+          <div className="field">
+            <label>Default extension duration</label>
+            <select
+              className="select"
+              value={draft.defaultExtensionDurationHours}
+              onChange={(event) => updateDraft({ defaultExtensionDurationHours: Number(event.target.value) })}
+              aria-label="Default PIM extension duration"
+            >
+              {EXTENSION_DURATION_OPTIONS.map((duration) => (
+                <option key={duration} value={duration}>{formatExtensionDuration(duration)}</option>
+              ))}
+            </select>
+            <p className="muted">Used by the notification Extend button. A stricter role policy still caps the request.</p>
           </div>
           <div className="field">
             <label>Activity history limit</label>

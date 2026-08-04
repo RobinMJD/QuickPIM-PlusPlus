@@ -15,6 +15,7 @@ export type QuickPimMessage =
   | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
   | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[] }
   | { action: "refreshTrackedRequests"; requestIds?: string[] }
+  | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
   | { action: "dismissRequestOperations"; operationIds: string[] }
   | { action: "capturePortalTokens"; tokens: string[]; source?: string }
@@ -101,6 +102,11 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
       action: "refreshTrackedRequests",
       requestIds: sanitizeRequestIds(message.requestIds)
     };
+  }
+
+  if (message.action === "extendTrackedRequest") {
+    const requestId = sanitizeSingleRequestId(message.requestId);
+    return { action: "extendTrackedRequest", requestId };
   }
 
   if (message.action === "dismissRequestOperations") {
@@ -325,4 +331,15 @@ function sanitizeRequestIds(value: unknown): string[] | undefined {
     if (result.length >= MAX_REQUEST_IDS) break;
   }
   return result;
+}
+
+function sanitizeSingleRequestId(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new Error("Tracked request identifier is invalid.");
+  }
+  const requestId = value.trim();
+  if (!requestId || requestId.length > MAX_REQUEST_ID_LENGTH) {
+    throw new Error("Tracked request identifier is invalid.");
+  }
+  return requestId;
 }

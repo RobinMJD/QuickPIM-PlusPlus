@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.10.14.
+Reviewed for v2.10.15.
 
 ## Threat Model
 
@@ -18,6 +18,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Errors are redacted before being displayed or returned from the background worker.
 - Activation and deactivation operations are journaled in session storage without bearer tokens. The background worker owns the Microsoft request, so closing the popup does not cancel it; reopening the popup reconnects to its progress and result.
 - Automatic portal recovery retries only failures identified before an activation or deactivation write was sent. Ambiguous network timeouts and server responses are never replayed automatically, preventing duplicate privileged-access requests.
+- Follow-on activation requests are submitted once with a future start time and linked to their source request. Their submission state is persisted before the Microsoft write; an ambiguous result is marked unknown and cannot be retried until the user verifies Microsoft PIM.
 - A Microsoft claims or MFA challenge requires a newly captured portal token before retry. QuickPIM++ discards the matching managed recovery tab, opens a fresh inactive portal page, focuses it only when Microsoft requires interaction, and retries after the token signature changes.
 
 ## Access And Messaging
@@ -38,7 +39,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Popup activation drafts are bounded, stored locally, expire after 24 hours, and are cleared when the in-progress selection is no longer useful.
 - Popup draft mutations and learned reference-name mutations are serialized; learned names are merged by timestamp so concurrent refresh completion cannot restore stale data.
 - Saved justifications, aliases, learned names, bundles, activity history, usage history, popup drafts, cached role data, and preferences remain local to the browser profile.
-- Tracked request records keep only bounded request identifiers, item metadata, lifecycle state, local justification text, and sanitized diagnostics. Tokens and raw Microsoft API payloads are never persisted in request history.
+- Tracked request records keep only bounded request identifiers, item metadata, lifecycle state, local justification and ticket text, continuation links, and sanitized diagnostics. Tokens and raw Microsoft API payloads are never persisted in request history.
 - Request records are matched to the captured tenant and principal before status calls are made. Microsoft API URLs remain constrained to the existing Graph and Azure Management allowlists.
 - Browser notifications require an optional permission requested only when the user enables request notifications; the feature is disabled by default and request tracking remains usable without it.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.

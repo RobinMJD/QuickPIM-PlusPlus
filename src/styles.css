@@ -1483,7 +1483,7 @@ a.btn {
 
 .advanced-preference-fields {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   align-items: start;
   margin-top: 12px;
@@ -1949,7 +1949,8 @@ a.btn {
 
 .request-status.submitted,
 .request-status.pendingApproval,
-.request-status.provisioning {
+.request-status.provisioning,
+.request-status.scheduled {
   background: #fef3c7;
   color: #92400e;
 }

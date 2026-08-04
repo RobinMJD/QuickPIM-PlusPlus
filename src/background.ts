@@ -54,6 +54,7 @@ import {
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
   mutateTrackedRequests,
+  reconcileTrackedExtensionSources,
   trackedRequestMatchesValidatedToken,
   trackedRequestStatusLabel,
   updateTrackedRequestFromPayload,
@@ -112,6 +113,10 @@ import {
   replaceAccessRecoveryErrors
 } from "./lib/requestRecovery";
 import {
+  buildTrackedRequestExtensionPlan,
+  formatExtensionDuration
+} from "./lib/requestExtension";
+import {
   clearStoredTokens,
   getStoredTokensFromSession,
   removeStoredTokenGroupsIfMatching,
@@ -139,12 +144,17 @@ import type {
   TicketInfo,
   TokenKind,
   TokenStatus,
+  TrackedRequestExtensionResult,
   TrackedPimRequest,
   TrackedPimRequestStatus,
   TrackedPimRequestStore
 } from "./lib/types";
 
 type ActivationRequirements = NonNullable<ActivationItem["activationRequirements"]>;
+interface ActivationSubmissionOptions {
+  startDateTime?: string;
+  continuationOfRequestId?: string;
+}
 interface AzureRoleDefinitionResponse {
   properties?: {
     roleName?: string;
@@ -170,6 +180,7 @@ const TARGET_SNAPSHOT_TIMEOUT_MS = 22_000;
 let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
 let requestTrackingMaintenanceInFlight: Promise<TrackedPimRequestStore> | undefined;
 const requestOperationTasks = new Map<string, Promise<ActivationResponse>>();
+const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionResult>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
 const REQUEST_TRACKING_STORAGE_TIMEOUT_MS = 750;
 
@@ -230,8 +241,20 @@ chrome.notifications?.onClicked?.addListener((notificationId) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  void chrome.tabs.create({ url: chrome.runtime.getURL("settings.html#activity") });
+  void openTrackedRequestDetails();
   void chrome.notifications.clear(notificationId);
+});
+
+chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex) => {
+  if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
+    return;
+  }
+  void chrome.notifications.clear(notificationId);
+  if (notificationId.endsWith(":expiry-extend") && buttonIndex === 0) {
+    void runWithServiceWorkerKeepAlive(() => handleExtensionNotificationClick(notificationId));
+    return;
+  }
+  void openTrackedRequestDetails();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -330,8 +353,9 @@ async function performTrackedRequestMaintenance(
   const hasEffectiveStatusChanges = initialStore.requests.some(
     (request) => getEffectiveTrackedRequestStatus(request, now) !== request.status
   );
-  const updatedStore = updates.size || hasEffectiveStatusChanges
-    ? await mutateTrackedRequests((current) => ({
+  const hasRetryableExtension = reconcileTrackedExtensionSources(initialStore, now) !== initialStore;
+  const updatedStore = updates.size || hasEffectiveStatusChanges || hasRetryableExtension
+    ? await mutateTrackedRequests((current) => reconcileTrackedExtensionSources({
       version: 1,
       requests: current.requests.map((request) => {
         const update = updates.get(request.id);
@@ -343,7 +367,7 @@ async function performTrackedRequestMaintenance(
           ? request
           : { ...request, status: effectiveStatus, updatedAt: new Date(now).toISOString(), nextCheckAt: undefined };
       })
-    }))
+    }, now))
     : initialStore;
   const notifiedStore = await notifyTrackedRequestChanges(initialStore, updatedStore, settings, now);
   await Promise.all([
@@ -505,7 +529,11 @@ async function notifyTrackedRequestChanges(
       const expiresAt = Date.parse(request.activeUntil);
       const reminderAt = expiresAt - reminderMinutes * 60_000;
       if (Number.isFinite(expiresAt) && now >= reminderAt && now < expiresAt) {
-        const shown = await showExpiryReminderNotification(request, reminderMinutes);
+        const shown = await showExpiryReminderNotification(
+          request,
+          reminderMinutes,
+          settings.preferences.defaultExtensionDurationHours
+        );
         if (shown) {
           patches.set(request.id, {
             ...patches.get(request.id),
@@ -538,13 +566,32 @@ async function showTrackedRequestNotification(
   return createRequestNotification(request, `Request ${trackedRequestStatusLabel(status).toLowerCase()}`, message, status);
 }
 
-async function showExpiryReminderNotification(request: TrackedPimRequest, reminderMinutes: number): Promise<boolean> {
+async function showExpiryReminderNotification(
+  request: TrackedPimRequest,
+  reminderMinutes: number,
+  preferredExtensionDurationHours: number
+): Promise<boolean> {
+  let extensionDurationHours: number | undefined;
+  try {
+    extensionDurationHours = buildTrackedRequestExtensionPlan(
+      request,
+      preferredExtensionDurationHours
+    ).durationHours;
+  } catch {
+    // Existing legacy requests may not contain enough metadata for one-click continuation.
+  }
   return createRequestNotification(
     request,
     "PIM access expiring soon",
     `${request.itemName} expires in about ${reminderMinutes} minutes.`,
     "active",
-    "expiry"
+    extensionDurationHours ? "expiry-extend" : "expiry-details",
+    extensionDurationHours
+      ? [
+          { title: `Extend ${formatExtensionDuration(extensionDurationHours)}` },
+          { title: "View details" }
+        ]
+      : [{ title: "View details" }]
   );
 }
 
@@ -553,7 +600,8 @@ async function createRequestNotification(
   title: string,
   message: string,
   status: TrackedPimRequestStatus,
-  suffix = "status"
+  suffix = "status",
+  buttons?: chrome.notifications.ButtonOptions[]
 ): Promise<boolean> {
   try {
     await chrome.notifications.create(
@@ -563,12 +611,67 @@ async function createRequestNotification(
         iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
         title,
         message,
-        contextMessage: "Click to open request details."
+        contextMessage: buttons?.length ? "Choose an action below or click to open details." : "Click to open request details.",
+        ...(buttons?.length ? { buttons } : {})
       }
     );
     return true;
   } catch {
     return false;
+  }
+}
+
+async function openTrackedRequestDetails(): Promise<void> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL("settings.html#activity") });
+}
+
+async function handleExtensionNotificationClick(notificationId: string): Promise<void> {
+  const store = await loadTrackedRequests();
+  const request = store.requests.find((candidate) =>
+    notificationId.startsWith(
+      `${REQUEST_TRACKING_NOTIFICATION_PREFIX}${candidate.itemType}:${candidate.requestId.slice(0, 128)}:`
+    )
+  );
+  if (!request) {
+    await createStandaloneRequestNotification(
+      "Extension could not be prepared",
+      "The tracked request is no longer available. Open Activity for current request details."
+    );
+    return;
+  }
+
+  const result = await extendTrackedRequest(request.id);
+  await createStandaloneRequestNotification(
+    result.success ? "PIM extension queued" : "PIM extension needs attention",
+    result.message
+  );
+}
+
+async function createStandaloneRequestNotification(title: string, message: string): Promise<void> {
+  try {
+    await chrome.notifications.create(
+      `${REQUEST_TRACKING_NOTIFICATION_PREFIX}result:${crypto.randomUUID()}`,
+      {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
+        title,
+        message,
+        contextMessage: "Click to open request details."
+      }
+    );
+  } catch {
+    // Request status remains available in Settings > Activity.
+  }
+}
+
+async function runWithServiceWorkerKeepAlive<T>(task: () => Promise<T>): Promise<T> {
+  const keepAlive = setInterval(() => {
+    void chrome.runtime.getPlatformInfo?.().catch(() => undefined);
+  }, 20_000);
+  try {
+    return await task();
+  } finally {
+    clearInterval(keepAlive);
   }
 }
 
@@ -727,6 +830,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getActivationSnapshot(message.targets);
     case "refreshTrackedRequests":
       return runTrackedRequestMaintenance(message.requestIds, true);
+    case "extendTrackedRequest":
+      return extendTrackedRequest(message.requestId);
     case "getRequestOperations":
       return loadRequestOperationsForPopup();
     case "dismissRequestOperations":
@@ -838,12 +943,13 @@ async function activateItemsWithPortalRecovery(
   durationHours: number,
   justification: string,
   ticketInfo: TicketInfo,
-  bundleName?: string
+  bundleName?: string,
+  options: ActivationSubmissionOptions = {}
 ): Promise<ActivationResponse> {
   return executeWithPortalAccessRecovery(
     items,
     "activation",
-    (retryItems) => activateItems(retryItems, durationHours, justification, ticketInfo, bundleName)
+    (retryItems) => activateItems(retryItems, durationHours, justification, ticketInfo, bundleName, options)
   );
 }
 
@@ -857,6 +963,147 @@ async function deactivateItemsWithPortalRecovery(
     "deactivation",
     (retryItems) => deactivateItems(retryItems, justification, ticketInfo)
   );
+}
+
+async function extendTrackedRequest(requestId: string): Promise<TrackedRequestExtensionResult> {
+  const existing = requestExtensionTasks.get(requestId);
+  if (existing) {
+    return existing;
+  }
+  const task = performTrackedRequestExtension(requestId).finally(() => {
+    requestExtensionTasks.delete(requestId);
+  });
+  requestExtensionTasks.set(requestId, task);
+  return task;
+}
+
+async function performTrackedRequestExtension(requestId: string): Promise<TrackedRequestExtensionResult> {
+  const [initialStore, settings] = await Promise.all([loadTrackedRequests(), loadSettings()]);
+  let source = initialStore.requests.find((request) => request.id === requestId || request.requestId === requestId);
+  if (!source) {
+    return extensionFailure(requestId, "The tracked activation is no longer available. Refresh Activity before trying again.");
+  }
+
+  const continuation = initialStore.requests.find((request) =>
+    request.continuationOfRequestId === source?.requestId
+    && !isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(request))
+  );
+  if (continuation) {
+    return extensionFailure(source.requestId, "An extension is already queued for this activation.");
+  }
+
+  if (source.extensionAttemptState === "queued") {
+    const failedContinuation = initialStore.requests.find((request) =>
+      request.continuationOfRequestId === source?.requestId
+      && isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(request))
+    );
+    if (failedContinuation) {
+      source = { ...source, extensionAttemptState: undefined, extensionRequestId: undefined };
+    }
+  }
+
+  let plan;
+  try {
+    plan = buildTrackedRequestExtensionPlan(
+      source,
+      settings.preferences.defaultExtensionDurationHours
+    );
+  } catch (error) {
+    return extensionFailure(source.requestId, sanitizeErrorMessage(error));
+  }
+
+  const attemptedAt = new Date().toISOString();
+  await patchTrackedExtensionSource(source.id, {
+    extensionAttemptState: "submitting",
+    extensionRequestedAt: attemptedAt,
+    extensionRequestId: undefined,
+    extensionLastError: undefined
+  });
+
+  try {
+    const response = await activateItemsWithPortalRecovery(
+      [plan.item],
+      plan.durationHours,
+      plan.justification,
+      plan.ticketInfo,
+      undefined,
+      {
+        startDateTime: plan.startDateTime,
+        continuationOfRequestId: source.requestId
+      }
+    );
+    const result = response.results[0];
+    if (!result?.success) {
+      const detail = result?.error || "Microsoft did not accept the extension request.";
+      const ambiguous = isAmbiguousMicrosoftWriteFailure(detail, Boolean(result?.accessRecoveryTarget));
+      await patchTrackedExtensionSource(source.id, {
+        extensionAttemptState: ambiguous ? "uncertain" : undefined,
+        extensionRequestId: undefined,
+        extensionLastError: detail
+      });
+      return extensionFailure(
+        source.requestId,
+        ambiguous
+          ? `${detail} The result may be unknown; check Microsoft PIM before retrying.`
+          : detail
+      );
+    }
+
+    await patchTrackedExtensionSource(source.id, {
+      extensionAttemptState: "queued",
+      extensionRequestId: result.requestId,
+      extensionLastError: undefined
+    });
+    return {
+      success: true,
+      message: `${source.itemName} is queued for ${formatExtensionDuration(plan.durationHours)} more access after its current activation ends.`,
+      sourceRequestId: source.requestId,
+      requestId: result.requestId,
+      scheduledStartAt: plan.startDateTime,
+      scheduledEndAt: plan.endDateTime,
+      durationHours: plan.durationHours
+    };
+  } catch (error) {
+    const detail = sanitizeErrorMessage(error);
+    await patchTrackedExtensionSource(source.id, {
+      extensionAttemptState: "uncertain",
+      extensionRequestId: undefined,
+      extensionLastError: detail
+    });
+    return extensionFailure(
+      source.requestId,
+      `${detail} The result may be unknown; check Microsoft PIM before retrying.`
+    );
+  }
+}
+
+async function patchTrackedExtensionSource(
+  requestId: string,
+  patch: Partial<Pick<TrackedPimRequest, "extensionAttemptState" | "extensionRequestedAt" | "extensionRequestId" | "extensionLastError">>
+): Promise<void> {
+  await mutateTrackedRequests((store) => ({
+    version: 1,
+    requests: store.requests.map((request) => request.id === requestId ? { ...request, ...patch } : request)
+  }));
+}
+
+function extensionFailure(sourceRequestId: string, message: string): TrackedRequestExtensionResult {
+  return {
+    success: false,
+    sourceRequestId,
+    message: sanitizeErrorMessage(message)
+  };
+}
+
+function isTerminalExtensionRequestStatus(status: TrackedPimRequestStatus): boolean {
+  return status === "denied" || status === "failed" || status === "canceled" || status === "expired";
+}
+
+function isAmbiguousMicrosoftWriteFailure(message: string, accessRecoveryRequired: boolean): boolean {
+  if (accessRecoveryRequired) {
+    return false;
+  }
+  return /timed out|network|failed to fetch|load failed|aborted|gateway|service unavailable|internal server|temporar|\b5\d\d\b/i.test(message);
 }
 
 async function executeWithPortalAccessRecovery(
@@ -2394,7 +2641,8 @@ async function activateItems(
   durationHours: number,
   justification: string,
   ticketInfo: TicketInfo,
-  bundleName?: string
+  bundleName?: string,
+  options: ActivationSubmissionOptions = {}
 ): Promise<ActivationResponse> {
   if (!items.length) {
     throw new Error("Select at least one item to activate.");
@@ -2408,7 +2656,8 @@ async function activateItems(
   }
 
   const tokens = await getStoredTokens();
-  const startDateTime = new Date().toISOString();
+  const submittedAt = new Date().toISOString();
+  const startDateTime = options.startDateTime || submittedAt;
   const executions = await mapWithConcurrency(
     items,
     4,
@@ -2445,10 +2694,13 @@ async function activateItems(
                 action: "activate",
                 requestId,
                 payload: data,
-                requestedAt: startDateTime,
+                requestedAt: submittedAt,
+                scheduledStartAt: startDateTime,
                 durationHours,
                 justification: justification.trim(),
+                ticketInfo,
                 bundleName,
+                continuationOfRequestId: options.continuationOfRequestId,
                 tenantId: getTokenTenantId(token)
               })
               : undefined
@@ -2542,6 +2794,7 @@ async function deactivateItems(
                 payload: data,
                 requestedAt: startDateTime,
                 justification: justification.trim(),
+                ticketInfo,
                 tenantId: getTokenTenantId(token)
               })
               : undefined

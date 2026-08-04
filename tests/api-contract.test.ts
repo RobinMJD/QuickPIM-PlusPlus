@@ -56,4 +56,12 @@ describe("Microsoft PIM API contracts", () => {
     expect(popup).toContain("requestContinuesInBackground = true");
     expect(popup).toContain("if (!requestContinuesInBackground) {");
   });
+
+  test("queues notification extensions in the service worker without replaying ambiguous writes", () => {
+    expect(background).toContain("chrome.notifications?.onButtonClicked");
+    expect(background).toContain("buildTrackedRequestExtensionPlan");
+    expect(background).toContain("continuationOfRequestId: source.requestId");
+    expect(background).toContain('extensionAttemptState: "uncertain"');
+    expect(background).toContain("check Microsoft PIM before retrying");
+  });
 });

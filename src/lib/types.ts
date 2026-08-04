@@ -94,6 +94,7 @@ export type TrackedPimRequestStatus =
   | "submitted"
   | "pendingApproval"
   | "provisioning"
+  | "scheduled"
   | "active"
   | "completed"
   | "denied"
@@ -139,9 +140,19 @@ export interface TrackedPimRequest {
   updatedAt: string;
   completedAt?: string;
   activeUntil?: string;
+  activeFrom?: string;
   durationHours?: number;
   justification?: string;
+  ticketSystem?: string;
+  ticketNumber?: string;
   bundleName?: string;
+  roleEligibilityScheduleId?: string;
+  activationRequirements?: BaseActivationItem["activationRequirements"];
+  continuationOfRequestId?: string;
+  extensionAttemptState?: "submitting" | "queued" | "uncertain";
+  extensionRequestedAt?: string;
+  extensionRequestId?: string;
+  extensionLastError?: string;
   approvalId?: string;
   targetScheduleId?: string;
   lastCheckedAt?: string;
@@ -159,6 +170,7 @@ export interface TrackedPimRequestStore {
 
 export interface QuickPimPreferences {
   defaultDurationHours: number;
+  defaultExtensionDurationHours: number;
   defaultSort: SortMode;
   recentJustificationLimit: number;
   activityHistoryLimit: number;
@@ -316,6 +328,16 @@ export interface ActivationResponse {
   success: boolean;
   results: ActivationResult[];
   errors: ActivationResult[];
+}
+
+export interface TrackedRequestExtensionResult {
+  success: boolean;
+  message: string;
+  sourceRequestId: string;
+  requestId?: string;
+  scheduledStartAt?: string;
+  scheduledEndAt?: string;
+  durationHours?: number;
 }
 
 export type RequestOperationAction = "activate" | "deactivate";

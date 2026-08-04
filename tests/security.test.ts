@@ -162,6 +162,10 @@ describe("runtime message validation", () => {
       action: "refreshTrackedRequests",
       requestIds: ["request-1", "request-2"]
     });
+    expect(validateQuickPimMessage({ action: "extendTrackedRequest", requestId: " directoryRole:request-1 " })).toEqual({
+      action: "extendTrackedRequest",
+      requestId: "directoryRole:request-1"
+    });
     expect(validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["a.b.c"], source: "entra" })).toEqual({
       action: "capturePortalTokens",
       tokens: ["a.b.c"],
@@ -180,6 +184,7 @@ describe("runtime message validation", () => {
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
     expect(() => validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: "request-1" })).toThrow(/identifiers/i);
+    expect(() => validateQuickPimMessage({ action: "extendTrackedRequest", requestId: "" })).toThrow(/identifier/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: "not-array" })).toThrow(/items/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(/between 1 and 100/i);
     const duplicateRole = {

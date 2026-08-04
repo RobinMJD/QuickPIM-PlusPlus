@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.10.14**
+Current version: **v2.10.15**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -30,6 +30,8 @@ The extension does not create a separate OAuth app registration and does not ask
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
 - Use quick filter chips for favorites, eligible items, active items, and roles that require a reason.
+- Queue a follow-on PIM activation from an expiry notification or Settings > Activity, starting one second after the current activation expires.
+- Choose a default continuation duration of 30 minutes, 1 hour, 2 hours, or 4 hours; role policy still applies the strictest maximum.
 - Review compact row policy details such as maximum duration, approval, ticket, required reason, active-until date, and disable availability.
 - Preflight bundle activation to show actionable, skipped, pending, and blocked entries before sending requests.
 - Track local activation and deactivation activity with searchable Settings history.
@@ -235,6 +237,14 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.10.15
+
+- Adds an `Extend` action to expiry notifications and active requests in Settings > Activity.
+- Queues the continuation one second after the current activation expires, reusing the original reason and required ticket details without interrupting current access.
+- Defaults extensions to 30 minutes and adds 1-hour, 2-hour, and 4-hour preferences, capped by the role's known policy maximum.
+- Tracks future continuations as scheduled requests and blocks automatic replay when Microsoft may have received a write but its response was lost.
+- Keeps legacy requests without sufficient policy, ticket, Azure eligibility, or justification data read-only instead of offering an unreliable extension action.
 
 ### v2.10.14
 

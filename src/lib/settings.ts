@@ -18,6 +18,7 @@ import {
   sanitizeUserJustification
 } from "./justifications";
 import { sanitizeErrorMessage } from "./security";
+import { DEFAULT_EXTENSION_DURATION_HOURS, sanitizeExtensionDurationHours } from "./requestExtension";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
 const MAX_HISTORY_ENTRIES = 50;
@@ -45,6 +46,7 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
   activationHistory: [],
   preferences: {
     defaultDurationHours: 0.5,
+    defaultExtensionDurationHours: DEFAULT_EXTENSION_DURATION_HOURS,
     defaultSort: "name",
     recentJustificationLimit: 8,
     activityHistoryLimit: 100,
@@ -355,6 +357,7 @@ function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
   const ignoredAt = sanitizeString(preferences.permissionWarningIgnoredAt, 64);
   return {
     defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
+    defaultExtensionDurationHours: sanitizeExtensionDurationHours(preferences.defaultExtensionDurationHours),
     defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     activityHistoryLimit: clampInteger(preferences.activityHistoryLimit, 10, MAX_ACTIVITY_HISTORY_ENTRIES, DEFAULT_SETTINGS.preferences.activityHistoryLimit),

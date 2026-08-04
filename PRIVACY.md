@@ -12,7 +12,7 @@ QuickPIM++ may process the following data in your browser profile:
 - Eligible and active PIM role, group, and Azure role assignment metadata for enabled QuickPIM++ features.
 - Role, group, subscription, administrative unit, device, and scope display names learned from Microsoft APIs.
 - Local aliases, favorites, bundles, saved justifications, recent justification history, usage counters, preferences, enabled feature choices, and cached activation data.
-- Bounded request identifiers, lifecycle status, item metadata, local justification text, and sanitized errors for PIM requests submitted through QuickPIM++.
+- Bounded request identifiers, lifecycle status, item metadata, local justification and ticket text, continuation links, and sanitized errors for PIM requests submitted through QuickPIM++.
 
 ## How Data Is Used
 
@@ -21,6 +21,7 @@ QuickPIM++ uses this data only to:
 - Display eligible and active PIM assignments in the extension popup for features you have enabled.
 - Resolve friendly display names for roles, groups, scopes, subscriptions, administrative units, and devices.
 - Submit self-activation requests to Microsoft Graph or Azure Management APIs.
+- Queue a follow-on activation to start after current PIM access expires when you use an extension action.
 - Check unresolved QuickPIM++ request status and display clickable local request details.
 - Optionally show browser notifications for request state changes and approaching activation expiry when you explicitly enable that setting.
 - Store local preferences and convenience data such as aliases, favorites, justifications, bundles, and enabled features.
