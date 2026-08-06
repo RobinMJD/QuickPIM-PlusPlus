@@ -3943,6 +3943,30 @@ describe("popup draft persistence", () => {
 });
 
 describe("popup role row styling", () => {
+  test("pins the popup document width while leaving Settings responsive", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const popupHtml = readFileSync(join(process.cwd(), "popup.html"), "utf8");
+    const settingsHtml = readFileSync(join(process.cwd(), "settings.html"), "utf8");
+    const bodyRule = css.match(/body\s*\{[^}]+\}/)?.[0] || "";
+    const popupDocumentRule = css.match(/html\.popup-page,[\s\S]*?body\.popup-page #root\s*\{[^}]+\}/)?.[0] || "";
+    const settingsDocumentRule = css.match(/html\.settings-page-root,[\s\S]*?body\.settings-page\s*\{[^}]+\}/)?.[0] || "";
+    const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(popupHtml).toContain('<html lang="en" class="popup-page">');
+    expect(popupHtml).toContain('<body class="popup-page">');
+    expect(settingsHtml).toContain('<html lang="en" class="settings-page-root">');
+    expect(bodyRule).toContain("width: 520px;");
+    expect(bodyRule).toContain("max-width: 520px;");
+    expect(bodyRule).toContain("overflow-x: hidden;");
+    expect(popupDocumentRule).toContain("min-width: 520px;");
+    expect(popupDocumentRule).toContain("max-width: 520px;");
+    expect(settingsDocumentRule).toContain("width: auto;");
+    expect(settingsDocumentRule).toContain("max-width: none;");
+    expect(shellRule).toContain("width: 100%;");
+    expect(shellRule).toContain("max-width: 100%;");
+    expect(shellRule).toContain("overflow-x: hidden;");
+  });
+
   test("right-aligns activation count and status badge in the status column", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const statusStackRule = css.match(/\.role-status-stack\s*\{[^}]+\}/)?.[0] || "";
