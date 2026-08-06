@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { APP_BUILD_TIMESTAMP, APP_NAME, APP_VERSION } from "../src/lib/appMetadata";
+import { TEST_RELEASE_TAG } from "./testMetadata";
 
 const packageJson = JSON.parse(readFileSync(resolve("package.json"), "utf8"));
 const packageLockJson = JSON.parse(readFileSync(resolve("package-lock.json"), "utf8"));
@@ -15,7 +16,7 @@ describe("versioning and extension manifest", () => {
     expect(packageLockJson.packages[""].name).toBe("quickpim-plusplus");
   });
 
-  test("keeps package, lockfile, and manifest versions in sync at v2.10.16", () => {
+  test(`keeps package, lockfile, and manifest versions in sync at ${TEST_RELEASE_TAG}`, () => {
     expect(packageJson.version).toBe(APP_VERSION);
     expect(packageLockJson.packages[""].version).toBe(APP_VERSION);
     expect(packageLockJson.version).toBe(APP_VERSION);
@@ -72,7 +73,7 @@ describe("versioning and extension manifest", () => {
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
     expect(readme).toContain("Original author: Daniel Bradley");
-    expect(readme).toContain("v2.10.16");
+    expect(readme).toContain(TEST_RELEASE_TAG);
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");

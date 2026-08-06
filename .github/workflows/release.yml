@@ -4,9 +4,27 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild and publish
+        required: true
+        type: string
+      publish_target:
+        description: Publication step to retry
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - github
+          - chrome
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -19,13 +37,14 @@ jobs:
       - name: Checkout exact tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify tagged commit is on main
         run: |
           git fetch origin main --no-tags
-          TAG_COMMIT="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          TAG_COMMIT="$(git rev-parse "${RELEASE_TAG}^{commit}")"
           git merge-base --is-ancestor "$TAG_COMMIT" origin/main
 
       - name: Setup Node
@@ -41,7 +60,7 @@ jobs:
         run: npm ci
 
       - name: Verify tag and all version consumers
-        run: node scripts/check-version-sync.mjs
+        run: node scripts/check-version-sync.mjs "$RELEASE_TAG"
 
       - name: Type check
         run: npm run type-check
@@ -55,24 +74,31 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Install browser test runtime
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Browser visual contracts
+        run: npm run test:e2e
+
       - name: Package and verify Web Store ZIP
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           mkdir -p release
           ZIP="release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
           (cd dist && zip -qr "../${ZIP}" . -x "*.DS_Store")
           unzip -p "$ZIP" manifest.json > /tmp/quickpim-manifest.json
-          node -e 'const m=require("/tmp/quickpim-manifest.json"); if(m.version !== process.env.GITHUB_REF_NAME.slice(1)) throw new Error(`ZIP version ${m.version} does not match tag`);'
+          node -e 'const m=require("/tmp/quickpim-manifest.json"); if(m.version !== process.env.RELEASE_TAG.slice(1)) throw new Error(`ZIP version ${m.version} does not match tag`);'
 
       - name: Upload verified ZIP artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: chrome-webstore-zip-${{ github.ref_name }}
+          name: chrome-webstore-zip-${{ env.RELEASE_TAG }}
           path: release/quickpim-plusplus-v*-chrome-webstore.zip
           if-no-files-found: error
 
   github-release:
     needs: verify-package
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_target != 'chrome' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -80,30 +106,31 @@ jobs:
       - name: Download verified ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: chrome-webstore-zip-${{ github.ref_name }}
+          name: chrome-webstore-zip-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Create immutable GitHub release asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           ZIP="quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
           LOCAL="release/${ZIP}"
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$ZIP"; then
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -Fxq "$ZIP"; then
               mkdir -p /tmp/existing-release
-              gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern "$ZIP" --dir /tmp/existing-release
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ZIP" --dir /tmp/existing-release
               cmp "$LOCAL" "/tmp/existing-release/$ZIP" || { echo "Existing release asset differs; refusing to overwrite it." >&2; exit 1; }
             else
-              gh release upload "$GITHUB_REF_NAME" "$LOCAL" --repo "$GITHUB_REPOSITORY"
+              gh release upload "$RELEASE_TAG" "$LOCAL" --repo "$GITHUB_REPOSITORY"
             fi
           else
-            gh release create "$GITHUB_REF_NAME" "$LOCAL" --repo "$GITHUB_REPOSITORY" --title "QuickPIM++ $GITHUB_REF_NAME" --generate-notes --verify-tag
+            gh release create "$RELEASE_TAG" "$LOCAL" --repo "$GITHUB_REPOSITORY" --title "QuickPIM++ $RELEASE_TAG" --generate-notes --verify-tag
           fi
 
   chrome-web-store:
     needs: [verify-package, github-release]
+    if: ${{ always() && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && (github.event_name != 'workflow_dispatch' || inputs.publish_target != 'github') }}
     runs-on: ubuntu-latest
     environment: chrome-web-store
     permissions:
@@ -112,6 +139,7 @@ jobs:
       - name: Checkout publisher script
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Setup Node
@@ -122,7 +150,7 @@ jobs:
       - name: Download verified ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: chrome-webstore-zip-${{ github.ref_name }}
+          name: chrome-webstore-zip-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Publish to Chrome Web Store
@@ -133,4 +161,4 @@ jobs:
           CHROME_WEBSTORE_REFRESH_TOKEN: ${{ secrets.CHROME_WEBSTORE_REFRESH_TOKEN }}
           CHROME_WEBSTORE_PUBLISHER_ID: ${{ secrets.CHROME_WEBSTORE_PUBLISHER_ID }}
           CHROME_WEBSTORE_EXTENSION_ID: ${{ secrets.CHROME_WEBSTORE_EXTENSION_ID }}
-          CHROME_WEBSTORE_ZIP: release/quickpim-plusplus-${{ github.ref_name }}-chrome-webstore.zip
+          CHROME_WEBSTORE_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chrome-webstore.zip

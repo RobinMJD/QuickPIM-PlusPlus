@@ -7,3 +7,5 @@ preview/
 /AI_HANDOVER.md
 /SessionExport*.txt
 /.local/
+playwright-report/
+test-results/

@@ -22,7 +22,7 @@ if (mismatches.length) {
   throw new Error(`Version mismatch; package=${expected}; ${mismatches.map(([name, value]) => `${name}=${value || "missing"}`).join(", ")}`);
 }
 
-const tag = process.env.GITHUB_REF_NAME;
+const tag = process.argv[2] || process.env.GITHUB_REF_NAME;
 if (tag?.startsWith("v") && tag.slice(1) !== expected) {
   throw new Error(`Tag/version mismatch: tag=${tag.slice(1)}, package=${expected}`);
 }

@@ -13,7 +13,8 @@ export type QuickPimMessage =
   | { action: "clearToken" }
   | { action: "getActivationItems"; targets?: AccessSetupTarget[] }
   | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
-  | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[] }
+  | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[]; detail?: "core" | "full" }
+  | { action: "enrichActivationPolicies"; items: ActivationItem[] }
   | { action: "refreshTrackedRequests"; requestIds?: string[] }
   | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
@@ -70,7 +71,10 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (TARGETED_FETCH_ACTIONS.has(message.action)) {
     return {
       action: message.action,
-      targets: sanitizeTargets(message.targets)
+      targets: sanitizeTargets(message.targets),
+      ...(message.action === "getActivationSnapshot" && (message.detail === "core" || message.detail === "full")
+        ? { detail: message.detail }
+        : {})
     } as QuickPimMessage;
   }
 
@@ -115,6 +119,15 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
       throw new Error("Request operation ids must not be empty.");
     }
     return { action: "dismissRequestOperations", operationIds };
+  }
+
+  if (message.action === "enrichActivationPolicies") {
+    if (!Array.isArray(message.items) || !message.items.length || message.items.length > MAX_ACTIVATION_ITEMS) {
+      throw new Error(`Policy enrichment must contain between 1 and ${MAX_ACTIVATION_ITEMS} items.`);
+    }
+    const items = message.items.map((item) => validateActivationItemForPolicy(item));
+    assertUniqueActivationItems(items);
+    return { action: "enrichActivationPolicies", items };
   }
 
   if (message.action !== "activateItems" && message.action !== "deactivateItems") {
@@ -185,6 +198,13 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   };
 }
 
+function validateActivationItemForPolicy(value: unknown): ActivationItem {
+  if (!isRecord(value) || (value.status !== "eligible" && value.status !== "active" && value.status !== "pendingApproval")) {
+    throw new Error("Policy enrichment items are invalid.");
+  }
+  return validateActivationItem(value, value.status);
+}
+
 function sanitizeOperationIds(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(sanitizeOperationId))].slice(0, 20);
@@ -208,7 +228,7 @@ function assertUniqueActivationItems(items: ActivationItem[]): void {
   }
 }
 
-function validateActivationItem(value: unknown, expectedStatus: "eligible" | "active"): ActivationItem {
+function validateActivationItem(value: unknown, expectedStatus: ActivationItem["status"]): ActivationItem {
   if (!isRecord(value) || !isBoundedString(value.id) || !isBoundedString(value.principalId) || value.status !== expectedStatus) {
     throw new Error(`Activation items must be valid ${expectedStatus} items.`);
   }

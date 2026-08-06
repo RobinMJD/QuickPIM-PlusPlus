@@ -827,7 +827,9 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     case "getActiveItems":
       return getActiveItems(message.targets);
     case "getActivationSnapshot":
-      return getActivationSnapshot(message.targets);
+      return message.detail === "core" ? getActivationCoreSnapshot(message.targets) : getActivationSnapshot(message.targets);
+    case "enrichActivationPolicies":
+      return enrichActivationPolicies(message.items);
     case "refreshTrackedRequests":
       return runTrackedRequestMaintenance(message.requestIds, true);
     case "extendTrackedRequest":
@@ -1816,6 +1818,113 @@ async function getActivationSnapshot(targets: AccessSetupTarget[] = ["directoryR
   };
 }
 
+async function getActivationCoreSnapshot(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<ActivationSnapshot> {
+  const tokens = await getStoredTokens();
+  const fetchers: Record<AccessSetupTarget, () => Promise<TargetSnapshotResult>> = {
+    directoryRole: () =>
+      fetchSnapshotGroup(
+        "directoryRole",
+        "graph",
+        getGraphTokenForTarget(tokens, "directoryRole"),
+        getDirectoryRoleCoreSnapshot,
+        getDirectoryRoles,
+        getActiveDirectoryRoles
+      ),
+    azureRole: () =>
+      fetchSnapshotGroup(
+        "azureRole",
+        "azureManagement",
+        tokens.azureManagementToken,
+        getAzureRoleCoreSnapshot,
+        getAzureRoles,
+        getActiveAzureRoles
+      ),
+    pimGroup: () =>
+      fetchSnapshotGroup(
+        "pimGroup",
+        "graph",
+        getGraphTokenForTarget(tokens, "pimGroup"),
+        getPimGroupCoreSnapshot,
+        getPimGroups,
+        getActivePimGroups
+      )
+  };
+  const results = await Promise.all(targets.map(async (target) => {
+    try {
+      return await withTimeout(
+        fetchers[target](),
+        TARGET_SNAPSHOT_TIMEOUT_MS,
+        `${ENDPOINT_LABELS[target].eligible} refresh timed out. Cached data remains available.`
+      );
+    } catch (error) {
+      return makeFailedTargetSnapshot(target, error);
+    }
+  }));
+  return {
+    eligible: combineSnapshotResults(results, "eligible"),
+    active: combineSnapshotResults(results, "active"),
+    eligibleByTarget: Object.fromEntries(results.map((result) => [result.target, result.eligible])),
+    activeByTarget: Object.fromEntries(results.map((result) => [result.target, result.active])),
+    tokenStatus: buildTokenStatus(tokens)
+  };
+}
+
+async function enrichActivationPolicies(items: ActivationItem[]): Promise<ActivationItem[]> {
+  const tokens = await getStoredTokens();
+  const targets = uniqueAccessTargets(items.map((item) => item.type));
+  const enrichedGroups = await Promise.all(
+    targets.map(async (target) => {
+      const targetItems = items.filter((item) => item.type === target);
+      if (target === "directoryRole") {
+        const token = getGraphTokenForTarget(tokens, "directoryRole");
+        if (!token) throw new Error("Graph token is missing.");
+        assertFreshToken(token, "graph");
+        const requirements = await getDirectoryRolePolicyRequirementsBestEffort(token);
+        return targetItems.map((item) => {
+          if (item.type !== "directoryRole") return markActivationPolicyReady(item);
+          const itemRequirements = getRoleDefinitionLookupKeys(item.roleDefinitionId)
+            .map((key) => requirements[key])
+            .find(Boolean);
+          return itemRequirements
+            ? markActivationPolicyReady(applyActivationRequirements(item, itemRequirements))
+            : markActivationPolicyPending(item);
+        });
+      }
+      if (target === "pimGroup") {
+        const token = getGraphTokenForTarget(tokens, "pimGroup");
+        if (!token) throw new Error("Graph token is missing.");
+        assertFreshToken(token, "graph");
+        const groupIds = [...new Set(targetItems.map((item) => item.type === "pimGroup" ? item.groupId : "").filter(Boolean))];
+        const requirements = await getPimGroupPolicyRequirementsBestEffort(token, groupIds);
+        return targetItems.map((item) => {
+          if (item.type !== "pimGroup") return markActivationPolicyReady(item);
+          const groupPolicy = requirements[item.groupId];
+          const itemRequirements = groupPolicy?.[item.accessId] || groupPolicy?.default;
+          return itemRequirements
+            ? markActivationPolicyReady(applyActivationRequirements(item, itemRequirements))
+            : markActivationPolicyPending(item);
+        });
+      }
+      const token = tokens.azureManagementToken;
+      if (!token) throw new Error("Azure Management token is missing.");
+      assertFreshToken(token, "azureManagement");
+      return (await applyAzureRolePolicyRequirements(targetItems, token)).map((item) =>
+        item.activationRequirements ? markActivationPolicyReady(item) : markActivationPolicyPending(item)
+      );
+    })
+  );
+  const enrichedById = new Map(enrichedGroups.flat().map((item) => [item.id, item]));
+  return items.map((item) => enrichedById.get(item.id) || item);
+}
+
+function markActivationPolicyPending<T extends ActivationItem>(item: T): T {
+  return { ...item, activationPolicyState: "pending" };
+}
+
+function markActivationPolicyReady<T extends ActivationItem>(item: T): T {
+  return { ...item, activationPolicyState: "ready" };
+}
+
 async function fetchSnapshotGroup(
   target: AccessSetupTarget,
   tokenKind: TokenKind,
@@ -2000,6 +2109,35 @@ async function getDirectoryRoleSnapshot(graphToken: string): Promise<[Activation
   });
   const active = getDirectoryRoleActiveInstanceItems(assignmentInstances, definitions, scopeNames, policyRequirements);
   const pending = getDirectoryRolePendingRequestItems(assignmentRequests, definitions, scopeNames, policyRequirements);
+  return [eligible, [...pending, ...active]];
+}
+
+async function getDirectoryRoleCoreSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+  assertFreshToken(graphToken, "graph");
+  const [eligibleRoles, assignmentInstances, assignmentRequests] = await Promise.all([
+    fetchAllPages<DirectoryRoleApi>(
+      graphApiUrl(`/v1.0/roleManagement/directory/roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')?${new URLSearchParams({ "$expand": "roleDefinition" }).toString()}`),
+      graphToken
+    ),
+    fetchAllPages<DirectoryRoleApi>(
+      graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
+      graphToken
+    ),
+    fetchAllPages<DirectoryRoleApi>(
+      graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
+      graphToken
+    )
+  ]);
+  const [definitions, scopeNames] = await Promise.all([
+    getDirectoryRoleDefinitionsBestEffort(graphToken),
+    getDirectoryScopeNamesBestEffort(graphToken, [...eligibleRoles, ...assignmentInstances, ...assignmentRequests])
+  ]);
+  const eligible = eligibleRoles.map((role) => {
+    const namedRole = withDirectoryRoleScopeName(withDirectoryRoleDefinitionName(role, definitions), scopeNames);
+    return markActivationPolicyPending(normalizeDirectoryRole(namedRole));
+  });
+  const active = getDirectoryRoleActiveInstanceItems(assignmentInstances, definitions, scopeNames).map(markActivationPolicyPending);
+  const pending = getDirectoryRolePendingRequestItems(assignmentRequests, definitions, scopeNames).map(markActivationPolicyPending);
   return [eligible, [...pending, ...active]];
 }
 
@@ -2291,6 +2429,38 @@ async function getPimGroupSnapshot(graphToken: string): Promise<[ActivationItem[
   return [eligible, [...pending, ...active]];
 }
 
+async function getPimGroupCoreSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+  assertFreshToken(graphToken, "graph");
+  const [eligibleSchedules, activeSchedules, assignmentRequests] = await Promise.all([
+    fetchAllPages<PimGroupApi>(
+      graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances/filterByCurrentUser(on='principal')"),
+      graphToken
+    ),
+    fetchAllPages<PimGroupApi>(
+      graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
+      graphToken
+    ),
+    fetchAllPages<PimGroupApi>(
+      graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on='principal')"),
+      graphToken
+    )
+  ]);
+  const groupIds = [
+    ...new Set(
+      [...eligibleSchedules, ...activeSchedules, ...assignmentRequests]
+        .map((schedule) => schedule.groupId)
+        .filter(Boolean) as string[]
+    )
+  ];
+  const groupInfos = await getGroupInfos(graphToken, groupIds);
+  const eligible = eligibleSchedules.map((schedule) =>
+    markActivationPolicyPending(normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]))
+  );
+  const active = getActivePimGroupInstanceItems(activeSchedules, groupInfos, {}).map(markActivationPolicyPending);
+  const pending = getPimGroupPendingRequestItems(assignmentRequests, groupInfos, {}).map(markActivationPolicyPending);
+  return [eligible, [...pending, ...active]];
+}
+
 function getActivePimGroupInstanceItems(
   instances: PimGroupApi[],
   groupInfos: Record<string, GroupInfo>,
@@ -2403,9 +2573,20 @@ async function getAzureRoleSnapshot(azureManagementToken: string): Promise<[Acti
   ]);
 }
 
+async function getAzureRoleCoreSnapshot(azureManagementToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+  assertFreshToken(azureManagementToken, "azureManagement");
+  const subscriptions = await getSubscriptions(azureManagementToken);
+  const [eligible, active] = await Promise.all([
+    getAzureRolesForSubscriptions(azureManagementToken, subscriptions, false),
+    getActiveAzureRolesForSubscriptions(azureManagementToken, subscriptions)
+  ]);
+  return [eligible.map(markActivationPolicyPending), active.map(markActivationPolicyPending)];
+}
+
 async function getAzureRolesForSubscriptions(
   azureManagementToken: string,
-  subscriptions: Array<{ subscriptionId: string; displayName: string }>
+  subscriptions: Array<{ subscriptionId: string; displayName: string }>,
+  includePolicies = true
 ): Promise<ActivationItem[]> {
   const roleGroups = await mapWithConcurrencySettled(
     subscriptions,
@@ -2429,7 +2610,7 @@ async function getAzureRolesForSubscriptions(
 
   assertAtLeastOneSubscriptionSucceeded(roleGroups, "eligible Azure roles");
   const items = roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []));
-  const itemsWithPolicies = await applyAzureRolePolicyRequirements(items, azureManagementToken);
+  const itemsWithPolicies = includePolicies ? await applyAzureRolePolicyRequirements(items, azureManagementToken) : items;
   return applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken);
 }
 

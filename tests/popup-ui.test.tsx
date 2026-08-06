@@ -152,7 +152,8 @@ describe("popup loading UI", () => {
       scopeLabel: "Tenant",
       status: "eligible",
       roleDefinitionId: "reader",
-      directoryScopeId: "/"
+      directoryScopeId: "/",
+      activationPolicyState: "pending"
     };
     const pimGroup: ActivationItem = {
       id: "pimGroup:group-1:member",
@@ -242,6 +243,90 @@ describe("popup loading UI", () => {
       }
     });
     await waitFor(() => expect(document.querySelector(".refresh-progress-panel")).toBeFalsy());
+  });
+
+  test("renders core role data before deferred policy enrichment completes", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const policyResponse = deferred<{ success: true; data: ActivationItem[] }>();
+    const role: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationPolicyState: "pending"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: true, isExpired: false },
+            graphTargets: { directoryRole: { hasToken: true, isExpired: false } },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            eligible: { items: [role], errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] }
+          }
+        });
+      }
+      if (message.action === "enrichActivationPolicies") return policyResponse.promise;
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    expect(document.body.textContent).not.toContain("Loading access data");
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "enrichActivationPolicies" })));
+
+    policyResponse.resolve({
+      success: true,
+      data: [{
+        ...role,
+        activationPolicyState: "ready",
+        activationRequirements: { justification: true, ticket: false, approval: false, maxDurationHours: 1 }
+      }]
+    });
+    await waitFor(() => {
+      const cache = storageData[DATA_CACHE_KEY] as { eligibleByTarget?: { directoryRole?: { items: ActivationItem[] } } };
+      expect(cache.eligibleByTarget?.directoryRole?.items[0]).toMatchObject({
+        activationPolicyState: "ready",
+        activationRequirements: { maxDurationHours: 1 }
+      });
+    });
   });
 
   test("keeps successful role data when another parallel source fails", async () => {
@@ -484,7 +569,8 @@ describe("popup compact controls", () => {
       scopeLabel: "Tenant",
       status: "eligible",
       roleDefinitionId: "reader",
-      directoryScopeId: "/"
+      directoryScopeId: "/",
+      activationPolicyState: "pending"
     };
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: {
@@ -744,7 +830,11 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "openPortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
     expect(createTab).not.toHaveBeenCalled();
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "getActivationSnapshot", targets: ["pimGroup"] }), 2500);
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
+      action: "getActivationSnapshot",
+      targets: ["pimGroup"],
+      detail: "core"
+    }), 2500);
     await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "closePortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
   });
 
@@ -4016,7 +4106,7 @@ describe("popup role row styling", () => {
 
     expect(shellRule).toContain("display: flex;");
     expect(shellRule).toContain("flex-direction: column;");
-    expect(shellRule).toContain("min-height: 600px;");
+    expect(shellRule).toContain("min-height: max(600px, 100vh);");
     expect(shellRule).not.toContain("min-height: 640px;");
     expect(contentRule).toContain("padding-bottom: 12px;");
     expect(contentRule).not.toContain("padding-bottom: 248px;");

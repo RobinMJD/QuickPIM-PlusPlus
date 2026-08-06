@@ -283,6 +283,10 @@ export function getRowActionState(item: ActivationItem | undefined, now = Date.n
 }
 
 export function getRowPolicySummary(item: ActivationItem): string[] {
+  if (item.activationPolicyState === "pending") {
+    const activeUntil = item.status === "active" && item.activeUntil ? `Active until: ${item.activeUntil.slice(0, 10)}` : undefined;
+    return ["Activation policy will be checked before the request", activeUntil].filter((value): value is string => Boolean(value));
+  }
   const requirements = item.activationRequirements || {};
   const maxDuration = requirements.maxDurationHours
     ? `Max duration: ${formatDurationLabel(requirements.maxDurationHours)}`

@@ -29,7 +29,7 @@ export function SmartProgressPanel({
   ].filter(Boolean).join(" ");
 
   return (
-    <section className={classes} aria-live="polite">
+    <section className={classes} role={isError ? "alert" : "status"} aria-live={isError ? "assertive" : "polite"} aria-atomic="true">
       <div className="progress-line">
         <strong>{title}</strong>
         <span className="progress-fraction">Step {progress.current}/{progress.steps.length}</span>

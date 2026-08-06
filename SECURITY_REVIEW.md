@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.10.16.
+Reviewed for v2.11.0.
 
 ## Threat Model
 
@@ -16,6 +16,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Token capture, migration, replacement, and cleanup mutations are serialized. Cleanup removes an invalid token only if the stored value still matches the validated stale snapshot, so it cannot delete a token captured concurrently.
 - Expired or invalid stored tokens are cleared when detected.
 - Errors are redacted before being displayed or returned from the background worker.
+- The diagnostics support report contains aggregate counts and sanitized capability state only. It excludes tokens, authorization headers, account names, role names, full object IDs, tickets, and justification text.
 - Activation and deactivation operations are journaled in session storage without bearer tokens. The background worker owns the Microsoft request, so closing the popup does not cancel it; reopening the popup reconnects to its progress and result.
 - Automatic portal recovery retries only failures identified before an activation or deactivation write was sent. Ambiguous network timeouts and server responses are never replayed automatically, preventing duplicate privileged-access requests.
 - Follow-on activation requests are submitted once with a future start time and linked to their source request. Their submission state is persisted before the Microsoft write; an ambiguous result is marked unknown and cannot be retried until the user verifies Microsoft PIM.
@@ -31,6 +32,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Popup refresh, background pre-refresh, and Access Setup share a bounded, timed, single-flight scan of already-open Entra tabs before opening new setup pages; the extension does not request Chrome cookie access and cannot exchange Microsoft session cookies directly for API tokens.
 - Extension pages use an explicit MV3 content security policy.
 - Background runtime messages are accepted only from this extension and are validated before privileged actions run.
+- The popup displays the captured account and tenant context, warns when live tokens belong to different identities, and the background rejects a request whose role principal does not match the selected API token.
 - Unsupported token injection paths are not exposed; users can clear captured tokens from Settings.
 
 ## Storage And Settings
@@ -44,6 +46,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Browser notifications require an optional permission requested only when the user enables request notifications; the feature is disabled by default and request tracking remains usable without it.
 - Bundle and activation fields are bounded before being sent to Microsoft APIs.
 - Activation messages reject duplicate logical role targets, durations outside 30 minutes to 24 hours, and durations above the strictest known tenant policy before a Microsoft write is attempted.
+- Fast role loading treats policy metadata as provisional, never substitutes an unknown policy with a successful policy state, and rechecks pending policy data before activation.
 - Cached role data is keyed by tenant, principal, and token capability so one signed-in identity cannot reuse another identity's PIM snapshot while a same-capability token renewal can keep fresh cached data.
 
 ## Dependency And Repository Hygiene
@@ -51,6 +54,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Build tooling is kept in `devDependencies`.
 - `npm audit --audit-level=low` is part of CI and the exact-tag release gate.
 - Release workflows pin third-party actions to immutable commit SHAs, rerun tests and audit, and refuse to overwrite a different existing release asset.
+- CI loads the built MV3 extension in Chromium and checks popup keyboard behavior, fixed-width layout, footer alignment, and responsive Settings diagnostics before packaging.
 - Generated build output, dependencies, and bundled tool runtimes remain ignored by git.
 
 ## Remaining Accepted Risks

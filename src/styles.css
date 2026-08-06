@@ -52,7 +52,7 @@ button {
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: 600px;
+  min-height: max(600px, 100vh);
   overflow-x: hidden;
   background: #f7f8fa;
 }
@@ -100,6 +100,18 @@ button {
   margin: 3px 0 0;
   color: #64748b;
   font-size: 12px;
+}
+
+.brand .identity-context {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.identity-mismatch {
+  margin: 8px 12px 0;
 }
 
 .status-stack {
@@ -536,6 +548,15 @@ body.dark-mode .field-clear-button:focus-visible {
 
 .role-row.selectable {
   cursor: pointer;
+}
+
+.role-row.selectable:focus-visible,
+.tab-button:focus-visible,
+.filter-chip:focus-visible,
+.btn:focus-visible,
+.settings-nav button:focus-visible {
+  outline: 3px solid #93c5fd;
+  outline-offset: 2px;
 }
 
 .role-row.selectable.disabled {
@@ -1424,9 +1445,46 @@ a.btn {
   white-space: pre-line;
 }
 
+.access-identity,
+.diagnostics-report-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.access-identity {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 10px;
+}
+
+.access-identity.mismatch {
+  border-color: #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.access-identity.mismatch span:last-child {
+  grid-column: 1 / -1;
+}
+
+.diagnostic-warning {
+  color: #b91c1c;
+  font-weight: 700;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .progress-fill {
     transition: none;
+  }
+
+  .spinner,
+  .icon-btn.spinning .button-icon,
+  .refresh-success-indicator {
+    animation: none;
   }
 }
 
@@ -2212,6 +2270,18 @@ body.dark-mode .request-row,
 body.dark-mode .saved-justification-menu {
   background: #0f172a;
   border-color: #334155;
+}
+
+body.dark-mode .access-identity,
+body.dark-mode .diagnostics-report-card {
+  background: #0f172a;
+  border-color: #475569;
+}
+
+body.dark-mode .access-identity.mismatch {
+  background: #450a0a;
+  border-color: #ef4444;
+  color: #fecaca;
 }
 
 body.dark-mode .settings-nav button.active,

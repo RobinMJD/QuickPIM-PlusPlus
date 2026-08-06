@@ -1,6 +1,6 @@
 {
   "name": "quickpim-plusplus",
-  "version": "2.10.16",
+  "version": "2.11.0",
   "private": true,
   "packageManager": "npm@11.6.2",
   "engines": {
@@ -11,13 +11,15 @@
     "type-check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run --maxWorkers=1 --no-file-parallelism",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/chrome": "^0.0.312",
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",

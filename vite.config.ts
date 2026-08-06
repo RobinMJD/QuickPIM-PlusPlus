@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 const entry = (path: string) => new URL(path, import.meta.url).pathname;
@@ -27,6 +27,7 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
-    globals: true
+    globals: true,
+    exclude: [...configDefaults.exclude, "tests/e2e/**"]
   }
 });

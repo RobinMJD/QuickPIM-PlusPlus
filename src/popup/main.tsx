@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import {
@@ -13,7 +13,6 @@ import {
   updateCacheFromTargetResults
 } from "../lib/cache";
 import { CLAIMS_CHALLENGE_MESSAGE } from "../lib/apiErrors";
-import { formatDateOnly } from "../lib/dateFormat";
 import {
   buildAccessCapabilityItems,
   buildTokenCacheKey,
@@ -25,23 +24,15 @@ import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
 import {
   coerceDurationForItems,
   filterAssignedActiveItems,
-  formatActivationItemStatusLabel,
-  formatRemainingActivationTime,
   formatLoadMessages,
   getActivationRequirements,
-  getActivationStatusTitle,
   getActivatableItems,
   applyQuickFilters,
   getDeactivatableItems,
   getBundlePreflight,
   getDurationOptions,
-  getEffectiveActiveAssignmentType,
-  getRemainingActivationTimeUpdateDelay,
   getRemainingSelectedIdsAfterActivationResults,
-  isHighPrivilegeItem,
   getRowActionState,
-  getRowPolicySummary,
-  shouldShowRemainingActivationTime,
   mergeEligibleWithActive,
   getPortalUrlForTab,
   tabLabel,
@@ -61,7 +52,6 @@ import {
   getDisplayName,
   getEnabledRoleFeatures,
   getScopeLabel,
-  getUsage,
   loadSettings,
   recordActivityResults,
   recordActivations,
@@ -82,6 +72,9 @@ import {
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
+import { getActivationItemIdentity } from "../lib/activationIdentity";
+import { getIdentityContext } from "../lib/identityContext";
+import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -410,6 +403,7 @@ function PopupApp() {
   const requirements = useMemo(() => getActivationRequirements(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
+  const identityContext = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
   const showInitialAccessState = hasActivationDataLoaded
     && !isLoading
     && !isRefreshing
@@ -901,7 +895,9 @@ function PopupApp() {
       }
 
       let staleTargets = refreshTargets.filter(
-        (target) => options.force || !initialCacheView.eligibleCache[target]?.isFresh || !initialCacheView.activeCache[target]?.isFresh
+        (target) => options.force
+          || !initialCacheView.eligibleCache[target]?.isFresh
+          || !initialCacheView.activeCache[target]?.isFresh
       );
       const portalTokenRecoveryTargets = getPortalTokenRecoveryTargets({
         cache: currentCache,
@@ -969,7 +965,9 @@ function PopupApp() {
         setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
         currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
         staleTargets = refreshTargets.filter(
-          (target) => options.force || !currentCacheView.eligibleCache[target]?.isFresh || !currentCacheView.activeCache[target]?.isFresh
+          (target) => options.force
+            || !currentCacheView.eligibleCache[target]?.isFresh
+            || !currentCacheView.activeCache[target]?.isFresh
         );
         managedPortalRecoveryCompleted = true;
       }
@@ -990,7 +988,9 @@ function PopupApp() {
           setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
           currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
           staleTargets = refreshTargets.filter(
-            (target) => options.force || !currentCacheView.eligibleCache[target]?.isFresh || !currentCacheView.activeCache[target]?.isFresh
+            (target) => options.force
+              || !currentCacheView.eligibleCache[target]?.isFresh
+              || !currentCacheView.activeCache[target]?.isFresh
           );
         } catch {
           // Existing tokens and cached data remain usable when no portal tab can answer the optional scan.
@@ -1096,6 +1096,50 @@ function PopupApp() {
           if (targetSucceeded) {
             successfulRefreshTargets.add(target);
           }
+          if (showBlockingLoading && target === preferredTarget) {
+            setIsLoading(false);
+          }
+
+          const policyCandidates = getUniquePolicyCandidates([...eligibleResult.items, ...activeResult.items]);
+          if (targetSucceeded && policyCandidates.some((item) => item.activationPolicyState === "pending")) {
+            showProgressStep(sourceProgressStep, `${tabLabel(target)} ready; checking activation policy`);
+            try {
+              const enriched = await enrichActivationPolicies(policyCandidates);
+              if (!isCurrentRun()) return;
+              eligibleResult.items = applyPolicyEnrichment(eligibleResult.items, enriched);
+              activeResult.items = applyPolicyEnrichment(activeResult.items, enriched);
+              progressiveCache = updateCacheFromTargetResults(
+                progressiveCache,
+                "eligible",
+                [target],
+                { [target]: eligibleResult },
+                fetchedAt,
+                targetCacheKeys,
+                refreshStartedAt
+              );
+              progressiveCache = updateCacheFromTargetResults(
+                progressiveCache,
+                "active",
+                [target],
+                { [target]: activeResult },
+                fetchedAt,
+                targetCacheKeys,
+                refreshStartedAt
+              );
+              const enrichedView = getActivationCacheView(progressiveCache, progressiveTokens, enabledRoleFeatures, Date.now());
+              renderLoadedActivationData(
+                loadedSettings,
+                progressiveTokens,
+                progressiveCache,
+                progressiveReferenceData,
+                enrichedView.eligible,
+                enrichedView.active
+              );
+              cachePersistence.push(saveDataCache(progressiveCache));
+            } catch {
+              // Core role data remains immediately usable for browsing. Selected items are revalidated before activation.
+            }
+          }
         } catch (targetError) {
           if (isCurrentRun()) {
             const detail = targetError instanceof Error ? targetError.message : String(targetError);
@@ -1106,7 +1150,7 @@ function PopupApp() {
             return;
           }
           completedTargets += 1;
-          if (showBlockingLoading && (target === preferredTarget || completedTargets === staleTargets.length)) {
+          if (showBlockingLoading && completedTargets === staleTargets.length) {
             setIsLoading(false);
           }
           showProgressStep(
@@ -1162,8 +1206,9 @@ function PopupApp() {
       );
       setHasActivationDataLoaded(true);
       showProgressStep(saveProgressStep, "Saving refreshed data");
+      await Promise.all(cachePersistence);
       await Promise.all([
-        ...cachePersistence,
+        saveDataCache(progressiveCache),
         saveReferenceData(progressiveReferenceData),
         ...(nextSettings === loadedSettings ? [] : [saveSettings(nextSettings)])
       ]);
@@ -1429,15 +1474,49 @@ function PopupApp() {
     }
   }
 
+  async function ensureActivationPolicies(items: ActivationItem[]): Promise<ActivationItem[]> {
+    const pendingItems = getUniquePolicyCandidates(items.filter((item) => item.activationPolicyState === "pending"));
+    if (!pendingItems.length) {
+      return items;
+    }
+
+    const enriched = await enrichActivationPolicies(pendingItems);
+    const resolvedItems = applyPolicyEnrichment(items, enriched);
+    if (resolvedItems.some((item) => item.activationPolicyState === "pending")) {
+      throw new Error("QuickPIM++ could not verify the selected activation policy. Refresh access and retry.");
+    }
+    setEligibleItems((current) => applyPolicyEnrichment(current, enriched));
+    setActiveItems((current) => applyPolicyEnrichment(current, enriched));
+    return resolvedItems;
+  }
+
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
     if (activationRequestInFlight.current) {
       return;
     }
-    const activatableItems = getActivatableItems(items);
+    let activatableItems = getActivatableItems(items);
     if (!activatableItems.length) {
       setActivationFailureNotice(null);
       setError(items.length ? "No selected items are currently eligible to activate." : "Select at least one role or group.");
       return;
+    }
+
+    if (activatableItems.some((item) => item.activationPolicyState === "pending")) {
+      activationRequestInFlight.current = true;
+      setIsActivating(true);
+      setError("");
+      setMessage("Checking the selected activation policy...");
+      try {
+        activatableItems = getActivatableItems(await ensureActivationPolicies(activatableItems));
+      } catch (policyError) {
+        setMessage("");
+        setError(policyError instanceof Error ? policyError.message : String(policyError));
+        return;
+      } finally {
+        activationRequestInFlight.current = false;
+        setIsActivating(false);
+      }
+      setMessage("");
     }
 
     const activationRequirements = getActivationRequirements(activatableItems);
@@ -1881,6 +1960,7 @@ function PopupApp() {
             <p>
               {isLoading ? null : showInitialAccessState ? "Ready to load roles" : `${activatableItemCount} eligible items${isRefreshing ? " so far" : ""}`}
             </p>
+            {identityContext.label ? <p className="identity-context" title={identityContext.detail}>{identityContext.label}</p> : null}
           </div>
         </div>
         <div className="status-stack">
@@ -1925,6 +2005,12 @@ function PopupApp() {
         </div>
       </header>
 
+      {identityContext.mismatch ? (
+        <p className="message error identity-mismatch" role="alert">
+          Microsoft portal tokens use different accounts or tenants. Refresh from one signed-in account before submitting a request.
+        </p>
+      ) : null}
+
       {showPermissionWarning ? (
         <PermissionWarningBanner
           missingCount={accessSetupTargets.length}
@@ -1936,9 +2022,30 @@ function PopupApp() {
       ) : null}
 
       {!showInitialAccessState && visibleTabs.length ? (
-        <nav className="tab-bar">
+        <nav className="tab-bar" role="tablist" aria-label="Role types">
           {visibleTabs.map((visibleTab) => (
-            <button className={`tab-button ${tab === visibleTab ? "active" : ""}`} onClick={() => setTab(visibleTab)} key={visibleTab}>
+            <button
+              id={`popup-tab-${visibleTab}`}
+              className={`tab-button ${tab === visibleTab ? "active" : ""}`}
+              onClick={() => setTab(visibleTab)}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+                event.preventDefault();
+                const currentIndex = visibleTabs.indexOf(visibleTab);
+                const nextIndex = event.key === "Home"
+                  ? 0
+                  : event.key === "End"
+                    ? visibleTabs.length - 1
+                    : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + visibleTabs.length) % visibleTabs.length;
+                const nextTab = visibleTabs[nextIndex];
+                setTab(nextTab);
+                window.requestAnimationFrame(() => document.getElementById(`popup-tab-${nextTab}`)?.focus());
+              }}
+              key={visibleTab}
+              role="tab"
+              aria-selected={tab === visibleTab}
+              aria-controls="popup-tab-panel"
+            >
               {tabLabel(visibleTab)}
             </button>
           ))}
@@ -2022,7 +2129,7 @@ function PopupApp() {
             </div>
           </section>
           <QuickFilterBar activeFilters={quickFilters} onToggle={toggleQuickFilter} />
-          <section className="content">
+          <section className="content" id="popup-tab-panel" role="tabpanel" aria-label={tabLabel(currentRoleTab)}>
             <RoleList
               items={visibleEligibleItems}
               settings={settings}
@@ -2066,7 +2173,7 @@ function PopupApp() {
       ) : null}
 
       {!showInitialAccessState && activeTabIsVisible && tab === "bundles" ? (
-        <section className="content item-list">
+        <section className="content item-list" id="popup-tab-panel" role="tabpanel" aria-label="Bundles">
           {settings.bundles.length ? (
             settings.bundles.map((bundle) => {
               const expansion = expandBundle(bundle, displayItems);
@@ -2252,9 +2359,11 @@ function ActivationFailureBanner({
   onOpenPortal: (target: RoleTab) => void;
   onOpenAccessSetup: () => void;
 }) {
+  const panelRef = useRef<HTMLElement>(null);
+  useEffect(() => panelRef.current?.focus(), []);
   const hasRecoveryAction = notice.recoveryTargets.length > 0;
   return (
-    <section className="message error activation-error-panel" role="alert" aria-live="assertive">
+    <section ref={panelRef} className="message error activation-error-panel" role="alert" aria-live="assertive" tabIndex={-1}>
       <div className="activation-error-list">
         {notice.errors.map((errorMessage, index) => (
           <p key={`${index}:${errorMessage}`}>{errorMessage}</p>
@@ -2278,203 +2387,6 @@ function ActivationFailureBanner({
         </>
       ) : null}
     </section>
-  );
-}
-
-function RoleList({
-  items,
-  settings,
-  referenceData,
-  selectedIds,
-  favoriteIds,
-  requestMode,
-  showActivationCounters,
-  showEnablementDetails,
-  showLastEnablementDate,
-  showRemainingActivationTime,
-  onToggle,
-  onToggleFavorite,
-  readonly = false
-}: {
-  items: ActivationItem[];
-  settings: QuickPimSettings;
-  referenceData?: ReferenceDataCache;
-  selectedIds: Set<string>;
-  favoriteIds: Set<string>;
-  requestMode?: PopupRequestMode;
-  showActivationCounters: boolean;
-  showEnablementDetails: boolean;
-  showLastEnablementDate: boolean;
-  showRemainingActivationTime: boolean;
-  onToggle?: (itemId: string) => void;
-  onToggleFavorite?: (itemId: string) => void;
-  readonly?: boolean;
-}) {
-  const [, refreshExpiredActionStates] = useState(0);
-  const handleActivationExpired = useCallback(() => {
-    refreshExpiredActionStates((current) => current + 1);
-  }, []);
-
-  if (!items.length) {
-    return <EmptyState text="No eligible roles or groups found." />;
-  }
-
-  return (
-    <div className="item-list">
-      {items.map((item) => {
-        const usage = getUsage(item, settings);
-        const actionState = getRowActionState(item);
-        const itemMode = actionState.mode;
-        const isActionable = !readonly && actionState.selectable && Boolean(itemMode);
-        const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
-        const selected = isSelectable && selectedIds.has(item.id);
-        const displayName = getDisplayName(item, settings, referenceData);
-        const isFavorite = favoriteIds.has(item.id);
-        const statusTitle = getActivationStatusTitle(item);
-        const activeAssignmentType = getEffectiveActiveAssignmentType(item);
-        const statusBadgeClass = activeAssignmentType === "assigned"
-          ? "assigned"
-          : activeAssignmentType === "activated"
-            ? "pim-active"
-            : item.status;
-        const statusRowClass = item.status === "active"
-          ? activeAssignmentType === "assigned" ? "assigned-row" : "active-row"
-          : item.status === "pendingApproval" ? "pending-row" : "";
-        const lastEnabledDate = showLastEnablementDate ? formatDateOnly(usage.lastUsedAt) : "";
-        const policySummary = showEnablementDetails ? getRowPolicySummary(item) : [];
-        const rowTitle = actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
-        const body = (
-          <>
-            <button
-              type="button"
-              className={`favorite-button ${isFavorite ? "active" : ""}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                onToggleFavorite?.(item.id);
-              }}
-              title={isFavorite ? "Remove from favorites" : "Add to favorites"}
-              aria-label={`${isFavorite ? "Remove" : "Add"} ${displayName} ${isFavorite ? "from" : "to"} favorites`}
-            >
-              <StarIcon filled={isFavorite} />
-            </button>
-            <div className="role-main">
-              <p className="role-title">
-                <span>{displayName}</span>
-                {isHighPrivilegeItem(item) ? <CrownIcon /> : null}
-              </p>
-              <div className="role-meta">
-                <span className={`badge ${item.type}`}>{typeLabel(item.type)}</span>
-                <span className="scope-label">{getScopeLabel(item, referenceData)}</span>
-                {lastEnabledDate ? <span>last enabled {lastEnabledDate}</span> : null}
-              </div>
-              {policySummary.length ? (
-                <details className="role-details" onClick={(event) => event.stopPropagation()}>
-                  <summary>Details</summary>
-                  <ul>
-                    {policySummary.map((detail) => (
-                      <li key={detail}>{detail}</li>
-                    ))}
-                  </ul>
-                </details>
-              ) : null}
-            </div>
-            <div className="role-status-stack">
-              {showActivationCounters ? (
-                <span className="activation-count" title={`${usage.activationCount} activation${usage.activationCount === 1 ? "" : "s"}`}>
-                  {usage.activationCount}
-                </span>
-              ) : null}
-              <span className={`badge status-badge ${statusBadgeClass}`} title={statusTitle}>
-                {formatActivationItemStatusLabel(item)}
-              </span>
-              {shouldShowRemainingActivationTime(item, showRemainingActivationTime) && item.activeUntil ? (
-                <RemainingActivationTime activeUntil={item.activeUntil} onExpired={handleActivationExpired} />
-              ) : null}
-            </div>
-          </>
-        );
-
-        if (!isActionable) {
-          return (
-            <div
-              className={`role-row readonly ${statusRowClass}`}
-              key={item.id}
-              title={rowTitle}
-            >
-              {body}
-            </div>
-          );
-        }
-
-        return (
-          <div
-            className={`role-row selectable ${selected ? "selected" : ""} ${!isSelectable ? "disabled" : ""} ${statusRowClass}`}
-            key={item.id}
-            onClick={() => {
-              if (isSelectable) {
-                onToggle?.(item.id);
-              }
-            }}
-            title={rowTitle}
-          >
-            <input
-              type="checkbox"
-              aria-label={`${selected ? "Unselect" : "Select"} ${displayName}`}
-              checked={selected}
-              disabled={!isSelectable}
-              onClick={(event) => event.stopPropagation()}
-              onChange={() => onToggle?.(item.id)}
-            />
-            {body}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function RemainingActivationTime({
-  activeUntil,
-  onExpired
-}: {
-  activeUntil: string;
-  onExpired?: () => void;
-}) {
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    let timeoutId: number | undefined;
-    const scheduleNextUpdate = () => {
-      const currentTime = Date.now();
-      setNow(currentTime);
-      const delay = getRemainingActivationTimeUpdateDelay(activeUntil, currentTime);
-      if (delay !== undefined) {
-        timeoutId = window.setTimeout(scheduleNextUpdate, delay);
-      } else if (Date.parse(activeUntil) <= currentTime) {
-        onExpired?.();
-      }
-    };
-    scheduleNextUpdate();
-    return () => {
-      if (timeoutId !== undefined) {
-        window.clearTimeout(timeoutId);
-      }
-    };
-  }, [activeUntil, onExpired]);
-
-  const remaining = formatRemainingActivationTime(activeUntil, now);
-  if (!remaining) {
-    return null;
-  }
-  return (
-    <time
-      className="remaining-activation-time"
-      dateTime={activeUntil}
-      title="Remaining PIM activation time"
-      aria-label={`${remaining} remaining on PIM activation`}
-    >
-      {remaining}
-    </time>
   );
 }
 
@@ -2525,7 +2437,12 @@ function ActivationBar(props: {
     <section className="activation-bar">
       {hasSelection && !props.isReviewOpen ? (
         <div className="button-row">
-          <button className="btn primary" onClick={props.onContinue} disabled={props.isActivating}>
+          <button
+            className="btn primary"
+            onClick={props.onContinue}
+            disabled={props.isActivating}
+            aria-label={`Continue with ${props.selectedCount} selected`}
+          >
             Continue
           </button>
           <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
@@ -2742,23 +2659,6 @@ function ClearIcon() {
   );
 }
 
-function StarIcon({ filled }: { filled: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="star-icon">
-      <path d="m12 3.7 2.5 5.1 5.6.8-4 3.9.9 5.5-5-2.6-5 2.6.9-5.5-4-3.9 5.6-.8L12 3.7Z" fill={filled ? "currentColor" : "none"} />
-    </svg>
-  );
-}
-
-function CrownIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="crown-icon">
-      <path d="m3 7 5 4 4-7 4 7 5-4-2 12H5L3 7Z" />
-      <path d="M5 19h14" />
-    </svg>
-  );
-}
-
 function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
 }
@@ -2781,12 +2681,6 @@ function applyDisplayData(
       scopeLabel: getScopeLabel(canonical, referenceData)
     } as ActivationItem;
   });
-}
-
-function typeLabel(type: ActivationItem["type"]) {
-  if (type === "directoryRole") return "Entra";
-  if (type === "azureRole") return "Azure";
-  return "PIM group";
 }
 
 function formatRequestConfirmation(requestType: "activation" | "deactivation", successCount: number, errorCount: number): string {
@@ -2874,7 +2768,8 @@ async function fetchActivationSnapshot(targets: AccessSetupTarget[]): Promise<Ac
     const snapshot = await sendMessage<ActivationSnapshot>(
       {
         action: "getActivationSnapshot",
-        targets
+        targets,
+        detail: "core"
       },
       { timeoutMs: ACTIVATION_SNAPSHOT_TIMEOUT_MS, timeoutMessage: `${targets.map(tabLabel).join(", ")} refresh timed out. Cached data remains available.` }
     );
@@ -2904,6 +2799,30 @@ async function fetchActivationSnapshot(targets: AccessSetupTarget[]): Promise<Ac
     eligibleByTarget: splitActivationResultByTarget(eligible, targets),
     activeByTarget: splitActivationResultByTarget(active, targets)
   };
+}
+
+async function enrichActivationPolicies(items: ActivationItem[]): Promise<ActivationItem[]> {
+  return sendMessage<ActivationItem[]>(
+    { action: "enrichActivationPolicies", items },
+    { timeoutMs: ACTIVATION_SNAPSHOT_TIMEOUT_MS, timeoutMessage: "Activation policy verification timed out. Retry the request." }
+  );
+}
+
+function getUniquePolicyCandidates(items: ActivationItem[]): ActivationItem[] {
+  return [...new Map(items.map((item) => [getActivationItemIdentity(item), item])).values()];
+}
+
+function applyPolicyEnrichment(items: ActivationItem[], enriched: ActivationItem[]): ActivationItem[] {
+  const byIdentity = new Map(enriched.map((item) => [getActivationItemIdentity(item), item]));
+  return items.map((item) => {
+    const policyItem = byIdentity.get(getActivationItemIdentity(item));
+    if (!policyItem) return item;
+    return {
+      ...item,
+      activationPolicyState: policyItem.activationPolicyState,
+      activationRequirements: policyItem.activationRequirements
+    };
+  });
 }
 
 function isActivationSnapshot(value: unknown): value is ActivationSnapshot {

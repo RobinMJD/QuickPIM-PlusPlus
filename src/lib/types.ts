@@ -13,6 +13,7 @@ export type PortalRecoveryInteractionReason = "signIn" | "microsoftPrompt";
 export type PopupRequestMode = "activate" | "deactivate";
 export type AccessDiagnosticOperation = "eligible" | "active" | "policy" | "nameLookup" | "activation" | "deactivation";
 export type AccessFailureKind = "missingToken" | "expiredToken" | "missingCapability" | "forbidden" | "claimsChallenge" | "network" | "unknown";
+export type ActivationPolicyState = "pending" | "ready";
 
 export interface UsageStats {
   activationCount: number;
@@ -38,6 +39,7 @@ export interface BaseActivationItem {
   assignmentScheduleId?: string;
   assignmentScheduleInstanceId?: string;
   isPrivileged?: boolean;
+  activationPolicyState?: ActivationPolicyState;
   activationRequirements?: {
     justification?: boolean;
     ticket?: boolean;
@@ -251,6 +253,7 @@ export interface TokenStatusEntry {
   hasToken: boolean;
   tenantId?: string;
   principalId?: string;
+  principalName?: string;
   capturedAt?: number;
   tokenAge?: number;
   expiresAt?: string;

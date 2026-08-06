@@ -158,6 +158,11 @@ describe("runtime message validation", () => {
       action: "getActivationSnapshot",
       targets: ["directoryRole", "azureRole"]
     });
+    expect(validateQuickPimMessage({ action: "getActivationSnapshot", targets: ["pimGroup"], detail: "core" })).toEqual({
+      action: "getActivationSnapshot",
+      targets: ["pimGroup"],
+      detail: "core"
+    });
     expect(validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: ["request-1", "request-1", " request-2 "] })).toEqual({
       action: "refreshTrackedRequests",
       requestIds: ["request-1", "request-2"]
@@ -195,6 +200,11 @@ describe("runtime message validation", () => {
       roleDefinitionId: "reader",
       directoryScopeId: "/"
     };
+    expect(validateQuickPimMessage({ action: "enrichActivationPolicies", items: [duplicateRole] })).toEqual({
+      action: "enrichActivationPolicies",
+      items: [duplicateRole]
+    });
+    expect(() => validateQuickPimMessage({ action: "enrichActivationPolicies", items: [] })).toThrow(/between 1 and 100/i);
     expect(() => validateQuickPimMessage({
       action: "activateItems",
       items: [duplicateRole, { ...duplicateRole, id: "different-client-id", roleDefinitionId: "READER" }],

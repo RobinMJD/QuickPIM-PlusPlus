@@ -16,11 +16,13 @@ export function makeTokenStatus(
   const expiresAtMs = getTokenExpiryMs(decoded);
   const tokenAge = Math.max(0, Math.round((now - timestamp) / 60000));
   const expiresInMinutes = expiresAtMs === undefined ? undefined : Math.max(0, Math.floor((expiresAtMs - now) / 60000));
+  const principalName = getPrincipalName(decoded);
 
   return {
     hasToken: true,
     ...(typeof decoded?.tid === "string" ? { tenantId: decoded.tid } : {}),
     ...(typeof decoded?.oid === "string" ? { principalId: decoded.oid } : {}),
+    ...(principalName ? { principalName } : {}),
     capturedAt: timestamp,
     tokenAge,
     expiresAt: expiresAtMs === undefined ? undefined : new Date(expiresAtMs).toISOString(),
@@ -29,6 +31,17 @@ export function makeTokenStatus(
     grantedScopes: getGrantedScopes(decoded),
     source
   };
+}
+
+function getPrincipalName(decoded: Record<string, unknown> | null): string | undefined {
+  for (const claim of ["preferred_username", "upn", "unique_name", "name"]) {
+    const value = decoded?.[claim];
+    if (typeof value === "string") {
+      const sanitized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 160);
+      if (sanitized) return sanitized;
+    }
+  }
+  return undefined;
 }
 
 export function assertFreshToken(token: string, tokenKind: TokenKind, now = Date.now()): void {

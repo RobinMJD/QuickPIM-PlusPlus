@@ -43,6 +43,8 @@ import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { savePopupDraft } from "../lib/popupDraft";
 import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
 import { EXTENSION_DURATION_OPTIONS, buildTrackedRequestExtensionPlan, formatExtensionDuration } from "../lib/requestExtension";
+import { getIdentityContext } from "../lib/identityContext";
+import { stringifySupportReport } from "../lib/supportReport";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -734,7 +736,14 @@ function SettingsApp() {
                 onError={setError}
               />
             ) : null}
-            {tab === "diagnostics" ? <DiagnosticsPanel tokenStatus={tokenStatus} dataCache={dataCache} /> : null}
+            {tab === "diagnostics" ? (
+              <DiagnosticsPanel
+                tokenStatus={tokenStatus}
+                dataCache={dataCache}
+                settings={settings}
+                trackedRequests={trackedRequests}
+              />
+            ) : null}
           </div>
         </div>
       </section>
@@ -947,6 +956,7 @@ function AccessSetupPanel({
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
   const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
+  const identity = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
   const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
 
   useEffect(() => {
@@ -1068,6 +1078,14 @@ function AccessSetupPanel({
           {warningIgnored ? "Show access warning" : "Ignore access warning"}
         </button>
       </div>
+
+      {identity.label ? (
+        <div className={`access-identity ${identity.mismatch ? "mismatch" : ""}`} title={identity.detail}>
+          <strong>Microsoft context</strong>
+          <span>{identity.label}</span>
+          {identity.mismatch ? <span>Different accounts or tenants were captured. Refresh from one account before submitting requests.</span> : null}
+        </div>
+      ) : null}
 
       <div className="button-row settings-action-lead">
         <button className="btn primary" onClick={() => void runPortalSetup()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible || (!setupTargets.length && portalRecoveryStatus.state === "idle")}>
@@ -1656,23 +1674,96 @@ function matchesTrackedRequestFilter(
 
 function DiagnosticsPanel({
   tokenStatus,
-  dataCache
+  dataCache,
+  settings,
+  trackedRequests
 }: {
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
+  settings: QuickPimSettings;
+  trackedRequests: TrackedPimRequestStore;
 }) {
-  const diagnostics = [
-    dataCache.eligible,
-    dataCache.active,
-    ...Object.values(dataCache.eligibleByTarget || {}),
-    ...Object.values(dataCache.activeByTarget || {})
-  ].flatMap((entry) => entry?.diagnostics || []);
+  const [reportStatus, setReportStatus] = useState("");
+  const identity = getIdentityContext(tokenStatus);
+  const diagnostics = useMemo(() => {
+    const allDiagnostics = [
+      dataCache.eligible,
+      dataCache.active,
+      ...Object.values(dataCache.eligibleByTarget || {}),
+      ...Object.values(dataCache.activeByTarget || {})
+    ].flatMap((entry) => entry?.diagnostics || []);
+    const uniqueDiagnostics = new Map<string, (typeof allDiagnostics)[number]>();
+    for (const diagnostic of allDiagnostics) {
+      const key = JSON.stringify(diagnostic);
+      if (!uniqueDiagnostics.has(key)) uniqueDiagnostics.set(key, diagnostic);
+    }
+    return [...uniqueDiagnostics.values()];
+  }, [dataCache]);
+
+  function createReport(): string {
+    return stringifySupportReport({
+      appVersion: APP_VERSION,
+      buildTimestamp: APP_BUILD_TIMESTAMP,
+      settings,
+      tokenStatus,
+      dataCache,
+      trackedRequests,
+      userAgent: navigator.userAgent
+    });
+  }
+
+  async function copyReport() {
+    const report = createReport();
+    try {
+      await navigator.clipboard.writeText(report);
+      setReportStatus("Support report copied.");
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = report;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.append(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      setReportStatus(copied ? "Support report copied." : "Copy was blocked. Download the report instead.");
+    }
+  }
+
+  function downloadReport() {
+    const blob = new Blob([createReport()], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `quickpim-support-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setReportStatus("Support report downloaded.");
+  }
 
   return (
     <section className="panel">
       <h2>Diagnostics</h2>
       <p className="muted">Safe local status information for troubleshooting. Tokens and raw authorization headers are not displayed.</p>
+      <div className="diagnostics-report-card settings-section-gap">
+        <div>
+          <h3>Sanitized support report</h3>
+          <p className="muted">Exports aggregate cache, capability, and request status only. Role names, object IDs, tickets, reasons, and tokens are excluded.</p>
+        </div>
+        <div className="button-row">
+          <button className="btn primary" onClick={() => void copyReport()}>Copy report</button>
+          <button className="btn" onClick={downloadReport}>Download JSON</button>
+        </div>
+        {reportStatus ? <p className="message success settings-inline-message" role="status">{reportStatus}</p> : null}
+      </div>
       <div className="permission-detail-grid settings-section-gap">
+        <div>
+          <strong>Current account</strong>
+          <p title={identity.detail}>{identity.label || "No signed-in token context"}</p>
+          {identity.mismatch ? <p className="diagnostic-warning">Tokens belong to different accounts or tenants.</p> : null}
+        </div>
         <div>
           <strong>Graph token</strong>
           <p>{tokenStatus?.graph.hasToken ? "Captured in this browser session" : "Missing"}</p>
