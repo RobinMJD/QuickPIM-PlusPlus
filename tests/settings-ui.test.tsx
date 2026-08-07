@@ -6,6 +6,7 @@ import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { REQUEST_TRACKING_KEY } from "../src/lib/requestTracking";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
+import { formatLocalDateTime } from "../src/lib/dateFormat";
 import { TEST_APP_VERSION, TEST_MANIFEST, TEST_RELEASE_TAG, testReleaseUrl } from "./testMetadata";
 
 afterEach(() => {
@@ -1309,6 +1310,7 @@ describe("settings Activity page", () => {
     clickButton("History");
     await waitFor(() => expect(document.body.textContent).toContain("Global Reader"));
     expect(document.body.textContent).toContain("Security Group");
+    expect(document.querySelector('button[aria-label="Copy justification"]')).toBeTruthy();
 
     const resultFilter = document.querySelector<HTMLSelectElement>('select[aria-label="Filter activity result"]')!;
     resultFilter.value = "failed";
@@ -1365,6 +1367,8 @@ describe("settings Activity page", () => {
         nextCheckAt: undefined
       }]
     };
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
     const openPopup = vi.fn(async () => undefined);
     const createTab = vi.fn(async () => undefined);
     const chromeMock = {
@@ -1400,10 +1404,18 @@ describe("settings Activity page", () => {
     await import("../src/settings/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Global Administrator"));
+    expect(document.querySelector(".request-row time")?.textContent).toBe(formatLocalDateTime(request.requestedAt));
     clickButton("Global Administrator");
     await waitFor(() => expect(document.body.textContent).toContain("Investigate production incident INC12345"));
     expect(document.body.textContent).toContain("request-1");
     expect(document.body.textContent).toContain("Pending approval");
+    expect(document.body.textContent).toContain(formatLocalDateTime(request.requestedAt));
+
+    const copyJustification = document.querySelector<HTMLButtonElement>('button[aria-label="Copy justification"]');
+    expect(copyJustification).toBeTruthy();
+    copyJustification?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(request.justification));
+    await waitFor(() => expect(document.querySelector('button[aria-label="justification copied"]')).toBeTruthy());
 
     const statusButtons = [...document.querySelectorAll<HTMLButtonElement>("button")]
       .filter((button) => button.textContent?.trim() === "Check status");

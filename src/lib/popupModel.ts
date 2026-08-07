@@ -441,7 +441,7 @@ export function getBundlePreflight(
     : missingJustification
       ? "A required justification is missing."
       : requirements.needsTicket
-        ? "This bundle contains a ticket-required item. Use defaults, then enter the ticket details in the activation review."
+        ? "This bundle contains a ticket-required item. Load the selection, then enter the ticket details in the activation review."
         : undefined;
 
   return {

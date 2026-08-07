@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.11.5**
+Current version: **v2.11.12**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -254,6 +254,44 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.11.12
+
+- Keeps bundle cards compact inside a bounded scrolling list and pins a normal-height Settings action to the popup bottom.
+- Shows each bundle's roles/groups, saved duration, and saved justification without expanding the card unnecessarily.
+- Replaces ambiguous bundle actions with `Load selection` for review and `Activate now as-is` for immediate use of saved settings.
+- Opens a loaded bundle on its first relevant role tab and prevents direct activation from borrowing hidden form values.
+
+### v2.11.11
+
+- Keeps the profile icon neutral until its account panel is actually open.
+- Closes the account panel when clicking elsewhere or pressing Escape, while preserving copy interactions inside it.
+
+### v2.11.10
+
+- Replaces the ambiguous saved-justification disclosure with a compact `History | Saved` view switch.
+- Shows only the selected justification category in one bounded list, automatically selecting whichever category contains entries.
+
+### v2.11.9
+
+- Stages signed-out portal recovery through one Microsoft authentication leader, then opens the remaining role pages after that sign-in establishes the shared browser session.
+- Keeps the faster parallel portal-page flow when an existing valid Microsoft portal token already indicates an authenticated session.
+- Preserves and retries every deferred role source when a temporary browser tab creation fails.
+
+### v2.11.8
+
+- Shows local date and time throughout Activity request lists, request details, and history entries.
+- Adds compact copy controls for tracked-request and activity-history justifications.
+
+### v2.11.7
+
+- Fixes a popup startup collapse caused by viewport-relative height constraints in browser toolbar popups.
+- Uses the browser-safe 600px popup height while retaining the independently scrolling role list and pinned compact action footer.
+
+### v2.11.6
+
+- Keeps the compact activation controls pinned to the popup bottom while the role list scrolls independently.
+- Reduces bottom-action button and form spacing, and requests a taller 680px popup where the browser permits it.
 
 ### v2.11.5
 

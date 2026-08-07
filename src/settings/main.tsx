@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "rea
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, hasRequiredPortalToken } from "../lib/access";
-import { formatDateOnly, formatUtcDateTime } from "../lib/dateFormat";
+import { formatDateOnly, formatLocalDateTime, formatUtcDateTime } from "../lib/dateFormat";
 import {
   DEFAULT_ACTIVE_CACHE_TTL_MS,
   DEFAULT_ELIGIBLE_CACHE_TTL_MS,
@@ -1517,7 +1517,7 @@ function ActivityPanel({
                     </span>
                     <span className="request-row-side">
                       <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
-                      <span className="muted">{formatDateOnly(request.requestedAt) || request.requestedAt}</span>
+                      <ActivityTimestamp value={request.requestedAt} className="muted" />
                     </span>
                   </button>
                 );
@@ -1570,11 +1570,16 @@ function ActivityPanel({
                     {entry.action} / {entry.result} / {popupTabLabel(entry.itemType)}
                     {entry.scopeLabel ? ` / ${entry.scopeLabel}` : ""}
                   </p>
-                  {entry.justification ? <p>{entry.justification}</p> : null}
+                  {entry.justification ? (
+                    <div className="activity-justification-row">
+                      <p>{entry.justification}</p>
+                      <CopyTextButton text={entry.justification} label="justification" />
+                    </div>
+                  ) : null}
                   {entry.error ? <p className="message error settings-inline-message">{entry.error}</p> : null}
                 </div>
                 <div className="activity-time">
-                  <span>{formatDateOnly(entry.completedAt || entry.requestedAt) || entry.completedAt || entry.requestedAt}</span>
+                  <ActivityTimestamp value={entry.completedAt || entry.requestedAt} />
                   {entry.durationHours ? <span>{entry.durationHours}h</span> : null}
                   {entry.bundleName ? <span>{entry.bundleName}</span> : null}
                 </div>
@@ -1631,19 +1636,27 @@ function TrackedRequestDetails({
         <button className="icon-btn request-details-close" onClick={onClose} title="Close request details" aria-label="Close request details">×</button>
       </div>
       <dl className="request-detail-grid">
-        <div><dt>Requested</dt><dd>{formatDateOnly(request.requestedAt) || request.requestedAt}</dd></div>
-        <div><dt>Last checked</dt><dd>{formatDateOnly(request.lastCheckedAt || request.updatedAt) || request.lastCheckedAt || request.updatedAt}</dd></div>
+        <div><dt>Requested</dt><dd><ActivityTimestamp value={request.requestedAt} /></dd></div>
+        <div><dt>Last checked</dt><dd><ActivityTimestamp value={request.lastCheckedAt || request.updatedAt} /></dd></div>
         {request.scopeLabel ? <div><dt>Scope</dt><dd>{request.scopeLabel}</dd></div> : null}
         {request.durationHours ? <div><dt>Duration</dt><dd>{formatExtensionDuration(request.durationHours)}</dd></div> : null}
-        {request.activeFrom ? <div><dt>Starts</dt><dd>{formatUtcDateTime(request.activeFrom)}</dd></div> : null}
-        {request.activeUntil ? <div><dt>Active until</dt><dd>{formatDateOnly(request.activeUntil) || request.activeUntil}</dd></div> : null}
+        {request.activeFrom ? <div><dt>Starts</dt><dd><ActivityTimestamp value={request.activeFrom} /></dd></div> : null}
+        {request.activeUntil ? <div><dt>Active until</dt><dd><ActivityTimestamp value={request.activeUntil} /></dd></div> : null}
         {request.continuationOfRequestId ? <div className="request-detail-wide"><dt>Continuation of</dt><dd className="monospace wrap-anywhere">{request.continuationOfRequestId}</dd></div> : null}
         {request.extensionAttemptState ? <div><dt>Extension</dt><dd>{request.extensionAttemptState === "queued" ? "Queued" : request.extensionAttemptState === "uncertain" ? "Outcome unknown" : "Submitting"}</dd></div> : null}
         {request.bundleName ? <div><dt>Bundle</dt><dd>{request.bundleName}</dd></div> : null}
         {request.rawStatus ? <div><dt>Microsoft status</dt><dd>{request.rawStatus}</dd></div> : null}
         <div className="request-detail-wide"><dt>Request ID</dt><dd className="monospace wrap-anywhere">{request.requestId}</dd></div>
         {request.approvalId ? <div className="request-detail-wide"><dt>Approval ID</dt><dd className="monospace wrap-anywhere">{request.approvalId}</dd></div> : null}
-        {request.justification ? <div className="request-detail-wide"><dt>Justification</dt><dd>{request.justification}</dd></div> : null}
+        {request.justification ? (
+          <div className="request-detail-wide">
+            <dt>Justification</dt>
+            <dd className="request-justification-value">
+              <span>{request.justification}</span>
+              <CopyTextButton text={request.justification} label="justification" />
+            </dd>
+          </div>
+        ) : null}
       </dl>
       {request.lastError ? <p className="message error settings-inline-message">{request.lastError}</p> : null}
       <div className="button-row request-detail-actions">
@@ -1658,6 +1671,64 @@ function TrackedRequestDetails({
         {canPrepareDisable ? <button className="btn danger" onClick={() => onPrepare("deactivate")}>Prepare disable</button> : null}
       </div>
     </aside>
+  );
+}
+
+function ActivityTimestamp({ value, className }: { value: string | undefined; className?: string }) {
+  const formatted = formatLocalDateTime(value);
+  if (!value) return null;
+  if (!formatted) return <span className={className}>{value}</span>;
+  return <time className={className} dateTime={value} title={formatUtcDateTime(value)}>{formatted}</time>;
+}
+
+function CopyTextButton({ text, label }: { text: string; label: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "error">("idle");
+  const resetTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => {
+    if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current);
+  }, []);
+
+  async function copyText() {
+    if (resetTimer.current !== undefined) window.clearTimeout(resetTimer.current);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
+      await navigator.clipboard.writeText(text);
+      setState("copied");
+    } catch {
+      setState("error");
+    }
+    resetTimer.current = window.setTimeout(() => setState("idle"), 2_000);
+  }
+
+  const actionLabel = state === "copied" ? `${label} copied` : state === "error" ? `Retry copying ${label}` : `Copy ${label}`;
+  return (
+    <button
+      type="button"
+      className={`inline-copy-button ${state}`}
+      onClick={() => void copyText()}
+      title={actionLabel}
+      aria-label={actionLabel}
+    >
+      {state === "copied" ? <SmallCheckIcon /> : <CopyIcon />}
+    </button>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="inline-copy-icon">
+      <rect x="9" y="9" width="10" height="10" rx="2" />
+      <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
+    </svg>
+  );
+}
+
+function SmallCheckIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="inline-copy-icon">
+      <path d="m5 12 4 4L19 6" />
+    </svg>
   );
 }
 

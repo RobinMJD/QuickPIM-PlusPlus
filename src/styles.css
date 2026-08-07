@@ -24,7 +24,10 @@ body.popup-page #root {
   width: 520px;
   min-width: 520px;
   max-width: 520px;
-  overflow-x: hidden;
+  height: 600px;
+  min-height: 600px;
+  max-height: 600px;
+  overflow: hidden;
 }
 
 html.settings-page-root,
@@ -52,8 +55,9 @@ button {
   width: 100%;
   min-width: 0;
   max-width: 100%;
-  min-height: max(600px, 100vh);
-  overflow-x: hidden;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
   background: #f7f8fa;
 }
 
@@ -158,6 +162,15 @@ button {
 }
 
 .header-account-button.available {
+  color: #475569;
+}
+
+.header-account-button:hover {
+  background: #f1f5f9;
+  color: #334155;
+}
+
+.account-popover[open] .header-account-button.available {
   color: #1d4ed8;
   background: #eff6ff;
   border-color: #bfdbfe;
@@ -523,6 +536,7 @@ button {
 }
 
 .toolbar {
+  flex-shrink: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 150px;
   gap: 8px;
@@ -530,6 +544,7 @@ button {
 }
 
 .quick-filter-row {
+  flex-shrink: 0;
   display: flex;
   gap: 6px;
   overflow-x: auto;
@@ -669,6 +684,9 @@ body.dark-mode .field-clear-button:focus-visible {
 }
 
 .content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   padding: 12px;
   padding-bottom: 12px;
 }
@@ -1145,6 +1163,17 @@ a.btn {
   color: #ffffff;
 }
 
+.btn.secondary {
+  border: 1px solid #93c5fd;
+  background: #ffffff;
+  color: #1d4ed8;
+}
+
+.btn.secondary:hover {
+  border-color: #60a5fa;
+  background: #eff6ff;
+}
+
 .btn.primary:hover {
   background: #1d4ed8;
 }
@@ -1327,46 +1356,71 @@ a.btn {
 
 .justification-shortcuts {
   display: grid;
-  gap: 8px;
+  gap: 5px;
 }
 
-.justification-recent-row {
-  align-items: flex-start;
+.justification-view-switch {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  justify-self: start;
+  width: 132px;
+  padding: 2px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f1f5f9;
 }
 
-.saved-justification-toggle {
-  min-height: 30px;
-  padding: 6px 10px;
+.justification-view-switch button {
+  min-height: 24px;
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
 }
 
-.saved-justification-menu {
+.justification-view-switch button.active {
+  background: #ffffff;
+  color: #1d4ed8;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12);
+}
+
+.justification-view-switch button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.justification-picker-list {
   display: grid;
-  gap: 4px;
-  max-height: 132px;
+  gap: 3px;
+  max-height: 100px;
   overflow: auto;
-  padding: 6px;
+  padding: 4px;
   border: 1px solid #d9dee7;
-  border-radius: 8px;
+  border-radius: 6px;
   background: #f8fafc;
 }
 
-.saved-justification-option {
+.justification-picker-option {
   display: flex;
   min-width: 0;
   overflow-wrap: anywhere;
   justify-content: flex-start;
   width: 100%;
-  min-height: 30px;
-  border-radius: 6px;
-  padding: 7px 8px;
+  min-height: 26px;
+  border-radius: 4px;
+  padding: 5px 7px;
   color: #334155;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.3;
   text-align: left;
 }
 
-.saved-justification-option:hover {
+.justification-picker-option:hover,
+.justification-picker-option:focus-visible {
   background: #e2e8f0;
 }
 
@@ -1400,24 +1454,53 @@ a.btn {
 }
 
 .activation-bar {
-  position: sticky;
-  bottom: 0;
+  position: relative;
   z-index: 20;
   flex-shrink: 0;
   width: 100%;
-  max-height: min(370px, calc(100vh - 96px));
+  max-height: min(340px, calc(100vh - 112px));
   display: grid;
-  gap: 10px;
-  margin-top: auto;
+  gap: 8px;
   overflow-y: auto;
-  padding: 12px;
+  padding: 8px 12px;
   background: #ffffff;
   border-top: 1px solid #e5e7eb;
   box-shadow: 0 -10px 24px rgba(15, 23, 42, 0.1);
 }
 
 .activation-bar .button-row {
+  gap: 6px;
+  flex-wrap: nowrap;
   margin-top: 0;
+}
+
+.activation-bar .btn {
+  min-height: 30px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.activation-bar .field {
+  gap: 4px;
+}
+
+.activation-bar .field label {
+  font-size: 11px;
+}
+
+.activation-bar .input,
+.activation-bar .select,
+.activation-bar .textarea {
+  padding: 7px 9px;
+  font-size: 12px;
+}
+
+.activation-bar .justification-textarea {
+  min-height: 52px;
+}
+
+.activation-bar .justification-shortcuts {
+  gap: 6px;
 }
 
 .activation-form-field {
@@ -2039,10 +2122,28 @@ a.btn {
   margin-top: 6px;
 }
 
+.bundle-tab {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+
+.bundle-list {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 8px;
+  align-content: start;
+  max-height: 390px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
 .bundle-card {
   display: grid;
-  gap: 8px;
-  padding: 12px;
+  gap: 7px;
+  padding: 10px;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
   background: #ffffff;
@@ -2050,30 +2151,113 @@ a.btn {
 
 .bundle-card h3 {
   margin: 0;
-  font-size: 14px;
+  font-size: 13px;
+}
+
+.bundle-card-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.bundle-card-heading > span {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.bundle-configuration {
+  display: grid;
+  gap: 5px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.bundle-configuration p {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  margin: 0;
+}
+
+.bundle-default-grid {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.bundle-config-label {
+  color: #64748b;
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.bundle-config-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #334155;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.bundle-item-summary,
+.bundle-justification {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .bundle-preflight {
   margin: 0;
   border-radius: 6px;
-  padding: 8px 9px;
+  padding: 6px 7px;
   background: #f1f5f9;
   color: #334155;
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 700;
   line-height: 1.35;
 }
 
-.justification-chip {
-  max-width: 100%;
-  min-width: 0;
-  overflow-wrap: anywhere;
-  border-radius: 999px;
-  padding: 6px 10px;
-  background: #f1f5f9;
-  color: #334155;
-  cursor: pointer;
-  font-size: 12px;
+.bundle-blocked-reason {
+  margin: 0;
+  color: #9a3412;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.bundle-actions {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.bundle-actions .btn {
+  min-height: 30px;
+  padding: 6px 9px;
+  font-size: 11px;
+}
+
+.bundle-tab-footer {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding: 8px 12px;
+  border-top: 1px solid #e5e7eb;
+  background: #ffffff;
+}
+
+.bundle-settings-button {
+  width: 100%;
+  min-height: 30px;
+  max-height: 30px;
+  padding: 5px 10px;
+  font-size: 11px;
 }
 
 .settings-row-actions {
@@ -2385,6 +2569,64 @@ a.btn {
   grid-column: 1 / -1;
 }
 
+.request-justification-value,
+.activity-justification-row {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.request-justification-value > span,
+.activity-justification-row > p {
+  flex: 1;
+  min-width: 0;
+}
+
+.activity-justification-row > p {
+  margin-top: 3px;
+}
+
+.inline-copy-button {
+  display: inline-flex;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  background: #eef2f7;
+  color: #64748b;
+  cursor: pointer;
+}
+
+.inline-copy-button:hover {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.inline-copy-button.copied {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.inline-copy-button.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.inline-copy-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .request-detail-actions {
   margin-top: 10px;
 }
@@ -2450,11 +2692,16 @@ a.btn {
   display: grid;
   gap: 3px;
   justify-items: end;
-  min-width: 80px;
+  min-width: 108px;
   color: #64748b;
   font-size: 11px;
   font-weight: 700;
   text-align: right;
+}
+
+.activity-time time,
+.request-row-side time {
+  white-space: nowrap;
 }
 
 body.dark-mode {
@@ -2485,7 +2732,7 @@ body.dark-mode .token-source-row.not-needed {
   color: #94a3b8;
 }
 
-body.dark-mode .header-account-button.available {
+body.dark-mode .account-popover[open] .header-account-button.available {
   background: #172554;
   border-color: #1d4ed8;
   color: #93c5fd;
@@ -2605,7 +2852,7 @@ body.dark-mode .bundle-card,
 body.dark-mode .permission-row,
 body.dark-mode .activity-row,
 body.dark-mode .request-row,
-body.dark-mode .saved-justification-menu {
+body.dark-mode .justification-picker-list {
   background: #0f172a;
   border-color: #334155;
 }
@@ -2631,7 +2878,6 @@ body.dark-mode .permission-detail-grid,
 body.dark-mode .permission-note,
 body.dark-mode .checkbox-grid,
 body.dark-mode .message,
-body.dark-mode .justification-chip,
 body.dark-mode .bundle-preflight,
 body.dark-mode .activation-count,
 body.dark-mode .status-badge.eligible,
@@ -2824,6 +3070,38 @@ body.dark-mode .btn.primary {
   color: #ffffff;
 }
 
+body.dark-mode .btn.secondary {
+  border-color: #3b82f6;
+  background: #0f172a;
+  color: #bfdbfe;
+}
+
+body.dark-mode .btn.secondary:hover {
+  background: #1e3a8a;
+}
+
+body.dark-mode .bundle-configuration {
+  background: #0f172a;
+}
+
+body.dark-mode .bundle-config-value {
+  color: #e2e8f0;
+}
+
+body.dark-mode .bundle-config-label,
+body.dark-mode .bundle-card-heading > span {
+  color: #94a3b8;
+}
+
+body.dark-mode .bundle-tab-footer {
+  border-color: #334155;
+  background: #111827;
+}
+
+body.dark-mode .bundle-blocked-reason {
+  color: #fdba74;
+}
+
 body.dark-mode .btn.subtle,
 body.dark-mode .permission-doc-link {
   color: #93c5fd;
@@ -2895,11 +3173,46 @@ body.dark-mode .request-detail-grid dd {
   color: #e2e8f0;
 }
 
-body.dark-mode .saved-justification-option {
+body.dark-mode .inline-copy-button {
+  background: #334155;
+  color: #cbd5e1;
+}
+
+body.dark-mode .inline-copy-button:hover {
+  background: #1e3a8a;
+  color: #bfdbfe;
+}
+
+body.dark-mode .inline-copy-button.copied {
+  background: #14532d;
+  color: #bbf7d0;
+}
+
+body.dark-mode .inline-copy-button.error {
+  background: #7f1d1d;
+  color: #fecaca;
+}
+
+body.dark-mode .justification-view-switch {
+  border-color: #475569;
+  background: #0f172a;
+}
+
+body.dark-mode .justification-view-switch button {
+  color: #94a3b8;
+}
+
+body.dark-mode .justification-view-switch button.active {
+  background: #334155;
+  color: #bfdbfe;
+}
+
+body.dark-mode .justification-picker-option {
   color: #e2e8f0;
 }
 
-body.dark-mode .saved-justification-option:hover {
+body.dark-mode .justification-picker-option:hover,
+body.dark-mode .justification-picker-option:focus-visible {
   background: #334155;
 }
 

@@ -110,14 +110,14 @@ function createApis() {
 }
 
 describe("managed portal recovery tabs", () => {
-  test("opens inactive pages in a collapsed named group and reuses them", async () => {
+  test("opens one authentication leader, defers the other pages, and reuses the staged session", async () => {
     const fixture = createApis();
 
     const first = await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1000);
-    expect(first).toEqual({ requestedCount: 2, openedCount: 2, reusedCount: 0, managedCount: 2, grouped: true });
+    expect(first).toEqual({ requestedCount: 2, openedCount: 1, reusedCount: 0, managedCount: 2, grouped: true });
     expect(fixture.create).toHaveBeenNthCalledWith(1, { url: ENTRA_PORTAL_URLS.directoryRole, active: false });
-    expect(fixture.create).toHaveBeenNthCalledWith(2, { url: ENTRA_PORTAL_URLS.pimGroup, active: false, windowId: 7 });
-    expect(fixture.group).toHaveBeenCalledWith({ tabIds: [1, 2], createProperties: { windowId: 7 } });
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+    expect(fixture.group).toHaveBeenCalledWith({ tabIds: [1], createProperties: { windowId: 7 } });
     expect(fixture.update).toHaveBeenCalledWith(44, {
       title: PORTAL_RECOVERY_GROUP_TITLE,
       color: "blue",
@@ -126,7 +126,63 @@ describe("managed portal recovery tabs", () => {
 
     const second = await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1100);
     expect(second).toEqual({ requestedCount: 2, openedCount: 0, reusedCount: 2, managedCount: 2, grouped: true });
-    expect(fixture.create).toHaveBeenCalledTimes(2);
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+
+    fixture.tabs.get(1)!.url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize";
+    await expect(getPortalRecoveryStatus(fixture.apis, 1200, missingTokenStatus())).resolves.toMatchObject({
+      state: "interactionRequired",
+      managedTargets: ["directoryRole", "pimGroup"],
+      interactionTargets: ["directoryRole"],
+      interactionReason: "signIn"
+    });
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+
+    fixture.tabs.get(1)!.url = ENTRA_PORTAL_URLS.directoryRole;
+    await expect(getPortalRecoveryStatus(fixture.apis, 1300, missingTokenStatus())).resolves.toMatchObject({
+      state: "waiting",
+      managedTargets: ["directoryRole", "pimGroup"],
+      interactionTargets: []
+    });
+    expect(fixture.create).toHaveBeenNthCalledWith(2, { url: ENTRA_PORTAL_URLS.pimGroup, active: false, windowId: 7 });
+    expect(fixture.group).toHaveBeenCalledWith({ groupId: 44, tabIds: [2] });
+  });
+
+  test("releases deferred pages when the leader captures a token without showing a sign-in prompt", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole", "pimGroup", "azureRole"], missingTokenStatus(), fixture.apis, 1000);
+
+    await expect(getPortalRecoveryStatus(fixture.apis, 1500, readyTokenStatus())).resolves.toMatchObject({
+      state: "waiting",
+      managedTargets: ["directoryRole", "pimGroup", "azureRole"]
+    });
+    expect(fixture.create).toHaveBeenCalledTimes(3);
+    expect(fixture.create).toHaveBeenNthCalledWith(2, { url: ENTRA_PORTAL_URLS.pimGroup, active: false, windowId: 7 });
+    expect(fixture.create).toHaveBeenNthCalledWith(3, { url: ENTRA_PORTAL_URLS.azureRole, active: false, windowId: 7 });
+  });
+
+  test("keeps a failed leader candidate deferred when a later target opens", async () => {
+    const fixture = createApis();
+    fixture.create.mockRejectedValueOnce(new Error("Temporary tab creation failure"));
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole", "pimGroup", "azureRole"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000
+    )).resolves.toEqual({
+      requestedCount: 3,
+      openedCount: 1,
+      reusedCount: 0,
+      managedCount: 3,
+      grouped: true
+    });
+
+    expect(fixture.create).toHaveBeenNthCalledWith(1, { url: ENTRA_PORTAL_URLS.directoryRole, active: false });
+    expect(fixture.create).toHaveBeenNthCalledWith(2, { url: ENTRA_PORTAL_URLS.pimGroup, active: false });
+
+    await getPortalRecoveryStatus(fixture.apis, 1100, readyTokenStatus());
+    expect(fixture.create).toHaveBeenCalledWith({ url: ENTRA_PORTAL_URLS.directoryRole, active: false, windowId: 7 });
+    expect(fixture.create).toHaveBeenCalledWith({ url: ENTRA_PORTAL_URLS.azureRole, active: false, windowId: 7 });
   });
 
   test("drops a stale browser window before recreating closed recovery tabs", async () => {
@@ -271,7 +327,7 @@ describe("managed portal recovery tabs", () => {
 
   test("closes all completed group tabs after API refresh confirmation", async () => {
     const fixture = createApis();
-    await openPortalRecoveryTabs(["directoryRole", "pimGroup", "azureRole"], missingTokenStatus(), fixture.apis, 1000);
+    await openPortalRecoveryTabs(["directoryRole", "pimGroup", "azureRole"], readyTokenStatus(), fixture.apis, 1000);
     fixture.tabs.get(1)!.url = "https://entra.microsoft.com/?feature.msaljs=true#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadmigratedroles/provider/azurerbac";
     fixture.tabs.get(2)!.url = "https://entra.microsoft.com/#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup/provider/azurerbac";
 

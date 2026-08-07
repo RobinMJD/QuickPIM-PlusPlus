@@ -1863,13 +1863,15 @@ function PopupApp() {
 
   function useBundleDefaults(bundle: QuickPimBundle) {
     const expansion = expandBundle(bundle, displayItems);
+    if (!expansion.items.length) return;
     setRequestMode(expansion.items.length ? "activate" : undefined);
     setSelectedIds(new Set(expansion.items.map((item) => item.id)));
     if (expansion.durationHours) setDurationHours(expansion.durationHours);
     if (expansion.justification) setJustification(expansion.justification);
     setTicketSystem("");
     setTicketNumber("");
-    setTab("directoryRole");
+    setIsActivationReviewOpen(false);
+    setTab(expansion.items[0].type);
   }
 
   async function openPortalForTarget(target: PopupTab) {
@@ -2188,41 +2190,77 @@ function PopupApp() {
       ) : null}
 
       {!showInitialAccessState && activeTabIsVisible && tab === "bundles" ? (
-        <section className="content item-list" id="popup-tab-panel" role="tabpanel" aria-label="Bundles">
-          {settings.bundles.length ? (
-            settings.bundles.map((bundle) => {
-              const expansion = expandBundle(bundle, displayItems);
-              const preflight = getBundlePreflight(bundle, displayItems, justification);
-              return (
-                <div className="bundle-card" key={bundle.id}>
-                  <h3>{bundle.name}</h3>
-                  <p className="muted">
-                    {expansion.items.length} available item(s)
-                    {bundle.defaultJustification ? ` / ${bundle.defaultJustification}` : ""}
-                  </p>
-                  <p className="bundle-preflight">
-                    {preflight.readyCount} ready / {preflight.alreadyActiveCount} already active / {preflight.pendingApprovalCount} pending
-                    {preflight.missingCount ? ` / ${preflight.missingCount} missing` : ""}
-                    {preflight.strictestMaxDurationHours ? ` / max ${preflight.strictestMaxDurationHours}h` : ""}
-                  </p>
-                  {preflight.blockedReason ? <p className="muted">{preflight.blockedReason}</p> : null}
-                  <div className="button-row">
-                    <button className="btn" onClick={() => useBundleDefaults(bundle)}>
-                      Use defaults
-                    </button>
-                    <button className="btn primary" onClick={() => void activate(preflight.readyItems, bundle)} disabled={preflight.isBlocked || isActivating}>
-                      {isActivating ? "Activating..." : "Activate bundle"}
-                    </button>
-                  </div>
-                </div>
-              );
-            })
-          ) : (
-            <EmptyState text="Create role bundles from Settings." />
-          )}
-          <button className="btn" onClick={() => void openSettingsSection("bundles")}>
-            Open settings
-          </button>
+        <section className="content bundle-tab" id="popup-tab-panel" role="tabpanel" aria-label="Bundles">
+          <div className="bundle-list">
+            {settings.bundles.length ? (
+              settings.bundles.map((bundle) => {
+                const expansion = expandBundle(bundle, displayItems);
+                const preflight = getBundlePreflight(bundle, displayItems, "");
+                const configuredItems = bundle.itemIds.map((itemId) => displayItems.find((item) => item.id === itemId));
+                const itemSummary = configuredItems.map((item, index) => item
+                  ? getDisplayName(item, settings, referenceData)
+                  : settings.aliasesByItemId[bundle.itemIds[index]] || "Unavailable item"
+                ).join(", ") || "No items configured";
+                return (
+                  <article className="bundle-card" key={bundle.id}>
+                    <div className="bundle-card-heading">
+                      <h3>{bundle.name}</h3>
+                      <span>{bundle.itemIds.length} item{bundle.itemIds.length === 1 ? "" : "s"}</span>
+                    </div>
+                    <div className="bundle-configuration">
+                      <p>
+                        <span className="bundle-config-label">Roles/groups</span>
+                        <span className="bundle-config-value bundle-item-summary" title={itemSummary}>{itemSummary}</span>
+                      </p>
+                      <div className="bundle-default-grid">
+                        <p>
+                          <span className="bundle-config-label">Default time</span>
+                          <span className="bundle-config-value">{formatBundleDuration(bundle.defaultDurationHours)}</span>
+                        </p>
+                        <p>
+                          <span className="bundle-config-label">Justification</span>
+                          <span className="bundle-config-value bundle-justification" title={bundle.defaultJustification || "Not set"}>
+                            {bundle.defaultJustification || "Not set"}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                    <p className="bundle-preflight">
+                      {preflight.readyCount} ready / {preflight.alreadyActiveCount} already active / {preflight.pendingApprovalCount} pending
+                      {preflight.missingCount ? ` / ${preflight.missingCount} missing` : ""}
+                      {preflight.strictestMaxDurationHours ? ` / max ${preflight.strictestMaxDurationHours}h` : ""}
+                    </p>
+                    {preflight.blockedReason ? <p className="bundle-blocked-reason">{preflight.blockedReason}</p> : null}
+                    <div className="button-row bundle-actions">
+                      <button
+                        className="btn secondary"
+                        onClick={() => useBundleDefaults(bundle)}
+                        disabled={!expansion.items.length || isActivating}
+                        title="Load the available bundle items so you can review or change the activation settings"
+                      >
+                        Load selection
+                      </button>
+                      <button
+                        className="btn primary"
+                        onClick={() => void activate(preflight.readyItems, bundle)}
+                        disabled={preflight.isBlocked || isActivating}
+                        title="Activate the ready bundle items immediately with the saved duration and justification"
+                      >
+                        {isActivating ? "Activating..." : "Activate now as-is"}
+                      </button>
+                    </div>
+                  </article>
+                );
+              })
+            ) : (
+              <EmptyState text="Create role bundles from Settings." />
+            )}
+          </div>
+          <div className="bundle-tab-footer">
+            <button className="btn bundle-settings-button" onClick={() => void openSettingsSection("bundles")}>
+              Open settings
+            </button>
+          </div>
         </section>
       ) : null}
 
@@ -2328,12 +2366,33 @@ function AccountMenu({ identity }: { identity: IdentityContext }) {
   const account = identity.principalName || identity.principalId || "No account captured";
   const tenant = identity.tenantId || "Not available";
   const [copyState, setCopyState] = useState<{ field: AccountCopyField; success: boolean } | null>(null);
+  const menuRef = useRef<HTMLDetailsElement>(null);
   const copyStateTimer = useRef<number | undefined>(undefined);
 
-  useEffect(() => () => {
-    if (copyStateTimer.current !== undefined) {
-      window.clearTimeout(copyStateTimer.current);
+  useEffect(() => {
+    function closeWhenClickingOutside(event: PointerEvent) {
+      const menu = menuRef.current;
+      if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) {
+        menu.open = false;
+      }
     }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape" && menuRef.current?.open) {
+        menuRef.current.open = false;
+        menuRef.current.querySelector<HTMLElement>("summary")?.focus();
+      }
+    }
+
+    document.addEventListener("pointerdown", closeWhenClickingOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeWhenClickingOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+      if (copyStateTimer.current !== undefined) {
+        window.clearTimeout(copyStateTimer.current);
+      }
+    };
   }, []);
 
   async function copyAccountValue(field: AccountCopyField, value: string) {
@@ -2353,7 +2412,7 @@ function AccountMenu({ identity }: { identity: IdentityContext }) {
   }
 
   return (
-    <details className="header-popover account-popover" name="quickpim-header-popover">
+    <details ref={menuRef} className="header-popover account-popover" name="quickpim-header-popover">
       <summary
         className={`header-account-button ${identity.identityCount ? "available" : "unavailable"}`}
         title="Show Microsoft account details"
@@ -2560,24 +2619,24 @@ function ActivationBar(props: {
   onClearSelection: () => void;
   onOpenSettings: () => void;
 }) {
-  const [isSavedListOpen, setIsSavedListOpen] = useState(false);
   const hasSelection = props.selectedCount > 0;
   const isDeactivateMode = props.requestMode === "deactivate";
   const isActivateMode = props.requestMode !== "deactivate";
   const savedJustifications = props.settings.savedJustifications;
   const savedLookup = new Set(savedJustifications.map((item) => item.toLowerCase()));
   const recentJustifications = props.settings.recentJustifications.filter((item) => !savedLookup.has(item.toLowerCase()));
+  const [preferredJustificationView, setPreferredJustificationView] = useState<"history" | "saved">("history");
+  const justificationView = preferredJustificationView === "history" && !recentJustifications.length && savedJustifications.length
+    ? "saved"
+    : preferredJustificationView === "saved" && !savedJustifications.length && recentJustifications.length
+      ? "history"
+      : preferredJustificationView;
   const showJustificationField = isDeactivateMode || props.requirements.needsJustification;
   const showJustificationShortcuts = showJustificationField && (recentJustifications.length > 0 || savedJustifications.length > 0);
+  const visibleJustifications = justificationView === "saved" ? savedJustifications : recentJustifications;
   const selectedDuration = props.durationOptions.some((option) => option.value === props.durationHours)
     ? props.durationHours
     : props.durationOptions[0]?.value;
-
-  useEffect(() => {
-    if (!hasSelection || !props.isReviewOpen || !showJustificationField || !savedJustifications.length) {
-      setIsSavedListOpen(false);
-    }
-  }, [hasSelection, props.isReviewOpen, showJustificationField, savedJustifications.length]);
 
   return (
     <section className="activation-bar">
@@ -2652,41 +2711,47 @@ function ActivationBar(props: {
       ) : null}
       {hasSelection && props.isReviewOpen && showJustificationShortcuts ? (
         <div className="justification-shortcuts">
-          <div className="chip-row justification-recent-row">
-            {recentJustifications.slice(0, 3).map((item) => (
-              <button className="justification-chip" key={`recent:${item}`} onClick={() => props.setJustification(item)}>
+          <div className="justification-view-switch" role="tablist" aria-label="Justification source">
+            <button
+              className={justificationView === "history" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={justificationView === "history"}
+              aria-controls="justification-picker-list"
+              disabled={!recentJustifications.length}
+              onClick={() => setPreferredJustificationView("history")}
+            >
+              History
+            </button>
+            <button
+              className={justificationView === "saved" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={justificationView === "saved"}
+              aria-controls="justification-picker-list"
+              disabled={!savedJustifications.length}
+              onClick={() => setPreferredJustificationView("saved")}
+            >
+              Saved
+            </button>
+          </div>
+          <div
+            className="justification-picker-list"
+            id="justification-picker-list"
+            role="tabpanel"
+            aria-label={justificationView === "saved" ? "Saved justifications" : "Justification history"}
+          >
+            {visibleJustifications.map((item) => (
+              <button
+                className="justification-picker-option"
+                type="button"
+                key={`${justificationView}:${item}`}
+                onClick={() => props.setJustification(item)}
+              >
                 {item}
               </button>
             ))}
-            {savedJustifications.length ? (
-              <button
-                className="btn saved-justification-toggle"
-                type="button"
-                onClick={() => setIsSavedListOpen((value) => !value)}
-                aria-expanded={isSavedListOpen}
-                aria-controls="saved-justification-list"
-              >
-                Saved
-              </button>
-            ) : null}
           </div>
-          {isSavedListOpen ? (
-            <div className="saved-justification-menu" id="saved-justification-list" aria-label="Saved justifications">
-              {savedJustifications.map((item) => (
-                <button
-                  className="saved-justification-option"
-                  type="button"
-                  key={`saved:${item}`}
-                  onClick={() => {
-                    props.setJustification(item);
-                    setIsSavedListOpen(false);
-                  }}
-                >
-                  {item}
-                </button>
-              ))}
-            </div>
-          ) : null}
         </div>
       ) : null}
       {hasSelection && props.isReviewOpen && isActivateMode && props.requirements.needsTicket ? (
@@ -2861,6 +2926,12 @@ function applyDisplayData(
       scopeLabel: getScopeLabel(canonical, referenceData)
     } as ActivationItem;
   });
+}
+
+function formatBundleDuration(durationHours: number | undefined): string {
+  if (!durationHours || !Number.isFinite(durationHours)) return "Not set";
+  if (durationHours < 1) return `${Math.round(durationHours * 60)} minutes`;
+  return `${durationHours} hour${durationHours === 1 ? "" : "s"}`;
 }
 
 function formatRequestConfirmation(requestType: "activation" | "deactivation", successCount: number, errorCount: number): string {

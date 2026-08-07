@@ -2889,7 +2889,7 @@ describe("popup compact controls", () => {
     );
   });
 
-  test("keeps saved justifications behind a dedicated picker instead of mixing them with recent chips", async () => {
+  test("switches between compact justification history and saved views", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
       id: "directoryRole:reader:/",
@@ -2962,17 +2962,25 @@ describe("popup compact controls", () => {
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
     clickButton("Continue");
 
-    await waitFor(() => expect(document.querySelector(".justification-chip")).toBeTruthy());
-    const chips = [...document.querySelectorAll<HTMLButtonElement>(".justification-chip")].map((button) => button.textContent?.trim());
-    expect(chips).toEqual(["Recent support", "Recent cleanup"]);
+    await waitFor(() => expect(document.querySelector(".justification-view-switch")).toBeTruthy());
+    expect(document.querySelector('.justification-view-switch [role="tab"][aria-selected="true"]')?.textContent).toBe("History");
+    expect(document.querySelector('#justification-picker-list')?.getAttribute("aria-label")).toBe("Justification history");
+    expect(document.body.textContent).toContain("Recent support");
+    expect(document.body.textContent).toContain("Recent cleanup");
+    expect(document.body.textContent).not.toContain("Saved break fix");
     expect(document.body.textContent).not.toContain("Saved audit review");
 
     clickButton("Saved");
     await waitFor(() => expect(document.body.textContent).toContain("Saved audit review"));
+    expect(document.querySelector('.justification-view-switch [role="tab"][aria-selected="true"]')?.textContent).toBe("Saved");
+    expect(document.querySelector('#justification-picker-list')?.getAttribute("aria-label")).toBe("Saved justifications");
+    expect(document.body.textContent).toContain("Saved break fix");
+    expect(document.body.textContent).not.toContain("Recent support");
+    expect(document.body.textContent).not.toContain("Recent cleanup");
     clickButton("Saved audit review");
 
     await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.value).toBe("Saved audit review"));
-    expect(document.querySelector(".saved-justification-menu")).toBeFalsy();
+    expect(document.querySelector('#justification-picker-list')?.getAttribute("aria-label")).toBe("Saved justifications");
   });
 
   test("shows activation errors without waiting forever", async () => {
@@ -3927,6 +3935,56 @@ describe("popup draft persistence", () => {
     expect(labels).toEqual(["Favorites", "Eligible", "Active", "Needs reason"]);
   });
 
+  test("shows compact bundle settings with clear review and immediate activation actions", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const bundleItem: ActivationItem = {
+      ...pimGroupItem,
+      activationRequirements: {
+        justification: true,
+        ticket: false,
+        maxDurationHours: 2
+      }
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        bundles: [{
+          id: "bundle:daily-work",
+          name: "Daily privileged work",
+          itemIds: [bundleItem.id],
+          defaultDurationHours: 2,
+          defaultJustification: "Complete the approved daily administration task."
+        }],
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    vi.stubGlobal("chrome", popupChromeMock(storageData, bundleItem));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    clickButton("Bundles");
+    await waitFor(() => expect(document.body.textContent).toContain("Daily privileged work"));
+
+    expect(document.querySelector(".bundle-configuration")?.textContent).toContain("Roles/groupsPrivileged Group");
+    expect(document.querySelector(".bundle-configuration")?.textContent).toContain("Default time2 hours");
+    expect(document.querySelector(".bundle-configuration")?.textContent).toContain("JustificationComplete the approved daily administration task.");
+    expect(document.body.textContent).not.toContain("Use defaults");
+    expect(document.body.textContent).not.toContain("Activate bundle");
+    expect(document.querySelector<HTMLButtonElement>(".bundle-actions .btn.secondary")?.textContent).toContain("Load selection");
+    expect(document.querySelector<HTMLButtonElement>(".bundle-actions .btn.primary")?.textContent).toContain("Activate now as-is");
+    expect(document.querySelector<HTMLButtonElement>(".bundle-actions .btn.primary")?.disabled).toBe(false);
+
+    clickButton("Load selection");
+    await waitFor(() => expect(document.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("PIM Groups"));
+    expect(document.querySelector(".role-row.selected")).toBeTruthy();
+    expect([...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Continue")).toBe(true);
+  });
+
   test("keeps account and required token details compact and moves the portal action into the selected tab", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const writeText = vi.fn(async () => undefined);
@@ -3958,6 +4016,18 @@ describe("popup draft persistence", () => {
     expect(document.querySelector(".token-source-row.not-needed")?.textContent).toContain("Azure Not needed");
     expect(document.querySelector('.header-actions [aria-label^="Open "]')).toBeNull();
     expect(document.querySelector('[aria-label="Open PIM Groups in Microsoft Entra"]')).toBeTruthy();
+
+    const accountMenu = document.querySelector<HTMLDetailsElement>(".account-popover")!;
+    const accountPanel = document.querySelector<HTMLElement>(".account-popover-panel")!;
+    accountMenu.open = true;
+    accountPanel.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    expect(accountMenu.open).toBe(true);
+    document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    expect(accountMenu.open).toBe(false);
+    accountMenu.open = true;
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(accountMenu.open).toBe(false);
+    expect(document.activeElement).toBe(accountMenu.querySelector("summary"));
 
     document.querySelector<HTMLButtonElement>('[aria-label="Copy Account"]')?.click();
     await waitFor(() => expect(writeText).toHaveBeenCalledWith("admin@contoso.onmicrosoft.com"));
@@ -4102,11 +4172,15 @@ describe("popup role row styling", () => {
     expect(bodyRule).toContain("overflow-x: hidden;");
     expect(popupDocumentRule).toContain("min-width: 520px;");
     expect(popupDocumentRule).toContain("max-width: 520px;");
+    expect(popupDocumentRule).toContain("height: 600px;");
+    expect(popupDocumentRule).toContain("min-height: 600px;");
+    expect(popupDocumentRule).toContain("max-height: 600px;");
+    expect(popupDocumentRule).toContain("overflow: hidden;");
     expect(settingsDocumentRule).toContain("width: auto;");
     expect(settingsDocumentRule).toContain("max-width: none;");
     expect(shellRule).toContain("width: 100%;");
     expect(shellRule).toContain("max-width: 100%;");
-    expect(shellRule).toContain("overflow-x: hidden;");
+    expect(shellRule).toContain("overflow: hidden;");
   });
 
   test("right-aligns activation count and status badge in the status column", () => {
@@ -4154,12 +4228,18 @@ describe("popup role row styling", () => {
 
   test("keeps account values on one line in a wide, copyable account panel", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const availableRule = css.match(/\.header-account-button\.available\s*\{[^}]+\}/)?.[0] || "";
+    const selectedRule = css.match(/\.account-popover\[open\] \.header-account-button\.available\s*\{[^}]+\}/)?.[0] || "";
     const panelRule = css.match(/\.account-popover-panel\s*\{[^}]+\}/)?.[0] || "";
     const rowRule = css.match(/\.account-detail-row\s*\{[^}]+\}/)?.[0] || "";
     const labelRule = css.match(/\.account-detail-row \.popover-label\s*\{[^}]+\}/)?.[0] || "";
     const valueRule = css.match(/\.account-detail-value\s*\{[^}]+\}/)?.[0] || "";
     const copyRule = css.match(/\.account-copy-button\s*\{[^}]+\}/)?.[0] || "";
 
+    expect(availableRule).toContain("color: #475569;");
+    expect(availableRule).not.toContain("background: #eff6ff;");
+    expect(selectedRule).toContain("background: #eff6ff;");
+    expect(selectedRule).toContain("color: #1d4ed8;");
     expect(panelRule).toContain("width: min(430px, calc(100vw - 24px));");
     expect(rowRule).toContain("grid-template-columns: 72px minmax(0, 1fr) 28px;");
     expect(rowRule).toContain("gap: 4px;");
@@ -4181,24 +4261,35 @@ describe("popup role row styling", () => {
     expect(successRule).toContain("animation: refreshSuccessFade 4s ease forwards;");
   });
 
-  test("keeps activation review in flow with sticky bottom behavior instead of fixed overlap", () => {
+  test("pins a compact activation footer while only the role content scrolls", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
     const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
+    const toolbarRule = css.match(/\.toolbar\s*\{[^}]+\}/)?.[0] || "";
+    const quickFilterRule = css.match(/\.quick-filter-row\s*\{[^}]+\}/)?.[0] || "";
     const activationRule = css.match(/\.activation-bar\s*\{[^}]+\}/)?.[0] || "";
+    const activationButtonRule = css.match(/\.activation-bar \.btn\s*\{[^}]+\}/)?.[0] || "";
 
     expect(shellRule).toContain("display: flex;");
     expect(shellRule).toContain("flex-direction: column;");
-    expect(shellRule).toContain("min-height: max(600px, 100vh);");
-    expect(shellRule).not.toContain("min-height: 640px;");
+    expect(shellRule).toContain("height: 100%;");
+    expect(shellRule).toContain("min-height: 0;");
+    expect(shellRule).toContain("overflow: hidden;");
+    expect(contentRule).toContain("flex: 1 1 auto;");
+    expect(contentRule).toContain("min-height: 0;");
+    expect(contentRule).toContain("overflow-y: auto;");
+    expect(toolbarRule).toContain("flex-shrink: 0;");
+    expect(quickFilterRule).toContain("flex-shrink: 0;");
     expect(contentRule).toContain("padding-bottom: 12px;");
     expect(contentRule).not.toContain("padding-bottom: 248px;");
-    expect(activationRule).toContain("position: sticky;");
+    expect(activationRule).toContain("position: relative;");
     expect(activationRule).toContain("z-index: 20;");
-    expect(activationRule).toContain("margin-top: auto;");
     expect(activationRule).toContain("flex-shrink: 0;");
     expect(activationRule).toContain("overflow-y: auto;");
     expect(activationRule).not.toContain("position: fixed;");
+    expect(activationRule).not.toContain("position: sticky;");
+    expect(activationButtonRule).toContain("min-height: 30px;");
+    expect(activationButtonRule).toContain("font-size: 12px;");
   });
 
   test("keeps activation progress visible near the top while the popup scrolls", () => {
@@ -4208,6 +4299,23 @@ describe("popup role row styling", () => {
     expect(progressRule).toContain("position: sticky;");
     expect(progressRule).toContain("top: 0;");
     expect(progressRule).toContain("z-index: 20;");
+  });
+
+  test("bounds the bundle list and pins a compact settings footer", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const tabRule = css.match(/\.bundle-tab\s*\{[^}]+\}/)?.[0] || "";
+    const listRule = css.match(/\.bundle-list\s*\{[^}]+\}/)?.[0] || "";
+    const footerRule = css.match(/\.bundle-tab-footer\s*\{[^}]+\}/)?.[0] || "";
+    const buttonRule = css.match(/\.bundle-settings-button\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(tabRule).toContain("display: flex;");
+    expect(tabRule).toContain("overflow: hidden;");
+    expect(listRule).toContain("align-content: start;");
+    expect(listRule).toContain("max-height: 390px;");
+    expect(listRule).toContain("overflow-y: auto;");
+    expect(footerRule).toContain("margin-top: auto;");
+    expect(footerRule).toContain("flex: 0 0 auto;");
+    expect(buttonRule).toContain("max-height: 30px;");
   });
 
   test("adds icon padding inside toolbar fields", () => {

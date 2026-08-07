@@ -812,9 +812,9 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     case "refreshPortalTokens":
       return refreshPortalTokensFromOpenTabs();
     case "getPortalRecoveryStatus":
-      return getPortalRecoveryStatus(getPortalRecoveryApis());
+      return getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), await getTokenStatus());
     case "focusPortalRecoveryTabs":
-      return focusPortalRecoveryTabs(getPortalRecoveryApis());
+      return focusPortalRecoveryTabs(getPortalRecoveryApis(), Date.now(), await getTokenStatus());
     case "openPortalRecoveryTabs":
       return openManagedPortalRecoveryTabs(message.targets);
     case "closePortalRecoveryTabs":
@@ -1201,15 +1201,15 @@ async function recoverPortalAccessForRequest(
       return { ready: true };
     }
     if (!interactionWasFocused) {
-      const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis());
+      const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), tokenStatus);
       if (recoveryStatus.state === "interactionRequired") {
         interactionWasFocused = true;
-        await focusPortalRecoveryTabs(getPortalRecoveryApis());
+        await focusPortalRecoveryTabs(getPortalRecoveryApis(), Date.now(), tokenStatus);
       }
     }
   }
 
-  const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis());
+  const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), tokenStatus);
   const interactionRequired = recoveryStatus.state === "interactionRequired";
   return {
     ready: false,

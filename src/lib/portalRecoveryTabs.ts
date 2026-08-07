@@ -13,6 +13,7 @@ export const PORTAL_RECOVERY_SESSION_KEY = "quickPimPortalRecovery.v1";
 export const PORTAL_RECOVERY_GROUP_TITLE = "QuickPIM++ access refresh";
 export const PORTAL_RECOVERY_SESSION_TTL_MS = 10 * 60_000;
 export const PORTAL_RECOVERY_INTERACTION_TIMEOUT_MS = 15_000;
+export const PORTAL_RECOVERY_AUTH_PROBE_GRACE_MS = 8_000;
 export const PORTAL_RECOVERY_CLEANUP_ALARM_NAME = "quickPimPortalRecoveryCleanup";
 
 interface PortalRecoverySession {
@@ -22,6 +23,9 @@ interface PortalRecoverySession {
   windowId?: number;
   tabsByTarget: Partial<Record<AccessSetupTarget, number>>;
   baselineTokenSignatures: Partial<Record<AccessSetupTarget, string>>;
+  deferredTargets: AccessSetupTarget[];
+  authenticationTarget?: AccessSetupTarget;
+  authenticationObserved?: boolean;
 }
 
 export interface PortalRecoveryTabsLike {
@@ -69,26 +73,41 @@ export async function openPortalRecoveryTabs(
     }
 
     session = session ? await pruneMissingOrNavigatedTabs(session, apis.tabs) : newPortalRecoverySession(now);
-    const reusedTargets = targets.filter((target) => session?.tabsByTarget[target] !== undefined);
-    const missingTargets = targets.filter((target) => session?.tabsByTarget[target] === undefined);
-    const openedTargets: AccessSetupTarget[] = [];
+    const advancedTargets = await advanceAuthenticationStage(session, tokenStatus, apis, now);
+    const managedBeforeOpen = getManagedTargets(session);
+    const reusedTargets = targets.filter((target) => managedBeforeOpen.includes(target));
+    const missingTargets = targets.filter((target) => !managedBeforeOpen.includes(target));
+    const openedTargets: AccessSetupTarget[] = [...advancedTargets];
 
     for (const target of missingTargets) {
-      try {
-        const tab = await apis.tabs.create({
-          url: ENTRA_PORTAL_URLS[target],
-          active: false,
-          ...(session.windowId !== undefined ? { windowId: session.windowId } : {})
-        });
-        if (typeof tab.id !== "number") {
-          continue;
+      session.baselineTokenSignatures[target] = getTargetTokenSignature(tokenStatus, target);
+    }
+
+    if (session.authenticationTarget) {
+      session.deferredTargets = uniqueTargets([...session.deferredTargets, ...missingTargets]);
+    } else if (shouldStageAuthentication(missingTargets, tokenStatus)) {
+      const leaderCandidates = [...missingTargets];
+      const failedTargets: AccessSetupTarget[] = [];
+      while (leaderCandidates.length) {
+        const leader = leaderCandidates.shift()!;
+        if (await openRecoveryTarget(session, leader, apis.tabs)) {
+          session.authenticationTarget = leader;
+          session.authenticationObserved = false;
+          session.deferredTargets = uniqueTargets([
+            ...session.deferredTargets,
+            ...failedTargets,
+            ...leaderCandidates
+          ]);
+          openedTargets.push(leader);
+          break;
         }
-        session.tabsByTarget[target] = tab.id;
-        session.baselineTokenSignatures[target] = getTargetTokenSignature(tokenStatus, target);
-        session.windowId ??= tab.windowId;
-        openedTargets.push(target);
-      } catch {
-        // One unavailable target must not prevent the remaining recovery tabs from opening.
+        failedTargets.push(leader);
+      }
+    } else {
+      for (const target of missingTargets) {
+        if (await openRecoveryTarget(session, target, apis.tabs)) {
+          openedTargets.push(target);
+        }
       }
     }
 
@@ -111,7 +130,7 @@ export async function openPortalRecoveryTabs(
       requestedCount: targets.length,
       openedCount: openedTargets.length,
       reusedCount: reusedTargets.length,
-      managedCount: targets.filter((target) => session.tabsByTarget[target] !== undefined).length,
+      managedCount: targets.filter((target) => getManagedTargets(session).includes(target)).length,
       grouped: session.groupId !== undefined
     };
   });
@@ -119,7 +138,8 @@ export async function openPortalRecoveryTabs(
 
 export async function getPortalRecoveryStatus(
   apis: PortalRecoveryApis,
-  now = Date.now()
+  now = Date.now(),
+  tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryStatus> {
   return enqueuePortalRecoveryMutation(async () => {
     let session = await loadPortalRecoverySession(apis.storage);
@@ -127,6 +147,9 @@ export async function getPortalRecoveryStatus(
       return idlePortalRecoveryStatus();
     }
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs);
+    if (tokenStatus) {
+      await advanceAuthenticationStage(session, tokenStatus, apis, now);
+    }
     await saveOrRemoveSession(session, apis.storage);
     return buildPortalRecoveryStatus(session, apis.tabs, now);
   });
@@ -134,7 +157,8 @@ export async function getPortalRecoveryStatus(
 
 export async function focusPortalRecoveryTabs(
   apis: PortalRecoveryApis,
-  now = Date.now()
+  now = Date.now(),
+  tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryFocusResult> {
   return enqueuePortalRecoveryMutation(async () => {
     let session = await loadPortalRecoverySession(apis.storage);
@@ -142,9 +166,14 @@ export async function focusPortalRecoveryTabs(
       return { focused: false, status: idlePortalRecoveryStatus() };
     }
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs);
+    if (tokenStatus) {
+      await advanceAuthenticationStage(session, tokenStatus, apis, now);
+    }
     await saveOrRemoveSession(session, apis.storage);
     const status = await buildPortalRecoveryStatus(session, apis.tabs, now);
-    const preferredTargets = status.interactionTargets.length ? status.interactionTargets : status.managedTargets;
+    const preferredTargets = status.interactionTargets.length
+      ? status.interactionTargets
+      : session.authenticationTarget ? [session.authenticationTarget] : status.managedTargets;
     const tabId = preferredTargets.map((target) => session?.tabsByTarget[target]).find((value): value is number => typeof value === "number");
     if (tabId === undefined || !apis.tabs.update) {
       return { focused: false, status };
@@ -213,11 +242,9 @@ export async function closeCompletedPortalRecoveryTabs(
     }
 
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs);
-    const completedTargets = uniqueTargets(
-      Object.keys(session.tabsByTarget).filter((target): target is AccessSetupTarget =>
-        isAccessSetupTarget(target) && isTargetRecoveryComplete(session, target, tokenStatus)
-      )
-    );
+    await advanceAuthenticationStage(session, tokenStatus, apis, Date.now());
+    const completedTargets = getManagedTargets(session)
+      .filter((target) => isTargetRecoveryComplete(session, target, tokenStatus));
 
     const closedTargets = await closeSessionTargets(session, completedTargets, apis.tabs);
     await saveOrRemoveSession(session, apis.storage);
@@ -235,7 +262,7 @@ export async function closePortalRecoveryTabsForTargets(
       return [];
     }
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs);
-    const targets = uniqueTargets(requestedTargets).filter((target) => session?.tabsByTarget[target] !== undefined);
+    const targets = uniqueTargets(requestedTargets).filter((target) => getManagedTargets(session!).includes(target));
     const closedTargets = await closeSessionTargets(session, targets, apis.tabs);
     await saveOrRemoveSession(session, apis.storage);
     return closedTargets;
@@ -252,7 +279,7 @@ export async function closeExpiredPortalRecoveryTabs(
       return [];
     }
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs);
-    const targets = uniqueTargets(Object.keys(session.tabsByTarget).filter(isAccessSetupTarget));
+    const targets = getManagedTargets(session);
     const closedTargets = await closeSessionTargets(session, targets, apis.tabs);
     await saveOrRemoveSession(session, apis.storage);
     return closedTargets;
@@ -264,8 +291,128 @@ function newPortalRecoverySession(now: number): PortalRecoverySession {
     version: 1,
     createdAt: now,
     tabsByTarget: {},
-    baselineTokenSignatures: {}
+    baselineTokenSignatures: {},
+    deferredTargets: []
   };
+}
+
+function shouldStageAuthentication(targets: AccessSetupTarget[], tokenStatus: TokenStatus): boolean {
+  return targets.length > 1 && !hasUsablePortalSessionHint(tokenStatus);
+}
+
+function hasUsablePortalSessionHint(tokenStatus: TokenStatus): boolean {
+  const candidates: Array<TokenStatusEntry | undefined> = [
+    tokenStatus.graph,
+    tokenStatus.graphTargets?.directoryRole,
+    tokenStatus.graphTargets?.pimGroup,
+    tokenStatus.azureManagement
+  ];
+  return candidates.some((token) => Boolean(token?.hasToken && !token.isExpired));
+}
+
+async function openRecoveryTarget(
+  session: PortalRecoverySession,
+  target: AccessSetupTarget,
+  tabs: PortalRecoveryTabsLike
+): Promise<boolean> {
+  try {
+    const tab = await tabs.create({
+      url: ENTRA_PORTAL_URLS[target],
+      active: false,
+      ...(session.windowId !== undefined ? { windowId: session.windowId } : {})
+    });
+    if (typeof tab.id !== "number") return false;
+    session.tabsByTarget[target] = tab.id;
+    session.windowId ??= tab.windowId;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function advanceAuthenticationStage(
+  session: PortalRecoverySession,
+  tokenStatus: TokenStatus,
+  apis: PortalRecoveryApis,
+  now: number
+): Promise<AccessSetupTarget[]> {
+  const authenticationTarget = session.authenticationTarget;
+  if (!authenticationTarget) {
+    if (!session.deferredTargets.length) return [];
+    const pendingTargets = [...session.deferredTargets];
+    session.deferredTargets = [];
+    const openedTargets: AccessSetupTarget[] = [];
+    if (hasUsablePortalSessionHint(tokenStatus)) {
+      for (const target of pendingTargets) {
+        if (await openRecoveryTarget(session, target, apis.tabs)) openedTargets.push(target);
+        else session.deferredTargets.push(target);
+      }
+    } else {
+      const failedTargets: AccessSetupTarget[] = [];
+      while (pendingTargets.length) {
+        const leader = pendingTargets.shift()!;
+        if (await openRecoveryTarget(session, leader, apis.tabs)) {
+          session.authenticationTarget = leader;
+          session.authenticationObserved = false;
+          openedTargets.push(leader);
+          break;
+        }
+        failedTargets.push(leader);
+      }
+      session.deferredTargets.push(...failedTargets, ...pendingTargets);
+    }
+    session.groupId = await ensurePortalRecoveryGroup(session, openedTargets, apis);
+    return openedTargets;
+  }
+  const tabId = session.tabsByTarget[authenticationTarget];
+  if (tabId === undefined) {
+    delete session.authenticationTarget;
+    delete session.authenticationObserved;
+    return [];
+  }
+
+  let tab: chrome.tabs.Tab;
+  try {
+    tab = await apis.tabs.get(tabId);
+  } catch {
+    return [];
+  }
+  const url = tab.url || tab.pendingUrl;
+  if (!url || isMicrosoftAuthenticationUrl(url)) {
+    session.authenticationObserved = true;
+    return [];
+  }
+
+  const tokenChanged = isTargetRecoveryComplete(session, authenticationTarget, tokenStatus);
+  const returnedFromAuthentication = session.authenticationObserved && isPortalRecoveryUrlForTarget(url, authenticationTarget);
+  const signedInWithoutPrompt = !session.authenticationObserved
+    && now - session.createdAt >= PORTAL_RECOVERY_AUTH_PROBE_GRACE_MS
+    && isPortalRecoveryUrlForTarget(url, authenticationTarget);
+  if (!tokenChanged && !returnedFromAuthentication && !signedInWithoutPrompt) {
+    return [];
+  }
+
+  const deferredTargets = [...session.deferredTargets];
+  session.deferredTargets = [];
+  delete session.authenticationTarget;
+  delete session.authenticationObserved;
+  const openedTargets: AccessSetupTarget[] = [];
+  for (const target of deferredTargets) {
+    if (await openRecoveryTarget(session, target, apis.tabs)) {
+      openedTargets.push(target);
+    } else {
+      session.deferredTargets.push(target);
+    }
+  }
+  session.groupId = await ensurePortalRecoveryGroup(session, openedTargets, apis);
+  return openedTargets;
+}
+
+function getManagedTargets(session: PortalRecoverySession): AccessSetupTarget[] {
+  return uniqueTargets([
+    ...Object.keys(session.tabsByTarget).filter(isAccessSetupTarget),
+    ...session.deferredTargets
+  ]);
 }
 
 async function ensurePortalRecoveryGroup(
@@ -323,12 +470,20 @@ async function pruneMissingOrNavigatedTabs(
       if (!isManagedPortalRecoveryTab(tab, target, session.groupId)) {
         delete session.tabsByTarget[target];
         delete session.baselineTokenSignatures[target];
+        if (session.authenticationTarget === target) {
+          delete session.authenticationTarget;
+          delete session.authenticationObserved;
+        }
         return undefined;
       }
       return tab;
     } catch {
       delete session.tabsByTarget[target];
       delete session.baselineTokenSignatures[target];
+      if (session.authenticationTarget === target) {
+        delete session.authenticationTarget;
+        delete session.authenticationObserved;
+      }
       return undefined;
     }
   }))).filter((tab): tab is chrome.tabs.Tab => Boolean(tab));
@@ -463,7 +618,7 @@ async function buildPortalRecoveryStatus(
     }
   }));
 
-  const managedTargets = entries.map(([target]) => target);
+  const managedTargets = getManagedTargets(session);
   const interactionTargets = interactionChecks.filter((target): target is AccessSetupTarget => Boolean(target));
   const timedOut = now - session.createdAt >= PORTAL_RECOVERY_INTERACTION_TIMEOUT_MS;
   const requiresInteraction = interactionTargets.length > 0 || timedOut;
@@ -505,13 +660,21 @@ async function closeSessionTargets(
   targets: AccessSetupTarget[],
   tabs: PortalRecoveryTabsLike
 ): Promise<AccessSetupTarget[]> {
-  const entries = targets.flatMap((target) => {
+  const managedTargets = targets.filter((target) => getManagedTargets(session).includes(target));
+  const entries = managedTargets.flatMap((target) => {
     const tabId = session.tabsByTarget[target];
     return tabId === undefined ? [] : [{ target, tabId }];
   });
-  if (!entries.length) {
-    return [];
+  const deferredTargets = managedTargets.filter((target) => session.tabsByTarget[target] === undefined);
+  session.deferredTargets = session.deferredTargets.filter((target) => !deferredTargets.includes(target));
+  for (const target of deferredTargets) {
+    delete session.baselineTokenSignatures[target];
   }
+  if (session.authenticationTarget && managedTargets.includes(session.authenticationTarget)) {
+    delete session.authenticationTarget;
+    delete session.authenticationObserved;
+  }
+  if (!entries.length) return deferredTargets;
 
   try {
     await tabs.remove(entries.map((entry) => entry.tabId));
@@ -519,7 +682,7 @@ async function closeSessionTargets(
       delete session.tabsByTarget[target];
       delete session.baselineTokenSignatures[target];
     }
-    return entries.map((entry) => entry.target);
+    return [...deferredTargets, ...entries.map((entry) => entry.target)];
   } catch {
     const closedTargets: AccessSetupTarget[] = [];
     for (const { target, tabId } of entries) {
@@ -532,12 +695,12 @@ async function closeSessionTargets(
         // Keep failed tab removals tracked so a later completion or timeout can retry them.
       }
     }
-    return closedTargets;
+    return [...deferredTargets, ...closedTargets];
   }
 }
 
 async function saveOrRemoveSession(session: PortalRecoverySession, storage: PortalRecoveryStorageLike): Promise<void> {
-  if (!Object.keys(session.tabsByTarget).length) {
+  if (!getManagedTargets(session).length) {
     await storage.remove(PORTAL_RECOVERY_SESSION_KEY);
   } else {
     await storage.set({ [PORTAL_RECOVERY_SESSION_KEY]: session });
@@ -556,11 +719,20 @@ async function loadPortalRecoverySession(storage: PortalRecoveryStorageLike): Pr
   }
   const tabsByTarget = sanitizeTargetNumbers(record.tabsByTarget);
   const baselineTokenSignatures = sanitizeTargetStrings(record.baselineTokenSignatures);
+  const deferredTargets = sanitizeTargetArray(record.deferredTargets)
+    .filter((target) => tabsByTarget[target] === undefined);
+  const authenticationTarget = isAccessSetupTarget(record.authenticationTarget)
+    && tabsByTarget[record.authenticationTarget] !== undefined
+    ? record.authenticationTarget
+    : undefined;
   return {
     version: 1,
     createdAt: record.createdAt,
     tabsByTarget,
     baselineTokenSignatures,
+    deferredTargets,
+    ...(authenticationTarget ? { authenticationTarget } : {}),
+    ...(authenticationTarget && record.authenticationObserved === true ? { authenticationObserved: true } : {}),
     ...(typeof record.groupId === "number" && Number.isInteger(record.groupId) ? { groupId: record.groupId } : {}),
     ...(typeof record.windowId === "number" && Number.isInteger(record.windowId) ? { windowId: record.windowId } : {})
   };
