@@ -64,16 +64,24 @@ button {
 
 .app-header,
 .settings-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 16px;
-  padding: 18px 20px 14px;
   background: #ffffff;
   border-bottom: 1px solid #e5e7eb;
 }
 
+.app-header {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 38px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px 14px;
+}
+
 .settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
   padding: 24px 32px;
 }
 
@@ -81,6 +89,7 @@ button {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
 }
 
 .brand img {
@@ -102,33 +111,249 @@ button {
   font-size: 12px;
 }
 
-.brand .identity-context {
-  max-width: 210px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 10px;
-}
-
 .identity-mismatch {
   margin: 8px 12px 0;
 }
 
-.status-stack {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px 8px;
+.header-account-slot {
+  display: flex;
   align-items: center;
-  justify-items: end;
-  max-width: 320px;
+  justify-content: center;
 }
 
 .header-actions {
-  grid-column: 2;
-  grid-row: 1 / span 2;
   display: flex;
+  align-items: center;
   gap: 6px;
   justify-content: flex-end;
+}
+
+.header-popover {
+  position: relative;
+}
+
+.header-popover > summary {
+  list-style: none;
+}
+
+.header-popover > summary::-webkit-details-marker {
+  display: none;
+}
+
+.header-account-button,
+.token-status-summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+  cursor: pointer;
+}
+
+.header-account-button {
+  width: 36px;
+}
+
+.header-account-button.available {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.header-account-button.unavailable {
+  color: #94a3b8;
+}
+
+.token-status-summary {
+  gap: 4px;
+  max-width: 116px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.token-status-summary.ok {
+  border-color: #bbf7d0;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.token-status-summary.warn {
+  border-color: #fed7aa;
+  background: #ffedd5;
+  color: #9a3412;
+}
+
+.token-status-summary.idle {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.token-summary-chevron {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s ease;
+}
+
+.header-popover[open] .token-summary-chevron {
+  transform: rotate(180deg);
+}
+
+.header-popover-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  z-index: 80;
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgb(15 23 42 / 18%);
+  color: #334155;
+}
+
+.account-popover-panel {
+  right: -148px;
+  width: min(430px, calc(100vw - 24px));
+}
+
+.token-status-panel {
+  right: 0;
+  width: 220px;
+}
+
+.popover-label {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.account-detail-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) 28px;
+  gap: 4px;
+  align-items: center;
+  min-height: 30px;
+}
+
+.account-detail-row .popover-label {
+  font-size: 9px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.account-detail-value {
+  min-width: 0;
+  overflow: hidden;
+  color: #1f2937;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-copy-button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: pointer;
+}
+
+.account-copy-button:hover {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.account-copy-button.copied {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.account-copy-button.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.account-copy-icon {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.popover-warning {
+  padding-top: 6px;
+  border-top: 1px solid #fecaca;
+  color: #b91c1c;
+  font-size: 11px;
+}
+
+.token-source-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+}
+
+.token-source-label {
+  font-weight: 750;
+}
+
+.token-source-value {
+  justify-self: end;
+  text-align: right;
+}
+
+.token-source-row.ok {
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.token-source-row.warn {
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.token-source-row.not-needed {
+  background: #f1f5f9;
+  color: #94a3b8;
 }
 
 .token-pill {
@@ -236,8 +461,16 @@ button {
   border-bottom: 1px solid #e5e7eb;
 }
 
+.tab-slot {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
 .tab-button {
   flex: 1;
+  width: 100%;
   min-height: 38px;
   border-radius: 6px 6px 0 0;
   background: transparent;
@@ -246,11 +479,47 @@ button {
   font-weight: 650;
 }
 
+.tab-button.has-portal-action {
+  padding-right: 34px;
+  padding-left: 34px;
+}
+
 .tab-button.active {
   color: #0f172a;
   background: #f7f8fa;
   border: 1px solid #e5e7eb;
   border-bottom-color: #f7f8fa;
+}
+
+.tab-portal-button {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #2563eb;
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+
+.tab-portal-button:hover {
+  background: #dbeafe;
+}
+
+.tab-portal-icon {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .toolbar {
@@ -552,6 +821,10 @@ body.dark-mode .field-clear-button:focus-visible {
 
 .role-row.selectable:focus-visible,
 .tab-button:focus-visible,
+.tab-portal-button:focus-visible,
+.header-account-button:focus-visible,
+.account-copy-button:focus-visible,
+.token-status-summary:focus-visible,
 .filter-chip:focus-visible,
 .btn:focus-visible,
 .settings-nav button:focus-visible {
@@ -2201,6 +2474,71 @@ body.dark-mode .tab-bar,
 body.dark-mode .activation-bar {
   background: #111827;
   border-color: #334155;
+}
+
+body.dark-mode .header-account-button,
+body.dark-mode .token-status-summary.idle,
+body.dark-mode .header-popover-panel,
+body.dark-mode .token-source-row.not-needed {
+  background: #1e293b;
+  border-color: #475569;
+  color: #94a3b8;
+}
+
+body.dark-mode .header-account-button.available {
+  background: #172554;
+  border-color: #1d4ed8;
+  color: #93c5fd;
+}
+
+body.dark-mode .token-status-summary.ok,
+body.dark-mode .token-source-row.ok {
+  background: #14532d;
+  border-color: #166534;
+  color: #bbf7d0;
+}
+
+body.dark-mode .token-status-summary.warn,
+body.dark-mode .token-source-row.warn {
+  background: #7c2d12;
+  border-color: #9a3412;
+  color: #fed7aa;
+}
+
+body.dark-mode .popover-label {
+  color: #94a3b8;
+}
+
+body.dark-mode .account-detail-value {
+  color: #e2e8f0;
+}
+
+body.dark-mode .account-copy-button {
+  background: #334155;
+  color: #cbd5e1;
+}
+
+body.dark-mode .account-copy-button:hover {
+  background: #1e3a8a;
+  color: #bfdbfe;
+}
+
+body.dark-mode .account-copy-button.copied {
+  background: #14532d;
+  color: #bbf7d0;
+}
+
+body.dark-mode .account-copy-button.error {
+  background: #7f1d1d;
+  color: #fecaca;
+}
+
+body.dark-mode .tab-portal-button {
+  color: #93c5fd;
+}
+
+body.dark-mode .tab-portal-button:hover {
+  background: #1e3a8a;
 }
 
 body.dark-mode .brand h1,

@@ -17,6 +17,8 @@ describe("safe account context", () => {
     };
     const context = getIdentityContext(tokenStatus);
     expect(context.label).toContain("admin@example.test");
+    expect(context.principalName).toBe("admin@example.test");
+    expect(context.tenantId).toBe("tenant-a");
     expect(context.mismatch).toBe(true);
     expect(context.identityCount).toBe(2);
   });
@@ -32,6 +34,7 @@ describe("safe account context", () => {
     });
     expect(makeTokenStatus(token, now, "portal", now)).toMatchObject({ principalName: "admin@example.test" });
   });
+
 });
 
 describe("sanitized support reports", () => {

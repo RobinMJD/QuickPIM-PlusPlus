@@ -3864,6 +3864,17 @@ describe("popup draft persistence", () => {
   };
 
   function popupChromeMock(storageData: Record<string, unknown>, item: ActivationItem = pimGroupItem) {
+    const tokenStatus = {
+      graph: {
+        hasToken: true,
+        isExpired: false,
+        tokenAge: 1,
+        principalName: "admin@contoso.onmicrosoft.com",
+        principalId: "principal-1",
+        tenantId: "tenant-1"
+      },
+      azureManagement: { hasToken: false }
+    };
     return {
       runtime: {
         getURL: (path: string) => `chrome-extension://quickpim/${path}`,
@@ -3875,17 +3886,15 @@ describe("popup draft persistence", () => {
                 eligible: { items: [item], errors: [], diagnostics: [] },
                 active: { items: [], errors: [], diagnostics: [] },
                 eligibleByTarget: { [item.type]: { items: [item], errors: [], diagnostics: [] } },
-                activeByTarget: { [item.type]: { items: [], errors: [], diagnostics: [] } }
+                activeByTarget: { [item.type]: { items: [], errors: [], diagnostics: [] } },
+                tokenStatus
               }
             };
           }
           if (message.action === "getTokenStatus") {
             return {
               success: true,
-              data: {
-                graph: { hasToken: true, isExpired: false, tokenAge: 1 },
-                azureManagement: { hasToken: false }
-              }
+              data: tokenStatus
             };
           }
           return { success: true, data: true };
@@ -3916,6 +3925,49 @@ describe("popup draft persistence", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
     const labels = [...document.querySelectorAll<HTMLButtonElement>(".filter-chip")].map((button) => button.textContent?.trim());
     expect(labels).toEqual(["Favorites", "Eligible", "Active", "Needs reason"]);
+  });
+
+  test("keeps account and required token details compact and moves the portal action into the selected tab", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const chromeMock = popupChromeMock(storageData);
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    expect(document.querySelector(".brand .identity-context")).toBeNull();
+    expect(document.querySelector('[aria-label="Show Microsoft account details"]')).toBeTruthy();
+    expect(document.querySelector(".account-popover-panel")?.textContent).toContain("admin@contoso.onmicrosoft.com");
+    expect(document.querySelector(".account-popover-panel")?.textContent).toContain("tenant-1");
+    expect(document.querySelectorAll(".account-detail-row")).toHaveLength(2);
+    expect(document.querySelector(".token-status-summary")?.textContent).toContain("Access ready");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Graph ready (1 min ago)");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Azure Not needed");
+    expect(document.querySelector(".token-source-row.not-needed")?.textContent).toContain("Azure Not needed");
+    expect(document.querySelector('.header-actions [aria-label^="Open "]')).toBeNull();
+    expect(document.querySelector('[aria-label="Open PIM Groups in Microsoft Entra"]')).toBeTruthy();
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Copy Account"]')?.click();
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("admin@contoso.onmicrosoft.com"));
+    await waitFor(() => expect(document.querySelector('[aria-label="Account copied"]')).toBeTruthy());
+
+    document.querySelector<HTMLButtonElement>('[aria-label="Copy Tenant ID"]')?.click();
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("tenant-1"));
+
+    clickButton("Bundles");
+    await waitFor(() => expect(document.querySelector('[aria-label="Open PIM Groups in Microsoft Entra"]')).toBeNull());
   });
 
   test("restores selection, tab, search, sort, review state, duration, justification, and tickets", async () => {
@@ -4086,6 +4138,37 @@ describe("popup role row styling", () => {
     expect(headerActionsRule).toContain("justify-content: flex-end;");
     expect(toolbarRule).toContain("grid-template-columns: minmax(0, 1fr) 150px;");
     expect(activationButtonRule).toContain("margin-top: 0;");
+  });
+
+  test("uses a three-zone header and reserves portal actions for the selected tab", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const headerRule = css.match(/\.app-header\s*\{[^}]+\}/)?.[0] || "";
+    const accountRule = css.match(/\.header-account-slot\s*\{[^}]+\}/)?.[0] || "";
+    const tabPortalRule = css.match(/\.tab-portal-button\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(headerRule).toContain("grid-template-columns: minmax(0, 1fr) 38px auto;");
+    expect(accountRule).toContain("justify-content: center;");
+    expect(tabPortalRule).toContain("position: absolute;");
+    expect(tabPortalRule).toContain("right: 5px;");
+  });
+
+  test("keeps account values on one line in a wide, copyable account panel", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const panelRule = css.match(/\.account-popover-panel\s*\{[^}]+\}/)?.[0] || "";
+    const rowRule = css.match(/\.account-detail-row\s*\{[^}]+\}/)?.[0] || "";
+    const labelRule = css.match(/\.account-detail-row \.popover-label\s*\{[^}]+\}/)?.[0] || "";
+    const valueRule = css.match(/\.account-detail-value\s*\{[^}]+\}/)?.[0] || "";
+    const copyRule = css.match(/\.account-copy-button\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(panelRule).toContain("width: min(430px, calc(100vw - 24px));");
+    expect(rowRule).toContain("grid-template-columns: 72px minmax(0, 1fr) 28px;");
+    expect(rowRule).toContain("gap: 4px;");
+    expect(labelRule).toContain("font-size: 9px;");
+    expect(labelRule).toContain("white-space: nowrap;");
+    expect(valueRule).toContain("font-size: 11px;");
+    expect(valueRule).toContain("white-space: nowrap;");
+    expect(valueRule).toContain("text-overflow: ellipsis;");
+    expect(copyRule).toContain("width: 28px;");
   });
 
   test("positions the refresh success check over the refresh button and fades it out", () => {

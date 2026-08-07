@@ -3,6 +3,9 @@ import type { TokenStatus, TokenStatusEntry } from "./types";
 export interface IdentityContext {
   label?: string;
   detail?: string;
+  principalName?: string;
+  principalId?: string;
+  tenantId?: string;
   mismatch: boolean;
   identityCount: number;
 }
@@ -31,6 +34,9 @@ export function getIdentityContext(tokenStatus: TokenStatus | null | undefined):
   return {
     label: tenant ? `${account} / ${tenant}` : account,
     detail: values.map(formatIdentityDetail).join(" | "),
+    principalName: preferred.principalName,
+    principalId: preferred.principalId,
+    tenantId: preferred.tenantId,
     mismatch: values.length > 1,
     identityCount: values.length
   };

@@ -4,9 +4,9 @@ import { getStorePackagePaths, STORE_PACKAGE_SUFFIXES } from "../scripts/package
 
 describe("dual Store packaging", () => {
   test("creates distinct Chrome and Edge package names from one version", () => {
-    const paths = getStorePackagePaths("2.11.1", "release");
-    expect(paths.chrome).toMatch(/quickpim-plusplus-v2\.11\.1-chrome-webstore\.zip$/);
-    expect(paths.edge).toMatch(/quickpim-plusplus-v2\.11\.1-edge-addons\.zip$/);
+    const paths = getStorePackagePaths("2.11.5", "release");
+    expect(paths.chrome).toMatch(/quickpim-plusplus-v2\.11\.5-chrome-webstore\.zip$/);
+    expect(paths.edge).toMatch(/quickpim-plusplus-v2\.11\.5-edge-addons\.zip$/);
     expect(STORE_PACKAGE_SUFFIXES).toEqual({ chrome: "chrome-webstore", edge: "edge-addons" });
   });
 

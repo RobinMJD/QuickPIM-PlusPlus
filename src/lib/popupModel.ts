@@ -1,6 +1,17 @@
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
 import { getActivationItemIdentity } from "./activationIdentity";
-import type { ActivationItem, ActivationResult, ActivationStatus, PopupRequestMode, PopupTab, QuickPimBundle, RoleTab, TokenStatusEntry } from "./types";
+import type {
+  AccessSetupTarget,
+  ActivationItem,
+  ActivationResult,
+  ActivationStatus,
+  PopupRequestMode,
+  PopupTab,
+  QuickPimBundle,
+  RoleTab,
+  TokenStatus,
+  TokenStatusEntry
+} from "./types";
 export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
@@ -30,6 +41,75 @@ export function tokenStatusText(label: string, status: TokenStatusEntry | undefi
 
   const age = status.tokenAge ?? 0;
   return `${label} ready (${age} min ago)`;
+}
+
+export interface PopupTokenSourceStatus {
+  id: "graph" | "azureManagement";
+  label: "Graph" | "Azure";
+  needed: boolean;
+  status?: TokenStatusEntry;
+}
+
+export interface PopupTokenStatusSummary {
+  label: "Access ready" | "Access needed" | "Refresh needed" | "Access not needed" | "Checking access";
+  tone: "ok" | "warn" | "idle";
+}
+
+export function getPopupTokenSourceStatuses(
+  enabledTargets: AccessSetupTarget[],
+  tokenStatus: TokenStatus | null | undefined
+): PopupTokenSourceStatus[] {
+  const graphTargets = enabledTargets.filter((target) => target !== "azureRole");
+  return [
+    {
+      id: "graph",
+      label: "Graph",
+      needed: graphTargets.length > 0,
+      status: selectGraphSourceStatus(graphTargets, tokenStatus)
+    },
+    {
+      id: "azureManagement",
+      label: "Azure",
+      needed: enabledTargets.includes("azureRole"),
+      status: tokenStatus?.azureManagement
+    }
+  ];
+}
+
+export function getPopupTokenStatusSummary(
+  sources: PopupTokenSourceStatus[],
+  tokenStatusLoaded: boolean
+): PopupTokenStatusSummary {
+  const neededSources = sources.filter((source) => source.needed);
+  if (!neededSources.length) {
+    return { label: "Access not needed", tone: "idle" };
+  }
+  if (!tokenStatusLoaded) {
+    return { label: "Checking access", tone: "idle" };
+  }
+  if (neededSources.some((source) => source.status?.isExpired)) {
+    return { label: "Refresh needed", tone: "warn" };
+  }
+  if (neededSources.some((source) => !source.status?.hasToken)) {
+    return { label: "Access needed", tone: "warn" };
+  }
+  return { label: "Access ready", tone: "ok" };
+}
+
+function selectGraphSourceStatus(
+  graphTargets: AccessSetupTarget[],
+  tokenStatus: TokenStatus | null | undefined
+): TokenStatusEntry | undefined {
+  if (!tokenStatus || !graphTargets.length) {
+    return tokenStatus?.graph;
+  }
+  const candidates = graphTargets.map((target) => (
+    target === "azureRole" ? undefined : tokenStatus.graphTargets?.[target] || tokenStatus.graph
+  ));
+  return candidates.find((candidate) => !candidate?.hasToken)
+    || candidates.find((candidate) => candidate?.isExpired)
+    || [...candidates].sort((left, right) => (right?.tokenAge || 0) - (left?.tokenAge || 0))[0]
+    || tokenStatus.graph;
 }
 
 export function formatLoadMessages(messages: string[]): string[] {

@@ -48,6 +48,39 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   await page.close();
 });
 
+test("account details stay within the popup and keep copyable values on one line", async ({}, testInfo) => {
+  const page = await openExtensionPage("popup.html", { width: 520, height: 800 });
+  await seedPopupIdentity(page);
+  await page.reload();
+
+  await page.getByLabel("Show Microsoft account details").click();
+  const panel = page.locator(".account-popover-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.locator(".account-detail-value")).toHaveText([
+    "admin@contoso.onmicrosoft.com",
+    "tenant-visual"
+  ]);
+  await expect(panel.locator(".account-copy-button")).toHaveCount(2);
+
+  const geometry = await panel.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const values = [...element.querySelectorAll<HTMLElement>(".account-detail-value")];
+    return {
+      left: rect.left,
+      right: rect.right,
+      viewportWidth: window.innerWidth,
+      valueWhiteSpace: values.map((value) => getComputedStyle(value).whiteSpace),
+      valueFits: values.map((value) => value.scrollWidth <= value.clientWidth)
+    };
+  });
+  expect(geometry.left).toBeGreaterThanOrEqual(0);
+  expect(geometry.right).toBeLessThanOrEqual(geometry.viewportWidth);
+  expect(geometry.valueWhiteSpace).toEqual(["nowrap", "nowrap"]);
+  expect(geometry.valueFits).toEqual([true, true]);
+  await testInfo.attach("popup-account-details", { body: await page.screenshot(), contentType: "image/png" });
+  await page.close();
+});
+
 test("settings navigation and diagnostics remain aligned at desktop and compact widths", async ({}, testInfo) => {
   const page = await openExtensionPage("settings.html#diagnostics", { width: 1280, height: 800 });
   await expect(page.getByRole("heading", { name: "Diagnostics" })).toBeVisible();
@@ -110,6 +143,27 @@ async function seedPopupRole(page: Page): Promise<void> {
         eligibleByTarget: { directoryRole: entry },
         activeByTarget: { directoryRole: empty }
       }
+    });
+  });
+}
+
+async function seedPopupIdentity(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+    const token = `${encode({ alg: "none" })}.${encode({
+      aud: "https://graph.microsoft.com",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      tid: "tenant-visual",
+      oid: "principal-visual",
+      preferred_username: "admin@contoso.onmicrosoft.com"
+    })}.signature`;
+    await chrome.storage.session.set({
+      graphToken: token,
+      tokenTimestamp: Date.now(),
+      tokenSource: "portal"
     });
   });
 }

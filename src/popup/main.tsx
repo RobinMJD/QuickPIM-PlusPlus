@@ -35,9 +35,13 @@ import {
   getRowActionState,
   mergeEligibleWithActive,
   getPortalUrlForTab,
+  getPopupTokenSourceStatuses,
+  getPopupTokenStatusSummary,
   tabLabel,
   tokenStatusText,
   tokenStatusTone,
+  type PopupTokenSourceStatus,
+  type PopupTokenStatusSummary,
   type QuickFilter,
   type PopupTab,
   type RoleTab
@@ -73,7 +77,7 @@ import {
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { getActivationItemIdentity } from "../lib/activationIdentity";
-import { getIdentityContext } from "../lib/identityContext";
+import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
 import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
@@ -404,6 +408,14 @@ function PopupApp() {
   const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
   const identityContext = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
+  const tokenSourceStatuses = useMemo(
+    () => getPopupTokenSourceStatuses(enabledRoleFeatures, tokenStatus),
+    [enabledRoleFeatures.join("|"), tokenStatus]
+  );
+  const tokenStatusSummary = useMemo(
+    () => getPopupTokenStatusSummary(tokenSourceStatuses, tokenStatus !== null),
+    [tokenSourceStatuses, tokenStatus]
+  );
   const showInitialAccessState = hasActivationDataLoaded
     && !isLoading
     && !isRefreshing
@@ -1901,10 +1913,6 @@ function PopupApp() {
     return results.filter(Boolean).length;
   }
 
-  function openPortalForCurrentTab() {
-    void openPortalForTarget(tab);
-  }
-
   async function openSettingsSection(section: "access" | "bundles" | "preferences") {
     await flushPopupDraft();
     const url = chrome.runtime.getURL(`settings.html#${section}`);
@@ -1941,8 +1949,6 @@ function PopupApp() {
 
   const activeTabIsVisible = visibleTabs.includes(tab);
   const currentRoleTab = activeTabIsVisible && roleTabs.includes(tab as RoleTab) ? tab as RoleTab : undefined;
-  const portalUrl = activeTabIsVisible ? getPortalUrlForTab(tab) : undefined;
-  const portalLabel = currentRoleTab ? tabLabel(currentRoleTab) : "Microsoft Entra";
   const manualRefreshTargets: AccessSetupTarget[] = enabledRoleFeatures;
   const isPortalInteractionRequired = portalRecoveryStatus.state === "interactionRequired";
   const manualRefreshLabel = isPortalInteractionRequired
@@ -1960,48 +1966,42 @@ function PopupApp() {
             <p>
               {isLoading ? null : showInitialAccessState ? "Ready to load roles" : `${activatableItemCount} eligible items${isRefreshing ? " so far" : ""}`}
             </p>
-            {identityContext.label ? <p className="identity-context" title={identityContext.detail}>{identityContext.label}</p> : null}
           </div>
         </div>
-        <div className="status-stack">
-          <TokenPill label="Graph" status={tokenStatus?.graph} />
-          <TokenPill label="Azure" status={tokenStatus?.azureManagement} />
-          <div className="header-actions" aria-label="Popup actions">
-            <button
-              className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
-              onClick={() => {
-                if (isPortalInteractionRequired) {
-                  void continueMicrosoftSignIn();
-                  return;
-                }
-                if (showInitialAccessState && enabledRoleFeatures.length) {
-                  setIsRefreshing(true);
-                  setTab(enabledRoleFeatures[0]);
-                }
-                void refresh({
-                  force: true,
-                  showLoading: false,
-                  targets: manualRefreshTargets,
-                  recoverMissingPortalAccess: true
-                });
-              }}
-              disabled={isLoading || isRefreshing}
-              title={manualRefreshLabel}
-              aria-label={manualRefreshLabel}
-            >
-              <RefreshIcon />
-              {refreshSuccessKey ? (
-                <span className="refresh-success-indicator" key={refreshSuccessKey} aria-label="Refresh completed">
-                  <CheckIcon />
-                </span>
-              ) : null}
-            </button>
-            {portalUrl ? (
-              <button className="btn icon-btn" onClick={openPortalForCurrentTab} title={`Open ${portalLabel} in Microsoft Entra`} aria-label={`Open ${portalLabel} in Microsoft Entra`}>
-                <LinkIcon />
-              </button>
+        <div className="header-account-slot">
+          <AccountMenu identity={identityContext} />
+        </div>
+        <div className="header-actions" aria-label="Popup actions">
+          <TokenStatusMenu sources={tokenSourceStatuses} summary={tokenStatusSummary} />
+          <button
+            className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
+            onClick={() => {
+              if (isPortalInteractionRequired) {
+                void continueMicrosoftSignIn();
+                return;
+              }
+              if (showInitialAccessState && enabledRoleFeatures.length) {
+                setIsRefreshing(true);
+                setTab(enabledRoleFeatures[0]);
+              }
+              void refresh({
+                force: true,
+                showLoading: false,
+                targets: manualRefreshTargets,
+                recoverMissingPortalAccess: true
+              });
+            }}
+            disabled={isLoading || isRefreshing || manualRefreshTargets.length === 0}
+            title={manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
+            aria-label={manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
+          >
+            <RefreshIcon />
+            {refreshSuccessKey ? (
+              <span className="refresh-success-indicator" key={refreshSuccessKey} aria-label="Refresh completed">
+                <CheckIcon />
+              </span>
             ) : null}
-          </div>
+          </button>
         </div>
       </header>
 
@@ -2023,32 +2023,47 @@ function PopupApp() {
 
       {!showInitialAccessState && visibleTabs.length ? (
         <nav className="tab-bar" role="tablist" aria-label="Role types">
-          {visibleTabs.map((visibleTab) => (
-            <button
-              id={`popup-tab-${visibleTab}`}
-              className={`tab-button ${tab === visibleTab ? "active" : ""}`}
-              onClick={() => setTab(visibleTab)}
-              onKeyDown={(event) => {
-                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
-                event.preventDefault();
-                const currentIndex = visibleTabs.indexOf(visibleTab);
-                const nextIndex = event.key === "Home"
-                  ? 0
-                  : event.key === "End"
-                    ? visibleTabs.length - 1
-                    : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + visibleTabs.length) % visibleTabs.length;
-                const nextTab = visibleTabs[nextIndex];
-                setTab(nextTab);
-                window.requestAnimationFrame(() => document.getElementById(`popup-tab-${nextTab}`)?.focus());
-              }}
-              key={visibleTab}
-              role="tab"
-              aria-selected={tab === visibleTab}
-              aria-controls="popup-tab-panel"
-            >
-              {tabLabel(visibleTab)}
-            </button>
-          ))}
+          {visibleTabs.map((visibleTab) => {
+            const selected = tab === visibleTab;
+            const selectedPortalUrl = selected ? getPortalUrlForTab(visibleTab) : undefined;
+            return (
+              <div className="tab-slot" role="presentation" key={visibleTab}>
+                <button
+                  id={`popup-tab-${visibleTab}`}
+                  className={`tab-button ${selected ? "active" : ""} ${selectedPortalUrl ? "has-portal-action" : ""}`}
+                  onClick={() => setTab(visibleTab)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+                    event.preventDefault();
+                    const currentIndex = visibleTabs.indexOf(visibleTab);
+                    const nextIndex = event.key === "Home"
+                      ? 0
+                      : event.key === "End"
+                        ? visibleTabs.length - 1
+                        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + visibleTabs.length) % visibleTabs.length;
+                    const nextTab = visibleTabs[nextIndex];
+                    setTab(nextTab);
+                    window.requestAnimationFrame(() => document.getElementById(`popup-tab-${nextTab}`)?.focus());
+                  }}
+                  role="tab"
+                  aria-selected={selected}
+                  aria-controls="popup-tab-panel"
+                >
+                  {tabLabel(visibleTab)}
+                </button>
+                {selectedPortalUrl ? (
+                  <button
+                    className="tab-portal-button"
+                    onClick={() => void openPortalForTarget(visibleTab)}
+                    title={`Open ${tabLabel(visibleTab)} in Microsoft Entra`}
+                    aria-label={`Open ${tabLabel(visibleTab)} in Microsoft Entra`}
+                  >
+                    <OpenExternalIcon />
+                  </button>
+                ) : null}
+              </div>
+            );
+          })}
         </nav>
       ) : null}
 
@@ -2307,8 +2322,139 @@ function InitialAccessState({
   );
 }
 
-function TokenPill({ label, status }: { label: string; status?: TokenStatus["graph"] }) {
-  return <span className={`token-pill ${tokenStatusTone(status)}`}>{tokenStatusText(label, status)}</span>;
+type AccountCopyField = "account" | "tenant";
+
+function AccountMenu({ identity }: { identity: IdentityContext }) {
+  const account = identity.principalName || identity.principalId || "No account captured";
+  const tenant = identity.tenantId || "Not available";
+  const [copyState, setCopyState] = useState<{ field: AccountCopyField; success: boolean } | null>(null);
+  const copyStateTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => {
+    if (copyStateTimer.current !== undefined) {
+      window.clearTimeout(copyStateTimer.current);
+    }
+  }, []);
+
+  async function copyAccountValue(field: AccountCopyField, value: string) {
+    if (copyStateTimer.current !== undefined) {
+      window.clearTimeout(copyStateTimer.current);
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyState({ field, success: true });
+    } catch {
+      setCopyState({ field, success: false });
+    }
+    copyStateTimer.current = window.setTimeout(() => {
+      setCopyState(null);
+      copyStateTimer.current = undefined;
+    }, 1600);
+  }
+
+  return (
+    <details className="header-popover account-popover" name="quickpim-header-popover">
+      <summary
+        className={`header-account-button ${identity.identityCount ? "available" : "unavailable"}`}
+        title="Show Microsoft account details"
+        aria-label="Show Microsoft account details"
+      >
+        <AccountIcon />
+      </summary>
+      <div className="header-popover-panel account-popover-panel">
+        <AccountDetailRow
+          field="account"
+          label="Account"
+          value={account}
+          copyState={copyState}
+          onCopy={copyAccountValue}
+        />
+        <AccountDetailRow
+          field="tenant"
+          label="Tenant ID"
+          value={tenant}
+          copyState={copyState}
+          onCopy={copyAccountValue}
+        />
+        <span className="visually-hidden" role="status" aria-live="polite">
+          {copyState ? `${copyState.success ? "Copied" : "Could not copy"} ${copyFieldLabel(copyState.field)}.` : ""}
+        </span>
+        {identity.mismatch ? <span className="popover-warning">Multiple Microsoft identities detected.</span> : null}
+      </div>
+    </details>
+  );
+}
+
+function AccountDetailRow({
+  field,
+  label,
+  value,
+  copyState,
+  onCopy
+}: {
+  field: AccountCopyField;
+  label: string;
+  value: string;
+  copyState: { field: AccountCopyField; success: boolean } | null;
+  onCopy: (field: AccountCopyField, value: string) => Promise<void>;
+}) {
+  const isCopied = copyState?.field === field && copyState.success;
+  const hasCopyError = copyState?.field === field && !copyState.success;
+  const actionLabel = isCopied ? `${label} copied` : hasCopyError ? `Retry copying ${label}` : `Copy ${label}`;
+  return (
+    <div className="account-detail-row">
+      <span className="popover-label">{label}</span>
+      <span className="account-detail-value" title={value}>{value}</span>
+      <button
+        type="button"
+        className={`account-copy-button ${isCopied ? "copied" : ""} ${hasCopyError ? "error" : ""}`}
+        onClick={() => void onCopy(field, value)}
+        title={actionLabel}
+        aria-label={actionLabel}
+      >
+        {isCopied ? <SmallCheckIcon /> : <CopyIcon />}
+      </button>
+    </div>
+  );
+}
+
+function copyFieldLabel(field: AccountCopyField): string {
+  return field === "account" ? "account" : "tenant ID";
+}
+
+function TokenStatusMenu({
+  sources,
+  summary
+}: {
+  sources: PopupTokenSourceStatus[];
+  summary: PopupTokenStatusSummary;
+}) {
+  return (
+    <details className="header-popover token-status-popover" name="quickpim-header-popover">
+      <summary
+        className={`token-status-summary ${summary.tone}`}
+        title="Show token status"
+        aria-label={`Token status: ${summary.label}. Show details`}
+      >
+        <span>{summary.label}</span>
+        <ChevronDownIcon />
+      </summary>
+      <div className="header-popover-panel token-status-panel">
+        {sources.map((source) => (
+          <div
+            className={`token-source-row ${source.needed ? tokenStatusTone(source.status) : "not-needed"}`}
+            key={source.id}
+          >
+            <span className="token-source-label">{source.label}</span>
+            {" "}
+            <span className="token-source-value">
+              {source.needed ? tokenStatusText(source.label, source.status).replace(`${source.label} `, "") : "Not needed"}
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 function LoadingState() {
@@ -2602,11 +2748,45 @@ function SignInIcon() {
   );
 }
 
-function LinkIcon() {
+function AccountIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
-      <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
-      <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1" />
+      <circle cx="12" cy="8" r="3" />
+      <path d="M5 20a7 7 0 0 1 14 0" />
+    </svg>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="account-copy-icon">
+      <rect x="9" y="9" width="10" height="10" rx="2" />
+      <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
+    </svg>
+  );
+}
+
+function SmallCheckIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="account-copy-icon">
+      <path d="m5 12 4 4L19 6" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="token-summary-chevron">
+      <path d="m7 10 5 5 5-5" />
+    </svg>
+  );
+}
+
+function OpenExternalIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="tab-portal-icon">
+      <path d="M5 19 19 5" />
+      <path d="M9 5h10v10" />
     </svg>
   );
 }

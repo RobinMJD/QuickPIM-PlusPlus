@@ -26,6 +26,8 @@ import {
   getActivatableItems,
   getDeactivatableItems,
   getActiveStatusTitle,
+  getPopupTokenSourceStatuses,
+  getPopupTokenStatusSummary,
   isHighPrivilegeItem,
   mergeEligibleWithActive,
   tokenStatusText
@@ -412,6 +414,27 @@ describe("popup model helpers", () => {
     expect(tokenStatusText("Graph", { hasToken: true, tokenAge: 1, isExpired: false })).toBe("Graph ready (1 min ago)");
     expect(tokenStatusText("Azure", { hasToken: false })).toBe("Azure access needed");
     expect(tokenStatusText("Graph", { hasToken: true, isExpired: true })).toBe("Graph refresh needed");
+  });
+
+  test("summarizes only token sources required by enabled role features", () => {
+    const tokenStatus = {
+      graph: { hasToken: true, tokenAge: 3, isExpired: false },
+      graphTargets: {
+        pimGroup: { hasToken: true, tokenAge: 3, isExpired: false }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const sources = getPopupTokenSourceStatuses(["pimGroup"], tokenStatus);
+
+    expect(sources).toMatchObject([
+      { id: "graph", needed: true, status: { hasToken: true } },
+      { id: "azureManagement", needed: false }
+    ]);
+    expect(getPopupTokenStatusSummary(sources, true)).toEqual({ label: "Access ready", tone: "ok" });
+    expect(getPopupTokenStatusSummary(getPopupTokenSourceStatuses([], tokenStatus), true)).toEqual({
+      label: "Access not needed",
+      tone: "idle"
+    });
   });
 
   test("explains Microsoft's five-minute deactivation minimum", () => {
