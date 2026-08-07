@@ -167,7 +167,7 @@ jobs:
 
   microsoft-edge-add-ons:
     needs: [verify-package, github-release]
-    if: ${{ always() && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != env.RELEASE_TAG && (github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
+    if: ${{ always() && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) && (github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
     runs-on: ubuntu-latest
     environment: microsoft-edge-add-ons
     permissions:

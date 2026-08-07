@@ -54,7 +54,10 @@ describe("Microsoft Edge Add-ons publisher", () => {
     expect(workflow).toContain("EDGE_ADDONS_CLIENT_ID");
     expect(workflow).toContain("EDGE_ADDONS_API_KEY");
     expect(workflow).toContain("EDGE_ADDONS_PRODUCT_ID");
-    expect(workflow).toContain("EDGE_ADDONS_MANUAL_SUBMISSION_TAG != env.RELEASE_TAG");
+    expect(workflow).toContain(
+      "EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name)"
+    );
+    expect(workflow).not.toContain("EDGE_ADDONS_MANUAL_SUBMISSION_TAG != env.RELEASE_TAG");
     expect(workflow).toContain("quickpim-plusplus-${{ env.RELEASE_TAG }}-edge-addons.zip");
   });
 });
