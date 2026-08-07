@@ -4,7 +4,7 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.11.0**
+Current version: **v2.11.1**
 
 Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
 
@@ -188,7 +188,12 @@ Run `node scripts/check-version-sync.mjs` to verify package, lockfile, manifest,
 
 ## Release Automation
 
-Pushing a `v*` tag checks the exact tagged commit, reruns type checking, tests, dependency audit, and the production build, creates an immutable GitHub release ZIP, and submits that same verified ZIP to the Chrome Web Store automatically.
+Pushing a `v*` tag checks the exact tagged commit, reruns type checking, tests, dependency audit, and the production build, then creates two verified packages from the same `dist/` payload:
+
+- `release/quickpim-plusplus-vX.Y.Z-chrome-webstore.zip`
+- `release/quickpim-plusplus-vX.Y.Z-edge-addons.zip`
+
+Both packages are attached to the immutable GitHub release. The Chrome package is submitted to the Chrome Web Store and the Edge package is submitted to Microsoft Edge Add-ons. CI also retains both packages together as one build artifact.
 
 Chrome Web Store publishing requires these GitHub repository secrets and fails visibly instead of silently skipping deployment when any value is missing:
 
@@ -201,6 +206,18 @@ Chrome Web Store publishing requires these GitHub repository secrets and fails v
 To create the credentials, enable the Chrome Web Store API in Google Cloud, create an OAuth web client, and generate a refresh token for the `https://www.googleapis.com/auth/chromewebstore` scope. Google documents the same flow in the official Chrome Web Store API guide: <https://developer.chrome.com/docs/webstore/using-api>.
 
 Once the secrets are present, the release workflow uploads `release/quickpim-plusplus-vX.Y.Z-chrome-webstore.zip` to the existing Chrome Web Store item and calls the publish endpoint, which submits the update for Chrome review.
+
+Microsoft Edge Add-ons update publishing uses Partner Center Publish API v1.1 and these GitHub environment secrets:
+
+- `EDGE_ADDONS_CLIENT_ID`
+- `EDGE_ADDONS_API_KEY`
+- `EDGE_ADDONS_PRODUCT_ID`
+
+The first Edge listing and any listing-metadata changes must be completed in Partner Center because Microsoft exposes its Publish API only for package updates to an existing product. After the first listing exists, tagged releases upload `release/quickpim-plusplus-vX.Y.Z-edge-addons.zip` and submit it for Edge certification automatically. The approved listing copy and reusable images are kept under `store/`.
+
+When the first version is already submitted manually, set the repository variable `EDGE_ADDONS_MANUAL_SUBMISSION_TAG` to that exact tag so its release workflow does not attempt a duplicate API submission. Later tags are unaffected and publish to Edge automatically.
+
+Run `npm run package:stores` after a production build to generate and verify both local upload packages. Run `npm run assets:stores` only when the tracked listing screenshots or branding assets need to be regenerated.
 
 ## Manual Verification
 
@@ -237,6 +254,13 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.11.1
+
+- Generates separate, verified Chrome Web Store and Microsoft Edge Add-ons packages from the same production build.
+- Adds Microsoft Edge Add-ons Publish API v1.1 deployment to tagged releases, with independent Chrome, Edge, and GitHub retry targets.
+- Keeps approved English listing metadata, certification instructions, screenshots, icons, and promotional artwork under `store/`.
+- Updates CI and GitHub releases to retain both browser-store packages together and reject version or archive-layout mismatches.
 
 ### v2.11.0
 

@@ -65,6 +65,7 @@ describe("release workflow Chrome Web Store publishing", () => {
     expect(workflow).toContain("CHROME_WEBSTORE_CLIENT_ID");
     expect(workflow).toContain("CHROME_WEBSTORE_REFRESH_TOKEN");
     expect(workflow).toContain("scripts/publish-chrome-webstore.mjs");
+    expect(workflow).toContain("browser-store-zips-${{ env.RELEASE_TAG }}");
     expect(workflow).toContain("npm test");
     expect(workflow).toContain("npm audit --audit-level=low");
     expect(workflow).not.toContain("--clobber");

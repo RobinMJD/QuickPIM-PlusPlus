@@ -51,17 +51,16 @@ jobs:
       - name: Audit
         run: npm audit --audit-level=low
 
-      - name: Package Web Store ZIP
-        run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          mkdir -p release
-          (cd dist && zip -qr "../release/quickpim-plusplus-v${VERSION}-chrome-webstore.zip" . -x "*.DS_Store")
+      - name: Package and verify both Store ZIPs
+        run: npm run package:stores
 
-      - name: Upload Web Store ZIP artifact
+      - name: Upload Store ZIP artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: chrome-webstore-zip
-          path: release/quickpim-plusplus-v*-chrome-webstore.zip
+          name: browser-store-zips
+          path: |
+            release/quickpim-plusplus-v*-chrome-webstore.zip
+            release/quickpim-plusplus-v*-edge-addons.zip
           if-no-files-found: error
 
       - name: Upload browser QA report

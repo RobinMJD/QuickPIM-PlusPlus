@@ -1,6 +1,6 @@
 {
   "name": "quickpim-plusplus",
-  "version": "2.11.0",
+  "version": "2.11.1",
   "private": true,
   "packageManager": "npm@11.6.2",
   "engines": {
@@ -10,6 +10,8 @@
   "scripts": {
     "type-check": "tsc --noEmit",
     "build": "tsc --noEmit && vite build",
+    "assets:stores": "node scripts/generate-store-assets.mjs",
+    "package:stores": "node scripts/package-stores.mjs",
     "test": "vitest run --maxWorkers=1 --no-file-parallelism",
     "test:watch": "vitest",
     "test:e2e": "playwright test"

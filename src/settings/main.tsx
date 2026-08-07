@@ -1691,10 +1691,19 @@ function DiagnosticsPanel({
       dataCache.active,
       ...Object.values(dataCache.eligibleByTarget || {}),
       ...Object.values(dataCache.activeByTarget || {})
-    ].flatMap((entry) => entry?.diagnostics || []);
+    ]
+      .flatMap((entry) => entry?.diagnostics || [])
+      .sort((left, right) => right.checkedAt.localeCompare(left.checkedAt));
     const uniqueDiagnostics = new Map<string, (typeof allDiagnostics)[number]>();
     for (const diagnostic of allDiagnostics) {
-      const key = JSON.stringify(diagnostic);
+      const key = JSON.stringify([
+        diagnostic.target,
+        diagnostic.operation || "",
+        diagnostic.endpointLabel || "",
+        diagnostic.success,
+        diagnostic.failureKind || "",
+        diagnostic.error || ""
+      ]);
       if (!uniqueDiagnostics.has(key)) uniqueDiagnostics.set(key, diagnostic);
     }
     return [...uniqueDiagnostics.values()];

@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.11.0.
+Reviewed for v2.11.1.
 
 ## Threat Model
 
@@ -54,6 +54,8 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Build tooling is kept in `devDependencies`.
 - `npm audit --audit-level=low` is part of CI and the exact-tag release gate.
 - Release workflows pin third-party actions to immutable commit SHAs, rerun tests and audit, and refuse to overwrite a different existing release asset.
+- Chrome Web Store OAuth credentials and Microsoft Edge Add-ons API credentials are read only from protected GitHub environment secrets. They are never embedded in the extension package, repository, release assets, or listing metadata.
+- Chrome and Edge packages are generated from the same verified `dist/` payload, checked for a root manifest, matching version, path traversal, and unwanted metadata before publication.
 - CI loads the built MV3 extension in Chromium and checks popup keyboard behavior, fixed-width layout, footer alignment, and responsive Settings diagnostics before packaging.
 - Generated build output, dependencies, and bundled tool runtimes remain ignored by git.
 
