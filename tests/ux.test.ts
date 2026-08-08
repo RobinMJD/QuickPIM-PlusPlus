@@ -22,6 +22,7 @@ import {
   coerceDurationForItems,
   getDurationOptions,
   getRemainingSelectedIdsAfterActivationResults,
+  getRequestReconciliationTargets,
   getPortalUrlForTab,
   getActivatableItems,
   getDeactivatableItems,
@@ -32,7 +33,7 @@ import {
   mergeEligibleWithActive,
   tokenStatusText
 } from "../src/lib/popupModel";
-import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole } from "../src/lib/pim";
+import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole, normalizePimGroup } from "../src/lib/pim";
 import { isPrivilegedAzureRoleDefinition } from "../src/lib/privilegedRoles";
 import { makeTokenStatus } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
@@ -637,6 +638,19 @@ describe("popup model helpers", () => {
     ]);
 
     expect([...remaining]).toEqual(["directoryRole:admin:/"]);
+  });
+
+  test("refreshes targets after successful or outcome-unknown writes", () => {
+    const items = [
+      normalizeDirectoryRole({ roleDefinitionId: "role-1", principalId: "user-1" }),
+      normalizePimGroup({ groupId: "group-1", accessId: "member", principalId: "user-1" })
+    ];
+
+    expect(getRequestReconciliationTargets([
+      { itemId: items[0].id, itemName: "Role", success: true },
+      { itemId: items[1].id, itemName: "Group", success: false, outcomeUnknown: true },
+      { itemId: "azureRole:failed:/", itemName: "Azure", success: false }
+    ], items)).toEqual(["directoryRole", "pimGroup"]);
   });
 
   test("formats token expiry API errors into a short action", () => {

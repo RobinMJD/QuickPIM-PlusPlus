@@ -126,6 +126,43 @@ describe("background request operation journal", () => {
       [REQUEST_OPERATIONS_SESSION_KEY]: [operation]
     });
   });
+
+  test("does not let journal cleanup overwrite an operation started after the initial read", async () => {
+    const staleValue = [{ id: "invalid" }];
+    const data: Record<string, unknown> = { [REQUEST_OPERATIONS_SESSION_KEY]: staleValue };
+    let releaseInitialRead: ((value: Record<string, unknown>) => void) | undefined;
+    let initialReadStarted: (() => void) | undefined;
+    const initialReadReady = new Promise<void>((resolve) => { initialReadStarted = resolve; });
+    let getCount = 0;
+    const storage = {
+      get: vi.fn((key: string) => {
+        getCount += 1;
+        if (getCount === 1) {
+          initialReadStarted?.();
+          return new Promise<Record<string, unknown>>((resolve) => { releaseInitialRead = resolve; });
+        }
+        return Promise.resolve({ [key]: data[key] });
+      }),
+      set: vi.fn(async (value: Record<string, unknown>) => { Object.assign(data, value); }),
+      remove: vi.fn(async (key: string) => { delete data[key]; })
+    };
+
+    const loading = loadRequestOperations({ storage, now: NOW });
+    await initialReadReady;
+    await beginRequestOperation({
+      id: "request_operation_race",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      startedAt: NOW
+    }, { storage, now: NOW });
+    releaseInitialRead?.({ [REQUEST_OPERATIONS_SESSION_KEY]: staleValue });
+    await loading;
+
+    expect(await loadRequestOperations({ storage, now: NOW })).toEqual([
+      expect.objectContaining({ id: "request_operation_race", state: "running" })
+    ]);
+  });
 });
 
 function makeStorage(data: Record<string, unknown>) {

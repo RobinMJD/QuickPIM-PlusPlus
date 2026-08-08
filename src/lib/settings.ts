@@ -12,6 +12,7 @@ import type {
   SortDirection,
   SortMode
 } from "./types";
+import { createStorageMutationLock } from "./storageMutation";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
 import {
@@ -34,6 +35,7 @@ const MAX_BUNDLE_ITEMS = 100;
 const MAX_BUNDLE_NAME_LENGTH = 80;
 export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "pimGroup", "azureRole"];
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
+const withSettingsMutationLock = createStorageMutationLock("quickPimSettingsMutation");
 
 export const DEFAULT_SETTINGS: QuickPimSettings = {
   version: 2,
@@ -96,8 +98,15 @@ export async function loadSettings(): Promise<QuickPimSettings> {
   return mergeSettings(result[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined);
 }
 
-export async function saveSettings(settings: QuickPimSettings): Promise<void> {
-  await chrome.storage.local.set({ [SETTINGS_KEY]: mergeSettings(settings) });
+export async function mutateSettings(
+  mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
+): Promise<QuickPimSettings> {
+  return withSettingsMutationLock(async () => {
+    const current = await loadSettings();
+    const next = mergeSettings(await mutator(current));
+    await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+    return next;
+  });
 }
 
 export function getDisplayName(

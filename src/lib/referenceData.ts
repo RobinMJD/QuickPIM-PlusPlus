@@ -1,11 +1,12 @@
 import type { ActivationItem, ReferenceDataCache, ReferenceValue } from "./types";
+import { createStorageMutationLock } from "./storageMutation";
 
 export const REFERENCE_DATA_KEY = "quickPimReferenceData.v1";
 
 const MAX_REFERENCE_ITEMS = 300;
 const MAX_REFERENCE_KEY_LENGTH = 256;
 const MAX_REFERENCE_NAME_LENGTH = 120;
-let referenceDataMutationQueue: Promise<void> = Promise.resolve();
+const withReferenceDataMutationLock = createStorageMutationLock("quickPimReferenceDataMutation");
 
 export const DEFAULT_REFERENCE_DATA: ReferenceDataCache = {
   version: 1,
@@ -24,21 +25,17 @@ export async function loadReferenceData(): Promise<ReferenceDataCache> {
 
 export async function saveReferenceData(referenceData: ReferenceDataCache): Promise<void> {
   const incoming = mergeReferenceData(referenceData);
-  const mutation = referenceDataMutationQueue.then(async () => {
+  await withReferenceDataMutationLock(async () => {
     const current = await loadReferenceData();
     const next = mergeReferenceDataForSave(current, incoming);
     if (JSON.stringify(current) !== JSON.stringify(next)) {
       await chrome.storage.local.set({ [REFERENCE_DATA_KEY]: next });
     }
   });
-  referenceDataMutationQueue = mutation.catch(() => undefined);
-  await mutation;
 }
 
 export async function clearReferenceData(): Promise<void> {
-  const mutation = referenceDataMutationQueue.then(() => chrome.storage.local.remove(REFERENCE_DATA_KEY));
-  referenceDataMutationQueue = mutation.catch(() => undefined);
-  await mutation;
+  await withReferenceDataMutationLock(() => chrome.storage.local.remove(REFERENCE_DATA_KEY));
 }
 
 export function mergeReferenceDataForSave(

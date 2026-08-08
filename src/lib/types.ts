@@ -327,6 +327,7 @@ export interface ActivationResult {
   requestId?: string;
   error?: string;
   accessRecoveryTarget?: AccessSetupTarget;
+  outcomeUnknown?: boolean;
 }
 
 export interface ActivationResponse {

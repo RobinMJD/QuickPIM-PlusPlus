@@ -105,10 +105,24 @@ export function summarizeAccessDiagnostics(diagnostics: AccessDiagnostic[]): {
   lastFailure?: AccessDiagnostic;
 } {
   const sorted = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
+  const latestSuccessByOperation = new Map<string, AccessDiagnostic>();
+  for (const diagnostic of sorted) {
+    if (diagnostic.success && !latestSuccessByOperation.has(diagnosticOperationKey(diagnostic))) {
+      latestSuccessByOperation.set(diagnosticOperationKey(diagnostic), diagnostic);
+    }
+  }
   return {
     lastSuccess: sorted.find((item) => item.success),
-    lastFailure: sorted.find((item) => !item.success)
+    lastFailure: sorted.find((item) => {
+      if (item.success) return false;
+      const recoveredAt = latestSuccessByOperation.get(diagnosticOperationKey(item))?.checkedAt;
+      return !recoveredAt || recoveredAt <= item.checkedAt;
+    })
   };
+}
+
+function diagnosticOperationKey(diagnostic: AccessDiagnostic): string {
+  return `${diagnostic.operation || "unknown"}|${diagnostic.endpointLabel || ""}`;
 }
 
 export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined): string {

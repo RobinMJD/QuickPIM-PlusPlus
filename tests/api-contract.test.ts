@@ -26,8 +26,20 @@ describe("Microsoft PIM API contracts", () => {
 
   test("keeps Azure roles from successful subscriptions when another subscription fails", () => {
     expect(background).toContain("assertAtLeastOneSubscriptionSucceeded");
+    expect(background).toContain('graphApiUrl("/v1.0/$batch")');
+    expect(background).toContain("GRAPH_BATCH_REQUEST_LIMIT = 20");
     expect(background).toContain('results.every((result) => result.status === "rejected")');
     expect(background).not.toContain("assertAllSubscriptionsSucceeded");
+  });
+
+  test("does not reset extension storage while background refresh is writing caches", () => {
+    expect(background).toContain("|| backgroundPreRefreshInFlight");
+  });
+
+  test("contains failures from fire-and-forget service worker tasks", () => {
+    expect(background).toContain("function runBestEffort(operation: Promise<unknown>): void");
+    expect(background).not.toContain("void runTrackedRequestMaintenance();");
+    expect(background).not.toContain("void closeExpiredPortalRecoveryTabs(getPortalRecoveryApis());");
   });
 
   test("tracks submitted requests with bounded Microsoft status checks", () => {

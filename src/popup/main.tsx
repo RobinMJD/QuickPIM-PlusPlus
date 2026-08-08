@@ -32,6 +32,7 @@ import {
   getBundlePreflight,
   getDurationOptions,
   getRemainingSelectedIdsAfterActivationResults,
+  getRequestReconciliationTargets,
   getRowActionState,
   mergeEligibleWithActive,
   getPortalUrlForTab,
@@ -58,9 +59,9 @@ import {
   getDefaultSortDirection,
   getScopeLabel,
   loadSettings,
+  mutateSettings,
   recordActivityResults,
   recordActivations,
-  saveSettings,
   sortItems
 } from "../lib/settings";
 import {
@@ -1256,7 +1257,16 @@ function PopupApp() {
       await Promise.all([
         saveDataCache(progressiveCache),
         saveReferenceData(progressiveReferenceData),
-        ...(nextSettings === loadedSettings ? [] : [saveSettings(nextSettings)])
+        ...(nextSettings === loadedSettings ? [] : [
+          mutateSettings((latest) => ({
+            ...latest,
+            preferences: {
+              ...latest.preferences,
+              enabledFeatures: [...nextSettings.preferences.enabledFeatures],
+              autoEnabledFeaturesInitialized: true
+            }
+          })).then((saved) => setSettings(saved))
+        ])
       ]);
       const nextAccessCapabilities = buildAccessCapabilityItems(progressiveTokens, progressiveCache, finalEnabledRoleFeatures);
       const completedRecoveryTargets = portalTokenRecoveryTargets.filter((target) => successfulRefreshTargets.has(target));
@@ -1464,6 +1474,8 @@ function PopupApp() {
       });
       setMessage(formatRequestConfirmation(operationLabel, successCount, response.errors.length));
 
+      const reconciliationTargets = getRequestReconciliationTargets(response.results, operationItems);
+
       if (failedSelectionIds.length) {
         setRequestMode(operation.action);
         setIsActivationReviewOpen(true);
@@ -1481,12 +1493,12 @@ function PopupApp() {
         await clearPopupDraft();
       }
 
-      if (successCount) {
+      if (reconciliationTargets.length) {
         await refresh({
           force: true,
           showLoading: false,
           suppressMessage: true,
-          targets: operation.targets
+          targets: reconciliationTargets
         });
       }
 
@@ -1687,12 +1699,13 @@ function PopupApp() {
       } else {
         setActivationFailureNotice(null);
       }
-      if (successItems.length) {
+      const reconciliationTargets = getRequestReconciliationTargets(response.results, activatableItems);
+      if (reconciliationTargets.length) {
         await refresh({
           force: true,
           showLoading: false,
           suppressMessage: true,
-          targets: [...new Set(successItems.map((item) => item.type))]
+          targets: reconciliationTargets
         });
       }
       if (remainingSelectedIds.size) {
@@ -1842,12 +1855,13 @@ function PopupApp() {
       } else {
         setActivationFailureNotice(null);
       }
-      if (successItems.length) {
+      const reconciliationTargets = getRequestReconciliationTargets(response.results, deactivatableItems);
+      if (reconciliationTargets.length) {
         await refresh({
           force: true,
           showLoading: false,
           suppressMessage: true,
-          targets: [...new Set(successItems.map((item) => item.type))]
+          targets: reconciliationTargets
         });
       }
       if (remainingSelectedIds.size) {
@@ -1980,9 +1994,7 @@ function PopupApp() {
   async function mutatePopupSettings(updater: (latest: QuickPimSettings) => QuickPimSettings): Promise<QuickPimSettings> {
     let result = settings;
     const operation = settingsMutationQueue.current.then(async () => {
-      const latest = await loadSettings();
-      result = updater(latest);
-      await saveSettings(result);
+      result = await mutateSettings(updater);
       setSettings(result);
     });
     settingsMutationQueue.current = operation.catch(() => undefined);

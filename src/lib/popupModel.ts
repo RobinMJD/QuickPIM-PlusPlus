@@ -133,6 +133,25 @@ export function getRemainingSelectedIdsAfterActivationResults(
   return new Set([...selectedIds].filter((itemId) => !successfulIds.has(itemId)));
 }
 
+export function getRequestReconciliationTargets(
+  results: ActivationResult[],
+  items: ActivationItem[]
+): AccessSetupTarget[] {
+  const itemTargets = new Map(items.map((item) => [item.id, item.type]));
+  const requested = new Set<AccessSetupTarget>();
+  for (const result of results) {
+    if (!result.success && !result.outcomeUnknown) {
+      continue;
+    }
+    const target = itemTargets.get(result.itemId);
+    if (target) {
+      requested.add(target);
+    }
+  }
+  return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
+    .filter((target) => requested.has(target));
+}
+
 export function getDurationOptions(items: ActivationItem[]): Array<{ value: number; label: string }> {
   const activatableItems = getActivatableItems(items);
   if (!activatableItems.length) {

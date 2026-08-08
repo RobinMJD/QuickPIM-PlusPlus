@@ -26,7 +26,7 @@ import {
   getScopeLabel,
   loadSettings,
   mergeSettings,
-  saveSettings
+  mutateSettings
 } from "../lib/settings";
 import {
   clearReferenceData,
@@ -591,13 +591,13 @@ function SettingsApp() {
     const sectionsToSave = changedSections.filter((key) => JSON.stringify(next[key]) !== JSON.stringify(settings[key]));
     const operation = settingsMutationQueue.current.then(async () => {
       try {
-        const latest = await loadSettings();
-        const mergedInput: QuickPimSettings = { ...latest };
-        for (const key of sectionsToSave) {
-          (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
-        }
-        const merged = mergeSettings(mergedInput);
-        await saveSettings(merged);
+        const merged = await mutateSettings((latest) => {
+          const mergedInput: QuickPimSettings = { ...latest };
+          for (const key of sectionsToSave) {
+            (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
+          }
+          return mergedInput;
+        });
         setSettings(merged);
         if (!exportTextDirty.current) {
           replaceExportText(JSON.stringify(merged, null, 2));

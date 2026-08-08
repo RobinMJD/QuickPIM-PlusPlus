@@ -27,7 +27,9 @@ export async function loadRequestOperations(
   const storedValue = result[REQUEST_OPERATIONS_SESSION_KEY];
   const operations = sanitizeRequestOperations(storedValue, now);
   if (Array.isArray(storedValue) && JSON.stringify(operations) !== JSON.stringify(storedValue)) {
-    await saveOperations(storage, operations);
+    // Re-read inside the mutation queue so cleanup cannot overwrite an operation
+    // that started after this read completed.
+    await mutateOperations(storage, now, (current) => current);
   }
   return operations;
 }
@@ -185,7 +187,8 @@ function sanitizeActivationResult(value: unknown): ActivationResult | undefined 
     success: value.success,
     ...(typeof value.requestId === "string" ? { requestId: value.requestId.slice(0, 512) } : {}),
     ...(typeof value.error === "string" ? { error: value.error.slice(0, 1_000) } : {}),
-    ...(accessRecoveryTarget ? { accessRecoveryTarget } : {})
+    ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
+    ...(value.outcomeUnknown === true ? { outcomeUnknown: true } : {})
   };
 }
 

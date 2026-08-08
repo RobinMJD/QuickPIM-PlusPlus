@@ -118,6 +118,12 @@ import {
   formatExtensionDuration
 } from "./lib/requestExtension";
 import {
+  formatUnknownWriteOutcome,
+  isAmbiguousMicrosoftWriteFailure,
+  isTransientMicrosoftFailure
+} from "./lib/requestOutcome";
+import { retryOnceIf } from "./lib/retry";
+import {
   clearStoredTokens,
   getStoredTokensFromSession,
   removeStoredTokenGroupsIfMatching,
@@ -171,6 +177,14 @@ interface AzureRoleDefinitionInfo {
   isPrivileged?: boolean;
 }
 
+interface GraphBatchResponse<T> {
+  responses?: Array<{
+    id?: string;
+    status?: number;
+    body?: T;
+  }>;
+}
+
 const REQUEST_HEADER_OPTIONS = ["requestHeaders", "extraHeaders"];
 const MICROSOFT_API_READ_TIMEOUT_MS = 12_000;
 const MICROSOFT_API_WRITE_TIMEOUT_MS = 45_000;
@@ -178,8 +192,11 @@ const MICROSOFT_API_WRITE_TOKEN_MIN_VALIDITY_MS = 5 * 60_000;
 const REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 90_000;
 const REQUEST_PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
 const TARGET_SNAPSHOT_TIMEOUT_MS = 22_000;
+const GRAPH_BATCH_REQUEST_LIMIT = 20;
+const TRANSIENT_READ_RETRY_DELAY_MS = 250;
 let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
 let requestTrackingMaintenanceInFlight: Promise<TrackedPimRequestStore> | undefined;
+let backgroundPreRefreshInFlight: Promise<void> | undefined;
 const requestOperationTasks = new Map<string, Promise<ActivationResponse>>();
 const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionResult>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
@@ -206,35 +223,35 @@ chrome.webRequest.onSendHeaders.addListener(
   REQUEST_HEADER_OPTIONS
 );
 
-void initializeBackgroundRefresh();
+runBestEffort(initializeBackgroundRefresh());
 
 chrome.runtime.onInstalled?.addListener(() => {
-  void initializeBackgroundRefresh();
-  void initializeRequestTracking();
+  runBestEffort(initializeBackgroundRefresh());
+  runBestEffort(initializeRequestTracking());
 });
 
 chrome.runtime.onStartup?.addListener(() => {
-  void initializeBackgroundRefresh().then(() => runBackgroundPreRefresh());
-  void initializeRequestTracking();
+  runBestEffort(initializeBackgroundRefresh().then(() => runBackgroundPreRefresh()));
+  runBestEffort(initializeRequestTracking());
 });
 
 chrome.storage.onChanged?.addListener((changes, areaName) => {
   if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
-    void initializeBackgroundRefresh();
-    void initializeRequestTracking();
+    runBestEffort(initializeBackgroundRefresh());
+    runBestEffort(initializeRequestTracking());
   }
   if (areaName === "local" && changes[REQUEST_TRACKING_KEY]) {
-    void initializeRequestTracking();
+    runBestEffort(initializeRequestTracking());
   }
 });
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (alarm.name === PRE_REFRESH_ALARM_NAME) {
-    void runBackgroundPreRefresh();
+    runBestEffort(runBackgroundPreRefresh());
   } else if (alarm.name === REQUEST_TRACKING_ALARM_NAME) {
-    void runTrackedRequestMaintenance();
+    runBestEffort(runTrackedRequestMaintenance());
   } else if (alarm.name === PORTAL_RECOVERY_CLEANUP_ALARM_NAME) {
-    void closeExpiredPortalRecoveryTabs(getPortalRecoveryApis());
+    runBestEffort(closeExpiredPortalRecoveryTabs(getPortalRecoveryApis()));
   }
 });
 
@@ -242,20 +259,20 @@ chrome.notifications?.onClicked?.addListener((notificationId) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  void openTrackedRequestDetails();
-  void chrome.notifications.clear(notificationId);
+  runBestEffort(openTrackedRequestDetails());
+  chrome.notifications.clear(notificationId);
 });
 
 chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  void chrome.notifications.clear(notificationId);
+  chrome.notifications.clear(notificationId);
   if (notificationId.endsWith(":expiry-extend") && buttonIndex === 0) {
-    void runWithServiceWorkerKeepAlive(() => handleExtensionNotificationClick(notificationId));
+    runBestEffort(runWithServiceWorkerKeepAlive(() => handleExtensionNotificationClick(notificationId)));
     return;
   }
-  void openTrackedRequestDetails();
+  runBestEffort(openTrackedRequestDetails());
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -291,6 +308,10 @@ async function initializeBackgroundRefresh(): Promise<void> {
   } catch {
     await syncPreRefreshAlarm(chrome.alarms, true);
   }
+}
+
+function runBestEffort(operation: Promise<unknown>): void {
+  void operation.catch(() => undefined);
 }
 
 async function initializeRequestTracking(): Promise<void> {
@@ -742,6 +763,18 @@ function escapeODataString(value: string): string {
 }
 
 async function runBackgroundPreRefresh(): Promise<void> {
+  if (backgroundPreRefreshInFlight) {
+    return backgroundPreRefreshInFlight;
+  }
+  const refresh = performBackgroundPreRefresh();
+  const refreshWithCleanup = refresh.finally(() => {
+    backgroundPreRefreshInFlight = undefined;
+  });
+  backgroundPreRefreshInFlight = refreshWithCleanup;
+  return refreshWithCleanup;
+}
+
+async function performBackgroundPreRefresh(): Promise<void> {
   const refreshStartedAt = Date.now();
   const settings = await loadSettings();
   if (!settings.preferences.backgroundPreRefreshEnabled) {
@@ -894,6 +927,7 @@ async function resetAllExtensionData(): Promise<void> {
       || requestExtensionTasks.size
       || portalTokenRefreshInFlight
       || requestTrackingMaintenanceInFlight
+      || backgroundPreRefreshInFlight
     ),
     closePortalRecoveryTabs: () => closePortalRecoveryTabsForTargets(
       ["directoryRole", "pimGroup", "azureRole"],
@@ -1133,13 +1167,6 @@ function extensionFailure(sourceRequestId: string, message: string): TrackedRequ
 
 function isTerminalExtensionRequestStatus(status: TrackedPimRequestStatus): boolean {
   return status === "denied" || status === "failed" || status === "canceled" || status === "expired";
-}
-
-function isAmbiguousMicrosoftWriteFailure(message: string, accessRecoveryRequired: boolean): boolean {
-  if (accessRecoveryRequired) {
-    return false;
-  }
-  return /timed out|network|failed to fetch|load failed|aborted|gateway|service unavailable|internal server|temporar|\b5\d\d\b/i.test(message);
 }
 
 async function executeWithPortalAccessRecovery(
@@ -2574,22 +2601,33 @@ async function getPimGroupPolicyRequirementsBestEffort(
 }
 
 async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Record<string, GroupInfo>> {
+  const uniqueIds = [...new Set(groupIds.filter(Boolean))];
   const entries = await mapWithConcurrency(
-    groupIds,
-    6,
-    async (groupId) => {
+    chunkItems(uniqueIds, GRAPH_BATCH_REQUEST_LIMIT),
+    3,
+    async (batchIds) => {
+      const fallbackEntries = batchIds.map((groupId) => [groupId, { id: groupId, displayName: groupId }] as const);
       try {
-        const group = await fetchJson<GroupInfo>(
-          graphApiUrl(`/v1.0/groups/${encodePathSegment(groupId)}?$select=id,displayName,description,mail`),
+        const response = await fetchGraphBatch<GroupInfo>(
+          batchIds.map((groupId, index) => ({
+            id: String(index),
+            method: "GET",
+            url: `/groups/${encodePathSegment(groupId)}?$select=id,displayName,description,mail`
+          })),
           graphToken
         );
-        return [groupId, group] as const;
+        const responsesById = new Map((response.responses || []).map((item) => [item.id, item]));
+        return batchIds.map((groupId, index) => {
+          const item = responsesById.get(String(index));
+          const group = item?.status && item.status >= 200 && item.status < 300 ? item.body : undefined;
+          return [groupId, group?.id ? group : { id: groupId, displayName: groupId }] as const;
+        });
       } catch {
-        return [groupId, { id: groupId, displayName: groupId }] as const;
+        return fallbackEntries;
       }
     }
   );
-  return Object.fromEntries(entries);
+  return Object.fromEntries(entries.flat());
 }
 
 async function getAzureRoles(azureManagementToken: string): Promise<ActivationItem[]> {
@@ -2626,11 +2664,13 @@ async function getAzureRolesForSubscriptions(
     subscriptions,
     4,
     async (subscription) => {
-      const roles = await fetchAllPages<AzureRoleApi>(
-        azureManagementUrl(
-          `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
-        ),
-        azureManagementToken
+      const roles = await retryTransientMicrosoftRead(() =>
+        fetchAllPages<AzureRoleApi>(
+          azureManagementUrl(
+            `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
+          ),
+          azureManagementToken
+        )
       );
       return roles.map((role) =>
         normalizeAzureRole({
@@ -2725,11 +2765,13 @@ async function getActiveAzureRolesForSubscriptions(
     subscriptions,
     4,
     async (subscription) => {
-      const roles = await fetchAllPages<AzureRoleApi>(
-        azureManagementUrl(
-          `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
-        ),
-        azureManagementToken
+      const roles = await retryTransientMicrosoftRead(() =>
+        fetchAllPages<AzureRoleApi>(
+          azureManagementUrl(
+            `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
+          ),
+          azureManagementToken
+        )
       );
       return roles
         .filter((role) => !role.properties?.endDateTime || new Date(role.properties.endDateTime).getTime() > now)
@@ -2768,6 +2810,14 @@ function assertAtLeastOneSubscriptionSucceeded<T>(
     const firstError = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
     throw new Error(`Unable to load ${operation} data from any subscription. ${sanitizeErrorMessage(firstError)}`.trim());
   }
+}
+
+function retryTransientMicrosoftRead<T>(operation: () => Promise<T>): Promise<T> {
+  return retryOnceIf(
+    operation,
+    (error) => isTransientMicrosoftFailure(sanitizeErrorMessage(error)),
+    TRANSIENT_READ_RETRY_DELAY_MS
+  );
 }
 
 async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
@@ -2923,13 +2973,16 @@ async function activateItems(
         });
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
+        const detail = sanitizeErrorMessage(error);
+        const outcomeUnknown = isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
         return {
           result: {
             itemId: item.id,
             itemName: item.displayName,
             success: false,
-            error: sanitizeErrorMessage(error),
-            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {})
+            error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
+            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
+            ...(outcomeUnknown ? { outcomeUnknown: true } : {})
           },
           trackedRequest: undefined
         };
@@ -3017,13 +3070,16 @@ async function deactivateItems(
         });
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
+        const detail = sanitizeErrorMessage(error);
+        const outcomeUnknown = isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
         return {
           result: {
             itemId: item.id,
             itemName: item.displayName,
             success: false,
-            error: sanitizeErrorMessage(error),
-            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {})
+            error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
+            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
+            ...(outcomeUnknown ? { outcomeUnknown: true } : {})
           },
           trackedRequest: undefined
         };
@@ -3154,6 +3210,39 @@ async function fetchJson<T>(url: string, token: string): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+async function fetchGraphBatch<T>(
+  requests: Array<{ id: string; method: "GET"; url: string }>,
+  token: string
+): Promise<GraphBatchResponse<T>> {
+  if (!requests.length || requests.length > GRAPH_BATCH_REQUEST_LIMIT) {
+    throw new Error("Microsoft Graph batch size is invalid.");
+  }
+  const url = graphApiUrl("/v1.0/$batch");
+  assertAllowedApiUrl(url, "graph");
+  const response = await fetchMicrosoftApi(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ requests })
+  }, MICROSOFT_API_READ_TIMEOUT_MS);
+  if (!response.ok) {
+    const errorData = await safeJson(response);
+    throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
+  }
+  return (await response.json()) as GraphBatchResponse<T>;
+}
+
+function chunkItems<T>(items: T[], chunkSize: number): T[][] {
+  const safeChunkSize = Math.max(1, Math.trunc(chunkSize));
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += safeChunkSize) {
+    chunks.push(items.slice(index, index + safeChunkSize));
+  }
+  return chunks;
 }
 
 async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

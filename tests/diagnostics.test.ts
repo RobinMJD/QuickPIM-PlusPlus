@@ -50,6 +50,44 @@ describe("capability diagnostics", () => {
     });
   });
 
+  test("clears a resolved failure without hiding failures from another operation", () => {
+    const diagnostics: AccessDiagnostic[] = [
+      {
+        target: "pimGroup",
+        success: false,
+        checkedAt: "2026-05-18T12:00:00.000Z",
+        operation: "eligible",
+        endpointLabel: "PIM group eligibility",
+        error: "Temporary eligibility failure"
+      },
+      {
+        target: "pimGroup",
+        success: false,
+        checkedAt: "2026-05-18T12:01:00.000Z",
+        operation: "active",
+        endpointLabel: "PIM group active assignments",
+        error: "Active assignments still unavailable"
+      },
+      {
+        target: "pimGroup",
+        success: true,
+        checkedAt: "2026-05-18T12:02:00.000Z",
+        operation: "eligible",
+        endpointLabel: "PIM group eligibility"
+      }
+    ];
+
+    expect(summarizeAccessDiagnostics(diagnostics).lastFailure).toMatchObject({
+      operation: "active",
+      error: "Active assignments still unavailable"
+    });
+
+    expect(summarizeAccessDiagnostics([
+      diagnostics[0],
+      diagnostics[2]
+    ]).lastFailure).toBeUndefined();
+  });
+
   test("surfaces last success and failure metadata in Access Setup capability items", () => {
     const tokenStatus: TokenStatus = {
       graph: { hasToken: true, isExpired: false },

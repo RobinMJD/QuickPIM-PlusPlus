@@ -1,4 +1,5 @@
 import type { AccessSetupTarget, ActivationDataResult, CachedActivationEntry, QuickPimDataCache, TargetActivationCache } from "./types";
+import { createStorageMutationLock } from "./storageMutation";
 
 export const DATA_CACHE_KEY = "quickPimDataCache.v1";
 export const DEFAULT_ELIGIBLE_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -6,7 +7,7 @@ export const DEFAULT_ACTIVE_CACHE_TTL_MS = 10 * 60 * 1000;
 export const STALE_ELIGIBLE_CACHE_TTL_MS = 60 * 60 * 1000;
 export const CACHE_TARGETS: AccessSetupTarget[] = ["directoryRole", "pimGroup", "azureRole"];
 
-let dataCacheMutationQueue: Promise<void> = Promise.resolve();
+const withDataCacheMutationLock = createStorageMutationLock("quickPimDataCacheMutation");
 
 type CacheBucket = "eligible" | "active";
 
@@ -57,18 +58,14 @@ export async function loadDataCache(): Promise<QuickPimDataCache> {
 }
 
 export async function saveDataCache(cache: QuickPimDataCache): Promise<void> {
-  const mutation = dataCacheMutationQueue.then(async () => {
+  await withDataCacheMutationLock(async () => {
     const current = await loadDataCache();
     await chrome.storage.local.set({ [DATA_CACHE_KEY]: mergeDataCachesForSave(current, cache) });
   });
-  dataCacheMutationQueue = mutation.catch(() => undefined);
-  await mutation;
 }
 
 export async function clearDataCache(): Promise<void> {
-  const mutation = dataCacheMutationQueue.then(() => chrome.storage.local.remove(DATA_CACHE_KEY));
-  dataCacheMutationQueue = mutation.catch(() => undefined);
-  await mutation;
+  await withDataCacheMutationLock(() => chrome.storage.local.remove(DATA_CACHE_KEY));
 }
 
 export function mergeDataCachesForSave(current: QuickPimDataCache, incoming: QuickPimDataCache): QuickPimDataCache {
