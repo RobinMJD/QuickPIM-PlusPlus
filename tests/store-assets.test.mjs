@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -47,7 +47,7 @@ describe("browser Store assets", () => {
     expect(generator).toContain("--load-extension=${DIST_DIR}");
     expect(generator).toContain("alex.wilber@contoso.onmicrosoft.com");
     expect(generator).not.toMatch(/robin\.monjaud|sonepar/i);
-    expect(existsSync(resolve("dist/manifest.json"))).toBe(true);
+    expect(generator).toContain("Build dist/ before generating Store assets");
   });
 });
 

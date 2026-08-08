@@ -16,7 +16,7 @@ afterEach(async () => {
   cleanupWindow.__quickPimSettingsUnmount = undefined;
   // Preferences intentionally flush on unmount. Let that queue settle before
   // replacing the mocked Chrome storage for the next test.
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 50));
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
   document.body.className = "";
@@ -1289,6 +1289,7 @@ describe("settings Access Setup page", () => {
     vi.resetModules();
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
+    await waitFor(() => expect(storageChangeListener).toBeTypeOf("function"));
 
     currentCapture = 2;
     storageChangeListener?.({
@@ -2817,7 +2818,9 @@ describe("settings dark mode", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Enabled tabs"));
     await waitFor(() => expect(document.querySelector('.settings-layout')?.getAttribute("aria-busy")).toBe("false"));
 
-    document.querySelector<HTMLInputElement>('input[aria-label="Enable Azure Roles feature"]')!.click();
+    const azureFeature = document.querySelector<HTMLInputElement>('input[aria-label="Enable Azure Roles feature"]')!;
+    await waitFor(() => expect(azureFeature.checked).toBe(false));
+    azureFeature.click();
     clickButton("Role Access");
     await waitFor(() => expect(document.body.textContent).toContain("Access status & recovery"));
     clickButton("Open missing portal pages");

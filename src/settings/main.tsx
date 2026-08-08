@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { buildAccessCapabilityItems, buildTargetCacheKey, buildTokenCacheKey, buildTargetCacheKeys, getAccessSetupTargets, hasRequiredPortalToken } from "../lib/access";
@@ -2747,7 +2747,7 @@ function PreferencesPanel({
   onSaveRef.current = onSave;
   draftRef.current = draft;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (revisionRef.current !== savedRevisionRef.current) {
       return;
     }
