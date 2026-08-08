@@ -326,7 +326,7 @@ function getMissingActivationScopeDetail(
   const requiredScopes = getRequiredGraphActivationScopes(graphTarget).join(" or ");
   return {
     detail: `Captured Graph token can read ${TARGET_LABELS[target]}, but it is missing the write scope required for activation.`,
-    lastError: `Missing activation scope: ${requiredScopes}. Open Access Setup and reload the matching Microsoft portal page.`
+    lastError: `Missing activation scope: ${requiredScopes}. Open Role Access and reload the matching Microsoft portal page.`
   };
 }
 

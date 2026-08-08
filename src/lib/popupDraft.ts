@@ -1,4 +1,4 @@
-import type { PopupRequestMode, PopupTab, SortMode } from "./types";
+import type { PopupRequestMode, PopupTab, SortDirection, SortMode } from "./types";
 import type { QuickFilter } from "./popupModel";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { sanitizeUserJustification } from "./justifications";
@@ -14,14 +14,16 @@ const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 let popupDraftMutationQueue: Promise<void> = Promise.resolve();
 
 const POPUP_TABS: PopupTab[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
-const SORT_MODES: SortMode[] = ["name", "lastUsed", "activationCount", "type", "scope"];
-const QUICK_FILTERS: QuickFilter[] = ["favorites", "eligible", "active", "requiresJustification"];
+const SORT_MODES: SortMode[] = ["name", "lastUsed", "activationCount", "scope"];
+const SORT_DIRECTIONS: SortDirection[] = ["ascending", "descending"];
+const QUICK_FILTERS: QuickFilter[] = ["active"];
 
 export interface PopupDraft {
   updatedAt: number;
   tab: PopupTab;
   search: string;
   sortMode: SortMode;
+  sortDirection: SortDirection;
   quickFilters: QuickFilter[];
   selectedIds: string[];
   durationHours: number;
@@ -32,7 +34,11 @@ export interface PopupDraft {
   requestMode?: PopupRequestMode;
 }
 
-export type PopupDraftInput = Omit<PopupDraft, "updatedAt" | "quickFilters"> & { updatedAt?: number; quickFilters?: QuickFilter[] };
+export type PopupDraftInput = Omit<PopupDraft, "updatedAt" | "quickFilters" | "sortDirection"> & {
+  updatedAt?: number;
+  quickFilters?: QuickFilter[];
+  sortDirection?: SortDirection;
+};
 
 export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | undefined> {
   const result = await chrome.storage.local.get(POPUP_DRAFT_KEY);
@@ -67,11 +73,13 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
   }
 
   const selectedIds = sanitizeSelectedIds(value.selectedIds);
+  const sortMode = isSortMode(value.sortMode) ? value.sortMode : "name";
   const draft: PopupDraft = {
     updatedAt,
     tab: isPopupTab(value.tab) ? value.tab : "directoryRole",
     search: sanitizeString(value.search, MAX_SEARCH_LENGTH),
-    sortMode: isSortMode(value.sortMode) ? value.sortMode : "name",
+    sortMode,
+    sortDirection: isSortDirection(value.sortDirection) ? value.sortDirection : defaultSortDirection(sortMode),
     quickFilters: sanitizeQuickFilters(value.quickFilters),
     selectedIds,
     durationHours: sanitizeDuration(value.durationHours),
@@ -91,6 +99,7 @@ export function hasPopupDraftContent(draft: PopupDraftInput): boolean {
       draft.search.trim() ||
       draft.tab !== "directoryRole" ||
       draft.sortMode !== "name" ||
+      draft.sortDirection === "descending" ||
       draft.quickFilters?.length
   );
 }
@@ -149,6 +158,14 @@ function isPopupTab(value: unknown): value is PopupTab {
 
 function isSortMode(value: unknown): value is SortMode {
   return typeof value === "string" && SORT_MODES.includes(value as SortMode);
+}
+
+function isSortDirection(value: unknown): value is SortDirection {
+  return typeof value === "string" && SORT_DIRECTIONS.includes(value as SortDirection);
+}
+
+function defaultSortDirection(sortMode: SortMode): SortDirection {
+  return sortMode === "lastUsed" || sortMode === "activationCount" ? "descending" : "ascending";
 }
 
 function isPopupRequestMode(value: unknown): value is PopupRequestMode {

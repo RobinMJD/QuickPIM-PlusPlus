@@ -55,6 +55,7 @@ import {
   getAutoEnabledFeatures,
   getDisplayName,
   getEnabledRoleFeatures,
+  getDefaultSortDirection,
   getScopeLabel,
   loadSettings,
   recordActivityResults,
@@ -111,6 +112,7 @@ import type {
   PortalRecoveryOpenResult,
   PortalRecoveryStatus,
   PortalTokenRefreshResult,
+  SortDirection,
   SortMode,
   TicketInfo,
   TokenStatus
@@ -304,6 +306,7 @@ function PopupApp() {
   const [portalRecoveryStatus, setPortalRecoveryStatus] = useState<PortalRecoveryStatus>(() => emptyPortalRecoveryStatus());
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("name");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("ascending");
   const [quickFilters, setQuickFilters] = useState<Set<QuickFilter>>(new Set());
   const [durationHours, setDurationHours] = useState(DEFAULT_SETTINGS.preferences.defaultDurationHours);
   const [justification, setJustification] = useState("");
@@ -318,6 +321,7 @@ function PopupApp() {
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [activationProgress, setActivationProgress] = useState<OperationProgress | null>(null);
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
+  const [dismissedIdentityMismatchDetail, setDismissedIdentityMismatchDetail] = useState<string | undefined>();
   const [isActivating, setIsActivating] = useState(false);
   const [requestMode, setRequestMode] = useState<PopupRequestMode | undefined>();
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
@@ -345,8 +349,15 @@ function PopupApp() {
       return;
     }
     setSortMode(settings.preferences.defaultSort);
+    setSortDirection(settings.preferences.defaultSortDirection);
     setDurationHours(settings.preferences.defaultDurationHours);
-  }, [hasRestoredPopupDraft, isPopupDraftReady, settings.preferences.defaultDurationHours, settings.preferences.defaultSort]);
+  }, [
+    hasRestoredPopupDraft,
+    isPopupDraftReady,
+    settings.preferences.defaultDurationHours,
+    settings.preferences.defaultSort,
+    settings.preferences.defaultSortDirection
+  ]);
 
   useEffect(() => {
     document.body.classList.toggle("dark-mode", settings.preferences.darkMode);
@@ -548,6 +559,7 @@ function PopupApp() {
     quickFilters,
     search,
     selectedIds,
+    sortDirection,
     sortMode,
     tab,
     ticketNumber,
@@ -670,9 +682,9 @@ function PopupApp() {
       const scope = getScopeLabel(item, referenceData).toLowerCase();
       return matchesType && (!term || name.includes(term) || scope.includes(term));
     });
-    const quickFiltered = applyQuickFilters(filtered, [...quickFilters], favoriteIds);
-    return sortItems(quickFiltered, settings, sortMode, referenceData);
-  }, [displayItems, favoriteIds, quickFilters, referenceData, search, settings, sortMode, tab]);
+    const quickFiltered = applyQuickFilters(filtered, [...quickFilters]);
+    return sortItems(quickFiltered, settings, sortMode, referenceData, sortDirection);
+  }, [displayItems, quickFilters, referenceData, search, settings, sortDirection, sortMode, tab]);
 
   function toggleQuickFilter(filter: QuickFilter) {
     setQuickFilters((current) => {
@@ -686,6 +698,24 @@ function PopupApp() {
     });
   }
 
+  function selectSortMode(nextMode: SortMode) {
+    const nextDirection = nextMode === sortMode
+      ? sortDirection === "ascending" ? "descending" : "ascending"
+      : getDefaultSortDirection(nextMode);
+    setSortMode(nextMode);
+    setSortDirection(nextDirection);
+    void mutatePopupSettings((latest) => ({
+      ...latest,
+      preferences: {
+        ...latest.preferences,
+        defaultSort: nextMode,
+        defaultSortDirection: nextDirection
+      }
+    })).catch((saveError) => {
+      setError(saveError instanceof Error ? saveError.message : String(saveError));
+    });
+  }
+
   async function initializePopup() {
     try {
       const draft = await loadPopupDraft();
@@ -693,6 +723,7 @@ function PopupApp() {
         setTab(draft.tab);
         setSearch(draft.search);
         setSortMode(draft.sortMode);
+        setSortDirection(draft.sortDirection);
         setQuickFilters(new Set(draft.quickFilters));
         setSelectedIds(new Set(draft.selectedIds));
         setDurationHours(draft.durationHours);
@@ -714,6 +745,7 @@ function PopupApp() {
       tab,
       search,
       sortMode,
+      sortDirection,
       quickFilters: [...quickFilters],
       selectedIds: [...selectedIds],
       durationHours,
@@ -753,6 +785,8 @@ function PopupApp() {
     setTicketNumber("");
     setRequestMode(undefined);
     setActivationProgress(null);
+    setActivationFailureNotice(null);
+    setError("");
     latestPopupDraft.current = undefined;
     await clearPopupDraft();
   }
@@ -1314,6 +1348,7 @@ function PopupApp() {
     if (isActivating) {
       return;
     }
+    dismissRequestErrors();
     setSelectedIds((current) => {
       const item = getItemByPersistedId(itemsById, itemId);
       const itemMode = getRequestModeForItem(item);
@@ -1349,6 +1384,12 @@ function PopupApp() {
       setActivationFailureNotice(null);
       setError(saveError instanceof Error ? saveError.message : String(saveError));
     }
+  }
+
+  function dismissRequestErrors() {
+    setError("");
+    setActivationFailureNotice(null);
+    setActivationProgress((current) => current?.status === "error" ? null : current);
   }
 
   async function reconcileDetachedRequestOperation(operation: RequestOperationRecord): Promise<void> {
@@ -1915,7 +1956,7 @@ function PopupApp() {
     return results.filter(Boolean).length;
   }
 
-  async function openSettingsSection(section: "access" | "bundles" | "preferences") {
+  async function openSettingsSection(section: "role-access" | "bundles" | "activation") {
     await flushPopupDraft();
     const url = chrome.runtime.getURL(`settings.html#${section}`);
     if (chrome.tabs?.create) {
@@ -2007,10 +2048,13 @@ function PopupApp() {
         </div>
       </header>
 
-      {identityContext.mismatch ? (
-        <p className="message error identity-mismatch" role="alert">
+      {identityContext.mismatch && identityContext.detail !== dismissedIdentityMismatchDetail ? (
+        <DismissibleErrorMessage
+          className="identity-mismatch"
+          onDismiss={() => setDismissedIdentityMismatchDetail(identityContext.detail)}
+        >
           Microsoft portal tokens use different accounts or tenants. Refresh from one signed-in account before submitting a request.
-        </p>
+        </DismissibleErrorMessage>
       ) : null}
 
       {showPermissionWarning ? (
@@ -2018,7 +2062,7 @@ function PopupApp() {
           missingCount={accessSetupTargets.length}
           signInRequired={isPortalInteractionRequired}
           onContinueSignIn={() => void continueMicrosoftSignIn()}
-          onDetails={() => openSettingsSection("access")}
+          onDetails={() => openSettingsSection("role-access")}
           onDismiss={() => void ignorePermissionWarning()}
         />
       ) : null}
@@ -2073,10 +2117,11 @@ function PopupApp() {
         <ActivationFailureBanner
           notice={activationFailureNotice}
           onOpenPortal={(target) => void openPortalForTarget(target)}
-          onOpenAccessSetup={() => void openSettingsSection("access")}
+          onOpenAccessSetup={() => void openSettingsSection("role-access")}
+          onDismiss={() => setActivationFailureNotice(null)}
         />
       ) : error && refreshProgress?.status !== "error" && activationProgress?.status !== "error" ? (
-        <p className="message error">{error}</p>
+        <DismissibleErrorMessage onDismiss={() => setError("")}>{error}</DismissibleErrorMessage>
       ) : null}
       {message && !activationFailureNotice && !(showInitialAccessState && isMissingAccessSummary(message)) ? <p className="message">{message}</p> : null}
       {isLoading ? (
@@ -2086,6 +2131,10 @@ function PopupApp() {
             title="Loading access data"
             progress={refreshProgress}
             helperText="Role types appear as soon as they are ready. This can take up to 15 seconds."
+            onDismiss={refreshProgress.status === "error" ? () => {
+              setRefreshProgress(null);
+              setError("");
+            } : undefined}
           />
         ) : <LoadingState />
       ) : null}
@@ -2094,6 +2143,10 @@ function PopupApp() {
           key={refreshProgress.operationId}
           title="Refreshing access data"
           progress={refreshProgress}
+          onDismiss={refreshProgress.status === "error" ? () => {
+            setRefreshProgress(null);
+            setError("");
+          } : undefined}
         />
       ) : null}
       {activationProgress && !activationFailureNotice ? (
@@ -2101,6 +2154,7 @@ function PopupApp() {
           key={activationProgress.operationId}
           title={`${requestMode === "deactivate" ? "Deactivation" : "Activation"} in progress`}
           progress={activationProgress}
+          onDismiss={activationProgress.status === "error" ? dismissRequestErrors : undefined}
         />
       ) : null}
 
@@ -2108,7 +2162,7 @@ function PopupApp() {
         <InitialAccessState
           recoveryStatus={portalRecoveryStatus}
           onContinueSignIn={() => void continueMicrosoftSignIn()}
-          onDetails={() => void openSettingsSection("access")}
+          onDetails={() => void openSettingsSection("role-access")}
         />
       ) : null}
 
@@ -2132,20 +2186,20 @@ function PopupApp() {
                 </button>
               ) : null}
             </div>
-            <div className="control-with-icon sort-field">
-              <span className="field-icon" aria-hidden="true">
-                <SortIcon />
-              </span>
-              <select className="select" value={sortMode} onChange={(event) => setSortMode(event.target.value as SortMode)} aria-label="Sort roles">
-                <option value="name">Name</option>
-                <option value="lastUsed">Last use</option>
-                <option value="activationCount">Activation count</option>
-                <option value="type">Type</option>
-                <option value="scope">Scope</option>
-              </select>
-            </div>
+            <SortMenu mode={sortMode} direction={sortDirection} onSelect={selectSortMode} />
+            <button
+              type="button"
+              className={`active-filter-switch ${quickFilters.has("active") ? "active" : ""}`}
+              role="switch"
+              aria-checked={quickFilters.has("active")}
+              aria-label="Show active PIM roles only"
+              onClick={() => toggleQuickFilter("active")}
+              title="Show only currently activated PIM roles"
+            >
+              <span className="switch-track" aria-hidden="true"><span /></span>
+              <span>Active</span>
+            </button>
           </section>
-          <QuickFilterBar activeFilters={quickFilters} onToggle={toggleQuickFilter} />
           <section className="content" id="popup-tab-panel" role="tabpanel" aria-label={tabLabel(currentRoleTab)}>
             <RoleList
               items={visibleEligibleItems}
@@ -2157,7 +2211,9 @@ function PopupApp() {
               showActivationCounters={settings.preferences.showActivationCounters}
               showEnablementDetails={settings.preferences.showEnablementDetails}
               showLastEnablementDate={settings.preferences.showLastEnablementDate}
-              showRemainingActivationTime={settings.preferences.showRemainingActivationTime}
+              showRemainingActivationTime={quickFilters.has("active") || settings.preferences.showRemainingActivationTime}
+              showActiveExpiryDetails={quickFilters.has("active")}
+              emptyText={quickFilters.has("active") ? "No active PIM roles or groups found." : undefined}
               onToggle={toggleSelected}
               onToggleFavorite={(itemId) => void toggleFavorite(itemId)}
             />
@@ -2166,11 +2222,20 @@ function PopupApp() {
             durationHours={durationHours}
             setDurationHours={setDurationHours}
             justification={justification}
-            setJustification={setJustification}
+            setJustification={(value) => {
+              setJustification(value);
+              dismissRequestErrors();
+            }}
             ticketSystem={ticketSystem}
-            setTicketSystem={setTicketSystem}
+            setTicketSystem={(value) => {
+              setTicketSystem(value);
+              dismissRequestErrors();
+            }}
             ticketNumber={ticketNumber}
-            setTicketNumber={setTicketNumber}
+            setTicketNumber={(value) => {
+              setTicketNumber(value);
+              dismissRequestErrors();
+            }}
             settings={settings}
             requirements={requirements}
             durationOptions={durationOptions}
@@ -2180,11 +2245,15 @@ function PopupApp() {
             isReviewOpen={isActivationReviewOpen}
             isActivating={isActivating}
             onContinue={() => setIsActivationReviewOpen(true)}
+            onBack={() => {
+              setIsActivationReviewOpen(false);
+              dismissRequestErrors();
+            }}
             onActivate={() => void activate(selectedItems)}
             onDeactivate={() => void deactivate(selectedItems)}
             onSaveJustification={() => void saveCurrentJustification()}
             onClearSelection={() => void clearSelectionAndDraft()}
-            onOpenSettings={() => void openSettingsSection("preferences")}
+            onOpenSettings={() => void openSettingsSection("activation")}
           />
         </>
       ) : null}
@@ -2267,7 +2336,7 @@ function PopupApp() {
       {!isLoading && !showInitialAccessState && !visibleTabs.length ? (
         <section className="content item-list empty-state">
           <p>No enabled features have data yet. Enable features in Settings or refresh data.</p>
-          <button className="btn" onClick={() => void openSettingsSection("preferences")}>
+          <button className="btn" onClick={() => void openSettingsSection("role-access")}>
             Settings
           </button>
         </section>
@@ -2525,50 +2594,96 @@ function LoadingState() {
   );
 }
 
-function QuickFilterBar({
-  activeFilters,
-  onToggle
+function SortMenu({
+  mode,
+  direction,
+  onSelect
 }: {
-  activeFilters: Set<QuickFilter>;
-  onToggle: (filter: QuickFilter) => void;
+  mode: SortMode;
+  direction: SortDirection;
+  onSelect: (mode: SortMode) => void;
 }) {
-  const filters: Array<{ id: QuickFilter; label: string }> = [
-    { id: "favorites", label: "Favorites" },
-    { id: "eligible", label: "Eligible" },
-    { id: "active", label: "Active" },
-    { id: "requiresJustification", label: "Needs reason" }
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const options: Array<{ id: SortMode; label: string }> = [
+    { id: "name", label: "Name" },
+    { id: "lastUsed", label: "Last use" },
+    { id: "activationCount", label: "Activation count" },
+    { id: "scope", label: "Scope" }
   ];
+  const selectedLabel = options.find((option) => option.id === mode)?.label || "Name";
+
+  useEffect(() => {
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (detailsRef.current?.open && !detailsRef.current.contains(event.target as Node)) {
+        detailsRef.current.removeAttribute("open");
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && detailsRef.current?.open) {
+        detailsRef.current.removeAttribute("open");
+        detailsRef.current.querySelector<HTMLElement>("summary")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, []);
+
   return (
-    <div className="quick-filter-row" aria-label="Quick filters">
-      {filters.map((filter) => (
-        <button
-          type="button"
-          className={`filter-chip ${activeFilters.has(filter.id) ? "active" : ""}`}
-          onClick={() => onToggle(filter.id)}
-          key={filter.id}
-          aria-pressed={activeFilters.has(filter.id)}
-        >
-          {filter.label}
-        </button>
-      ))}
-    </div>
+    <details className="sort-menu" ref={detailsRef}>
+      <summary
+        aria-label={`Sort roles by ${selectedLabel}, ${direction}`}
+        title={`Sort by ${selectedLabel}. Select ${selectedLabel} again to reverse the order.`}
+      >
+        <SortIcon />
+        <span className="sort-menu-label">{selectedLabel}</span>
+        <span className="sort-direction" aria-hidden="true">{direction === "ascending" ? "↑" : "↓"}</span>
+      </summary>
+      <div className="sort-menu-options" role="menu" aria-label="Sort roles">
+        {options.map((option) => (
+          <button
+            type="button"
+            role="menuitemradio"
+            aria-checked={option.id === mode}
+            className={option.id === mode ? "active" : ""}
+            onClick={() => {
+              onSelect(option.id);
+              detailsRef.current?.removeAttribute("open");
+            }}
+            key={option.id}
+            title={option.id === mode ? `Reverse ${option.label} order` : `Sort by ${option.label}`}
+          >
+            <span>{option.label}</span>
+            {option.id === mode ? <span aria-hidden="true">{direction === "ascending" ? "↑" : "↓"}</span> : null}
+          </button>
+        ))}
+      </div>
+    </details>
   );
 }
 
 function ActivationFailureBanner({
   notice,
   onOpenPortal,
-  onOpenAccessSetup
+  onOpenAccessSetup,
+  onDismiss
 }: {
   notice: ActivationFailureNotice;
   onOpenPortal: (target: RoleTab) => void;
   onOpenAccessSetup: () => void;
+  onDismiss: () => void;
 }) {
   const panelRef = useRef<HTMLElement>(null);
   useEffect(() => panelRef.current?.focus(), []);
   const hasRecoveryAction = notice.recoveryTargets.length > 0;
   return (
     <section ref={panelRef} className="message error activation-error-panel" role="alert" aria-live="assertive" tabIndex={-1}>
+      <button className="message-dismiss-button activation-error-dismiss" type="button" onClick={onDismiss} title="Dismiss error" aria-label="Dismiss error">
+        <ClearIcon />
+      </button>
       <div className="activation-error-list">
         {notice.errors.map((errorMessage, index) => (
           <p key={`${index}:${errorMessage}`}>{errorMessage}</p>
@@ -2595,6 +2710,25 @@ function ActivationFailureBanner({
   );
 }
 
+function DismissibleErrorMessage({
+  children,
+  className = "",
+  onDismiss
+}: {
+  children: string;
+  className?: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className={`message error dismissible-message ${className}`.trim()} role="alert">
+      <span>{children}</span>
+      <button className="message-dismiss-button" type="button" onClick={onDismiss} title="Dismiss error" aria-label="Dismiss error">
+        <ClearIcon />
+      </button>
+    </div>
+  );
+}
+
 function ActivationBar(props: {
   durationHours: number;
   setDurationHours: (value: number) => void;
@@ -2613,6 +2747,7 @@ function ActivationBar(props: {
   isReviewOpen: boolean;
   isActivating: boolean;
   onContinue: () => void;
+  onBack: () => void;
   onActivate: () => void;
   onDeactivate: () => void;
   onSaveJustification: () => void;
@@ -2641,7 +2776,7 @@ function ActivationBar(props: {
   return (
     <section className="activation-bar">
       {hasSelection && !props.isReviewOpen ? (
-        <div className="button-row">
+        <div className="button-row activation-footer-actions">
           <button
             className="btn primary"
             onClick={props.onContinue}
@@ -2653,7 +2788,7 @@ function ActivationBar(props: {
           <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
             Unselect all
           </button>
-          <button className="btn" onClick={props.onOpenSettings}>
+          <button className="btn activation-settings-button" onClick={props.onOpenSettings}>
             Settings
           </button>
         </div>
@@ -2685,12 +2820,21 @@ function ActivationBar(props: {
       ) : null}
       {hasSelection && props.isReviewOpen && showJustificationField ? (
         <div className="field activation-form-field">
-          <div className="justification-label-row">
-            <label>
-              {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
-            </label>
+          <label>
+            {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
+          </label>
+          <div className="justification-input-wrapper">
+            <textarea
+              className="textarea justification-textarea"
+              rows={2}
+              maxLength={MAX_USER_JUSTIFICATION_LENGTH}
+              value={props.justification}
+              onChange={(event) => props.setJustification(event.target.value)}
+              placeholder={isDeactivateMode ? "Why are you disabling this access early?" : "Why do you need this activation?"}
+            />
             <button
-              className="btn icon-btn save-justification-button"
+              className="btn icon-btn save-justification-button justification-save-overlay"
+              type="button"
               onClick={props.onSaveJustification}
               disabled={!props.justification.trim()}
               title="Save this justification for reuse"
@@ -2699,14 +2843,6 @@ function ActivationBar(props: {
               <SaveIcon />
             </button>
           </div>
-          <textarea
-            className="textarea justification-textarea"
-            rows={2}
-            maxLength={MAX_USER_JUSTIFICATION_LENGTH}
-            value={props.justification}
-            onChange={(event) => props.setJustification(event.target.value)}
-            placeholder={isDeactivateMode ? "Why are you disabling this access early?" : "Why do you need this activation?"}
-          />
         </div>
       ) : null}
       {hasSelection && props.isReviewOpen && showJustificationShortcuts ? (
@@ -2761,20 +2897,32 @@ function ActivationBar(props: {
         </div>
       ) : null}
       {props.isReviewOpen || !hasSelection ? (
-        <div className="button-row">
+        <div className={`button-row activation-footer-actions ${hasSelection && props.isReviewOpen ? "activation-review-actions" : "activation-idle-actions"}`}>
           {hasSelection && props.isReviewOpen ? (
-            <button className="btn primary" onClick={isDeactivateMode ? props.onDeactivate : props.onActivate} disabled={props.isActivating}>
-              {props.isActivating
-                ? isDeactivateMode ? "Disabling..." : "Activating..."
-                : isDeactivateMode ? `Disable ${props.selectedCount} selected` : `Activate ${props.selectedCount} selected`}
-            </button>
+            <>
+              <button
+                className="btn icon-btn activation-review-back-button"
+                type="button"
+                onClick={props.onBack}
+                disabled={props.isActivating}
+                title="Back to role selection"
+                aria-label="Back to role selection"
+              >
+                <ArrowLeftIcon />
+              </button>
+              <button className="btn primary" onClick={isDeactivateMode ? props.onDeactivate : props.onActivate} disabled={props.isActivating}>
+                {props.isActivating
+                  ? isDeactivateMode ? "Disabling..." : "Activating..."
+                  : isDeactivateMode ? `Disable ${props.selectedCount} selected` : `Activate ${props.selectedCount} selected`}
+              </button>
+            </>
           ) : null}
           {hasSelection ? (
             <button className="btn subtle" onClick={props.onClearSelection} disabled={props.isActivating}>
               Unselect all
             </button>
           ) : null}
-          <button className="btn" onClick={props.onOpenSettings}>
+          <button className="btn activation-settings-button" onClick={props.onOpenSettings}>
             Settings
           </button>
         </div>
@@ -2790,6 +2938,15 @@ function RefreshIcon() {
       <path d="M4 18v-5h5" />
       <path d="M18.2 9A7 7 0 0 0 6.7 6.7L4 9" />
       <path d="M5.8 15a7 7 0 0 0 11.5 2.3L20 15" />
+    </svg>
+  );
+}
+
+function ArrowLeftIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
+      <path d="M19 12H5" />
+      <path d="m12 19-7-7 7-7" />
     </svg>
   );
 }

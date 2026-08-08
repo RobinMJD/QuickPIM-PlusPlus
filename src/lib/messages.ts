@@ -11,6 +11,7 @@ export type QuickPimMessage =
   | { action: "openPortalRecoveryTabs"; targets: AccessSetupTarget[] }
   | { action: "closePortalRecoveryTabs"; targets: AccessSetupTarget[] }
   | { action: "clearToken" }
+  | { action: "resetExtensionData" }
   | { action: "getActivationItems"; targets?: AccessSetupTarget[] }
   | { action: "getActiveItems"; targets?: AccessSetupTarget[] }
   | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[]; detail?: "core" | "full" }
@@ -43,6 +44,7 @@ const SIMPLE_ACTIONS = new Set([
   "getPortalRecoveryStatus",
   "focusPortalRecoveryTabs",
   "clearToken",
+  "resetExtensionData",
   "getRequestOperations"
 ]);
 const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", "getActivationSnapshot"]);

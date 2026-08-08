@@ -4,9 +4,9 @@ QuickPIM++ is a Microsoft Edge and Chrome MV3 extension for activating Microsoft
 
 It brings Microsoft Entra roles, PIM-enabled groups, and Azure resource roles into one local-first activation console with saved justifications, favorites, bundles, aliases, learned names, and a cleaner settings experience.
 
-Current version: **v2.11.12**
+Current version: **v2.13.11**
 
-Original author: Daniel Bradley. QuickPIM++ continues the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project with later community contributions and the v2 React/TypeScript rewrite.
+Concept credit: [Daniel Bradley](https://github.com/DanielBradley1/QuickPIM), who created the original QuickPIM idea. QuickPIM++ is an independent React/TypeScript implementation with a fully rewritten application codebase and its own expanded feature set.
 
 ## Why QuickPIM++ Exists
 
@@ -29,7 +29,7 @@ The extension does not create a separate OAuth app registration and does not ask
 - Block generic audit justifications such as `BAU`, `Admin`, or `needed`.
 - Append `{Activated using QuickPIM++}` to submitted justifications without adding it to the text field.
 - Sort and filter by name, scope, last use, activation count, and other useful fields.
-- Use quick filter chips for favorites, eligible items, active items, and roles that require a reason.
+- Switch to an Active-only view for currently activated PIM access and its live expiry countdown.
 - Queue a follow-on PIM activation from an expiry notification or Settings > Activity, starting one second after the current activation expires.
 - Choose a default continuation duration of 30 minutes, 1 hour, 2 hours, or 4 hours; role policy still applies the strictest maximum.
 - Review compact row policy details such as maximum duration, approval, ticket, required reason, active-until date, and disable availability.
@@ -75,7 +75,7 @@ The popup is designed for daily activation:
 - Refresh and portal-link actions in the top control area, with visible refresh progress.
 - Manual refresh shows progress, and background pre-refresh keeps tokens and cached data ready when possible.
 - Favorite stars on role rows.
-- Quick filter chips to narrow the current tab without leaving the popup.
+- A compact Active switch for current PIM activations and early-disable workflows.
 - Row click selection, plus checkbox selection.
 - Active rows can be selected for early disable, while eligible rows are selected for activation.
 - Enable and disable selections are mutually exclusive until the selection is cleared.
@@ -88,23 +88,23 @@ The popup is designed for daily activation:
 
 ## Settings Experience
 
-Settings are organized around setup, configuration, and local data:
+Settings follow the same journey as day-to-day use:
 
-- **Home** - brief product overview, quick links, and dynamically loaded GitHub changelog.
-- **Access Setup** - guided portal refresh flow for missing or limited feature areas.
-- **Activity** - request lifecycle details plus searchable local activation/deactivation history.
-- **Aliases** - local display-name overrides for roles, groups, and scopes.
-- **Justifications** - saved justification templates and recent history controls.
-- **Bundles** - create, edit, duplicate, and remove role/group bundles.
-- **Preferences** - activation defaults, recent-history limits, dark mode, and enabled feature areas.
-- **Import / Export** - move local configuration between browser profiles.
-- **About** - version, attribution, repository links, and local privacy note.
+- **Overview**: Home provides the product summary, quick links, and dynamically loaded GitHub changelog.
+- **Access**: Role Access shows access status, portal recovery, learned-name cleanup, and captured-token cleanup.
+- **Personalization**: Popup & Appearance controls enabled Microsoft role sources, background refresh, sorting, theme, Bundles visibility, assigned-role visibility, countdowns, counters, and optional policy details. Names & Aliases manages local display-name overrides and learned-name context.
+- **Activation**: Activation & Notifications contains activation and extension defaults, request notifications, and expiry reminders. Justifications and Bundles manage reusable activation inputs.
+- **Review**: Activity & Usage provides separate Requests, History, and Usage views so only the selected local dataset is rendered.
+- **Data & Support**: Diagnostics creates sanitized support information. Backup & Restore provides a validated JSON editor, clipboard and file export, staged file loading, explicit save/reload actions, and confirmed full reset.
+- **Product**: About shows version/build information, attribution, repository links, and the local privacy note without operational controls.
 
-![QuickPIM++ Preferences showing enabled feature areas](docs/images/screenshot-03-enabled-features-1280x800.png)
+Preference pages autosave and include page-scoped restore actions. Legacy Settings links remain compatible and resolve to their closest new destination.
+
+![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
 ## Access Setup
 
-QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Access Setup** and choose **Open missing portal pages**.
+QuickPIM++ uses portal-driven access. When it needs a fresh token or a feature area is limited, use **Settings > Role Access** and choose **Open missing portal pages**.
 
 The popup, background alarm, and guided setup share one bounded scan of already-open Entra admin center tabs for fresh portal tokens. Concurrent scans are deduplicated, and a renewed token with the same tenant, user, and API scopes keeps compatible cached role data. Access Setup opens only the Microsoft portal pages still needed for enabled feature areas that remain missing or limited. Recovery pages open inactive in a collapsed **QuickPIM++ access refresh** tab group, so the popup or Settings page stays in place:
 
@@ -114,7 +114,7 @@ The popup, background alarm, and guided setup share one bounded scan of already-
 
 QuickPIM++ closes temporary recovery pages after a newer usable token is captured or the matching feature API refresh succeeds. When all tracked targets finish together, their tab IDs are removed as one batch and the empty group disappears. A ten-minute safety timeout cleans up an abandoned recovery group. If Microsoft requires sign-in, tenant selection, or another prompt, QuickPIM++ keeps that recovery state available after the popup closes and offers a **Continue sign-in** action that expands the temporary group. Role loading resumes automatically after access is captured. A recovery tab moved outside its managed group is left open and untracked.
 
-![QuickPIM++ Access Setup showing feature-specific access checks](docs/images/screenshot-02-access-setup-1280x800.png)
+![QuickPIM++ Popup and Appearance settings](docs/images/screenshot-05-settings-appearance-1280x800.png)
 
 ## Privacy And Security Model
 
@@ -150,7 +150,7 @@ Then load the built extension:
 3. Choose **Load unpacked**.
 4. Select the `dist/` folder from this repository.
 5. Pin QuickPIM++ to the browser toolbar.
-6. Open Microsoft Entra or Azure Portal, sign in, then run **Settings > Access Setup**.
+6. Open Microsoft Entra or Azure Portal, sign in, then run **Settings > Role Access**.
 
 ## Development
 
@@ -188,12 +188,13 @@ Run `node scripts/check-version-sync.mjs` to verify package, lockfile, manifest,
 
 ## Release Automation
 
-Pushing a `v*` tag checks the exact tagged commit, reruns type checking, tests, dependency audit, and the production build, then creates two verified packages from the same `dist/` payload:
+Pushing a `v*` tag checks the exact tagged commit, reruns type checking, tests, dependency audit, and the production build, then creates one verified Chromium MV3 package:
 
-- `release/quickpim-plusplus-vX.Y.Z-chrome-webstore.zip`
-- `release/quickpim-plusplus-vX.Y.Z-edge-addons.zip`
+- `release/quickpim-plusplus-vX.Y.Z-chromium-stores.zip`
 
-Both packages are attached to the immutable GitHub release. The Chrome package is submitted to the Chrome Web Store and the Edge package is submitted to Microsoft Edge Add-ons. CI also retains both packages together as one build artifact.
+The package is attached once to the immutable GitHub release and submitted unchanged to both the Chrome Web Store and Microsoft Edge Add-ons. The current extension uses one Chromium-compatible manifest and payload, so separate byte-identical archives would be redundant. If either Store later needs different code or metadata inside the archive, the packaging pipeline must be split and tested explicitly.
+
+`npm run check:edge` enforces the current [Microsoft Edge porting guidance](https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/port-chrome-extension): the Store manifest must not contain `update_url` or Chrome branding, and every used `chrome.*` API must remain on the repository's reviewed Edge-compatible API list. CI, tagged releases, and local Store packaging all run this gate. On a workstation with Microsoft Edge installed, `npm run test:edge` sideloads `dist/` into Edge and smoke-tests the popup.
 
 Chrome Web Store publishing requires these GitHub repository secrets and fails visibly instead of silently skipping deployment when any value is missing:
 
@@ -205,7 +206,7 @@ Chrome Web Store publishing requires these GitHub repository secrets and fails v
 
 To create the credentials, enable the Chrome Web Store API in Google Cloud, create an OAuth web client, and generate a refresh token for the `https://www.googleapis.com/auth/chromewebstore` scope. Google documents the same flow in the official Chrome Web Store API guide: <https://developer.chrome.com/docs/webstore/using-api>.
 
-Once the secrets are present, the release workflow uploads `release/quickpim-plusplus-vX.Y.Z-chrome-webstore.zip` to the existing Chrome Web Store item and calls the publish endpoint, which submits the update for Chrome review.
+Once the secrets are present, the release workflow uploads `release/quickpim-plusplus-vX.Y.Z-chromium-stores.zip` to the existing Chrome Web Store item and calls the publish endpoint, which submits the update for Chrome review.
 
 Microsoft Edge Add-ons update publishing uses Partner Center Publish API v1.1 and these GitHub environment secrets:
 
@@ -213,18 +214,18 @@ Microsoft Edge Add-ons update publishing uses Partner Center Publish API v1.1 an
 - `EDGE_ADDONS_API_KEY`
 - `EDGE_ADDONS_PRODUCT_ID`
 
-The first Edge listing and any listing-metadata changes must be completed in Partner Center because Microsoft exposes its Publish API only for package updates to an existing product. After the first listing exists, tagged releases upload `release/quickpim-plusplus-vX.Y.Z-edge-addons.zip` and submit it for Edge certification automatically. The approved listing copy and reusable images are kept under `store/`.
+The first Edge listing and any listing-metadata changes must be completed in Partner Center because Microsoft exposes its Publish API only for package updates to an existing product. After the first listing exists, tagged releases upload the same `release/quickpim-plusplus-vX.Y.Z-chromium-stores.zip` and submit it for Edge certification automatically. The approved listing copy and reusable images are kept under `store/`.
 
 When the first version is already submitted manually, set the repository variable `EDGE_ADDONS_MANUAL_SUBMISSION_TAG` to that exact tag so its release workflow does not attempt a duplicate API submission. Later tags are unaffected and publish to Edge automatically.
 
-Run `npm run package:stores` after a production build to generate and verify both local upload packages. Run `npm run assets:stores` only when the tracked listing screenshots or branding assets need to be regenerated.
+Run `npm run package:stores` after a production build to generate and verify the shared local upload package. Run `npm run assets:stores` only when the tracked listing screenshots or branding assets need to be regenerated.
 
 ## Manual Verification
 
 After building and loading `dist/`, verify:
 
 - Graph and Azure token statuses appear in the popup header.
-- Access Setup opens only the portal pages needed for missing or limited feature areas.
+- Role Access opens only the portal pages needed for missing or limited feature areas.
 - Refresh shows progress, and the popup refresh icon spins while data is being refreshed.
 - Eligible Entra roles, Azure roles, and PIM groups render with friendly names.
 - Admin unit, device, subscription, and inherited Azure scope names display when available.
@@ -254,6 +255,91 @@ After building and loading `dist/`, verify:
 - Security review notes live in `SECURITY_REVIEW.md`.
 
 ## Changelog
+
+### v2.13.11
+
+- Replaces obsolete Settings-heavy Store screenshots with five deterministic captures from the current unpacked extension build.
+- Leads Chrome Web Store, Microsoft Edge Add-ons, and GitHub documentation with real popup role, activation, bundle, and active-access workflows.
+- Refreshes promotional tiles around the current QuickPIM++ popup and removes stale screenshot sources from the asset pipeline.
+
+### v2.13.10
+
+- Clarifies that Daniel Bradley is credited for the original QuickPIM concept while QuickPIM++ is an independent implementation with a fully rewritten application codebase.
+- Updates About, README attribution, tests, and the current project copyright wording to reflect that distinction consistently.
+
+### v2.13.9
+
+- Consolidates byte-identical Chrome Web Store and Microsoft Edge Add-ons archives into one verified Chromium Store package.
+- Keeps independent Chrome and Edge submission jobs while making both consume the same immutable release asset.
+- Removes same-version legacy duplicate archives during local packaging so stale Store-specific files cannot be mistaken for distinct builds.
+- Adds a Microsoft Edge compatibility gate for `update_url`, Store branding, and newly introduced extension APIs.
+- Adds a local Microsoft Edge sideload smoke command so the porting guide's browser-test step is repeatable before release.
+
+### v2.13.8
+
+- Keeps alias-picker names canonical and groups alphabetically sorted roles before alphabetically sorted PIM groups.
+
+### v2.13.7
+
+- Top-aligns Saved and Recent justification panels and adds a compact copy action to every recent reason.
+
+### v2.13.6
+
+- Reduces error-banner padding and dismiss-control size so one-line errors stay dense and vertically centered.
+
+### v2.13.5
+
+- Clears obsolete request errors when selections or request inputs change and when activation review is closed.
+- Adds compact dismiss controls to validation, identity, activation-recovery, and failed progress messages.
+
+### v2.13.4
+
+- Keeps the Settings action anchored to the footer's right edge in idle, selected, and activation-review states.
+
+### v2.13.3
+
+- Anchors the idle Settings action to the right and keeps the footer action row at one consistent height before and after Continue.
+- Caps the justification editor at a compact 2.5-line visual height while retaining its inset save action.
+
+### v2.13.2
+
+- Aligns activation-review actions in a stable four-column footer while preserving the compact Continue-state layout.
+- Replaces the review chevron with a conventional lightweight back arrow and restrained secondary styling.
+
+### v2.13.1
+
+- Adds a compact back control to collapse activation review without losing selected roles, duration, or request details.
+- Moves the reusable-justification save action inside the textarea so the field label and review layout stay compact.
+
+### v2.13.0
+
+- Remembers the popup's last-used sorter and direction without exposing a redundant default-sort setting.
+- Consolidates all popup tab controls under Enabled tabs and standardizes default-state labels for role-row details.
+- Moves learned-name cleanup beside learned names and shows the complete Microsoft account and tenant context in Settings.
+- Adds a guarded Reset QuickPIM++ page for securely clearing all local and session extension data after a recommended backup.
+- Tightens and aligns the popup search, sort, and Active controls for a denser toolbar.
+
+### v2.12.0
+
+- Replaces the popup filter-chip row with one compact Active switch beside search and sorting.
+- Active view shows only PIM activations, including a live countdown and local activation end date/time.
+- Removes ineffective Type sorting from type-specific role tabs and lets selecting the current sorter again reverse its direction.
+- Keeps favorite roles pinned while preserving popup search, sort field, direction, and Active-view state across popup reopen.
+
+### v2.11.14
+
+- Reorganizes Settings around access, personalization, activation, review, and maintenance while retaining every setting and stored value.
+- Adds page-scoped Restore defaults actions that never clear aliases, saved reasons, recent reasons, or bundles.
+- Combines request tracking, local history, and usage counters into lightweight Requests, History, and Usage views.
+- Replaces Import / Export with Backup & Restore, including validated JSON editing, clipboard copy, timestamped downloads, staged file loading, explicit save/reload actions, and external-change protection.
+- Strengthens light- and dark-mode section contrast, spacing, control sizing, responsive navigation, and legacy deep-link compatibility.
+
+### v2.11.13
+
+- Reorganizes Settings into Overview, Access, Activation, Experience, Data & Support, and Product groups.
+- Splits the former Preferences screen into focused Role Sources, Activation Defaults, Popup & Display, Automation, and Data Management pages without changing saved values or defaults.
+- Renames Activity to Requests & Activity and Aliases to Role Names so page labels match their actual scope.
+- Keeps legacy Preferences deep links working and routes popup Settings actions to the relevant new page.
 
 ### v2.11.12
 
@@ -610,9 +696,9 @@ After building and loading `dist/`, verify:
 
 ## Attribution
 
-Original author: Daniel Bradley, creator of the original [QuickPIM](https://github.com/DanielBradley1/QuickPIM) project.
+Concept credit: [Daniel Bradley](https://github.com/DanielBradley1/QuickPIM), creator of the original QuickPIM idea.
 
-QuickPIM++ builds on that original idea with a React rewrite, PIM groups, Azure roles, role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!
+QuickPIM++ was inspired by that concept, but the current extension is an independent React/TypeScript implementation with a fully rewritten application codebase. It adds PIM groups, Azure roles, role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!
 
 ## License
 

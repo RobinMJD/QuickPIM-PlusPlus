@@ -10,12 +10,14 @@ export function SmartProgressPanel({
   title,
   progress,
   helperText,
-  className = ""
+  className = "",
+  onDismiss
 }: {
   title: string;
   progress: OperationProgress;
   helperText?: string;
   className?: string;
+  onDismiss?: () => void;
 }) {
   const percent = useMonotonicProgressPercent(progress);
   const roundedPercent = Math.round(percent);
@@ -32,7 +34,14 @@ export function SmartProgressPanel({
     <section className={classes} role={isError ? "alert" : "status"} aria-live={isError ? "assertive" : "polite"} aria-atomic="true">
       <div className="progress-line">
         <strong>{title}</strong>
-        <span className="progress-fraction">Step {progress.current}/{progress.steps.length}</span>
+        <span className="progress-status-actions">
+          <span className="progress-fraction">Step {progress.current}/{progress.steps.length}</span>
+          {isError && onDismiss ? (
+            <button className="message-dismiss-button" type="button" onClick={onDismiss} title="Dismiss error" aria-label="Dismiss error">
+              <DismissIcon />
+            </button>
+          ) : null}
+        </span>
       </div>
       {helperText ? <p className="progress-helper">{helperText}</p> : null}
       <p className="progress-detail">{progress.label}</p>
@@ -48,6 +57,15 @@ export function SmartProgressPanel({
       </div>
       {isError && progress.error ? <p className="progress-error" role="alert">{progress.error}</p> : null}
     </section>
+  );
+}
+
+function DismissIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m7 7 10 10" />
+      <path d="m17 7-10 10" />
+    </svg>
   );
 }
 

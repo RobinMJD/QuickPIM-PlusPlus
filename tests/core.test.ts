@@ -296,6 +296,14 @@ describe("settings helpers", () => {
       "directoryRole:reader:/",
       "pimGroup:group-1:member"
     ]);
+    expect(sortItems(items, baseSettings, "name", undefined, "descending").map((item) => item.id)).toEqual([
+      "directoryRole:reader:/",
+      "pimGroup:group-1:member"
+    ]);
+    expect(sortItems(items, baseSettings, "lastUsed", undefined, "ascending").map((item) => item.id)).toEqual([
+      "directoryRole:reader:/",
+      "pimGroup:group-1:member"
+    ]);
   });
 
   test("places favorite roles before other items for every sort mode", () => {
@@ -412,6 +420,7 @@ describe("settings helpers", () => {
         defaultDurationHours: 99,
         defaultExtensionDurationHours: 3,
         defaultSort: "invalid" as any,
+        defaultSortDirection: "invalid" as any,
         recentJustificationLimit: 99,
         activityHistoryLimit: 999,
         darkMode: true,
@@ -444,6 +453,7 @@ describe("settings helpers", () => {
       defaultDurationHours: 24,
       defaultExtensionDurationHours: 0.5,
       defaultSort: "name",
+      defaultSortDirection: "ascending",
       recentJustificationLimit: 20,
       activityHistoryLimit: 200,
       darkMode: true,
@@ -458,6 +468,19 @@ describe("settings helpers", () => {
       enabledFeatures: ["directoryRole", "pimGroup"]
     });
     expect(imported.preferences).not.toHaveProperty("showAdvancedSettings");
+  });
+
+  test("migrates a saved sorter without a direction to its natural direction", () => {
+    const imported = mergeSettings({
+      preferences: {
+        ...DEFAULT_SETTINGS.preferences,
+        defaultSort: "lastUsed",
+        defaultSortDirection: undefined as never
+      }
+    });
+
+    expect(imported.preferences.defaultSort).toBe("lastUsed");
+    expect(imported.preferences.defaultSortDirection).toBe("descending");
   });
 
   test("preserves omitted sections when importing a partial settings object", () => {

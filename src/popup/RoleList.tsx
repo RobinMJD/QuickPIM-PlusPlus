@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { formatDateOnly } from "../lib/dateFormat";
+import { formatDateOnly, formatLocalDateTime } from "../lib/dateFormat";
 import {
   formatActivationItemStatusLabel,
   formatRemainingActivationTime,
@@ -25,6 +25,8 @@ export function RoleList({
   showEnablementDetails,
   showLastEnablementDate,
   showRemainingActivationTime,
+  showActiveExpiryDetails = false,
+  emptyText = "No eligible roles or groups found.",
   onToggle,
   onToggleFavorite,
   readonly = false
@@ -39,6 +41,8 @@ export function RoleList({
   showEnablementDetails: boolean;
   showLastEnablementDate: boolean;
   showRemainingActivationTime: boolean;
+  showActiveExpiryDetails?: boolean;
+  emptyText?: string;
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
   readonly?: boolean;
@@ -49,7 +53,7 @@ export function RoleList({
   }, []);
 
   if (!items.length) {
-    return <div className="empty-state">No eligible roles or groups found.</div>;
+    return <div className="empty-state">{emptyText}</div>;
   }
 
   return (
@@ -74,6 +78,9 @@ export function RoleList({
           ? activeAssignmentType === "assigned" ? "assigned-row" : "active-row"
           : item.status === "pendingApproval" ? "pending-row" : "";
         const lastEnabledDate = showLastEnablementDate ? formatDateOnly(usage.lastUsedAt) : "";
+        const activeEndDateTime = showActiveExpiryDetails && activeAssignmentType === "activated"
+          ? formatLocalDateTime(item.activeUntil)
+          : "";
         const policySummary = showEnablementDetails ? getRowPolicySummary(item) : [];
         const rowTitle = actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
         const body = (
@@ -120,6 +127,11 @@ export function RoleList({
               </span>
               {shouldShowRemainingActivationTime(item, showRemainingActivationTime) && item.activeUntil ? (
                 <RemainingActivationTime activeUntil={item.activeUntil} onExpired={handleActivationExpired} />
+              ) : null}
+              {activeEndDateTime && item.activeUntil ? (
+                <time className="active-end-time" dateTime={item.activeUntil} title="PIM activation end time in your local time zone">
+                  until {activeEndDateTime}
+                </time>
               ) : null}
             </div>
           </>

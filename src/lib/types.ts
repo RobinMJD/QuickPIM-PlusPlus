@@ -1,7 +1,8 @@
 export type ActivationItemType = "directoryRole" | "azureRole" | "pimGroup";
 export type ActivationStatus = "eligible" | "active" | "pendingApproval";
 export type ActiveAssignmentType = "activated" | "assigned" | "unknown";
-export type SortMode = "name" | "lastUsed" | "activationCount" | "type" | "scope";
+export type SortMode = "name" | "lastUsed" | "activationCount" | "scope";
+export type SortDirection = "ascending" | "descending";
 export type RoleTab = ActivationItemType;
 export type PopupTab = RoleTab | "bundles";
 export type QuickPimFeature = PopupTab;
@@ -174,6 +175,7 @@ export interface QuickPimPreferences {
   defaultDurationHours: number;
   defaultExtensionDurationHours: number;
   defaultSort: SortMode;
+  defaultSortDirection: SortDirection;
   recentJustificationLimit: number;
   activityHistoryLimit: number;
   darkMode: boolean;

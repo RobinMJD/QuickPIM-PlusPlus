@@ -7,12 +7,16 @@ import { REQUEST_TRACKING_KEY } from "../src/lib/requestTracking";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 import { formatLocalDateTime } from "../src/lib/dateFormat";
+import { MAX_SETTINGS_BACKUP_BYTES } from "../src/lib/settingsBackup";
 import { TEST_APP_VERSION, TEST_MANIFEST, TEST_RELEASE_TAG, testReleaseUrl } from "./testMetadata";
 
-afterEach(() => {
+afterEach(async () => {
   const cleanupWindow = window as Window & { __quickPimSettingsUnmount?: () => void };
   cleanupWindow.__quickPimSettingsUnmount?.();
   cleanupWindow.__quickPimSettingsUnmount = undefined;
+  // Preferences intentionally flush on unmount. Let that queue settle before
+  // replacing the mocked Chrome storage for the next test.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   vi.unstubAllGlobals();
   document.body.innerHTML = "";
   document.body.className = "";
@@ -23,6 +27,20 @@ function clickButton(label: string): HTMLButtonElement {
   if (!button) {
     throw new Error(`Button not found: ${label}`);
   }
+  button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  return button;
+}
+
+function getExactButton(label: string): HTMLButtonElement {
+  const button = [...document.querySelectorAll("button")].find((item) => item.textContent?.trim() === label);
+  if (!button) {
+    throw new Error(`Button not found: ${label}`);
+  }
+  return button;
+}
+
+function clickExactButton(label: string): HTMLButtonElement {
+  const button = getExactButton(label);
   button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   return button;
 }
@@ -56,6 +74,44 @@ async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promi
     throw lastError;
   }
   throw new Error("Timed out waiting for assertion.");
+}
+
+function createBasicSettingsChrome(storageData: Record<string, unknown>, options: {
+  removePermission?: ReturnType<typeof vi.fn>;
+} = {}) {
+  return {
+    permissions: {
+      request: vi.fn(async () => true),
+      remove: options.removePermission || vi.fn(async () => true)
+    },
+    runtime: {
+      getManifest: () => TEST_MANIFEST,
+      getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+      sendMessage: vi.fn(async (message: { action: string }) => {
+        if (message.action === "getTokenStatus") {
+          return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+        }
+        if (message.action === "getActivationSnapshot") {
+          return {
+            success: true,
+            data: {
+              eligible: { items: [], errors: [], diagnostics: [] },
+              active: { items: [], errors: [], diagnostics: [] },
+              tokenStatus: { graph: { hasToken: false }, azureManagement: { hasToken: false } }
+            }
+          };
+        }
+        return { success: true, data: { items: [], errors: [], diagnostics: [] } };
+      })
+    },
+    storage: {
+      local: {
+        get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+        set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+        remove: vi.fn(async () => undefined)
+      }
+    }
+  };
 }
 
 describe("settings Home page", () => {
@@ -118,28 +174,32 @@ describe("settings Home page", () => {
     await waitFor(() => expect(document.body.textContent).toContain(`QuickPIM++ ${TEST_RELEASE_TAG}`));
     expect(document.body.textContent).toContain("2026-05-18");
     expect(document.body.textContent).not.toContain("5/18/2026");
-    expect(document.body.textContent).toContain("Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.");
+    expect(document.body.textContent).toContain("Set up role access, personalize the popup, configure activation, and manage local data.");
     expect(document.body.textContent).toContain("Overview");
-    expect(document.body.textContent).toContain("Setup");
-    expect(document.body.textContent).toContain("Daily Use");
-    expect(document.body.textContent).toContain("Preferences");
-    expect(document.body.textContent).toContain("Maintenance");
+    expect(document.body.textContent).toContain("Access");
+    expect(document.body.textContent).toContain("Activation");
+    expect(document.body.textContent).toContain("Personalization");
+    expect(document.body.textContent).toContain("Review");
+    expect(document.body.textContent).toContain("Data & Support");
+    expect(document.body.textContent).toContain("Product");
 
     const navButtons = [...document.querySelectorAll(".settings-nav button")].map((button) => button.textContent?.trim());
     expect(navButtons).toEqual([
       "Home",
-      "Access Setup",
-      "Activity",
+      "Role Access",
+      "Popup & Appearance",
+      "Names & Aliases",
+      "Activation & Notifications",
       "Justifications",
       "Bundles",
-      "Aliases",
-      "Preferences",
-      "Import / Export",
+      "Activity & Usage",
       "Diagnostics",
+      "Backup & Restore",
+      "Reset QuickPIM++",
       "About"
     ]);
     expect(navButtons.at(-1)).toBe("About");
-    expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(10);
+    expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(12);
     expect(fetchMock.mock.calls[0][0]).toBe(`https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/${TEST_RELEASE_TAG}`);
   });
 
@@ -279,7 +339,7 @@ describe("settings Home page", () => {
 });
 
 describe("settings About page", () => {
-  test("renders v2 version, original author credit, and local privacy note", async () => {
+  test("renders independent rewrite attribution, version, and local privacy note", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#about");
 
@@ -323,10 +383,11 @@ describe("settings About page", () => {
     expect(text).toContain(`QuickPIM++ ${TEST_APP_VERSION}`);
     expect(text).not.toContain("0.0.0");
     expect(text).toMatch(/Build: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/);
-    expect(text).toContain("Original author: Daniel Bradley");
+    expect(text).toContain("Concept credit: Daniel Bradley");
     expect(document.querySelector<HTMLAnchorElement>('a[href="https://github.com/DanielBradley1/QuickPIM"]')?.textContent).toBe(
       "Daniel Bradley"
     );
+    expect(text).toContain("independent React and TypeScript implementation with a fully rewritten application codebase");
     expect(text).toContain("role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!");
     expect(text).not.toContain("security hardening");
     expect(text).toContain("Tokens and settings stay in this browser profile.");
@@ -337,9 +398,14 @@ describe("settings Access Setup page", () => {
   test("uses fresh cached eligible items when settings opens", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#aliases");
+    const settings = createDefaultSettings();
+    settings.aliasesByItemId = {
+      "directoryRole:windows-laps:/": "Privileged workstation alias",
+      "pimGroup:group-z:member": "Global Administrator"
+    };
 
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: createDefaultSettings(),
+      [SETTINGS_KEY]: settings,
       [DATA_CACHE_KEY]: {
         eligible: {
           fetchedAt: Date.now(),
@@ -347,14 +413,47 @@ describe("settings Access Setup page", () => {
           errors: [],
           items: [
             {
-              id: "directoryRole:reader:/",
+              id: "directoryRole:windows-laps:/",
               type: "directoryRole",
-              sourceName: "Global Reader",
-              displayName: "Global Reader",
+              sourceName: "Windows LAPS Administrator",
+              displayName: "Windows LAPS Administrator",
               principalId: "user-1",
-              roleDefinitionId: "reader",
+              roleDefinitionId: "windows-laps",
               directoryScopeId: "/",
               scopeLabel: "Tenant",
+              status: "eligible"
+            },
+            {
+              id: "directoryRole:application-admin:/",
+              type: "directoryRole",
+              sourceName: "Application Administrator",
+              displayName: "Application Administrator",
+              principalId: "user-1",
+              roleDefinitionId: "application-admin",
+              directoryScopeId: "/",
+              scopeLabel: "Tenant",
+              status: "eligible"
+            },
+            {
+              id: "pimGroup:group-z:member",
+              type: "pimGroup",
+              sourceName: "GRP_Z_Privileged",
+              displayName: "GRP_Z_Privileged",
+              principalId: "user-1",
+              groupId: "group-z",
+              accessId: "member",
+              scopeLabel: "Member",
+              status: "eligible"
+            },
+            {
+              id: "pimGroup:group-a:member",
+              type: "pimGroup",
+              sourceName: "GRP_A_Privileged",
+              displayName: "GRP_A_Privileged",
+              principalId: "user-1",
+              groupId: "group-a",
+              accessId: "member",
+              scopeLabel: "Member",
               status: "eligible"
             }
           ]
@@ -392,7 +491,22 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Global Reader"));
+    await waitFor(() => expect(document.body.textContent).toContain("Windows LAPS Administrator"));
+
+    const picker = document.querySelector<HTMLSelectElement>('select[aria-label="Role or group"]');
+    expect(picker).toBeTruthy();
+    const groups = [...picker!.querySelectorAll("optgroup")];
+    expect(groups.map((group) => group.label)).toEqual(["Roles", "Groups"]);
+    expect([...groups[0].querySelectorAll("option")].map((option) => option.textContent?.trim())).toEqual([
+      "Application Administrator / Tenant",
+      "Windows LAPS Administrator / Tenant"
+    ]);
+    expect([...groups[1].querySelectorAll("option")].map((option) => option.textContent?.trim())).toEqual([
+      "GRP_A_Privileged / Member",
+      "GRP_Z_Privileged / Member"
+    ]);
+    expect(picker!.textContent).not.toContain("Privileged workstation alias");
+    expect(picker!.textContent).not.toContain("Global Administrator");
 
     const actions = chromeMock.runtime.sendMessage.mock.calls.map(([message]) => message.action);
     expect(actions).not.toContain("getActivationItems");
@@ -457,7 +571,7 @@ describe("settings Access Setup page", () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
 
     const text = document.body.textContent || "";
-    expect(text).toContain("Access Setup");
+    expect(text).toContain("Role Access");
     expect(text).toContain("Open missing portal pages");
     expect(text).not.toMatch(/dedicated app|manual token|app registration|PowerShell/i);
 
@@ -659,7 +773,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
     await waitFor(() => expect(tokenRequests).toBeGreaterThanOrEqual(1));
 
     clickButton("Open missing portal pages");
@@ -901,7 +1015,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     clickButton("Recheck now");
 
@@ -973,7 +1087,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     clickButton("Recheck now");
 
@@ -1019,7 +1133,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     clickButton("Recheck now");
 
@@ -1106,6 +1220,96 @@ describe("settings Access Setup page", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Portal access updated."));
   });
 
+  test("clears an older access error after a queued token recovery succeeds", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#access");
+
+    const configuredSettings = createDefaultSettings();
+    configuredSettings.preferences.enabledFeatures = ["pimGroup"];
+    configuredSettings.preferences.autoEnabledFeaturesInitialized = true;
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: configuredSettings };
+    let storageChangeListener: ((changes: Record<string, chrome.storage.StorageChange>, areaName: string) => void) | undefined;
+    let currentCapture = 1;
+    let snapshotCalls = 0;
+    let resolveFirstSnapshot: ((value: unknown) => void) | undefined;
+    const status = () => ({
+      graph: { hasToken: true, capturedAt: currentCapture },
+      graphTargets: { pimGroup: { hasToken: true, capturedAt: currentCapture } },
+      azureManagement: { hasToken: false }
+    });
+    const snapshot = (errors: string[], capturedAt: number) => ({
+      success: true,
+      data: {
+        eligible: { items: [], errors, diagnostics: [] },
+        active: { items: [], errors: [], diagnostics: [] },
+        eligibleByTarget: { pimGroup: { items: [], errors, diagnostics: [] } },
+        activeByTarget: { pimGroup: { items: [], errors: [], diagnostics: [] } },
+        tokenStatus: {
+          graph: { hasToken: true, capturedAt },
+          graphTargets: { pimGroup: { hasToken: true, capturedAt } },
+          azureManagement: { hasToken: false }
+        }
+      }
+    });
+    const chromeMock = {
+      runtime: {
+        getManifest: () => TEST_MANIFEST,
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage: vi.fn(async (message: { action: string }) => {
+          if (message.action === "getTokenStatus") {
+            return { success: true, data: status() };
+          }
+          if (message.action === "refreshPortalTokens") {
+            return { success: true, data: { tokenStatus: status(), tabsFound: 1, tabsScanned: 1, captured: ["graph"] } };
+          }
+          if (message.action === "getActivationSnapshot") {
+            snapshotCalls += 1;
+            if (snapshotCalls === 1) {
+              return await new Promise((resolve) => { resolveFirstSnapshot = resolve; });
+            }
+            return snapshot([], currentCapture);
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        },
+        onChanged: {
+          addListener: vi.fn((listener) => { storageChangeListener = listener; }),
+          removeListener: vi.fn()
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
+
+    currentCapture = 2;
+    storageChangeListener?.({
+      graphPimGroupToken: { oldValue: "initial", newValue: "first" },
+      graphPimGroupTokenTimestamp: { oldValue: 1, newValue: 2 }
+    }, "session");
+    await waitFor(() => expect(snapshotCalls).toBe(1));
+    currentCapture = 3;
+    storageChangeListener?.({
+      graphPimGroupToken: { oldValue: "first", newValue: "second" },
+      graphPimGroupTokenTimestamp: { oldValue: 2, newValue: 3 }
+    }, "session");
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    resolveFirstSnapshot?.(snapshot(["Microsoft Graph access is limited in the captured portal token."], 2));
+
+    await waitFor(() => expect(snapshotCalls).toBe(2), 2000);
+    await waitFor(() => expect(document.body.textContent).toContain("Portal access updated."), 2000);
+    expect(document.body.textContent).not.toContain("Microsoft Graph access is limited in the captured portal token.");
+    expect(document.querySelector(".message.error")).toBeNull();
+  });
+
   test("shows progress while rechecking access data", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#access");
@@ -1160,7 +1364,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     holdEligibleRefresh = true;
     clickButton("Recheck now");
@@ -1230,7 +1434,7 @@ describe("settings Access Setup page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Access Setup"));
+    await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     holdEligibleRefresh = true;
     clickButton("Refresh eligible items");
@@ -1436,6 +1640,35 @@ describe("settings Activity page", () => {
 });
 
 describe("settings justification guardrails", () => {
+  test("top-aligns saved and recent reasons and copies a recent justification", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#justifications");
+    const settings = createDefaultSettings();
+    settings.savedJustifications = ["Saved incident reason"];
+    settings.recentJustifications = ["Recent incident reason"];
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Recent incident reason"));
+    expect(document.querySelector(".justification-columns")).toBeTruthy();
+    const copyButton = document.querySelector<HTMLButtonElement>('button[aria-label="Copy recent justification"]');
+    expect(copyButton).toBeTruthy();
+    copyButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("Recent incident reason"));
+    await waitFor(() => expect(document.querySelector('button[aria-label="recent justification copied"]')).toBeTruthy());
+
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const columnsRule = css.match(/\.justification-columns\s*\{[^}]+\}/)?.[0] || "";
+    const adjacentRule = css.match(/\.justification-columns\s*>\s*\.settings-subsection\s*\+\s*\.settings-subsection\s*\{[^}]+\}/)?.[0] || "";
+    expect(columnsRule).toContain("align-items: start;");
+    expect(adjacentRule).toContain("margin-top: 0;");
+  });
+
   test("blocks generic saved justifications", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#justifications");
@@ -1703,7 +1936,7 @@ describe("settings Bundles page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Role Bundles"));
+    await waitFor(() => expect(document.body.textContent).toContain("Bundles"));
 
     expect(document.body.textContent).not.toMatch(/Ticket system|Ticket number/i);
     expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
@@ -1760,7 +1993,7 @@ describe("settings Bundles page", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Role Bundles"));
+    await waitFor(() => expect(document.body.textContent).toContain("Bundles"));
 
     setFieldValue(document.querySelector<HTMLInputElement>('input[placeholder="Daily operations"]')!, "Daily operations");
     setFieldValue(document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Bundle default justification"]')!, "Admin");
@@ -1878,8 +2111,8 @@ describe("settings layout spacing", () => {
     const actionRule = css.match(/\.settings-form-actions\s*\{[^}]+\}/)?.[0] || "";
     const nestedPanelRule = css.match(/\.panel\s*>\s*\.panel\s*\{[^}]+\}/)?.[0] || "";
 
-    expect(actionRule).toContain("margin-top: 8px;");
-    expect(actionRule).toContain("margin-bottom: 18px;");
+    expect(actionRule).toContain("margin-top: 12px;");
+    expect(actionRule).toContain("margin-bottom: 0;");
     expect(nestedPanelRule).toContain("margin-top: 16px;");
   });
 
@@ -1954,6 +2187,7 @@ describe("settings dark mode", () => {
     storageListeners[0]({ [SETTINGS_KEY]: { oldValue: current, newValue: external } }, "local");
 
     await waitFor(() => expect(textarea.value).toBe(localDraft));
+    await waitFor(() => expect(document.body.textContent).toContain("Saved settings changed elsewhere"));
   });
 
   test("preserves and autosaves a preference draft when another settings section changes", async () => {
@@ -1986,32 +2220,31 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
+    await waitFor(() => expect(document.body.textContent).toContain("Enabled tabs"));
     await waitFor(() => expect(storageListeners).toHaveLength(1));
     await waitFor(() => expect(document.querySelector(".settings-layout")?.getAttribute("aria-busy")).toBe("false"));
 
-    const sortSelect = [...document.querySelectorAll<HTMLSelectElement>(".popup-defaults-grid select")][1];
-    sortSelect.value = "scope";
-    sortSelect.dispatchEvent(new Event("change", { bubbles: true }));
-    await waitFor(() => expect(sortSelect.value).toBe("scope"));
+    const countersToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show activation counters in popup"]')!;
+    countersToggle.click();
+    await waitFor(() => expect(countersToggle.checked).toBe(true));
 
     const current = storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS;
     const external = { ...current, savedJustifications: ["Remote saved reason"] };
     storageData[SETTINGS_KEY] = external;
     storageListeners[0]({ [SETTINGS_KEY]: { oldValue: current, newValue: external } }, "local");
 
-    await waitFor(() => expect(sortSelect.value).toBe("scope"));
+    await waitFor(() => expect(countersToggle.checked).toBe(true));
     await waitFor(() => {
       expect(storageData[SETTINGS_KEY]).toMatchObject({
         savedJustifications: ["Remote saved reason"],
-        preferences: expect.objectContaining({ defaultSort: "scope" })
+        preferences: expect.objectContaining({ showActivationCounters: true })
       });
     });
   });
 
   test("serializes saves from different settings sections without losing either change", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#display");
 
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
     let releasePreferenceSave!: () => void;
@@ -2071,7 +2304,7 @@ describe("settings dark mode", () => {
 
   test("retries a transient preference autosave failure without requiring another edit", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#display");
 
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
     let preferenceSaveAttempts = 0;
@@ -2118,7 +2351,7 @@ describe("settings dark mode", () => {
 
   test("clarifies popup defaults and uses labeled activation duration options", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#defaults");
 
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: createDefaultSettings()
@@ -2154,14 +2387,13 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
+    await waitFor(() => expect(document.body.textContent).toContain("Activation and extension timing"));
 
     expect(document.body.textContent).toContain("Default activation duration");
-    expect(document.body.textContent).toContain("Preselected in the popup when selected roles allow it.");
-    expect(document.body.textContent).toContain("Default sort order");
-    expect(document.body.textContent).toContain("Recent justification history limit");
+    expect(document.body.textContent).toContain("Preselected when selected roles allow it.");
+    expect(document.body.textContent).not.toContain("Recent justification history limit");
     expect(document.body.textContent).not.toContain("Default duration");
-    expect(document.body.textContent).toContain("Changes on this page are saved automatically.");
+    expect(document.body.textContent).toContain("Changes are saved automatically.");
     expect([...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Save preferences")).toBe(false);
 
     const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Default activation duration"]');
@@ -2179,7 +2411,7 @@ describe("settings dark mode", () => {
 
   test("flushes a valid pending preference change when leaving the page", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#defaults");
 
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
     const chromeMock = {
@@ -2201,20 +2433,21 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Popup defaults"));
+    await waitFor(() => expect(document.body.textContent).toContain("Activation and extension timing"));
     await waitFor(() => expect(document.querySelector(".settings-layout")?.getAttribute("aria-busy")).toBe("false"));
 
-    const recentLimit = document.querySelector<HTMLInputElement>('input[type="number"][min="1"]')!;
-    setFieldValue(recentLimit, "12");
+    const duration = document.querySelector<HTMLSelectElement>('select[aria-label="Default activation duration"]')!;
+    duration.value = "2";
+    duration.dispatchEvent(new Event("change", { bubbles: true }));
     await waitFor(() => expect(document.querySelector(".autosave-status")?.textContent).toContain("Changes pending"));
     clickButton("Home");
 
     await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({
-      preferences: expect.objectContaining({ recentJustificationLimit: 12 })
+      preferences: expect.objectContaining({ defaultDurationHours: 2 })
     }));
   });
 
-  test("shows advanced preference controls in a dedicated section without a reveal toggle", async () => {
+  test("organizes personalization, access refresh, and activation controls into focused pages", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#preferences");
 
@@ -2249,37 +2482,52 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Advanced settings"));
+    await waitFor(() => expect(document.body.textContent).toContain("Enabled tabs"));
 
     expect(document.body.textContent).not.toContain("Show advanced settings");
-    expect(document.body.textContent).toContain("Usage counters");
-    expect(document.body.textContent).toContain("Background pre-refresh");
     expect(document.body.textContent).toContain("Show enablement details");
     expect(document.body.textContent).toContain("Show last enablement date");
-    expect(document.body.textContent).toContain("Request status notifications");
     const enablementDetailsToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show enablement details in popup"]');
     const lastEnablementToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show last enablement date in popup"]');
     const assignedRolesToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show assigned active roles in popup"]');
     const showRemainingTimeToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show remaining activation time in popup"]');
-    const requestNotificationsToggle = document.querySelector<HTMLInputElement>('input[aria-label="Notify me about request updates"]');
-    const extensionDuration = document.querySelector<HTMLSelectElement>('select[aria-label="Default PIM extension duration"]');
     expect(enablementDetailsToggle).toBeTruthy();
     expect(lastEnablementToggle).toBeTruthy();
     expect(assignedRolesToggle).toBeTruthy();
     expect(showRemainingTimeToggle).toBeTruthy();
     expect(showRemainingTimeToggle!.checked).toBe(true);
+    expect(enablementDetailsToggle!.checked).toBe(false);
+    expect(lastEnablementToggle!.checked).toBe(false);
+    const defaultStates = [...document.querySelectorAll(".preference-default-state")].map((item) => item.textContent?.trim());
+    expect(defaultStates).toEqual([
+      "Enabled by default",
+      "Disabled by default",
+      "Disabled by default",
+      "Disabled by default",
+      "Disabled by default"
+    ]);
+
+    expect(document.body.textContent).toContain("Background pre-refresh");
+    expect(document.body.textContent).not.toContain("Request status notifications");
+
+    clickButton("Role Access");
+    await waitFor(() => expect(document.body.textContent).not.toContain("Background pre-refresh"));
+
+    clickButton("Activation & Notifications");
+    await waitFor(() => expect(document.body.textContent).toContain("Activation and extension timing"));
+    const requestNotificationsToggle = document.querySelector<HTMLInputElement>('input[aria-label="Notify me about request updates"]');
     expect(requestNotificationsToggle).toBeTruthy();
+    expect(requestNotificationsToggle!.checked).toBe(false);
+
+    const extensionDuration = document.querySelector<HTMLSelectElement>('select[aria-label="Default PIM extension duration"]');
     expect(extensionDuration).toBeTruthy();
     expect(extensionDuration!.value).toBe("0.5");
     expect([...extensionDuration!.options].map((option) => option.textContent)).toEqual(["30 minutes", "1 hour", "2 hours", "4 hours"]);
-    expect(enablementDetailsToggle!.checked).toBe(false);
-    expect(lastEnablementToggle!.checked).toBe(false);
-    expect(requestNotificationsToggle!.checked).toBe(false);
   });
 
   test("requests optional notification permission only when notifications are enabled", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#automation");
 
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
     const requestPermission = vi.fn(async () => true);
@@ -2321,7 +2569,7 @@ describe("settings dark mode", () => {
 
   test("saves display preferences and applies dark mode to settings", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#display");
 
     const settings = createDefaultSettings();
     settings.preferences.darkMode = true;
@@ -2362,7 +2610,7 @@ describe("settings dark mode", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Dark mode"));
     await waitFor(() => expect(document.querySelector<HTMLInputElement>('input[aria-label="Show enablement details in popup"]')).toBeTruthy());
 
-    const darkModeToggle = document.querySelector<HTMLInputElement>('input[aria-label="Dark mode"]');
+    const darkModeToggle = document.querySelector<HTMLButtonElement>('button[role="switch"][aria-label="Dark mode"]');
     const enablementDetailsToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show enablement details in popup"]');
     const lastEnablementToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show last enablement date in popup"]');
     const assignedRolesToggle = document.querySelector<HTMLInputElement>('input[aria-label="Show assigned active roles in popup"]');
@@ -2372,11 +2620,21 @@ describe("settings dark mode", () => {
     expect(lastEnablementToggle).toBeTruthy();
     expect(assignedRolesToggle).toBeTruthy();
     expect(showRemainingTimeToggle).toBeTruthy();
-    await waitFor(() => expect(darkModeToggle!.checked).toBe(true));
+    await waitFor(() => expect(darkModeToggle!.getAttribute("aria-checked")).toBe("true"));
+    expect(darkModeToggle!.textContent).toContain("Light mode");
+    expect(darkModeToggle!.textContent).toContain("Dark mode");
+    const colorThemeSection = darkModeToggle!.closest(".preference-section");
+    const sourceSection = Array.from(document.querySelectorAll(".preference-section"))
+      .find((section) => section.textContent?.includes("Enabled tabs"));
+    expect(colorThemeSection).toBeTruthy();
+    expect(sourceSection).toBeTruthy();
+    expect(colorThemeSection!.compareDocumentPosition(sourceSection!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(document.body.classList.contains("dark-mode")).toBe(true);
     expect(enablementDetailsToggle!.checked).toBe(false);
     expect(lastEnablementToggle!.checked).toBe(false);
     expect(assignedRolesToggle!.checked).toBe(false);
     expect(showRemainingTimeToggle!.checked).toBe(true);
+    darkModeToggle!.click();
     enablementDetailsToggle!.click();
     lastEnablementToggle!.click();
     assignedRolesToggle!.click();
@@ -2384,17 +2642,18 @@ describe("settings dark mode", () => {
 
     await waitFor(() => {
       expect(storageData[SETTINGS_KEY]).toMatchObject({
-        preferences: expect.objectContaining({ darkMode: true, showAssignedRoles: true, showRemainingActivationTime: false, showEnablementDetails: true, showLastEnablementDate: true })
+        preferences: expect.objectContaining({ darkMode: false, showAssignedRoles: true, showRemainingActivationTime: false, showEnablementDetails: true, showLastEnablementDate: true })
       });
-      expect(document.body.classList.contains("dark-mode")).toBe(true);
+      expect(document.body.classList.contains("dark-mode")).toBe(false);
+      expect(darkModeToggle!.getAttribute("aria-checked")).toBe("false");
     });
     await waitFor(() => expect(document.querySelector(".autosave-status")?.textContent).toContain("Saved"));
     expect(document.body.textContent).not.toContain("Settings saved.");
   });
 
-  test("shows usage dates as yyyy-MM-dd in preferences", async () => {
+  test("shows usage dates as yyyy-MM-dd in Activity & Usage", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#activity");
 
     const settings = createDefaultSettings();
     settings.usageStatsByItemId = {
@@ -2435,13 +2694,17 @@ describe("settings dark mode", () => {
     vi.resetModules();
     await import("../src/settings/main");
 
+    await waitFor(() => expect(document.body.textContent).toContain("Activity & Usage"));
+    [...document.querySelectorAll(".activity-view-switch button")]
+      .find((button) => button.textContent?.trim() === "Usage")
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await waitFor(() => expect(document.body.textContent).toContain("2026-06-12"));
     expect(document.body.textContent).not.toContain("6/12/2026");
   });
 
   test("saves enabled feature preferences", async () => {
     document.body.innerHTML = '<div id="root"></div>';
-    window.history.replaceState(null, "", "#preferences");
+    window.history.replaceState(null, "", "#display");
 
     const settings = createDefaultSettings();
     settings.preferences.enabledFeatures = ["directoryRole", "pimGroup", "bundles"];
@@ -2480,7 +2743,7 @@ describe("settings dark mode", () => {
     vi.stubGlobal("chrome", chromeMock);
     vi.resetModules();
     await import("../src/settings/main");
-    await waitFor(() => expect(document.body.textContent).toContain("Enabled features"));
+    await waitFor(() => expect(document.body.textContent).toContain("Enabled tabs"));
 
     const azureRolesFeature = document.querySelector<HTMLInputElement>('input[aria-label="Enable Azure Roles feature"]');
     expect(azureRolesFeature).toBeTruthy();
@@ -2495,6 +2758,355 @@ describe("settings dark mode", () => {
         })
       });
     });
+  });
+
+  test("flushes role-source changes before access recovery starts", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#display");
+    const settings = createDefaultSettings();
+    settings.preferences.enabledFeatures = ["directoryRole", "bundles"];
+    settings.preferences.autoEnabledFeaturesInitialized = true;
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const openedTargets: string[][] = [];
+    const missingTokens = {
+      graph: { hasToken: false },
+      azureManagement: { hasToken: false }
+    };
+    const chromeMock = {
+      runtime: {
+        getManifest: () => TEST_MANIFEST,
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage: vi.fn(async (message: { action: string; targets?: string[] }) => {
+          if (message.action === "getTokenStatus") {
+            return { success: true, data: missingTokens };
+          }
+          if (message.action === "refreshPortalTokens") {
+            return { success: true, data: { tokenStatus: missingTokens, tabsFound: 0, tabsScanned: 0, captured: [] } };
+          }
+          if (message.action === "openPortalRecoveryTabs") {
+            openedTargets.push(message.targets || []);
+            return { success: true, data: { opened: message.targets || [], managedCount: message.targets?.length || 0 } };
+          }
+          if (message.action === "getPortalRecoveryStatus") {
+            return {
+              success: true,
+              data: {
+                state: openedTargets.length ? "interactionRequired" : "idle",
+                requestedTargets: openedTargets.at(-1) || [],
+                openedTargets: openedTargets.at(-1) || [],
+                pendingTargets: openedTargets.at(-1) || [],
+                tabIds: []
+              }
+            };
+          }
+          return { success: true, data: true };
+        })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Enabled tabs"));
+    await waitFor(() => expect(document.querySelector('.settings-layout')?.getAttribute("aria-busy")).toBe("false"));
+
+    document.querySelector<HTMLInputElement>('input[aria-label="Enable Azure Roles feature"]')!.click();
+    clickButton("Role Access");
+    await waitFor(() => expect(document.body.textContent).toContain("Access status & recovery"));
+    clickButton("Open missing portal pages");
+
+    await waitFor(() => expect(openedTargets.length).toBeGreaterThan(0));
+    expect(openedTargets.at(-1)).toEqual(["directoryRole", "azureRole"]);
+    expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).preferences.enabledFeatures).toEqual([
+      "directoryRole",
+      "azureRole",
+      "bundles"
+    ]);
+  });
+});
+
+describe("settings journey safeguards", () => {
+  test("keeps legacy hashes mapped to their new journey pages", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#access");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    const routes: Array<[string, string]> = [
+      ["#access", "Role Access"],
+      ["#sources", "Popup & Appearance"],
+      ["#defaults", "Activation & Notifications"],
+      ["#automation", "Activation & Notifications"],
+      ["#activity", "Activity & Usage"],
+      ["#display", "Popup & Appearance"],
+      ["#preferences", "Popup & Appearance"],
+      ["#aliases", "Names & Aliases"],
+      ["#data", "Backup & Restore"]
+    ];
+
+    for (const [hash, heading] of routes) {
+      window.history.replaceState(null, "", hash);
+      window.dispatchEvent(new Event("hashchange"));
+      await waitFor(() => expect([...document.querySelectorAll("h2")].some((item) => item.textContent === heading)).toBe(true));
+    }
+  });
+
+  test("places a guarded full reset after Backup & Restore and recommends a backup first", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#reset");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reset QuickPIM++"));
+    expect(document.body.textContent).toContain("Download a JSON backup before resetting");
+    expect(getExactButton("Open Backup & Restore")).toBeTruthy();
+    clickExactButton("Erase all extension data");
+    await waitFor(() => expect(document.body.textContent).toContain("I understand this cannot be undone without a backup"));
+    const confirm = getExactButton("Erase everything");
+    expect(confirm.disabled).toBe(true);
+    document.querySelector<HTMLInputElement>('.reset-extension-confirmation input[type="checkbox"]')!.click();
+    await waitFor(() => expect(confirm.disabled).toBe(false));
+    confirm.click();
+    await waitFor(() => expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "resetExtensionData" }));
+    await waitFor(() => expect(document.body.textContent).toContain("All QuickPIM++ data was cleared"));
+  });
+
+  test("shows the full Microsoft tenant and owns learned-name cleanup under Names & Aliases", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#access");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    chromeMock.runtime.sendMessage.mockImplementation(async (message: { action: string }): Promise<any> => {
+      if (message.action === "getTokenStatus") {
+        return {
+          success: true,
+          data: {
+            graph: {
+              hasToken: true,
+              isExpired: false,
+              principalName: "admin@contoso.onmicrosoft.com",
+              principalId: "principal-1",
+              tenantId: "687bbaa1-7c7d-4e66-8aa1-4633a953046b"
+            },
+            azureManagement: { hasToken: false }
+          }
+        };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return {
+          success: true,
+          data: {
+            eligible: { items: [], errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] }
+          }
+        };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector(".access-identity-value")?.textContent).toContain("687bbaa1-7c7d-4e66-8aa1-4633a953046b"));
+    expect([...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Clear learned names")).toBe(false);
+    clickExactButton("Names & Aliases");
+    await waitFor(() => expect(getExactButton("Clear learned names")).toBeTruthy());
+  });
+
+  test("restores only Popup & Appearance defaults and preserves role sources and user data", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#display");
+    const settings = createDefaultSettings();
+    settings.aliasesByItemId = { "directoryRole:reader:/": "Local Reader" };
+    settings.savedJustifications = ["Keep this saved reason"];
+    settings.preferences.defaultDurationHours = 4;
+    settings.preferences.defaultSort = "scope";
+    settings.preferences.darkMode = true;
+    settings.preferences.showAssignedRoles = true;
+    settings.preferences.showRemainingActivationTime = false;
+    settings.preferences.showActivationCounters = true;
+    settings.preferences.showEnablementDetails = true;
+    settings.preferences.showLastEnablementDate = true;
+    settings.preferences.enabledFeatures = ["directoryRole", "pimGroup"];
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(getExactButton("Restore defaults").disabled).toBe(false));
+    clickExactButton("Restore defaults");
+    await waitFor(() => expect(getExactButton("Restore")).toBeTruthy());
+    clickExactButton("Restore");
+    await waitFor(() => {
+      const saved = storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS;
+      expect(saved.preferences).toMatchObject({
+        defaultDurationHours: 4,
+        defaultSort: "scope",
+        darkMode: false,
+        showAssignedRoles: false,
+        showRemainingActivationTime: true,
+        showActivationCounters: false,
+        showEnablementDetails: false,
+        showLastEnablementDate: false,
+        enabledFeatures: ["directoryRole", "pimGroup", "bundles"]
+      });
+      expect(saved.aliasesByItemId).toEqual({ "directoryRole:reader:/": "Local Reader" });
+      expect(saved.savedJustifications).toEqual(["Keep this saved reason"]);
+    });
+    await waitFor(() => expect(getExactButton("Restore defaults").disabled).toBe(true));
+  });
+
+  test("restores activation defaults and removes the optional notification permission", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#automation");
+    const settings = createDefaultSettings();
+    settings.preferences.darkMode = true;
+    settings.preferences.defaultDurationHours = 4;
+    settings.preferences.defaultExtensionDurationHours = 2;
+    settings.preferences.requestNotificationsEnabled = true;
+    settings.preferences.expiryReminderMinutes = 60;
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const removePermission = vi.fn(async () => true);
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData, { removePermission }));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(getExactButton("Restore defaults").disabled).toBe(false));
+    clickExactButton("Restore defaults");
+    await waitFor(() => expect(getExactButton("Restore")).toBeTruthy());
+    clickExactButton("Restore");
+    await waitFor(() => {
+      expect(storageData[SETTINGS_KEY]).toMatchObject({
+        preferences: expect.objectContaining({
+          darkMode: true,
+          defaultDurationHours: DEFAULT_SETTINGS.preferences.defaultDurationHours,
+          defaultExtensionDurationHours: DEFAULT_SETTINGS.preferences.defaultExtensionDurationHours,
+          requestNotificationsEnabled: false,
+          expiryReminderMinutes: DEFAULT_SETTINGS.preferences.expiryReminderMinutes
+        })
+      });
+      expect(removePermission).toHaveBeenCalledWith({ permissions: ["notifications"] });
+    });
+  });
+
+  test("restores only the recent justification limit", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#justifications");
+    const settings = createDefaultSettings();
+    settings.savedJustifications = ["Saved reason"];
+    settings.recentJustifications = ["Recent reason"];
+    settings.preferences.recentJustificationLimit = 3;
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(getExactButton("Restore defaults").disabled).toBe(false));
+    clickExactButton("Restore defaults");
+    await waitFor(() => expect(getExactButton("Restore")).toBeTruthy());
+    clickExactButton("Restore");
+    await waitFor(() => {
+      expect(storageData[SETTINGS_KEY]).toMatchObject({
+        savedJustifications: ["Saved reason"],
+        recentJustifications: ["Recent reason"],
+        preferences: expect.objectContaining({ recentJustificationLimit: DEFAULT_SETTINGS.preferences.recentJustificationLimit })
+      });
+    });
+  });
+
+  test("renders only the selected Activity & Usage view", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#activity");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activity & Usage"));
+    expect(document.body.textContent).not.toContain("History retention");
+    expect(document.body.textContent).not.toContain("Usage counters");
+    clickExactButton("History");
+    await waitFor(() => expect(document.body.textContent).toContain("History retention"));
+    expect(document.body.textContent).not.toContain("Usage counters");
+    clickExactButton("Usage");
+    await waitFor(() => expect(document.body.textContent).toContain("Usage counters"));
+    expect(document.body.textContent).not.toContain("History retention");
+  });
+
+  test("keeps Backup & Restore actions aligned with editor validity and dirty state", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#data");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const writeText = vi.fn(async () => undefined);
+    vi.stubGlobal("navigator", { userAgent: window.navigator.userAgent, clipboard: { writeText } });
+    vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>("textarea.code-box")).toBeTruthy());
+    const editor = document.querySelector<HTMLTextAreaElement>("textarea.code-box")!;
+    expect(getExactButton("Save changes").disabled).toBe(true);
+    expect(getExactButton("Reload saved").disabled).toBe(true);
+    expect(getExactButton("Copy JSON").disabled).toBe(false);
+    expect(getExactButton("Download JSON").disabled).toBe(false);
+
+    const partial = '{"preferences":{"darkMode":true}}';
+    setFieldValue(editor, partial);
+    await waitFor(() => expect(getExactButton("Save changes").disabled).toBe(false));
+    expect(getExactButton("Reload saved").disabled).toBe(false);
+    clickExactButton("Copy JSON");
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(partial));
+
+    setFieldValue(editor, "{");
+    await waitFor(() => expect(getExactButton("Save changes").disabled).toBe(true));
+    expect(getExactButton("Copy JSON").disabled).toBe(true);
+    expect(getExactButton("Download JSON").disabled).toBe(true);
+    expect(getExactButton("Reload saved").disabled).toBe(false);
+    clickExactButton("Reload saved");
+    await waitFor(() => expect(getExactButton("Reload saved").disabled).toBe(true));
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+    const oversizedFile = {
+      name: "oversized.json",
+      size: MAX_SETTINGS_BACKUP_BYTES + 1,
+      text: vi.fn(async () => "{}")
+    } as unknown as File;
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [oversizedFile] });
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => expect(document.body.textContent).toContain("larger than 1 MiB"));
+    expect(oversizedFile.text).not.toHaveBeenCalled();
+
+    const stagedJson = '{"preferences":{"darkMode":true}}';
+    const stagedFile = {
+      name: "quickpim-settings.json",
+      size: stagedJson.length,
+      text: vi.fn(async () => stagedJson)
+    } as unknown as File;
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [stagedFile] });
+    fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+    await waitFor(() => expect(document.body.textContent).toContain("loaded for review"));
+    expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).preferences.darkMode).toBe(false);
+    expect(editor.value).toContain('"darkMode": true');
+    clickExactButton("Save changes");
+    await waitFor(() => expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).preferences.darkMode).toBe(true));
+    await waitFor(() => expect(getExactButton("Save changes").disabled).toBe(true));
+
+    clickExactButton("Reset all settings");
+    await waitFor(() => expect(getExactButton("Reset everything")).toBeTruthy());
+    clickExactButton("Reset everything");
+    await waitFor(() => expect(storageData[SETTINGS_KEY]).toEqual(DEFAULT_SETTINGS));
   });
 });
 
@@ -2517,5 +3129,14 @@ describe("settings message contrast", () => {
     expect(css).toMatch(/\.checkbox-grid\.enabled-features-grid\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.checkbox-grid\.enabled-features-grid\s*\{\s*grid-template-columns: 1fr;/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.settings-nav\s*\{[\s\S]*display: flex;[\s\S]*overflow-x: auto;/);
+  });
+
+  test("allows long Microsoft context values to wrap without clipping", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const identityValueRule = css.match(/\.access-identity\s*>\s*span\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(identityValueRule).toContain("min-width: 0;");
+    expect(identityValueRule).toContain("overflow-wrap: anywhere;");
+    expect(identityValueRule).toContain("word-break: break-word;");
   });
 });

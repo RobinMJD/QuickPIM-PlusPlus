@@ -26,16 +26,23 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   await page.reload();
 
   await expect(page.getByRole("heading", { name: "QuickPIM++" })).toBeVisible();
+  const idleFooter = page.locator(".activation-footer-actions");
+  const idleFooterHeight = await idleFooter.evaluate((element) => element.getBoundingClientRect().height);
+  await expect(idleFooter).toHaveCSS("justify-content", "flex-end");
+  const idleSettingsBox = await idleFooter.getByRole("button", { name: "Settings" }).boundingBox();
+  expect((idleSettingsBox?.x || 0) + (idleSettingsBox?.width || 0)).toBeGreaterThan(500);
   const row = page.locator(".role-row.selectable").first();
   await expect(row).toBeVisible();
   await row.focus();
   await page.keyboard.press("Space");
   await expect(page.getByRole("button", { name: /Continue with 1 selected/i })).toBeVisible();
+  const selectedSettingsBox = await page.locator(".activation-footer-actions").getByRole("button", { name: "Settings" }).boundingBox();
+  expect((selectedSettingsBox?.x || 0) + (selectedSettingsBox?.width || 0)).toBeGreaterThan(500);
 
   const geometry = await page.evaluate(() => {
     const content = document.querySelector<HTMLElement>(".content");
     const footer = document.querySelector<HTMLElement>(".activation-bar");
-    const quickFilters = document.querySelector<HTMLElement>(".quick-filter-row");
+    const activeFilter = document.querySelector<HTMLElement>(".active-filter-switch");
     const shell = document.querySelector<HTMLElement>(".app-shell");
     if (content) content.scrollTop = content.scrollHeight;
     return {
@@ -47,8 +54,8 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
       contentClientHeight: content?.clientHeight,
       contentScrollHeight: content?.scrollHeight,
       contentOverflowY: content ? getComputedStyle(content).overflowY : undefined,
-      quickFilterClientHeight: quickFilters?.clientHeight,
-      quickFilterScrollHeight: quickFilters?.scrollHeight,
+      activeFilterClientHeight: activeFilter?.clientHeight,
+      activeFilterScrollHeight: activeFilter?.scrollHeight,
       footerBottom: footer?.getBoundingClientRect().bottom,
       shellBottom: shell?.getBoundingClientRect().bottom
     };
@@ -58,13 +65,50 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   expect(geometry.documentScrollHeight).toBeLessThanOrEqual(geometry.viewportHeight);
   expect(geometry.contentOverflowY).toBe("auto");
   expect(geometry.contentScrollHeight).toBeGreaterThan(geometry.contentClientHeight || 0);
-  expect(geometry.quickFilterScrollHeight).toBeLessThanOrEqual(geometry.quickFilterClientHeight || 0);
+  expect(geometry.activeFilterScrollHeight).toBeLessThanOrEqual(geometry.activeFilterClientHeight || 0);
   if (geometry.footerBottom !== undefined) {
     expect(geometry.footerBottom).toBeLessThanOrEqual(geometry.viewportHeight);
     expect(geometry.footerBottom).toBeCloseTo(geometry.shellBottom || geometry.viewportHeight, 0);
   }
 
   await page.getByRole("button", { name: /Continue with 1 selected/i }).click();
+  const backButton = page.getByRole("button", { name: "Back to role selection" });
+  const activateButton = page.getByRole("button", { name: "Activate 1 selected" });
+  const saveButton = page.getByRole("button", { name: "Save justification" });
+  const justification = page.locator(".justification-textarea");
+  await expect(backButton).toBeVisible();
+  await expect(saveButton).toHaveClass(/justification-save-overlay/);
+  const [backBox, activateBox] = await Promise.all([backButton.boundingBox(), activateButton.boundingBox()]);
+  expect(backBox?.x).toBeLessThan(activateBox?.x || 0);
+  const reviewActionBoxes = await page.locator(".activation-review-actions .btn").evaluateAll((buttons) =>
+    buttons.map((button) => {
+      const rect = button.getBoundingClientRect();
+      return { top: rect.top, height: rect.height };
+    })
+  );
+  expect(reviewActionBoxes).toHaveLength(4);
+  expect(new Set(reviewActionBoxes.map((box) => box.top)).size).toBe(1);
+  expect(new Set(reviewActionBoxes.map((box) => box.height)).size).toBe(1);
+  await expect(page.locator(".activation-review-actions")).toHaveJSProperty("clientHeight", idleFooterHeight);
+  await expect(justification).toHaveCSS("height", "58px");
+  await activateButton.click();
+  const validationError = page.locator(".dismissible-message").filter({ hasText: "Enter a justification" });
+  await expect(validationError).toBeVisible();
+  const validationDismiss = validationError.getByRole("button", { name: "Dismiss error" });
+  const [validationBox, validationDismissBox] = await Promise.all([validationError.boundingBox(), validationDismiss.boundingBox()]);
+  expect(validationBox?.height || 0).toBeLessThanOrEqual(40);
+  expect(Math.abs(
+    ((validationBox?.y || 0) + (validationBox?.height || 0) / 2)
+    - ((validationDismissBox?.y || 0) + (validationDismissBox?.height || 0) / 2)
+  )).toBeLessThanOrEqual(1);
+  await validationDismiss.click();
+  await expect(validationError).toBeHidden();
+  await justification.fill("Draft retained while reviewing roles");
+  await backButton.click();
+  await expect(page.getByRole("button", { name: /Continue with 1 selected/i })).toBeVisible();
+  await expect(row.locator('input[type="checkbox"]')).toBeChecked();
+  await page.getByRole("button", { name: /Continue with 1 selected/i }).click();
+  await expect(justification).toHaveValue("Draft retained while reviewing roles");
   await expect(page.getByRole("tab", { name: "History" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("tabpanel", { name: "Justification history" })).toContainText("Recent visual reason");
   await expect(page.getByRole("tabpanel", { name: "Justification history" })).not.toContainText("Saved visual reason");
@@ -177,12 +221,127 @@ test("settings navigation and diagnostics remain aligned at desktop and compact 
   await page.close();
 });
 
+test("settings pages follow the user-journey information architecture", async ({}, testInfo) => {
+  const page = await openExtensionPage("settings.html#display", { width: 1280, height: 900 });
+  await seedPopupIdentity(page);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Popup & Appearance" })).toBeVisible();
+  await expect(page.locator(".settings-nav-heading")).toHaveText([
+    "Overview",
+    "Access",
+    "Personalization",
+    "Activation",
+    "Review",
+    "Data & Support",
+    "Product"
+  ]);
+  await expect(page.locator(".settings-nav button")).toHaveCount(12);
+  await expect(page.getByText("Enabled tabs", { exact: true })).toBeVisible();
+  await expect(page.getByText("Refresh behavior", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Role Access", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Role Access" })).toBeVisible();
+  await expect(page.getByText("Enabled tabs", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Refresh behavior", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Access status & recovery", { exact: true })).toBeVisible();
+  const contextValue = page.locator(".access-identity-value");
+  await expect(contextValue).toBeVisible();
+  const contextStyle = await contextValue.evaluate((element) => ({
+    overflowWrap: getComputedStyle(element).overflowWrap,
+    right: element.getBoundingClientRect().right,
+    viewportWidth: window.innerWidth
+  }));
+  expect(contextStyle.overflowWrap).toBe("anywhere");
+  expect(contextStyle.right).toBeLessThanOrEqual(contextStyle.viewportWidth);
+
+  await page.setViewportSize({ width: 720, height: 800 });
+  await assertNoHorizontalOverflow(page);
+  const compactContextGeometry = await contextValue.evaluate((element) => ({
+    right: element.getBoundingClientRect().right,
+    viewportWidth: window.innerWidth,
+    scrollWidth: element.scrollWidth,
+    clientWidth: element.clientWidth
+  }));
+  expect(compactContextGeometry.right).toBeLessThanOrEqual(compactContextGeometry.viewportWidth);
+  expect(compactContextGeometry.scrollWidth).toBeLessThanOrEqual(compactContextGeometry.clientWidth);
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  await page.getByRole("button", { name: "Reset QuickPIM++", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Reset QuickPIM++" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open Backup & Restore" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Activation & Notifications", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Activation & Notifications" })).toBeVisible();
+  await expect(page.getByLabel("Default activation duration")).toBeVisible();
+  await expect(page.getByLabel("Default PIM extension duration")).toBeVisible();
+  await expect(page.getByLabel("Notify me about request updates")).toBeVisible();
+  await assertNoHorizontalOverflow(page);
+  await testInfo.attach("settings-architecture", { body: await page.screenshot(), contentType: "image/png" });
+
+  await page.setViewportSize({ width: 720, height: 800 });
+  await assertNoHorizontalOverflow(page);
+  await expect(page.getByRole("button", { name: "About", exact: true })).toBeVisible();
+  await page.close();
+});
+
+test("saved and recent justifications align and recent reasons are copyable", async ({}, testInfo) => {
+  const page = await openExtensionPage("settings.html#justifications", { width: 1000, height: 720 });
+  await seedPopupRole(page);
+  await page.reload();
+
+  await expect(page.getByRole("heading", { name: "Justifications" })).toBeVisible();
+  const columns = page.locator(".justification-columns > .settings-subsection");
+  await expect(columns).toHaveCount(2);
+  const [savedBox, recentBox] = await Promise.all([columns.nth(0).boundingBox(), columns.nth(1).boundingBox()]);
+  expect(Math.abs((savedBox?.y || 0) - (recentBox?.y || 0))).toBeLessThanOrEqual(1);
+
+  const recentRow = page.locator(".recent-justification-row").first();
+  const recentCopy = recentRow.getByRole("button", { name: "Copy recent justification" });
+  await expect(recentCopy).toBeVisible();
+  const [rowBox, copyBox] = await Promise.all([recentRow.boundingBox(), recentCopy.boundingBox()]);
+  expect(copyBox?.x || 0).toBeGreaterThan((rowBox?.x || 0) + (rowBox?.width || 0) / 2);
+  await recentCopy.click();
+  await expect(recentRow.getByRole("button", { name: "recent justification copied" })).toBeVisible();
+  await assertNoHorizontalOverflow(page);
+  await testInfo.attach("settings-justifications", { body: await page.screenshot(), contentType: "image/png" });
+  await page.close();
+});
+
+test("settings semantic surfaces remain distinct in light and dark modes", async ({}, testInfo) => {
+  const page = await openExtensionPage("settings.html#appearance", { width: 1280, height: 900 });
+  await setDarkMode(page, false);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Popup & Appearance" })).toBeVisible();
+  const themeSwitch = page.getByRole("switch", { name: "Dark mode" });
+  await expect(themeSwitch).toHaveAttribute("aria-checked", "false");
+  await expect(themeSwitch.getByText("Light mode")).toBeVisible();
+  await expect(themeSwitch.getByText("Dark mode")).toBeVisible();
+  const lightColors = await readSettingsSurfaceColors(page);
+  expect(lightColors.body).not.toBe(lightColors.panel);
+  expect(lightColors.panel).not.toBe(lightColors.section);
+  await assertNoHorizontalOverflow(page);
+  await testInfo.attach("settings-light", { body: await page.screenshot(), contentType: "image/png" });
+
+  await setDarkMode(page, true);
+  await page.reload();
+  await expect(page.locator("body.dark-mode")).toBeVisible();
+  const darkColors = await readSettingsSurfaceColors(page);
+  expect(darkColors.body).not.toBe(darkColors.panel);
+  expect(darkColors.panel).not.toBe(darkColors.section);
+  expect(darkColors.body).not.toBe(lightColors.body);
+  await page.setViewportSize({ width: 720, height: 800 });
+  await assertNoHorizontalOverflow(page);
+  await testInfo.attach("settings-dark-compact", { body: await page.screenshot(), contentType: "image/png" });
+  await setDarkMode(page, false);
+  await page.close();
+});
+
 test("activity shows useful timestamps and a justification copy action", async ({}, testInfo) => {
   const page = await openExtensionPage("settings.html#activity", { width: 1000, height: 720 });
   await seedActivity(page);
   await page.reload();
 
-  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Activity & Usage" })).toBeVisible();
   const requestRow = page.getByRole("button", { name: /Exchange Administrator/ }).first();
   await expect(requestRow.locator("time")).toHaveText(/2026-07-20 \d{2}:\d{2}/);
   await requestRow.click();
@@ -294,6 +453,34 @@ async function seedPopupIdentity(page: Page): Promise<void> {
       tokenTimestamp: Date.now(),
       tokenSource: "portal"
     });
+  });
+}
+
+async function setDarkMode(page: Page, darkMode: boolean): Promise<void> {
+  await page.evaluate(async (enabled) => {
+    const key = "quickPimSettings.v1";
+    const stored = await chrome.storage.local.get(key);
+    const settings = stored[key] as Record<string, unknown> | undefined;
+    const preferences = (settings?.preferences || {}) as Record<string, unknown>;
+    await chrome.storage.local.set({
+      [key]: {
+        ...settings,
+        preferences: { ...preferences, darkMode: enabled }
+      }
+    });
+  }, darkMode);
+}
+
+async function readSettingsSurfaceColors(page: Page): Promise<{ body: string; panel: string; section: string }> {
+  return await page.evaluate(() => {
+    const panel = document.querySelector<HTMLElement>(".settings-layout > div > .panel");
+    const section = document.querySelector<HTMLElement>(".preference-section");
+    if (!panel || !section) throw new Error("Settings surfaces are missing.");
+    return {
+      body: getComputedStyle(document.body).backgroundColor,
+      panel: getComputedStyle(panel).backgroundColor,
+      section: getComputedStyle(section).backgroundColor
+    };
   });
 }
 

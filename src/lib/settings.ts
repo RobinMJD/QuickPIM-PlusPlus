@@ -9,6 +9,7 @@ import type {
   QuickPimFeature,
   ReferenceDataCache,
   QuickPimSettings,
+  SortDirection,
   SortMode
 } from "./types";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
@@ -48,6 +49,7 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
     defaultDurationHours: 0.5,
     defaultExtensionDurationHours: DEFAULT_EXTENSION_DURATION_HOURS,
     defaultSort: "name",
+    defaultSortDirection: "ascending",
     recentJustificationLimit: 8,
     activityHistoryLimit: 100,
     darkMode: false,
@@ -119,7 +121,8 @@ export function sortItems(
   items: ActivationItem[],
   settings: QuickPimSettings,
   sortMode: SortMode,
-  referenceData?: ReferenceDataCache
+  referenceData?: ReferenceDataCache,
+  sortDirection: SortDirection = getDefaultSortDirection(sortMode)
 ): ActivationItem[] {
   const sortable = [...items];
   const favoriteItemIds = new Set(settings.favoriteItemIds || []);
@@ -129,27 +132,25 @@ export function sortItems(
       return favoriteDiff;
     }
 
+    let comparison: number;
     if (sortMode === "lastUsed") {
       const aDate = getUsage(a, settings).lastUsedAt || "";
       const bDate = getUsage(b, settings).lastUsedAt || "";
-      return bDate.localeCompare(aDate) || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
-    }
-
-    if (sortMode === "activationCount") {
+      comparison = aDate.localeCompare(bDate) || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
+    } else if (sortMode === "activationCount") {
       const diff = getUsage(b, settings).activationCount - getUsage(a, settings).activationCount;
-      return diff || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
+      comparison = -diff || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
+    } else if (sortMode === "scope") {
+      comparison = getScopeLabel(a, referenceData).localeCompare(getScopeLabel(b, referenceData)) || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
+    } else {
+      comparison = getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
     }
-
-    if (sortMode === "type") {
-      return a.type.localeCompare(b.type) || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
-    }
-
-    if (sortMode === "scope") {
-      return getScopeLabel(a, referenceData).localeCompare(getScopeLabel(b, referenceData)) || getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
-    }
-
-    return getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData));
+    return sortDirection === "descending" ? -comparison : comparison;
   });
+}
+
+export function getDefaultSortDirection(sortMode: SortMode): SortDirection {
+  return sortMode === "lastUsed" || sortMode === "activationCount" ? "descending" : "ascending";
 }
 
 export function addRecentJustification(settings: QuickPimSettings, justification: string): QuickPimSettings {
@@ -355,10 +356,14 @@ function sanitizeFavoriteItemIds(value: unknown): string[] {
 function sanitizePreferences(value: unknown): QuickPimSettings["preferences"] {
   const preferences = isRecord(value) ? value : {};
   const ignoredAt = sanitizeString(preferences.permissionWarningIgnoredAt, 64);
+  const defaultSort = isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort;
   return {
     defaultDurationHours: clampNumber(preferences.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
     defaultExtensionDurationHours: sanitizeExtensionDurationHours(preferences.defaultExtensionDurationHours),
-    defaultSort: isSortMode(preferences.defaultSort) ? preferences.defaultSort : DEFAULT_SETTINGS.preferences.defaultSort,
+    defaultSort,
+    defaultSortDirection: isSortDirection(preferences.defaultSortDirection)
+      ? preferences.defaultSortDirection
+      : getDefaultSortDirection(defaultSort),
     recentJustificationLimit: clampInteger(preferences.recentJustificationLimit, 1, 20, DEFAULT_SETTINGS.preferences.recentJustificationLimit),
     activityHistoryLimit: clampInteger(preferences.activityHistoryLimit, 10, MAX_ACTIVITY_HISTORY_ENTRIES, DEFAULT_SETTINGS.preferences.activityHistoryLimit),
     darkMode: preferences.darkMode === true,
@@ -644,7 +649,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isSortMode(value: unknown): value is SortMode {
-  return value === "name" || value === "lastUsed" || value === "activationCount" || value === "type" || value === "scope";
+  return value === "name" || value === "lastUsed" || value === "activationCount" || value === "scope";
+}
+
+function isSortDirection(value: unknown): value is SortDirection {
+  return value === "ascending" || value === "descending";
 }
 
 function isQuickPimFeature(value: unknown): value is QuickPimFeature {

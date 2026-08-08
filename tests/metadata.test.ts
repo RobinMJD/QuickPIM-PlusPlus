@@ -67,17 +67,18 @@ describe("versioning and extension manifest", () => {
     expect(packageJson.devDependencies).not.toHaveProperty("@testing-library/react");
   });
 
-  test("documents the security review and original author credit", () => {
+  test("documents the security review and original concept credit", () => {
     const readme = readFileSync(resolve("README.md"), "utf8");
     const securityReview = readFileSync(resolve("SECURITY_REVIEW.md"), "utf8");
     const license = readFileSync(resolve("LICENSE"), "utf8");
 
-    expect(readme).toContain("Original author: Daniel Bradley");
+    expect(readme).toContain("Concept credit: [Daniel Bradley]");
+    expect(readme).toContain("fully rewritten application codebase");
     expect(readme).toContain(TEST_RELEASE_TAG);
     expect(securityReview).toContain("Threat Model");
     expect(securityReview).toContain("Token Handling");
     expect(license).toContain("MIT License");
-    expect(license).toContain("Daniel Bradley and QuickPIM++ contributors");
+    expect(license).toContain("Copyright (c) QuickPIM++ contributors");
   });
 
   test("references existing README images", () => {

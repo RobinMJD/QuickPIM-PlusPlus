@@ -289,7 +289,7 @@ export function getDeactivatableItems(items: ActivationItem[], now = Date.now())
   });
 }
 
-export type QuickFilter = "favorites" | "eligible" | "active" | "requiresJustification";
+export type QuickFilter = "active";
 
 export interface RowActionState {
   mode?: PopupRequestMode;
@@ -381,20 +381,12 @@ export function getRowPolicySummary(item: ActivationItem): string[] {
 
 export function applyQuickFilters(
   items: ActivationItem[],
-  filters: QuickFilter[],
-  favoriteIds: Set<string>
+  filters: QuickFilter[]
 ): ActivationItem[] {
-  const filterSet = new Set(filters);
-  if (!filterSet.size) {
+  if (!filters.includes("active")) {
     return items;
   }
-  return items.filter((item) => {
-    if (filterSet.has("favorites") && !favoriteIds.has(item.id)) return false;
-    if (filterSet.has("eligible") && item.status !== "eligible") return false;
-    if (filterSet.has("active") && item.status !== "active") return false;
-    if (filterSet.has("requiresJustification") && item.activationRequirements?.justification === false) return false;
-    return true;
-  });
+  return items.filter((item) => item.status === "active" && getEffectiveActiveAssignmentType(item) === "activated");
 }
 
 export function getBundlePreflight(

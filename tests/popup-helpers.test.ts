@@ -178,12 +178,12 @@ describe("popup action helpers", () => {
   });
 
   test("applies quick filters after row data is assembled", () => {
-    const filters: QuickFilter[] = ["favorites", "active"];
+    const filters: QuickFilter[] = ["active"];
     expect(applyQuickFilters([
       { ...eligibleRole, isPrivileged: true },
       { ...activeRole, isPrivileged: true },
-      { ...blockedActiveRole, isPrivileged: false }
-    ], filters, new Set([activeRole.id]))).toEqual([{ ...activeRole, isPrivileged: true }]);
+      { ...assignedActiveRole, isPrivileged: false }
+    ], filters)).toEqual([{ ...activeRole, isPrivileged: true }]);
   });
 });
 

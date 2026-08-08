@@ -1,6 +1,6 @@
 {
   "name": "quickpim-plusplus",
-  "version": "2.11.12",
+  "version": "2.13.11",
   "private": true,
   "packageManager": "npm@11.6.2",
   "engines": {
@@ -9,10 +9,12 @@
   "type": "module",
   "scripts": {
     "type-check": "tsc --noEmit",
+    "check:edge": "node scripts/check-edge-compatibility.mjs",
     "build": "tsc --noEmit && vite build",
     "assets:stores": "node scripts/generate-store-assets.mjs",
     "package:stores": "node scripts/package-stores.mjs",
     "test": "vitest run --maxWorkers=1 --no-file-parallelism",
+    "test:edge": "node scripts/smoke-edge-extension.mjs",
     "test:watch": "vitest",
     "test:e2e": "playwright test"
   },

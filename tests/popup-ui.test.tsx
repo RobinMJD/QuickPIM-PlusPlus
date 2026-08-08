@@ -1096,7 +1096,7 @@ describe("popup compact controls", () => {
     expect(document.querySelector(".initial-access-icon")).toBeFalsy();
     expect(document.querySelector('button[aria-label^="Open "]')).toBeFalsy();
     clickButton("Access details");
-    await waitFor(() => expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#access"]));
+    await waitFor(() => expect(openedUrls).toEqual(["chrome-extension://quickpim/settings.html#role-access"]));
 
     document.querySelector<HTMLButtonElement>(
       'button[aria-label="Refresh all enabled data and recover missing portal access"]'
@@ -1727,7 +1727,8 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Reader"));
     expect(document.querySelector(".filter-field .field-icon")).toBeTruthy();
-    expect(document.querySelector(".sort-field .field-icon")).toBeTruthy();
+    expect(document.querySelector(".sort-menu .field-icon-svg")).toBeTruthy();
+    expect(document.querySelector('[role="switch"][aria-label="Show active PIM roles only"]')).toBeTruthy();
     expect(document.querySelector('[aria-label="Clear search"]')).toBeNull();
 
     const searchInput = document.querySelector<HTMLInputElement>('[aria-label="Filter roles"]')!;
@@ -2328,7 +2329,7 @@ describe("popup compact controls", () => {
     expect(chromeMock.runtime.openOptionsPage).not.toHaveBeenCalled();
   });
 
-  test("shows an Unselect all button while rows are selected and clears selection", async () => {
+  test("collapses activation review without clearing selection and still supports Unselect all", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
       id: "directoryRole:reader:/",
@@ -2398,6 +2399,18 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("Activate 1 selected");
     expect(document.body.textContent).not.toContain("Activation time");
     expect(document.body.textContent).toContain("Unselect all");
+
+    clickButton("Continue");
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
+    const backButton = document.querySelector<HTMLButtonElement>('button[aria-label="Back to role selection"]');
+    expect(backButton).toBeTruthy();
+    expect(backButton?.title).toBe("Back to role selection");
+    expect(backButton?.parentElement?.classList.contains("activation-review-actions")).toBe(true);
+    backButton?.click();
+
+    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+    expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
 
     clickButton("Unselect all");
 
@@ -2795,12 +2808,23 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.querySelector(".required-marker")).toBeTruthy());
     expect(document.querySelector(".required-marker")?.textContent).toBe("*");
     expect(document.body.textContent).not.toContain("Justifications are requested for audit and approval");
-    expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.maxLength).toBe(MAX_USER_JUSTIFICATION_LENGTH);
+    const justificationField = document.querySelector<HTMLTextAreaElement>(".justification-textarea")!;
+    expect(justificationField.maxLength).toBe(MAX_USER_JUSTIFICATION_LENGTH);
+    clickButton("Activate 1 selected");
+    await waitFor(() => expect(document.body.textContent).toContain("Enter a justification or choose a saved one."));
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Dismiss error"]')).toBeTruthy();
+    setFieldValue(justificationField, "Needed for a specific access review");
+    await waitFor(() => expect(document.body.textContent).not.toContain("Enter a justification or choose a saved one."));
+    setFieldValue(justificationField, "");
+    clickButton("Activate 1 selected");
+    await waitFor(() => expect(document.body.textContent).toContain("Enter a justification or choose a saved one."));
+    document.querySelector<HTMLButtonElement>('button[aria-label="Dismiss error"]')?.click();
+    await waitFor(() => expect(document.body.textContent).not.toContain("Enter a justification or choose a saved one."));
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     expect(css.match(/\.required-marker\s*\{[^}]+\}/)?.[0] || "").toContain("color: #dc2626;");
   });
 
-  test("uses an icon-only save justification action beside the justification label", async () => {
+  test("uses an icon-only save justification action inside the textarea", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const eligibleItem: ActivationItem = {
       id: "directoryRole:reader:/",
@@ -2868,15 +2892,17 @@ describe("popup compact controls", () => {
     document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
 
     await waitFor(() => expect(document.body.textContent).toContain("Continue"));
-    expect(document.querySelector(".justification-label-row")).toBeFalsy();
+    expect(document.querySelector(".justification-input-wrapper")).toBeFalsy();
     clickButton("Continue");
-    await waitFor(() => expect(document.querySelector(".justification-label-row")).toBeTruthy());
+    await waitFor(() => expect(document.querySelector(".justification-input-wrapper")).toBeTruthy());
     expect(document.body.textContent).not.toContain("Save justification");
 
     const saveButton = document.querySelector<HTMLButtonElement>('button[aria-label="Save justification"]');
     expect(saveButton).toBeTruthy();
     expect(saveButton?.title).toBe("Save this justification for reuse");
     expect(saveButton?.querySelector(".save-icon")).toBeTruthy();
+    expect(saveButton?.parentElement?.classList.contains("justification-input-wrapper")).toBe(true);
+    expect(saveButton?.classList.contains("justification-save-overlay")).toBe(true);
     expect(document.querySelector(".activation-bar > .button-row")?.textContent).not.toContain("Save justification");
 
     setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "INC-123 break fix");
@@ -3518,7 +3544,9 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(createTab).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining("aadmigratedroles") })));
 
     clickButton("Access Setup");
-    await waitFor(() => expect(createTab).toHaveBeenCalledWith({ url: "chrome-extension://quickpim/settings.html#access" }));
+    await waitFor(() => expect(createTab).toHaveBeenCalledWith({ url: "chrome-extension://quickpim/settings.html#role-access" }));
+    document.querySelector<HTMLButtonElement>('.activation-error-panel button[aria-label="Dismiss error"]')?.click();
+    await waitFor(() => expect(document.querySelector(".activation-error-panel")).toBeFalsy());
   });
 
   test("toggles favorite rows with a star button and keeps favorites first", async () => {
@@ -3872,6 +3900,8 @@ describe("popup draft persistence", () => {
   };
 
   function popupChromeMock(storageData: Record<string, unknown>, item: ActivationItem = pimGroupItem) {
+    const eligibleItems = item.status === "eligible" ? [item] : [];
+    const activeItems = item.status === "active" ? [item] : [];
     const tokenStatus = {
       graph: {
         hasToken: true,
@@ -3891,10 +3921,10 @@ describe("popup draft persistence", () => {
             return {
               success: true,
               data: {
-                eligible: { items: [item], errors: [], diagnostics: [] },
-                active: { items: [], errors: [], diagnostics: [] },
-                eligibleByTarget: { [item.type]: { items: [item], errors: [], diagnostics: [] } },
-                activeByTarget: { [item.type]: { items: [], errors: [], diagnostics: [] } },
+                eligible: { items: eligibleItems, errors: [], diagnostics: [] },
+                active: { items: activeItems, errors: [], diagnostics: [] },
+                eligibleByTarget: { [item.type]: { items: eligibleItems, errors: [], diagnostics: [] } },
+                activeByTarget: { [item.type]: { items: activeItems, errors: [], diagnostics: [] } },
                 tokenStatus
               }
             };
@@ -3923,7 +3953,7 @@ describe("popup draft persistence", () => {
     };
   }
 
-  test("shows only the useful quick filters", async () => {
+  test("uses one compact Active switch and reverses the selected useful sorter", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS };
     vi.stubGlobal("chrome", popupChromeMock(storageData));
@@ -3931,8 +3961,87 @@ describe("popup draft persistence", () => {
     await import("../src/popup/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
-    const labels = [...document.querySelectorAll<HTMLButtonElement>(".filter-chip")].map((button) => button.textContent?.trim());
-    expect(labels).toEqual(["Favorites", "Eligible", "Active", "Needs reason"]);
+    expect(document.querySelector(".quick-filter-row")).toBeNull();
+    expect(document.querySelector(".filter-chip")).toBeNull();
+    const activeSwitch = document.querySelector<HTMLButtonElement>('button[role="switch"][aria-label="Show active PIM roles only"]');
+    expect(activeSwitch).toBeTruthy();
+    expect(activeSwitch?.closest(".toolbar")).toBeTruthy();
+    expect(activeSwitch?.getAttribute("aria-checked")).toBe("false");
+
+    const sortMenu = document.querySelector<HTMLDetailsElement>(".sort-menu")!;
+    sortMenu.open = true;
+    const sorterLabels = [...sortMenu.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')]
+      .map((button) => button.textContent?.trim().replace(/[↑↓]/g, ""));
+    expect(sorterLabels).toEqual(["Name", "Last use", "Activation count", "Scope"]);
+    sortMenu.querySelector<HTMLButtonElement>('[role="menuitemradio"][aria-checked="true"]')?.click();
+    await waitFor(() => expect(sortMenu.querySelector("summary")?.getAttribute("aria-label")).toContain("descending"));
+
+    activeSwitch?.click();
+    await waitFor(() => expect(activeSwitch?.getAttribute("aria-checked")).toBe("true"));
+    expect(document.body.textContent).not.toContain("Privileged Group");
+    expect(document.body.textContent).toContain("No active PIM roles or groups found.");
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({
+      sortMode: "name",
+      sortDirection: "descending",
+      quickFilters: ["active"]
+    }));
+    await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({
+      preferences: expect.objectContaining({
+        defaultSort: "name",
+        defaultSortDirection: "descending"
+      })
+    }));
+  });
+
+  test("restores the last used sorter and direction when no popup draft exists", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          defaultSort: "scope",
+          defaultSortDirection: "descending"
+        }
+      }
+    };
+    vi.stubGlobal("chrome", popupChromeMock(storageData));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    expect(document.querySelector(".sort-menu summary")?.getAttribute("aria-label")).toBe("Sort roles by Scope, descending");
+  });
+
+  test("Active view shows only PIM activations with a countdown and local end time", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const activeUntil = new Date(Date.now() + 2 * 60 * 60_000 + 5 * 60_000).toISOString();
+    const activeItem: ActivationItem = {
+      ...pimGroupItem,
+      status: "active",
+      activeAssignmentType: "activated",
+      activeUntil,
+      assignmentScheduleId: "schedule-1"
+    };
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      preferences: {
+        ...DEFAULT_SETTINGS.preferences,
+        showRemainingActivationTime: false
+      }
+    };
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    vi.stubGlobal("chrome", popupChromeMock(storageData, activeItem));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    document.querySelector<HTMLButtonElement>('button[role="switch"][aria-label="Show active PIM roles only"]')?.click();
+    await waitFor(() => expect(document.querySelector(".remaining-activation-time")?.textContent).toMatch(/2h 0[45]m/));
+    const localEnd = document.querySelector<HTMLTimeElement>(".active-end-time");
+    expect(localEnd?.dateTime).toBe(activeUntil);
+    expect(localEnd?.textContent).toMatch(/^until \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+    expect(document.body.textContent).toContain("PIM active");
   });
 
   test("shows compact bundle settings with clear review and immediate activation actions", async () => {
@@ -4065,7 +4174,7 @@ describe("popup draft persistence", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
     expect(document.querySelector<HTMLInputElement>('input[aria-label="Filter roles"]')?.value).toBe("Privileged");
-    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Sort roles"]')?.value).toBe("activationCount");
+    expect(document.querySelector(".sort-menu summary")?.getAttribute("aria-label")).toBe("Sort roles by Activation count, descending");
     expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")?.value).toBe("Needed for group maintenance");
     const inputs = [...document.querySelectorAll<HTMLInputElement>(".activation-grid .input")];
     expect(inputs.map((input) => input.value)).toEqual(["ServiceNow", "INC-123"]);
@@ -4210,8 +4319,55 @@ describe("popup role row styling", () => {
     const activationButtonRule = css.match(/\.activation-bar\s+\.button-row\s*\{[^}]+\}/)?.[0] || "";
 
     expect(headerActionsRule).toContain("justify-content: flex-end;");
-    expect(toolbarRule).toContain("grid-template-columns: minmax(0, 1fr) 150px;");
+    expect(toolbarRule).toContain("grid-template-columns: minmax(0, 30ch) minmax(120px, 1fr) 84px;");
+    expect(toolbarRule).toContain("align-items: stretch;");
     expect(activationButtonRule).toContain("margin-top: 0;");
+  });
+
+  test("uses compact dismiss controls on error messages", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const messageRule = css.match(/\.dismissible-message\s*\{[^}]+\}/)?.[0] || "";
+    const dismissRule = css.match(/\.message-dismiss-button\s*\{[^}]+\}/)?.[0] || "";
+    const recoveryRule = css.match(/\.activation-error-dismiss\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(messageRule).toContain("grid-template-columns: minmax(0, 1fr) 20px;");
+    expect(messageRule).toContain("align-items: center;");
+    expect(messageRule).toContain("padding: 7px 8px 7px 10px;");
+    expect(dismissRule).toContain("width: 20px;");
+    expect(dismissRule).toContain("height: 20px;");
+    expect(recoveryRule).toContain("position: absolute;");
+    expect(recoveryRule).toContain("right: 6px;");
+  });
+
+  test("positions review navigation beside the primary action and save inside justification", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const footerRule = css.match(/\.activation-bar \.activation-footer-actions\s*\{[^}]+\}/)?.[0] || "";
+    const idleRule = css.match(/\.activation-bar \.activation-idle-actions\s*\{[^}]+\}/)?.[0] || "";
+    const settingsRule = css.match(/\.activation-bar \.activation-settings-button\s*\{[^}]+\}/)?.[0] || "";
+    const actionsRule = css.match(/\.activation-bar \.activation-review-actions\s*\{[^}]+\}/)?.[0] || "";
+    const backRule = css.match(/\.activation-review-back-button\s*\{[^}]+\}/)?.[0] || "";
+    const wrapperRule = css.match(/\.justification-input-wrapper\s*\{[^}]+\}/)?.[0] || "";
+    const saveRule = css.match(/\.justification-save-overlay\s*\{[^}]+\}/)?.[0] || "";
+    const textareaRule = css.match(/\.activation-bar \.justification-textarea\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(footerRule).toContain("min-height: 30px;");
+    expect(footerRule).toContain("align-items: stretch;");
+    expect(idleRule).toContain("justify-content: flex-end;");
+    expect(settingsRule).toContain("margin-left: auto;");
+    expect(actionsRule).toContain("display: grid;");
+    expect(actionsRule).toContain("grid-template-columns: 32px minmax(128px, 1fr) auto auto;");
+    expect(actionsRule).toContain("align-items: stretch;");
+    expect(backRule).toContain("width: 32px;");
+    expect(backRule).toContain("border: 1px solid #cbd5e1;");
+    expect(wrapperRule).toContain("position: relative;");
+    expect(saveRule).toContain("position: absolute;");
+    expect(saveRule).toContain("right: 7px;");
+    expect(saveRule).toContain("bottom: 7px;");
+    expect(textareaRule).toContain("padding-right: 44px;");
+    expect(textareaRule).toContain("height: 58px;");
+    expect(textareaRule).toContain("max-height: 58px;");
+    expect(textareaRule).toContain("padding-bottom: 7px;");
+    expect(textareaRule).toContain("resize: none;");
   });
 
   test("uses a three-zone header and reserves portal actions for the selected tab", () => {
@@ -4266,7 +4422,7 @@ describe("popup role row styling", () => {
     const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
     const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
     const toolbarRule = css.match(/\.toolbar\s*\{[^}]+\}/)?.[0] || "";
-    const quickFilterRule = css.match(/\.quick-filter-row\s*\{[^}]+\}/)?.[0] || "";
+    const activeFilterRule = css.match(/\.active-filter-switch\s*\{[^}]+\}/)?.[0] || "";
     const activationRule = css.match(/\.activation-bar\s*\{[^}]+\}/)?.[0] || "";
     const activationButtonRule = css.match(/\.activation-bar \.btn\s*\{[^}]+\}/)?.[0] || "";
 
@@ -4279,7 +4435,8 @@ describe("popup role row styling", () => {
     expect(contentRule).toContain("min-height: 0;");
     expect(contentRule).toContain("overflow-y: auto;");
     expect(toolbarRule).toContain("flex-shrink: 0;");
-    expect(quickFilterRule).toContain("flex-shrink: 0;");
+    expect(toolbarRule).toContain("grid-template-columns: minmax(0, 30ch) minmax(120px, 1fr) 84px;");
+    expect(activeFilterRule).toContain("min-height: 40px;");
     expect(contentRule).toContain("padding-bottom: 12px;");
     expect(contentRule).not.toContain("padding-bottom: 248px;");
     expect(activationRule).toContain("position: relative;");

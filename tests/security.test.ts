@@ -143,6 +143,7 @@ describe("runtime message validation", () => {
   test("rejects unsupported and malformed privileged messages", () => {
     const operationId = "request_security_test";
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
+    expect(validateQuickPimMessage({ action: "resetExtensionData" })).toEqual({ action: "resetExtensionData" });
     expect(validateQuickPimMessage({ action: "refreshPortalTokens" })).toEqual({ action: "refreshPortalTokens" });
     expect(validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: ["pimGroup", "pimGroup", "azureRole"] })).toEqual({
       action: "openPortalRecoveryTabs",

@@ -18,6 +18,7 @@ describe("popup draft storage", () => {
         tab: "pimGroup",
         search: " groups ",
         sortMode: "activationCount",
+        sortDirection: "ascending",
         quickFilters: ["favorites", "active", "requiresApproval", "highPrivilege", "favorites", "bad"],
         selectedIds: ["pimGroup:group-1:member", "pimGroup:group-1:member", 42],
         durationHours: 3.7,
@@ -34,7 +35,8 @@ describe("popup draft storage", () => {
       tab: "pimGroup",
       search: "groups",
       sortMode: "activationCount",
-      quickFilters: ["favorites", "active"],
+      sortDirection: "ascending",
+      quickFilters: ["active"],
       selectedIds: ["pimGroup:group-1:member"],
       durationHours: 3.5,
       justification: "Need access",
@@ -81,6 +83,17 @@ describe("popup draft storage", () => {
         now
       )?.requestMode
     ).toBeUndefined();
+  });
+
+  test("migrates ineffective type sorting and derives a useful default direction", () => {
+    expect(sanitizePopupDraft({ updatedAt: now, tab: "pimGroup", sortMode: "type" }, now)).toMatchObject({
+      sortMode: "name",
+      sortDirection: "ascending"
+    });
+    expect(sanitizePopupDraft({ updatedAt: now, tab: "pimGroup", sortMode: "lastUsed" }, now)).toMatchObject({
+      sortMode: "lastUsed",
+      sortDirection: "descending"
+    });
   });
 
   test("caps restored user text so the outbound audit marker still fits", () => {

@@ -25,7 +25,6 @@ import {
   getEnabledRoleFeatures,
   getScopeLabel,
   loadSettings,
-  mergeImportedSettings,
   mergeSettings,
   saveSettings
 } from "../lib/settings";
@@ -45,6 +44,7 @@ import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
 import { EXTENSION_DURATION_OPTIONS, buildTrackedRequestExtensionPlan, formatExtensionDuration } from "../lib/requestExtension";
 import { getIdentityContext } from "../lib/identityContext";
 import { stringifySupportReport } from "../lib/supportReport";
+import { MAX_SETTINGS_BACKUP_BYTES, buildSettingsExportFileName, validateSettingsBackup } from "../lib/settingsBackup";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -63,12 +63,13 @@ import {
   sanitizeTrackedRequestStore,
   trackedRequestStatusLabel
 } from "../lib/requestTracking";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, SortMode, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore, TrackedRequestExtensionResult } from "../lib/types";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore, TrackedRequestExtensionResult } from "../lib/types";
 
-type SettingsTab = "home" | "access" | "activity" | "justifications" | "bundles" | "aliases" | "preferences" | "data" | "diagnostics" | "about";
+type SettingsTab = "home" | "role-access" | "appearance" | "aliases" | "activation" | "justifications" | "bundles" | "activity" | "diagnostics" | "backup" | "reset" | "about";
+type PreferencePage = "appearance" | "activation";
 
-const ORIGINAL_AUTHOR = "Daniel Bradley";
-const ORIGINAL_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
+const CONCEPT_CREATOR = "Daniel Bradley";
+const INSPIRATION_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
 const REPOSITORY_URL = "https://github.com/RobinMJD/QuickPIM-PlusPlus";
 const GITHUB_API_BASE = "https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus";
 const CHANGELOG_CACHE_KEY = "quickPimChangelog.v2";
@@ -92,11 +93,12 @@ const ACCESS_REFRESH_STEPS: readonly ProgressStepDefinition[] = [
 
 const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Overview", tabs: ["home"] },
-  { title: "Setup", tabs: ["access"] },
-  { title: "Daily Use", tabs: ["activity", "justifications", "bundles", "aliases"] },
-  { title: "Preferences", tabs: ["preferences"] },
-  { title: "Maintenance", tabs: ["data", "diagnostics"] },
-  { title: "About", tabs: ["about"] }
+  { title: "Access", tabs: ["role-access"] },
+  { title: "Personalization", tabs: ["appearance", "aliases"] },
+  { title: "Activation", tabs: ["activation", "justifications", "bundles"] },
+  { title: "Review", tabs: ["activity"] },
+  { title: "Data & Support", tabs: ["diagnostics", "backup", "reset"] },
+  { title: "Product", tabs: ["about"] }
 ];
 
 interface ChangelogItem {
@@ -128,6 +130,8 @@ function SettingsApp() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [exportText, setExportText] = useState("");
+  const [exportBaselineText, setExportBaselineText] = useState("");
+  const [exportExternalChange, setExportExternalChange] = useState(false);
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
   const [eligibleRefreshProgress, setEligibleRefreshProgress] = useState<OperationProgress | null>(null);
@@ -143,12 +147,17 @@ function SettingsApp() {
   const settingsProgressRunId = useRef(0);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
   const pendingTabFlushRef = useRef<(() => Promise<void>) | undefined>(undefined);
+  const pendingPreferenceFlush = useRef<Promise<void>>(Promise.resolve());
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   function replaceExportText(value: string, dirty = false) {
     exportTextDirty.current = dirty;
     setExportText(value);
+    if (!dirty) {
+      setExportBaselineText(value);
+      setExportExternalChange(false);
+    }
   }
 
   useEffect(() => {
@@ -192,8 +201,12 @@ function SettingsApp() {
       }
       const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
       setSettings(merged);
+      const serialized = JSON.stringify(merged, null, 2);
       if (!exportTextDirty.current) {
-        replaceExportText(JSON.stringify(merged, null, 2));
+        replaceExportText(serialized);
+      } else {
+        setExportBaselineText(serialized);
+        setExportExternalChange(true);
       }
     }
     storageChangeEvent.addListener(handleStorageChange);
@@ -395,16 +408,18 @@ function SettingsApp() {
     setIsRefreshingAccess(true);
     setEligibleRefreshProgress(null);
     setAccessRefreshProgress(progress);
-    setError("");
-    setMessage("");
-
     const refreshRun = accessRefreshQueue.current.then(() => {
+      // Clear feedback when this queued run actually starts. Clearing it while
+      // enqueuing allows an older run to publish a stale error after the clear.
+      setError("");
+      setMessage("");
       showProgressStep(1, "Reading local access state");
       return performAccessDataRefresh(tokens, targets, options, showProgressStep);
     });
     accessRefreshQueue.current = refreshRun.then(() => undefined, () => undefined);
 
     return refreshRun.then(() => {
+      setError("");
       progress = completeOperationProgress(progress, "Access data refreshed");
       progressCompleted = true;
       setAccessRefreshProgress(progress);
@@ -629,8 +644,41 @@ function SettingsApp() {
     }
   }
 
+  async function resetExtensionData(): Promise<boolean> {
+    try {
+      await pendingPreferenceFlush.current;
+      await pendingTabFlushRef.current?.();
+      await pendingPreferenceFlush.current;
+      await sendMessage<boolean>(
+        { action: "resetExtensionData" },
+        { timeoutMs: 15_000, timeoutMessage: "QuickPIM++ data reset timed out. No success was confirmed." }
+      );
+      setSettings(DEFAULT_SETTINGS);
+      setItems([]);
+      setTokenStatus({ graph: { hasToken: false }, azureManagement: { hasToken: false } });
+      setDataCache({});
+      setReferenceData(undefined);
+      setTrackedRequests({ version: 1, requests: [] });
+      replaceExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2));
+      setError("");
+      setMessage("All QuickPIM++ data was cleared.");
+      if (!isTestRuntime()) {
+        window.location.hash = "#home";
+        window.location.reload();
+      }
+      return true;
+    } catch (resetError) {
+      setMessage("");
+      setError(resetError instanceof Error ? resetError.message : String(resetError));
+      return false;
+    }
+  }
+
   function transitionToTab(nextTab: SettingsTab, updateHash = true) {
-    void pendingTabFlushRef.current?.();
+    const flush = pendingTabFlushRef.current?.();
+    if (flush) {
+      pendingPreferenceFlush.current = flush.catch(() => undefined);
+    }
     setTab(nextTab);
     if (updateHash && window.location.hash !== `#${nextTab}`) {
       window.history.replaceState(null, "", `#${nextTab}`);
@@ -648,7 +696,7 @@ function SettingsApp() {
           <img src="/img/QuickPim48.png" alt="" />
           <div>
             <h1>QuickPIM++ Settings</h1>
-            <p>Manage activation defaults, access setup, saved justifications, bundles, aliases, and local data.</p>
+            <p>Set up role access, personalize the popup, configure activation, and manage local data.</p>
           </div>
         </div>
         <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible || isRefreshingAccess}>
@@ -697,39 +745,71 @@ function SettingsApp() {
             ))}
           </nav>
           <div>
-            {tab === "home" ? <HomePanel /> : null}
-            {tab === "about" ? <AboutPanel tokenStatus={tokenStatus} onClearTokens={() => void clearCapturedTokens()} /> : null}
-            {tab === "access" ? (
-              <AccessSetupPanel
-                settings={settings}
-                tokenStatus={tokenStatus}
-                dataCache={dataCache}
-                isRefreshingAccess={isRefreshingAccess}
-                isRefreshingEligible={isRefreshingEligible}
-                onSave={persist}
-                onRefreshAccessData={forceRefreshAccessData}
-                onScanPortalTabsForTokens={scanPortalTabsForTokens}
-                onClearReferenceData={clearLearnedReferences}
-              />
+            {tab === "home" ? <HomePanel onNavigate={selectTab} /> : null}
+            {tab === "about" ? <AboutPanel tokenStatus={tokenStatus} /> : null}
+            {tab === "role-access" ? (
+              <section className="panel role-access-page">
+                <div className="preferences-title-row">
+                  <div>
+                    <h2>Role Access</h2>
+                    <p className="muted">Review captured Microsoft access, recover missing role data, and manage local access artifacts.</p>
+                  </div>
+                </div>
+                <AccessSetupPanel
+                  embedded
+                  settings={settings}
+                  tokenStatus={tokenStatus}
+                  dataCache={dataCache}
+                  isRefreshingAccess={isRefreshingAccess}
+                  isRefreshingEligible={isRefreshingEligible}
+                  onSave={persist}
+                  onFlushPreferences={async () => {
+                    await pendingPreferenceFlush.current;
+                    await pendingTabFlushRef.current?.();
+                    await pendingPreferenceFlush.current;
+                    const latest = await loadSettings();
+                    setSettings(latest);
+                    return latest;
+                  }}
+                  onRefreshAccessData={forceRefreshAccessData}
+                  onScanPortalTabsForTokens={scanPortalTabsForTokens}
+                  onClearTokens={clearCapturedTokens}
+                />
+              </section>
             ) : null}
             {tab === "activity" ? (
               <ActivityPanel
                 settings={settings}
+                items={items}
+                referenceData={referenceData}
                 trackedRequests={trackedRequests}
                 onTrackedRequestsChange={setTrackedRequests}
                 onSave={persist}
               />
             ) : null}
-            {tab === "aliases" ? <AliasesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
+            {tab === "aliases" ? (
+              <AliasesPanel
+                settings={settings}
+                items={items}
+                referenceData={referenceData}
+                onSave={persist}
+                onClearReferenceData={clearLearnedReferences}
+              />
+            ) : null}
             {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
             {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
-            {tab === "preferences" ? (
-              <PreferencesPanel settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
+            {tab === "activation" ? (
+              <PreferencesPanel page="activation" settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
             ) : null}
-            {tab === "data" ? (
+            {tab === "appearance" ? (
+              <PreferencesPanel page="appearance" settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
+            ) : null}
+            {tab === "backup" ? (
               <DataPanel
                 settings={settings}
                 exportText={exportText}
+                exportBaselineText={exportBaselineText}
+                externalChange={exportExternalChange}
                 setExportText={replaceExportText}
                 onSave={persist}
                 onClearMessage={() => setMessage("")}
@@ -744,6 +824,7 @@ function SettingsApp() {
                 trackedRequests={trackedRequests}
               />
             ) : null}
+            {tab === "reset" ? <ResetDataPanel onNavigate={selectTab} onReset={resetExtensionData} /> : null}
           </div>
         </div>
       </section>
@@ -751,7 +832,7 @@ function SettingsApp() {
   );
 }
 
-function HomePanel() {
+function HomePanel({ onNavigate }: { onNavigate: (tab: SettingsTab) => void }) {
   const [changelog, setChangelog] = useState<ChangelogItem[]>([]);
   const [isLoadingChangelog, setIsLoadingChangelog] = useState(true);
   const [changelogError, setChangelogError] = useState("");
@@ -806,6 +887,12 @@ function HomePanel() {
             <span>Manage aliases, justifications, bundles, popup defaults, access setup, and import/export in one place.</span>
           </div>
         </div>
+        <div className="button-row home-quick-links" aria-label="Settings shortcuts">
+          <button className="btn" onClick={() => onNavigate("role-access")}>Role Access</button>
+          <button className="btn" onClick={() => onNavigate("appearance")}>Popup & Appearance</button>
+          <button className="btn" onClick={() => onNavigate("activation")}>Activation & Notifications</button>
+          <button className="btn" onClick={() => onNavigate("activity")}>Activity & Usage</button>
+        </div>
       </div>
 
       <div className="panel">
@@ -851,14 +938,16 @@ function HomePanel() {
 function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
   const pathByTab: Record<SettingsTab, string[]> = {
     home: ["M3 11.5 12 4l9 7.5", "M5 10.5V20h14v-9.5", "M9 20v-6h6v6"],
-    access: ["M12 3l7 3v5c0 4.5-2.8 8.1-7 10-4.2-1.9-7-5.5-7-10V6l7-3z", "M9.5 12.5l1.8 1.8 3.8-4.4"],
+    "role-access": ["M12 3l7 3v5c0 4.5-2.8 8.1-7 10-4.2-1.9-7-5.5-7-10V6l7-3z", "M9.5 12.5l1.8 1.8 3.8-4.4"],
+    appearance: ["M3 5h18v12H3z", "M8 21h8", "M12 17v4"],
+    activation: ["M12 3v3", "M12 18v3", "M6.6 6.6l2.1 2.1", "M15.3 15.3l2.1 2.1", "M5 12h3", "M16 12h3", "M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"],
     activity: ["M4 19h16", "M7 16V8", "M12 16V5", "M17 16v-6"],
     aliases: ["M4 7h16", "M7 4v6", "M17 4v6", "M6 14h7", "M6 18h11"],
     justifications: ["M6 4h9l3 3v13H6z", "M14 4v4h4", "M9 12h6", "M9 16h6"],
     bundles: ["M5 7h14v5H5z", "M7 12v5h10v-5", "M9 7V5h6v2"],
-    preferences: ["M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", "M12 2v3", "M12 19v3", "M4.9 4.9 7 7", "M17 17l2.1 2.1", "M2 12h3", "M19 12h3"],
-    data: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
     diagnostics: ["M4 5h16", "M4 12h16", "M4 19h16", "M8 5v14", "M16 5v14"],
+    backup: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
+    reset: ["M4 7h16", "M9 7V4h6v3", "M7 7l1 14h8l1-14", "M10 11v6", "M14 11v6"],
     about: ["M12 17v-5", "M12 8h.01", "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z"]
   };
   return (
@@ -873,11 +962,9 @@ function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
 }
 
 function AboutPanel({
-  tokenStatus,
-  onClearTokens
+  tokenStatus
 }: {
   tokenStatus: TokenStatus | null;
-  onClearTokens: () => void;
 }) {
   const manifest = chrome.runtime.getManifest();
   const appName = sanitizeManifestText(manifest.name) || APP_NAME;
@@ -891,14 +978,16 @@ function AboutPanel({
       <div className="about-grid">
         <div>
           <strong>
-            Original author:{" "}
-            <a href={ORIGINAL_REPOSITORY_URL} target="_blank" rel="noreferrer">
-              {ORIGINAL_AUTHOR}
+            Concept credit:{" "}
+            <a href={INSPIRATION_REPOSITORY_URL} target="_blank" rel="noreferrer">
+              {CONCEPT_CREATOR}
             </a>
           </strong>
           <p className="muted">
-            v2 continues the original QuickPIM project as QuickPIM++ with the React rewrite, PIM groups, Azure roles,
-            role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!
+            QuickPIM++ was inspired by Daniel Bradley&apos;s original QuickPIM idea. The current extension is an
+            independent React and TypeScript implementation with a fully rewritten application codebase, adding PIM
+            groups, Azure roles, role bundles, saved justifications, favorites, aliases, dark mode, learned names,
+            access setup, and much more!
           </p>
         </div>
         <div>
@@ -919,9 +1008,6 @@ function AboutPanel({
             Graph: {tokenStatus?.graph.hasToken ? "captured" : "missing"} / Azure:{" "}
             {tokenStatus?.azureManagement.hasToken ? "captured" : "missing"}
           </p>
-          <button className="btn danger settings-inline-action" onClick={onClearTokens}>
-            Clear captured tokens
-          </button>
         </div>
       </div>
     </section>
@@ -929,25 +1015,29 @@ function AboutPanel({
 }
 
 function AccessSetupPanel({
+  embedded = false,
   settings,
   tokenStatus,
   dataCache,
   isRefreshingAccess,
   isRefreshingEligible,
   onSave,
+  onFlushPreferences,
   onRefreshAccessData,
   onScanPortalTabsForTokens,
-  onClearReferenceData
+  onClearTokens
 }: {
+  embedded?: boolean;
   settings: QuickPimSettings;
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
   isRefreshingAccess: boolean;
   isRefreshingEligible: boolean;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onFlushPreferences: () => Promise<QuickPimSettings>;
   onRefreshAccessData: (tokens?: TokenStatus, targets?: AccessSetupTarget[], options?: AccessRefreshOptions) => Promise<void>;
   onScanPortalTabsForTokens: () => Promise<TokenStatus>;
-  onClearReferenceData: () => Promise<void>;
+  onClearTokens: () => Promise<void>;
 }) {
   const [isRunningSetup, setIsRunningSetup] = useState(false);
   const [isRecheckingPortalTabs, setIsRecheckingPortalTabs] = useState(false);
@@ -997,13 +1087,15 @@ function AccessSetupPanel({
       await continueMicrosoftSignIn();
       return;
     }
-    const initialTargets = setupTargets;
     setIsRunningSetup(true);
     setPortalRecoveryError("");
     try {
+      const latestSettings = await onFlushPreferences();
+      const currentFeatures = getEnabledRoleFeatures(latestSettings);
+      const initialTargets = getAccessSetupTargets(buildAccessCapabilityItems(tokenStatus, dataCache, currentFeatures));
       const scannedTokens = await onScanPortalTabsForTokens();
       const remainingTargets = getAccessSetupTargets(
-        buildAccessCapabilityItems(scannedTokens, dataCache, enabledRoleFeatures)
+        buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures)
       ).filter((target) => initialTargets.includes(target));
       if (remainingTargets.length) {
         await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
@@ -1049,23 +1141,26 @@ function AccessSetupPanel({
   async function recheckPortalAccess() {
     setIsRecheckingPortalTabs(true);
     try {
+      const latestSettings = await onFlushPreferences();
+      const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const scannedTokens = await onScanPortalTabsForTokens();
       const recoveryStatus = await readPortalRecoveryStatus();
       setPortalRecoveryStatus(recoveryStatus);
       if (recoveryStatus.state === "interactionRequired") {
         return;
       }
-      await onRefreshAccessData(scannedTokens, setupTargets.length ? setupTargets : enabledRoleFeatures);
+      const currentTargets = getAccessSetupTargets(buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures));
+      await onRefreshAccessData(scannedTokens, currentTargets.length ? currentTargets : currentFeatures);
     } finally {
       setIsRecheckingPortalTabs(false);
     }
   }
 
   return (
-    <section className="panel permissions-panel">
+    <section className={`${embedded ? "access-setup-section" : "panel"} permissions-panel`}>
       <div className="panel-title-row">
         <div>
-          <h2>Access Setup</h2>
+          <h2>Access status & recovery</h2>
           <p className="muted">
             {setupTargets.length
               ? `${setupTargets.length} area(s) need a portal refresh or are limited by the captured portal token.`
@@ -1082,7 +1177,10 @@ function AccessSetupPanel({
       {identity.label ? (
         <div className={`access-identity ${identity.mismatch ? "mismatch" : ""}`} title={identity.detail}>
           <strong>Microsoft context</strong>
-          <span>{identity.label}</span>
+          <span className="access-identity-value">
+            {identity.principalName || identity.principalId || "Microsoft account"}
+            {identity.tenantId ? ` / tenant ${identity.tenantId}` : ""}
+          </span>
           {identity.mismatch ? <span>Different accounts or tenants were captured. Refresh from one account before submitting requests.</span> : null}
         </div>
       ) : null}
@@ -1112,8 +1210,8 @@ function AccessSetupPanel({
             "Recheck now"
           )}
         </button>
-        <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible}>
-          Clear learned names
+        <button className="btn danger" onClick={() => void onClearTokens()} disabled={isRunningSetup || isRecheckingPortalTabs || isRefreshingAccess || isRefreshingEligible}>
+          Clear captured tokens
         </button>
       </div>
       {portalRecoveryStatus.state === "interactionRequired" ? (
@@ -1148,10 +1246,10 @@ function AccessSetupPanel({
         {accessStatus.map((item) => (
           <AccessStatusRow item={item} key={item.target} />
         ))}
-        {!accessStatus.length ? <p className="muted">Enable Entra Roles, PIM Groups, or Azure Roles in Preferences to add access checks.</p> : null}
+        {!accessStatus.length ? <p className="muted">Enable Entra Roles, PIM Groups, or Azure Roles in Popup & Appearance to add access checks.</p> : null}
       </div>
 
-      <div className="panel">
+      <div className="settings-subsection tutorial-section">
         <h3>Quick Tutorial</h3>
         <ol className="tutorial-list">
           <li>Use Open missing portal pages to load the required Microsoft pages in a collapsed background tab group.</li>
@@ -1193,7 +1291,7 @@ function AccessStatusRow({ item }: { item: ReturnType<typeof buildAccessCapabili
         </div>
         <div>
           <strong>Next action</strong>
-          <p>{item.recommendedAction || (item.status === "ready" ? "No action needed." : "Open Access Setup and reload the matching portal page.")}</p>
+          <p>{item.recommendedAction || (item.status === "ready" ? "No action needed." : "Use Role Access to reload the matching portal page.")}</p>
         </div>
       </div>
     </article>
@@ -1328,16 +1426,20 @@ function delay(ms: number): Promise<void> {
 
 function ActivityPanel({
   settings,
+  items,
+  referenceData,
   trackedRequests,
   onTrackedRequestsChange,
   onSave
 }: {
   settings: QuickPimSettings;
+  items: ActivationItem[];
+  referenceData?: ReferenceDataCache;
   trackedRequests: TrackedPimRequestStore;
   onTrackedRequestsChange: (store: TrackedPimRequestStore) => void;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
 }) {
-  const [view, setView] = useState<"requests" | "history">("requests");
+  const [view, setView] = useState<"requests" | "history" | "usage">("requests");
   const [requestSearch, setRequestSearch] = useState("");
   const [requestStatusFilter, setRequestStatusFilter] = useState<"all" | "pending" | "active" | "attention" | "finished">("all");
   const [selectedRequestId, setSelectedRequestId] = useState<string>();
@@ -1349,6 +1451,7 @@ function ActivityPanel({
   const [actionFilter, setActionFilter] = useState<ActivityAction | "all">("all");
   const [resultFilter, setResultFilter] = useState<ActivityResult | "all">("all");
   const [typeFilter, setTypeFilter] = useState<ActivationItem["type"] | "all">("all");
+  const [historyLimit, setHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
   const now = Date.now();
   const selectedRequest = trackedRequests.requests.find((request) => request.id === selectedRequestId);
   const filteredRequests = useMemo(() => {
@@ -1373,6 +1476,28 @@ function ActivityPanel({
       );
     });
   }, [actionFilter, resultFilter, search, settings.activityHistory, typeFilter]);
+  const usageEntries = useMemo(() => {
+    const itemsById = new Map(items.map((item) => [item.id, item]));
+    const historyNamesById = new Map<string, string>();
+    for (const entry of settings.activityHistory) {
+      if (!historyNamesById.has(entry.itemId) && entry.itemName.trim()) {
+        historyNamesById.set(entry.itemId, entry.itemName);
+      }
+    }
+    return Object.entries(settings.usageStatsByItemId)
+      .map(([id, stats]) => {
+        const item = itemsById.get(id);
+        const name = item
+          ? getDisplayName(item, settings, referenceData)
+          : settings.aliasesByItemId[id] || historyNamesById.get(id) || id;
+        return { id, name, stats };
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }, [items, referenceData, settings]);
+
+  useEffect(() => {
+    setHistoryLimit(settings.preferences.activityHistoryLimit);
+  }, [settings.preferences.activityHistoryLimit]);
 
   useEffect(() => {
     if (selectedRequestId && !trackedRequests.requests.some((request) => request.id === selectedRequestId)) {
@@ -1406,6 +1531,21 @@ function ActivityPanel({
     setRequestMessage("Tracked requests cleared.");
   }
 
+  async function saveHistoryLimit() {
+    if (!Number.isInteger(historyLimit) || historyLimit < 10 || historyLimit > 200 || historyLimit === settings.preferences.activityHistoryLimit) {
+      return;
+    }
+    await onSave({
+      ...settings,
+      preferences: { ...settings.preferences, activityHistoryLimit: historyLimit },
+      activityHistory: settings.activityHistory.slice(0, historyLimit)
+    }, "");
+  }
+
+  async function resetUsageCounters() {
+    await onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [] }, "Usage counters reset.");
+  }
+
   async function prepareRequestInPopup(request: TrackedPimRequest, requestMode: "activate" | "deactivate") {
     setRequestError("");
     setRequestMessage("");
@@ -1413,6 +1553,7 @@ function ActivityPanel({
       tab: request.itemType,
       search: "",
       sortMode: settings.preferences.defaultSort,
+      sortDirection: settings.preferences.defaultSortDirection,
       selectedIds: [request.itemId],
       durationHours: request.durationHours || settings.preferences.defaultDurationHours,
       justification: request.justification || "",
@@ -1461,16 +1602,20 @@ function ActivityPanel({
     <section className="panel">
       <div className="panel-title-row">
         <div>
-          <h2>Activity</h2>
-          <p className="muted">Follow requests submitted by QuickPIM++ and review local activation history.</p>
+          <h2>Activity & Usage</h2>
+          <p className="muted">Follow submitted requests, review local history, and inspect role usage counters.</p>
         </div>
         {view === "requests" ? (
           <button className="btn danger" disabled={!trackedRequests.requests.length} onClick={() => void clearRequests()}>
             Clear requests
           </button>
-        ) : (
+        ) : view === "history" ? (
           <button className="btn danger" disabled={!settings.activityHistory.length} onClick={() => void onSave({ ...settings, activityHistory: [] }, "Activity history cleared.")}>
             Clear history
+          </button>
+        ) : (
+          <button className="btn danger" disabled={!usageEntries.length} onClick={() => void resetUsageCounters()}>
+            Reset counters
           </button>
         )}
       </div>
@@ -1481,6 +1626,9 @@ function ActivityPanel({
         </button>
         <button className={view === "history" ? "active" : ""} role="tab" aria-selected={view === "history"} onClick={() => setView("history")}>
           History
+        </button>
+        <button className={view === "usage" ? "active" : ""} role="tab" aria-selected={view === "usage"} onClick={() => setView("usage")}>
+          Usage
         </button>
       </div>
       {view === "requests" ? (
@@ -1539,8 +1687,27 @@ function ActivityPanel({
             ) : null}
           </div>
         </>
-      ) : (
+      ) : view === "history" ? (
         <>
+          <div className="settings-subsection settings-section-gap activity-retention-section">
+            <h3>History retention</h3>
+            <div className="form-grid compact-preference-fields">
+              <div className="field">
+                <label>Activity history limit</label>
+                <input
+                  className="input"
+                  type="number"
+                  min="10"
+                  max="200"
+                  value={historyLimit}
+                  aria-invalid={!Number.isInteger(historyLimit) || historyLimit < 10 || historyLimit > 200}
+                  onChange={(event) => setHistoryLimit(Number(event.target.value))}
+                  onBlur={() => void saveHistoryLimit()}
+                />
+                <p className="muted">Maximum local activation and deactivation entries to keep.</p>
+              </div>
+            </div>
+          </div>
           <div className="toolbar settings-section-gap activity-toolbar">
             <input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search history" aria-label="Search activity" />
             <select className="select" value={actionFilter} onChange={(event) => setActionFilter(event.target.value as ActivityAction | "all")} aria-label="Filter activity action">
@@ -1588,6 +1755,27 @@ function ActivityPanel({
             {!filtered.length ? <p className="muted">No activity matches the current filters.</p> : null}
           </div>
         </>
+      ) : (
+        <div className="settings-subsection settings-section-gap usage-list">
+          <div>
+            <h3>Usage counters</h3>
+            <p className="muted">Local counts used for sorting and optional popup details.</p>
+          </div>
+          {usageEntries.map(({ id, name, stats }) => (
+            <div className="settings-row usage-row" key={id}>
+              <span>
+                <strong>{name}</strong>
+                <span className="muted usage-item-id">{name === id ? "Saved role identifier" : id}</span>
+              </span>
+              <span className="usage-summary">
+                <strong>{stats.activationCount}</strong>
+                <span className="muted">activation{stats.activationCount === 1 ? "" : "s"}</span>
+                {formatDateOnly(stats.lastUsedAt) ? <span className="muted">Last used {formatDateOnly(stats.lastUsedAt)}</span> : null}
+              </span>
+            </div>
+          ))}
+          {!usageEntries.length ? <p className="muted">No local usage counters recorded.</p> : null}
+        </div>
       )}
     </section>
   );
@@ -1879,16 +2067,35 @@ function AliasesPanel({
   settings,
   items,
   referenceData,
-  onSave
+  onSave,
+  onClearReferenceData
 }: {
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onClearReferenceData: () => Promise<void>;
 }) {
   const [itemId, setItemId] = useState("");
   const [alias, setAlias] = useState("");
   const selectedItem = items.find((item) => item.id === itemId);
+  const aliasPickerGroups = useMemo(() => {
+    const compareRawItems = (left: ActivationItem, right: ActivationItem) =>
+      left.sourceName.localeCompare(right.sourceName, undefined, { sensitivity: "base" })
+      || getScopeLabel(left, referenceData).localeCompare(getScopeLabel(right, referenceData), undefined, { sensitivity: "base" });
+    return {
+      roles: items.filter((item) => item.type !== "pimGroup").sort(compareRawItems),
+      groups: items.filter((item) => item.type === "pimGroup").sort(compareRawItems)
+    };
+  }, [items, referenceData]);
+  const learnedNameCount = referenceData
+    ? Object.keys(referenceData.directoryRoleDefinitions).length
+      + Object.keys(referenceData.pimGroups).length
+      + Object.keys(referenceData.azureRoleDefinitions).length
+      + Object.keys(referenceData.azureSubscriptions).length
+      + Object.keys(referenceData.scopes).length
+      + Object.keys(referenceData.directoryScopes).length
+    : 0;
 
   async function saveAlias() {
     if (!selectedItem || !alias.trim()) return;
@@ -1910,30 +2117,59 @@ function AliasesPanel({
 
   return (
     <section className="panel">
-      <h2>Custom Role Names</h2>
-      <div className="form-grid">
-        <div className="field">
-          <label>Role or group</label>
-          <select className="select" value={itemId} onChange={(event) => setItemId(event.target.value)}>
-            <option value="">Choose an eligible item</option>
-            {items.map((item) => (
-              <option value={item.id} key={item.id}>
-                {getDisplayName(item, settings, referenceData)} / {getScopeLabel(item, referenceData)}
-              </option>
-            ))}
-          </select>
+      <h2>Names & Aliases</h2>
+      <p className="muted">Override API and learned display names without changing the Microsoft role or group.</p>
+      <div className="settings-subsection settings-section-gap">
+        <h3>Add an alias</h3>
+        <div className="form-grid">
+          <div className="field">
+            <label>Role or group</label>
+            <select className="select" value={itemId} onChange={(event) => setItemId(event.target.value)} aria-label="Role or group">
+              <option value="">Choose an eligible item</option>
+              {aliasPickerGroups.roles.length ? (
+                <optgroup label="Roles">
+                  {aliasPickerGroups.roles.map((item) => (
+                    <option value={item.id} key={item.id}>
+                      {item.sourceName} / {getScopeLabel(item, referenceData)}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+              {aliasPickerGroups.groups.length ? (
+                <optgroup label="Groups">
+                  {aliasPickerGroups.groups.map((item) => (
+                    <option value={item.id} key={item.id}>
+                      {item.sourceName} / {getScopeLabel(item, referenceData)}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null}
+            </select>
+          </div>
+          <div className="field">
+            <label>Alias</label>
+            <input className="input" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Display name" />
+          </div>
         </div>
-        <div className="field">
-          <label>Alias</label>
-          <input className="input" value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="Display name" />
+        <div className="button-row settings-form-actions">
+          <button className="btn primary" onClick={() => void saveAlias()} disabled={!itemId || !alias.trim()}>
+            Save alias
+          </button>
         </div>
       </div>
-      <div className="button-row settings-form-actions">
-        <button className="btn primary" onClick={() => void saveAlias()} disabled={!itemId || !alias.trim()}>
-          Save alias
-        </button>
+      <div className="settings-subsection">
+        <h3>Learned names</h3>
+        <p className="muted">
+          QuickPIM++ has retained {learnedNameCount} Microsoft name{learnedNameCount === 1 ? "" : "s"} locally for fast display fallback.
+          Manual aliases always take priority. Clearing learned names does not remove aliases.
+        </p>
+        <div className="button-row settings-form-actions">
+          <button className="btn danger" onClick={() => void onClearReferenceData()} disabled={!learnedNameCount}>
+            Clear learned names
+          </button>
+        </div>
       </div>
-      <div className="panel">
+      <div className="settings-subsection">
         <h3>Saved aliases</h3>
         {Object.entries(settings.aliasesByItemId).length ? (
           Object.entries(settings.aliasesByItemId).map(([id, value]) => (
@@ -1964,6 +2200,32 @@ function JustificationsPanel({
 }) {
   const [value, setValue] = useState("");
   const [validationWarning, setValidationWarning] = useState("");
+  const [recentLimit, setRecentLimit] = useState(settings.preferences.recentJustificationLimit);
+  const [confirmRestore, setConfirmRestore] = useState(false);
+
+  useEffect(() => {
+    setRecentLimit(settings.preferences.recentJustificationLimit);
+  }, [settings.preferences.recentJustificationLimit]);
+
+  async function saveRecentLimit() {
+    if (!Number.isInteger(recentLimit) || recentLimit < 1 || recentLimit > 20 || recentLimit === settings.preferences.recentJustificationLimit) {
+      return;
+    }
+    await onSave({
+      ...settings,
+      preferences: { ...settings.preferences, recentJustificationLimit: recentLimit }
+    }, "");
+  }
+
+  async function restoreRecentLimit() {
+    setConfirmRestore(false);
+    const defaultLimit = DEFAULT_SETTINGS.preferences.recentJustificationLimit;
+    setRecentLimit(defaultLimit);
+    await onSave({
+      ...settings,
+      preferences: { ...settings.preferences, recentJustificationLimit: defaultLimit }
+    }, "Justification picker default restored.");
+  }
 
   async function add() {
     const trimmed = value.trim();
@@ -2004,7 +2266,50 @@ function JustificationsPanel({
 
   return (
     <section className="panel">
-      <h2>Justifications</h2>
+      <div className="panel-title-row">
+        <div>
+          <h2>Justifications</h2>
+          <p className="muted">Manage reusable reasons and the recent-reason picker used during activation.</p>
+        </div>
+        <button
+          className="btn secondary restore-defaults-button"
+          disabled={recentLimit === DEFAULT_SETTINGS.preferences.recentJustificationLimit}
+          onClick={() => setConfirmRestore(true)}
+        >
+          <ResetIcon />
+          <span>Restore defaults</span>
+        </button>
+      </div>
+      {confirmRestore ? (
+        <div className="settings-confirmation" role="alertdialog" aria-label="Restore Justifications defaults">
+          <span>Restore the recent-history limit? Saved and recent justifications will not be removed.</span>
+          <div className="button-row nowrap">
+            <button className="btn primary" onClick={() => void restoreRecentLimit()}>Restore</button>
+            <button className="btn" onClick={() => setConfirmRestore(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
+      <div className="settings-subsection">
+        <h3>Recent history</h3>
+        <div className="form-grid compact-preference-fields">
+          <div className="field">
+            <label>Recent justification history limit</label>
+            <input
+              className="input"
+              type="number"
+              min="1"
+              max="20"
+              value={recentLimit}
+              aria-invalid={!Number.isInteger(recentLimit) || recentLimit < 1 || recentLimit > 20}
+              onChange={(event) => setRecentLimit(Number(event.target.value))}
+              onBlur={() => void saveRecentLimit()}
+            />
+            <p className="muted">Number of recent reasons kept in the popup picker.</p>
+          </div>
+        </div>
+      </div>
+      <div className="settings-subsection">
+        <h3>Add a saved justification</h3>
       <div className="form-row">
         <input
           className="input"
@@ -2021,8 +2326,9 @@ function JustificationsPanel({
         </button>
       </div>
       {validationWarning ? <p className="field-warning settings-field-gap">{validationWarning}</p> : null}
-      <div className="two-column settings-section-gap">
-        <div className="panel">
+      </div>
+      <div className="two-column justification-columns settings-section-gap">
+        <div className="settings-subsection">
           <h3>Saved</h3>
           {settings.savedJustifications.map((item, index) => (
             <div className="settings-row saved-justification-row" key={item}>
@@ -2054,11 +2360,12 @@ function JustificationsPanel({
           ))}
           {!settings.savedJustifications.length ? <p className="muted">No saved justifications.</p> : null}
         </div>
-        <div className="panel">
+        <div className="settings-subsection">
           <h3>Recent</h3>
           {settings.recentJustifications.map((item) => (
-            <div className="settings-row" key={item}>
+            <div className="settings-row recent-justification-row" key={item}>
               <span>{item}</span>
+              <CopyTextButton text={item} label="recent justification" />
             </div>
           ))}
           <button className="btn danger" onClick={() => void onSave({ ...settings, recentJustifications: [] }, "Recent history cleared.")}>
@@ -2191,7 +2498,8 @@ function BundlesPanel({
 
   return (
     <section className="panel">
-      <h2>Role Bundles</h2>
+      <h2>Bundles</h2>
+      <p className="muted">Create reusable activation selections with policy-aware duration and an optional default justification.</p>
       {draftMode === "edit" ? <p className="muted">Editing {draftSourceName}</p> : null}
       {draftMode === "duplicate" ? <p className="muted">Duplicating {draftSourceName}</p> : null}
       <div className="form-grid">
@@ -2298,7 +2606,6 @@ type PreferenceSaveState = "idle" | "pending" | "saving" | "saved" | "invalid" |
 interface PreferenceDraft {
   defaultDurationHours: number;
   defaultExtensionDurationHours: number;
-  defaultSort: SortMode;
   recentJustificationLimit: number;
   activityHistoryLimit: number;
   darkMode: boolean;
@@ -2317,7 +2624,6 @@ function createPreferenceDraft(settings: QuickPimSettings): PreferenceDraft {
   return {
     defaultDurationHours: settings.preferences.defaultDurationHours,
     defaultExtensionDurationHours: settings.preferences.defaultExtensionDurationHours,
-    defaultSort: settings.preferences.defaultSort,
     recentJustificationLimit: settings.preferences.recentJustificationLimit,
     activityHistoryLimit: settings.preferences.activityHistoryLimit,
     darkMode: settings.preferences.darkMode,
@@ -2331,6 +2637,25 @@ function createPreferenceDraft(settings: QuickPimSettings): PreferenceDraft {
     expiryReminderMinutes: settings.preferences.expiryReminderMinutes,
     enabledFeatures: PREFERENCE_FEATURES.filter((feature) => settings.preferences.enabledFeatures.includes(feature))
   };
+}
+
+function isAppearancePreferenceDefault(draft: PreferenceDraft): boolean {
+  const defaults = DEFAULT_SETTINGS.preferences;
+  return draft.darkMode === defaults.darkMode
+    && draft.showAssignedRoles === defaults.showAssignedRoles
+    && draft.showRemainingActivationTime === defaults.showRemainingActivationTime
+    && draft.showActivationCounters === defaults.showActivationCounters
+    && draft.showEnablementDetails === defaults.showEnablementDetails
+    && draft.showLastEnablementDate === defaults.showLastEnablementDate
+    && draft.enabledFeatures.includes("bundles") === defaults.enabledFeatures.includes("bundles");
+}
+
+function isActivationPreferenceDefault(draft: PreferenceDraft): boolean {
+  const defaults = DEFAULT_SETTINGS.preferences;
+  return draft.defaultDurationHours === defaults.defaultDurationHours
+    && draft.defaultExtensionDurationHours === defaults.defaultExtensionDurationHours
+    && draft.requestNotificationsEnabled === defaults.requestNotificationsEnabled
+    && draft.expiryReminderMinutes === defaults.expiryReminderMinutes;
 }
 
 function isPreferenceDraftValid(draft: PreferenceDraft): boolean {
@@ -2360,17 +2685,49 @@ function PreferenceSaveIndicator({ state }: { state: PreferenceSaveState }) {
   );
 }
 
+function PreferenceToggleText({
+  title,
+  description,
+  defaultEnabled
+}: {
+  title: string;
+  description: string;
+  defaultEnabled: boolean;
+}) {
+  return (
+    <span className="preference-toggle-copy">
+      <strong>{title}</strong>
+      <span className="muted">{description}</span>
+      <span className={`preference-default-state ${defaultEnabled ? "enabled" : "disabled"}`}>
+        {defaultEnabled ? "Enabled by default" : "Disabled by default"}
+      </span>
+    </span>
+  );
+}
+
+function ResetIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon">
+      <path d="M4 4v6h6" />
+      <path d="M5.5 15a7 7 0 1 0 1.5-7.5L4 10" />
+    </svg>
+  );
+}
+
 function PreferencesPanel({
+  page,
   settings,
   onSave,
   navigationFlushRef
 }: {
+  page: PreferencePage;
   settings: QuickPimSettings;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
   navigationFlushRef: MutableRefObject<(() => Promise<void>) | undefined>;
 }) {
   const [draft, setDraft] = useState<PreferenceDraft>(() => createPreferenceDraft(settings));
   const [saveState, setSaveState] = useState<PreferenceSaveState>("idle");
+  const [confirmRestore, setConfirmRestore] = useState(false);
   const [notificationPermissionError, setNotificationPermissionError] = useState("");
   const [isRequestingNotificationPermission, setIsRequestingNotificationPermission] = useState(false);
   const settingsRef = useRef(settings);
@@ -2456,10 +2813,6 @@ function PreferencesPanel({
     setSaveState(isPreferenceDraftValid(next) ? "pending" : "invalid");
   }
 
-  function flushAutosave() {
-    queueAutosave(draftRef.current, revisionRef.current);
-  }
-
   function queueAutosave(snapshot: PreferenceDraft, revision: number): Promise<void> {
     if (
       revision <= savedRevisionRef.current
@@ -2540,13 +2893,13 @@ function PreferencesPanel({
     try {
       const granted = await chrome.permissions.request({ permissions: ["notifications"] });
       if (!granted) {
-        setNotificationPermissionError("Notification permission was not granted. Request tracking still works in Settings > Activity.");
+        setNotificationPermissionError("Notification permission was not granted. Request tracking still works in Settings > Activity & Usage.");
         return;
       }
       notificationPermissionGrantedRef.current = true;
       updateDraft({ requestNotificationsEnabled: true });
     } catch {
-      setNotificationPermissionError("This browser could not enable request notifications. Request tracking still works in Settings > Activity.");
+      setNotificationPermissionError("This browser could not enable request notifications. Request tracking still works in Settings > Activity & Usage.");
     } finally {
       setIsRequestingNotificationPermission(false);
     }
@@ -2562,259 +2915,248 @@ function PreferencesPanel({
     updateDraft({ enabledFeatures: PREFERENCE_FEATURES.filter((item) => nextFeatures.has(item)) });
   }
 
-  const recentLimitValid = draft.recentJustificationLimit >= 1 && draft.recentJustificationLimit <= 20;
-  const activityLimitValid = draft.activityHistoryLimit >= 10 && draft.activityHistoryLimit <= 200;
+  function restorePageDefaults() {
+    setConfirmRestore(false);
+    if (page === "appearance") {
+      const roleFeatures = new Set<QuickPimFeature>(draftRef.current.enabledFeatures.filter((feature) => feature !== "bundles"));
+      if (DEFAULT_SETTINGS.preferences.enabledFeatures.includes("bundles")) {
+        roleFeatures.add("bundles");
+      }
+      updateDraft({
+        darkMode: DEFAULT_SETTINGS.preferences.darkMode,
+        showAssignedRoles: DEFAULT_SETTINGS.preferences.showAssignedRoles,
+        showRemainingActivationTime: DEFAULT_SETTINGS.preferences.showRemainingActivationTime,
+        showActivationCounters: DEFAULT_SETTINGS.preferences.showActivationCounters,
+        showEnablementDetails: DEFAULT_SETTINGS.preferences.showEnablementDetails,
+        showLastEnablementDate: DEFAULT_SETTINGS.preferences.showLastEnablementDate,
+        enabledFeatures: PREFERENCE_FEATURES.filter((feature) => roleFeatures.has(feature))
+      });
+      return;
+    }
+    if (page === "activation") {
+      updateDraft({
+        defaultDurationHours: DEFAULT_SETTINGS.preferences.defaultDurationHours,
+        defaultExtensionDurationHours: DEFAULT_SETTINGS.preferences.defaultExtensionDurationHours,
+        requestNotificationsEnabled: DEFAULT_SETTINGS.preferences.requestNotificationsEnabled,
+        expiryReminderMinutes: DEFAULT_SETTINGS.preferences.expiryReminderMinutes
+      });
+    }
+  }
+
+  const canRestoreDefaults = page === "appearance"
+    ? !isAppearancePreferenceDefault(draft)
+    : !isActivationPreferenceDefault(draft);
+  const pageCopy: Record<PreferencePage, { title: string; description: string }> = {
+    appearance: {
+      title: "Popup & Appearance",
+      description: "Choose visible tabs and refresh behavior, then control role details and appearance."
+    },
+    activation: {
+      title: "Activation & Notifications",
+      description: "Choose activation and extension defaults, then configure request follow-up."
+    }
+  };
+  const copy = pageCopy[page];
+  const restoreDescription = page === "appearance"
+    ? "Restore dark mode, Bundles visibility, assigned roles, remaining time, counters, enablement details, and last-enablement date?"
+    : "Restore activation duration, extension duration, request notifications, and expiry reminder?";
 
   return (
-    <section className="preferences-panel">
+    <section className="panel preferences-panel" data-preference-page={page}>
       <div className="preferences-title-row">
         <div>
-          <h2>Preferences</h2>
-          <p className="muted">Changes on this page are saved automatically.</p>
+          <h2>{copy.title}</h2>
+          <p className="muted">{copy.description} Changes are saved automatically.</p>
         </div>
-        <PreferenceSaveIndicator state={saveState} />
-      </div>
-      <div className="preference-section">
-        <h3>Popup defaults</h3>
-        <p className="muted">These values are preselected when the popup opens. Role policies can still cap duration choices.</p>
-        <div className="form-grid three settings-section-gap popup-defaults-grid">
-          <div className="field">
-            <label>Default activation duration</label>
-            <select
-              className="select"
-              value={String(draft.defaultDurationHours)}
-              onChange={(event) => updateDraft({ defaultDurationHours: Number(event.target.value) })}
-              aria-label="Default activation duration"
-            >
-              {DEFAULT_DURATION_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <p className="muted">Preselected in the popup when selected roles allow it.</p>
-          </div>
-          <div className="field">
-            <label>Default sort order</label>
-            <select
-              className="select"
-              value={draft.defaultSort}
-              onChange={(event) => updateDraft({ defaultSort: event.target.value as SortMode })}
-            >
-              <option value="name">Name</option>
-              <option value="lastUsed">Last use</option>
-              <option value="activationCount">Activation count</option>
-              <option value="type">Type</option>
-              <option value="scope">Scope</option>
-            </select>
-            <p className="muted">Initial sort used in role tabs.</p>
-          </div>
-          <div className="field">
-            <label>Recent justification history limit</label>
-            <input
-              className="input"
-              type="number"
-              min="1"
-              max="20"
-              value={draft.recentJustificationLimit}
-              aria-invalid={!recentLimitValid}
-              onChange={(event) => updateDraft({ recentJustificationLimit: Number(event.target.value) })}
-              onBlur={flushAutosave}
-            />
-            <p className="muted">How many recent reasons the picker keeps.</p>
-          </div>
+        <div className="settings-page-actions">
+          <button className="btn secondary restore-defaults-button" disabled={!canRestoreDefaults} onClick={() => setConfirmRestore(true)}>
+            <ResetIcon />
+            <span>Restore defaults</span>
+          </button>
+          <PreferenceSaveIndicator state={saveState} />
         </div>
       </div>
-      <div className="preference-section">
-        <h3>Display</h3>
-        <div className="preference-toggle-list">
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.darkMode}
-              onChange={(event) => updateDraft({ darkMode: event.target.checked })}
+      {confirmRestore ? (
+        <div className="settings-confirmation" role="alertdialog" aria-label={`Restore ${copy.title} defaults`}>
+          <span>{restoreDescription} Saved aliases, justifications, and bundles will not be changed.</span>
+          <div className="button-row nowrap">
+            <button className="btn primary" onClick={restorePageDefaults}>Restore</button>
+            <button className="btn" onClick={() => setConfirmRestore(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
+
+      {page === "activation" ? (
+        <>
+          <div className="preference-section">
+            <h3>Activation and extension timing</h3>
+            <p className="muted">Microsoft role policies can still reduce the available duration.</p>
+            <div className="form-grid settings-section-gap popup-defaults-grid">
+              <div className="field">
+                <label>Default activation duration</label>
+                <select
+                  className="select"
+                  value={String(draft.defaultDurationHours)}
+                  onChange={(event) => updateDraft({ defaultDurationHours: Number(event.target.value) })}
+                  aria-label="Default activation duration"
+                >
+                  {DEFAULT_DURATION_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+                <p className="muted">Preselected when selected roles allow it.</p>
+              </div>
+              <div className="field">
+                <label>Default extension duration</label>
+                <select
+                  className="select"
+                  value={draft.defaultExtensionDurationHours}
+                  onChange={(event) => updateDraft({ defaultExtensionDurationHours: Number(event.target.value) })}
+                  aria-label="Default PIM extension duration"
+                >
+                  {EXTENSION_DURATION_OPTIONS.map((duration) => (
+                    <option key={duration} value={duration}>{formatExtensionDuration(duration)}</option>
+                  ))}
+                </select>
+                <p className="muted">Used by Extend actions; stricter role policies still apply.</p>
+              </div>
+            </div>
+          </div>
+          <div className="preference-section">
+            <h3>Request follow-up</h3>
+            <div className="preference-toggle-list">
+              <label className="checkbox-option preference-toggle">
+                <input
+                  type="checkbox"
+                  checked={draft.requestNotificationsEnabled}
+                  disabled={isRequestingNotificationPermission}
+                  onChange={(event) => void toggleRequestNotifications(event.target.checked)}
+                  aria-label="Notify me about request updates"
+                />
+                <span><strong>Request status notifications</strong><span className="muted">Notify when a request is approved, denied, completed, or close to expiry. Disabled by default.</span></span>
+              </label>
+            </div>
+            <div className="form-grid settings-section-gap compact-preference-fields">
+              <div className="field">
+                <label>Expiry reminder</label>
+                <select
+                  className="select"
+                  value={draft.expiryReminderMinutes}
+                  disabled={!draft.requestNotificationsEnabled}
+                  onChange={(event) => updateDraft({ expiryReminderMinutes: Number(event.target.value) })}
+                  aria-label="Request expiry reminder"
+                >
+                  <option value={5}>5 minutes before</option>
+                  <option value={15}>15 minutes before</option>
+                  <option value={30}>30 minutes before</option>
+                  <option value={60}>1 hour before</option>
+                </select>
+                <p className="muted">Used only when Microsoft returns an activation end time.</p>
+              </div>
+            </div>
+            {notificationPermissionError ? <p className="message error settings-inline-message" role="alert">{notificationPermissionError}</p> : null}
+          </div>
+        </>
+      ) : null}
+
+      {page === "appearance" ? (
+        <>
+          <div className="preference-section theme-preference-section">
+            <div className="theme-preference-copy">
+              <h3>Color theme</h3>
+              <p className="muted">Choose the appearance used by both the popup and Settings.</p>
+            </div>
+            <button
+              type="button"
+              className="theme-mode-switch"
+              role="switch"
+              aria-checked={draft.darkMode}
               aria-label="Dark mode"
-            />
-            <span>
-              <strong>Dark mode</strong>
-              <span className="muted">Use dark surfaces in the popup and settings.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.showRemainingActivationTime}
-              onChange={(event) => updateDraft({ showRemainingActivationTime: event.target.checked })}
-              aria-label="Show remaining activation time in popup"
-            />
-            <span>
-              <strong>Show remaining activation time</strong>
-              <span className="muted">Display a live countdown under PIM-active roles. Enabled by default.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.showAssignedRoles}
-              onChange={(event) => updateDraft({ showAssignedRoles: event.target.checked })}
-              aria-label="Show assigned active roles in popup"
-            />
-            <span>
-              <strong>Show assigned active roles</strong>
-              <span className="muted">Include direct active assignments that were not activated through PIM. Hidden by default.</span>
-            </span>
-          </label>
-        </div>
-      </div>
-      <div className="preference-section">
-        <h3>Advanced settings</h3>
-        <p className="muted">Optional detail, usage, and cache controls for users who want more visibility.</p>
-        <div className="preference-toggle-list">
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.showActivationCounters}
-              onChange={(event) => updateDraft({ showActivationCounters: event.target.checked })}
-              aria-label="Show activation counters in popup"
-            />
-            <span>
-              <strong>Show activation counters</strong>
-              <span className="muted">Display the compact usage number on each popup row.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.showEnablementDetails}
-              onChange={(event) => updateDraft({ showEnablementDetails: event.target.checked })}
-              aria-label="Show enablement details in popup"
-            />
-            <span>
-              <strong>Show enablement details</strong>
-              <span className="muted">Display per-row policy details such as max duration, required reason, ticket, and approval.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.showLastEnablementDate}
-              onChange={(event) => updateDraft({ showLastEnablementDate: event.target.checked })}
-              aria-label="Show last enablement date in popup"
-            />
-            <span>
-              <strong>Show last enablement date</strong>
-              <span className="muted">Display the last enablement date on popup rows as yyyy-MM-dd.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.backgroundPreRefreshEnabled}
-              onChange={(event) => updateDraft({ backgroundPreRefreshEnabled: event.target.checked })}
-              aria-label="Enable background pre-refresh"
-            />
-            <span>
-              <strong>Background pre-refresh</strong>
-              <span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span>
-            </span>
-          </label>
-          <label className="checkbox-option preference-toggle">
-            <input
-              type="checkbox"
-              checked={draft.requestNotificationsEnabled}
-              disabled={isRequestingNotificationPermission}
-              onChange={(event) => void toggleRequestNotifications(event.target.checked)}
-              aria-label="Notify me about request updates"
-            />
-            <span>
-              <strong>Request status notifications</strong>
-              <span className="muted">Notify when a QuickPIM++ request is approved, denied, completed, or close to expiry. Disabled by default.</span>
-            </span>
-          </label>
-        </div>
-        <div className="advanced-preference-fields">
-          <div className="field">
-            <label>Expiry reminder</label>
-            <select
-              className="select"
-              value={draft.expiryReminderMinutes}
-              disabled={!draft.requestNotificationsEnabled}
-              onChange={(event) => updateDraft({ expiryReminderMinutes: Number(event.target.value) })}
-              aria-label="Request expiry reminder"
+              onClick={() => updateDraft({ darkMode: !draft.darkMode })}
             >
-              <option value={5}>5 minutes before</option>
-              <option value={15}>15 minutes before</option>
-              <option value={30}>30 minutes before</option>
-              <option value={60}>1 hour before</option>
-            </select>
-            <p className="muted">Applies only when Microsoft returns an activation end time.</p>
+              <span className={!draft.darkMode ? "active" : undefined}>Light mode</span>
+              <span className={draft.darkMode ? "active" : undefined}>Dark mode</span>
+            </button>
           </div>
-          <div className="field">
-            <label>Default extension duration</label>
-            <select
-              className="select"
-              value={draft.defaultExtensionDurationHours}
-              onChange={(event) => updateDraft({ defaultExtensionDurationHours: Number(event.target.value) })}
-              aria-label="Default PIM extension duration"
-            >
-              {EXTENSION_DURATION_OPTIONS.map((duration) => (
-                <option key={duration} value={duration}>{formatExtensionDuration(duration)}</option>
+          <div className="preference-section">
+            <h3>Enabled tabs</h3>
+            <p className="muted">Choose which role sources and saved bundles appear in the popup. Disabled role sources are not requested or refreshed; empty role tabs remain hidden automatically.</p>
+            <div className="checkbox-grid compact settings-section-gap enabled-features-grid">
+              {PREFERENCE_FEATURES.map((feature) => (
+                <label className="checkbox-option preference-toggle" key={feature}>
+                  <input
+                    type="checkbox"
+                    checked={draft.enabledFeatures.includes(feature)}
+                    onChange={(event) => toggleFeature(feature, event.target.checked)}
+                    aria-label={`Enable ${popupTabLabel(feature)} feature`}
+                  />
+                  <span>
+                    <strong>{popupTabLabel(feature)}</strong>
+                    <span className="muted">
+                      {feature === "bundles" ? "Show saved activation bundles." : "Fetch and show this Microsoft role source."}
+                    </span>
+                  </span>
+                </label>
               ))}
-            </select>
-            <p className="muted">Used by the notification Extend button. A stricter role policy still caps the request.</p>
+            </div>
           </div>
-          <div className="field">
-            <label>Activity history limit</label>
-            <input
-              className="input"
-              type="number"
-              min="10"
-              max="200"
-              value={draft.activityHistoryLimit}
-              aria-invalid={!activityLimitValid}
-              onChange={(event) => updateDraft({ activityHistoryLimit: Number(event.target.value) })}
-              onBlur={flushAutosave}
-            />
-            <p className="muted">Maximum local activation/deactivation activity entries to keep.</p>
+          <div className="preference-section">
+            <h3>Refresh behavior</h3>
+            <div className="preference-toggle-list">
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.backgroundPreRefreshEnabled} onChange={(event) => updateDraft({ backgroundPreRefreshEnabled: event.target.checked })} aria-label="Enable background pre-refresh" />
+                <span><strong>Background pre-refresh</strong><span className="muted">Refresh stale enabled role data every 10 minutes while browser alarms are available.</span></span>
+              </label>
+            </div>
           </div>
-        </div>
-        {notificationPermissionError ? <p className="message error settings-inline-message" role="alert">{notificationPermissionError}</p> : null}
-      </div>
-      <div className="preference-section">
-        <h3>Enabled features</h3>
-        <p className="muted">Only enabled role features are fetched, shown in the popup, and checked by Access Setup. Empty enabled role tabs are still hidden automatically.</p>
-        <div className="checkbox-grid compact settings-section-gap enabled-features-grid">
-          {PREFERENCE_FEATURES.map((feature) => (
-            <label className="checkbox-option" key={feature}>
-              <input
-                type="checkbox"
-                checked={draft.enabledFeatures.includes(feature)}
-                onChange={(event) => toggleFeature(feature, event.target.checked)}
-                aria-label={`Enable ${popupTabLabel(feature)} feature`}
-              />
-              <span>Enable {popupTabLabel(feature)}</span>
-            </label>
-          ))}
-        </div>
-      </div>
-      <div className="panel preferences-usage-panel">
-        <h3>Usage counters</h3>
-        {Object.entries(settings.usageStatsByItemId).map(([id, stats]) => (
-          <div className="settings-row" key={id}>
-            <span>
-              {id}
-              <br />
-              <span className="muted">
-                {stats.activationCount} activation(s)
-                {formatDateOnly(stats.lastUsedAt) ? ` / ${formatDateOnly(stats.lastUsedAt)}` : ""}
-              </span>
-            </span>
+          <div className="preference-section">
+            <h3>Role row details</h3>
+            <p className="muted">Optional information shown beneath or beside each role in the popup.</p>
+            <div className="preference-toggle-list">
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.showRemainingActivationTime} onChange={(event) => updateDraft({ showRemainingActivationTime: event.target.checked })} aria-label="Show remaining activation time in popup" />
+                <PreferenceToggleText
+                  title="Show remaining activation time"
+                  description="Display a live countdown under PIM-active roles."
+                  defaultEnabled={DEFAULT_SETTINGS.preferences.showRemainingActivationTime}
+                />
+              </label>
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.showAssignedRoles} onChange={(event) => updateDraft({ showAssignedRoles: event.target.checked })} aria-label="Show assigned active roles in popup" />
+                <PreferenceToggleText
+                  title="Show assigned active roles"
+                  description="Include direct active assignments that were not activated through PIM."
+                  defaultEnabled={DEFAULT_SETTINGS.preferences.showAssignedRoles}
+                />
+              </label>
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.showActivationCounters} onChange={(event) => updateDraft({ showActivationCounters: event.target.checked })} aria-label="Show activation counters in popup" />
+                <PreferenceToggleText
+                  title="Show activation counters"
+                  description="Display the compact usage number on each popup row."
+                  defaultEnabled={DEFAULT_SETTINGS.preferences.showActivationCounters}
+                />
+              </label>
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.showEnablementDetails} onChange={(event) => updateDraft({ showEnablementDetails: event.target.checked })} aria-label="Show enablement details in popup" />
+                <PreferenceToggleText
+                  title="Show enablement details"
+                  description="Display max duration, required reason, ticket, and approval policy details."
+                  defaultEnabled={DEFAULT_SETTINGS.preferences.showEnablementDetails}
+                />
+              </label>
+              <label className="checkbox-option preference-toggle">
+                <input type="checkbox" checked={draft.showLastEnablementDate} onChange={(event) => updateDraft({ showLastEnablementDate: event.target.checked })} aria-label="Show last enablement date in popup" />
+                <PreferenceToggleText
+                  title="Show last enablement date"
+                  description="Display the last enablement date as yyyy-MM-dd."
+                  defaultEnabled={DEFAULT_SETTINGS.preferences.showLastEnablementDate}
+                />
+              </label>
+            </div>
           </div>
-        ))}
-        <button className="btn danger" onClick={() => void onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [], activityHistory: [] }, "Usage data reset.")}>
-          Reset usage data
-        </button>
-      </div>
+        </>
+      ) : null}
     </section>
   );
 }
@@ -2822,6 +3164,8 @@ function PreferencesPanel({
 function DataPanel({
   settings,
   exportText,
+  exportBaselineText,
+  externalChange,
   setExportText,
   onSave,
   onClearMessage,
@@ -2829,72 +3173,270 @@ function DataPanel({
 }: {
   settings: QuickPimSettings;
   exportText: string;
+  exportBaselineText: string;
+  externalChange: boolean;
   setExportText: (value: string, dirty?: boolean) => void;
   onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
   onClearMessage: () => void;
   onError: (message: string) => void;
 }) {
-  async function importSettings() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [actionMessage, setActionMessage] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
+  const validation = useMemo(() => validateSettingsBackup(exportText, settings), [exportText, settings]);
+  const isDirty = exportText !== exportBaselineText;
+
+  async function saveEditor() {
     onClearMessage();
     onError("");
+    setActionMessage("");
+    if (!validation.settings) {
+      onError(validation.error || "The JSON cannot be saved.");
+      return;
+    }
+    if (await onSave(validation.settings, "Settings restored from JSON.")) {
+      setExportText(JSON.stringify(validation.settings, null, 2), false);
+    }
+  }
+
+  async function copyJson() {
+    onError("");
+    setActionMessage("");
+    if (!validation.settings) return;
     try {
-      const parsed: unknown = JSON.parse(exportText);
-      if (!isSettingsImportObject(parsed)) {
-        throw new Error("Import JSON must be a QuickPIM++ settings object with at least one recognized section.");
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
+      await navigator.clipboard.writeText(exportText);
+      setActionMessage("Settings JSON copied.");
+    } catch (copyError) {
+      onError(copyError instanceof Error ? copyError.message : String(copyError));
+    }
+  }
+
+  function downloadJson() {
+    onError("");
+    setActionMessage("");
+    if (!validation.settings) return;
+    const blob = new Blob([exportText], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = buildSettingsExportFileName(new Date());
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setActionMessage("Settings JSON downloaded.");
+  }
+
+  async function loadJsonFile(file: File | undefined) {
+    if (!file) return;
+    onClearMessage();
+    onError("");
+    setActionMessage("");
+    try {
+      if (!file.name.toLowerCase().endsWith(".json")) {
+        throw new Error("Choose a .json settings file.");
       }
-      const imported = mergeImportedSettings(settings, parsed);
-      if (await onSave(imported, "Settings imported.")) {
-        setExportText(JSON.stringify(imported, null, 2));
+      if (file.size > MAX_SETTINGS_BACKUP_BYTES) {
+        throw new Error("The settings file is larger than 1 MiB.");
       }
-    } catch (importError) {
-      onError(importError instanceof Error ? importError.message : String(importError));
+      const text = await file.text();
+      const nextValidation = validateSettingsBackup(text, settings);
+      if (!nextValidation.settings) {
+        throw new Error(nextValidation.error || "The selected file is not a valid QuickPIM++ settings backup.");
+      }
+      const formatted = JSON.stringify(JSON.parse(text) as unknown, null, 2);
+      setExportText(formatted, formatted !== exportBaselineText);
+      setActionMessage(`${file.name} loaded for review. Save changes to apply it.`);
+    } catch (fileError) {
+      onError(fileError instanceof Error ? fileError.message : String(fileError));
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function reloadSaved() {
+    onClearMessage();
+    onError("");
+    setActionMessage("Saved settings reloaded.");
+    setExportText(exportBaselineText, false);
+  }
+
+  async function resetAllSettings() {
+    setConfirmReset(false);
+    if (await onSave(DEFAULT_SETTINGS, "Settings reset to defaults.")) {
+      setExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2), false);
+      setActionMessage("");
     }
   }
 
   return (
-    <section className="panel">
-      <h2>Import / Export</h2>
-      <p className="muted">Settings are stored locally in Chrome storage under {SETTINGS_KEY}.</p>
-      <textarea aria-label="QuickPIM++ settings JSON" className="textarea code-box" value={exportText} onChange={(event) => setExportText(event.target.value, true)} />
-      <div className="button-row settings-form-actions">
-        <button className="btn" onClick={() => setExportText(JSON.stringify(settings, null, 2))}>
-          Refresh export
+    <section className="panel backup-panel">
+      <div className="panel-title-row">
+        <div>
+          <h2>Backup & Restore</h2>
+          <p className="muted">Copy, download, review, or restore the settings stored locally under {SETTINGS_KEY}.</p>
+        </div>
+        <span className={`backup-dirty-state ${isDirty ? "dirty" : "saved"}`}>{isDirty ? "Unsaved JSON changes" : "Matches saved settings"}</span>
+      </div>
+      <div className="button-row backup-file-actions">
+        <button className="btn" disabled={!validation.settings} onClick={() => void copyJson()}>
+          <CopyIcon />
+          <span>Copy JSON</span>
         </button>
-        <button className="btn primary" onClick={() => void importSettings()}>
-          Import JSON
+        <button className="btn" disabled={!validation.settings} onClick={downloadJson}>
+          <DownloadIcon />
+          <span>Download JSON</span>
         </button>
-        <button className="btn danger" onClick={() => void (async () => {
-          if (await onSave(DEFAULT_SETTINGS, "Settings reset.")) {
-            setExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2));
-          }
-        })()}>
-          Reset all settings
+        <button className="btn" onClick={() => fileInputRef.current?.click()}>
+          <UploadIcon />
+          <span>Load JSON file</span>
+        </button>
+        <input
+          ref={fileInputRef}
+          className="visually-hidden"
+          type="file"
+          accept=".json,application/json"
+          onChange={(event) => void loadJsonFile(event.target.files?.[0])}
+          aria-label="Load QuickPIM++ settings JSON file"
+        />
+      </div>
+      {externalChange && isDirty ? <p className="message warning settings-inline-message">Saved settings changed elsewhere. Reload to use the latest saved version, or save this editor to replace it.</p> : null}
+      {validation.error ? <p className="message error settings-inline-message" role="alert">{validation.error}</p> : null}
+      {actionMessage ? <p className="message success settings-inline-message" role="status">{actionMessage}</p> : null}
+      <div className="field settings-section-gap">
+        <label>Settings JSON</label>
+        <textarea
+          aria-label="QuickPIM++ settings JSON"
+          className="textarea code-box"
+          value={exportText}
+          spellCheck={false}
+          onChange={(event) => setExportText(event.target.value, event.target.value !== exportBaselineText)}
+        />
+        <p className="muted">This editor is not autosaved. Save changes to apply valid JSON to this browser.</p>
+      </div>
+      <div className="button-row settings-form-actions backup-editor-actions">
+        <button className="btn primary" disabled={!isDirty || !validation.settings} onClick={() => void saveEditor()}>
+          <SaveIcon />
+          <span>Save changes</span>
+        </button>
+        <button className="btn" disabled={!isDirty} onClick={reloadSaved}>
+          <ResetIcon />
+          <span>Reload saved</span>
         </button>
       </div>
+      <div className="settings-danger-zone">
+        <div>
+          <h3>Reset settings</h3>
+          <p className="muted">Restore all QuickPIM++ settings and locally stored preferences to their defaults.</p>
+        </div>
+        <button className="btn danger" onClick={() => setConfirmReset(true)}>Reset all settings</button>
+      </div>
+      {confirmReset ? (
+        <div className="settings-confirmation danger" role="alertdialog" aria-label="Reset all QuickPIM++ settings">
+          <span>This resets aliases, favorites, justifications, bundles, usage data, history, and preferences. Captured tokens are not changed.</span>
+          <div className="button-row nowrap">
+            <button className="btn danger" onClick={() => void resetAllSettings()}>Reset everything</button>
+            <button className="btn" onClick={() => setConfirmReset(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
 
-function isSettingsImportObject(value: unknown): value is Partial<QuickPimSettings> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
+function DownloadIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>;
+}
+
+function UploadIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon"><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></svg>;
+}
+
+function SaveIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true" className="button-icon"><path d="M5 4h12l2 2v14H5z" /><path d="M8 4v6h8V4" /><path d="M8 20v-6h8v6" /></svg>;
+}
+
+function ResetDataPanel({
+  onNavigate,
+  onReset
+}: {
+  onNavigate: (tab: SettingsTab) => void;
+  onReset: () => Promise<boolean>;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+
+  async function resetEverything() {
+    setIsResetting(true);
+    try {
+      if (await onReset()) {
+        setConfirming(false);
+        setAcknowledged(false);
+      }
+    } finally {
+      setIsResetting(false);
+    }
   }
-  const keys = new Set(Object.keys(value));
-  return ["aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles", "usageStatsByItemId", "activityHistory", "preferences"]
-    .some((key) => keys.has(key));
+
+  return (
+    <section className="panel reset-data-panel">
+      <div className="panel-title-row">
+        <div>
+          <h2>Reset QuickPIM++</h2>
+          <p className="muted">Erase all extension data from this browser profile and return QuickPIM++ to its first-run state.</p>
+        </div>
+      </div>
+      <div className="settings-subsection backup-recommendation">
+        <h3>Back up first</h3>
+        <p className="muted">Download a JSON backup before resetting if you may need your aliases, justifications, bundles, preferences, or local history again.</p>
+        <button className="btn" onClick={() => onNavigate("backup")}>
+          Open Backup & Restore
+        </button>
+      </div>
+      <div className="settings-danger-zone reset-extension-zone">
+        <div>
+          <h3>Start from scratch</h3>
+          <p className="muted">This removes settings, aliases, favorites, justifications, bundles, usage and request history, learned names, caches, drafts, tracked requests, and captured session tokens.</p>
+        </div>
+        <button className="btn danger" onClick={() => setConfirming(true)}>Erase all extension data</button>
+      </div>
+      {confirming ? (
+        <div className="settings-confirmation danger reset-extension-confirmation" role="alertdialog" aria-label="Erase all QuickPIM++ data">
+          <label className="checkbox-option">
+            <input
+              type="checkbox"
+              checked={acknowledged}
+              onChange={(event) => setAcknowledged(event.target.checked)}
+            />
+            <span>I understand this cannot be undone without a backup.</span>
+          </label>
+          <div className="button-row nowrap">
+            <button className="btn danger" disabled={!acknowledged || isResetting} onClick={() => void resetEverything()}>
+              {isResetting ? "Erasing..." : "Erase everything"}
+            </button>
+            <button className="btn" disabled={isResetting} onClick={() => { setConfirming(false); setAcknowledged(false); }}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
 }
 
 function tabLabel(tab: SettingsTab): string {
   const labels: Record<SettingsTab, string> = {
     home: "Home",
-    access: "Access Setup",
-    activity: "Activity",
-    aliases: "Aliases",
+    "role-access": "Role Access",
+    appearance: "Popup & Appearance",
+    aliases: "Names & Aliases",
+    activation: "Activation & Notifications",
     justifications: "Justifications",
     bundles: "Bundles",
-    preferences: "Preferences",
-    data: "Import / Export",
+    activity: "Activity & Usage",
     diagnostics: "Diagnostics",
+    backup: "Backup & Restore",
+    reset: "Reset QuickPIM++",
     about: "About"
   };
   return labels[tab];
@@ -2902,10 +3444,23 @@ function tabLabel(tab: SettingsTab): string {
 
 function tabFromHash(): SettingsTab {
   const value = window.location.hash.replace("#", "");
-  if (value === "permissions") {
-    return "access";
+  const legacyRoutes: Record<string, SettingsTab> = {
+    permissions: "role-access",
+    access: "role-access",
+    sources: "appearance",
+    preferences: "appearance",
+    display: "appearance",
+    defaults: "activation",
+    automation: "activation",
+    data: "backup"
+  };
+  if (legacyRoutes[value]) {
+    return legacyRoutes[value];
   }
-  if (["home", "about", "access", "activity", "aliases", "justifications", "bundles", "preferences", "data", "diagnostics"].includes(value)) {
+  if (value === "reset-data") {
+    return "reset";
+  }
+  if (["home", "role-access", "appearance", "aliases", "activation", "justifications", "bundles", "activity", "diagnostics", "backup", "reset", "about"].includes(value)) {
     return value as SettingsTab;
   }
   return "home";

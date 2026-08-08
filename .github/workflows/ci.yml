@@ -33,6 +33,9 @@ jobs:
       - name: Check version sync
         run: node scripts/check-version-sync.mjs
 
+      - name: Check Microsoft Edge compatibility
+        run: npm run check:edge
+
       - name: Type check
         run: npm run type-check
 
@@ -51,16 +54,14 @@ jobs:
       - name: Audit
         run: npm audit --audit-level=low
 
-      - name: Package and verify both Store ZIPs
+      - name: Package and verify Chromium Store ZIP
         run: npm run package:stores
 
-      - name: Upload Store ZIP artifacts
+      - name: Upload Store ZIP artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: browser-store-zips
-          path: |
-            release/quickpim-plusplus-v*-chrome-webstore.zip
-            release/quickpim-plusplus-v*-edge-addons.zip
+          name: browser-store-package
+          path: release/quickpim-plusplus-v*-chromium-stores.zip
           if-no-files-found: error
 
       - name: Upload browser QA report

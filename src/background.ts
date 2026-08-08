@@ -88,6 +88,7 @@ import {
   type GraphTokenTarget
 } from "./lib/graphTokenCapabilities";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
+import { resetExtensionData } from "./lib/extensionReset";
 import { isPrivilegedAzureRoleDefinition } from "./lib/privilegedRoles";
 import {
   assertAllowedApiUrl,
@@ -822,6 +823,9 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     case "clearToken":
       await clearTokens();
       return true;
+    case "resetExtensionData":
+      await resetAllExtensionData();
+      return true;
     case "getActivationItems":
       return getActivationItems(message.targets);
     case "getActiveItems":
@@ -880,6 +884,36 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     default:
       throw new Error("Unsupported QuickPIM++ message");
   }
+}
+
+async function resetAllExtensionData(): Promise<void> {
+  await resetExtensionData({
+    loadRequestOperations,
+    hasInFlightTasks: () => Boolean(
+      requestOperationTasks.size
+      || requestExtensionTasks.size
+      || portalTokenRefreshInFlight
+      || requestTrackingMaintenanceInFlight
+    ),
+    closePortalRecoveryTabs: () => closePortalRecoveryTabsForTargets(
+      ["directoryRole", "pimGroup", "azureRole"],
+      getPortalRecoveryApis()
+    ),
+    clearNotifications: async () => {
+      if (!chrome.notifications?.getAll) return;
+      const notifications = await new Promise<object>((resolve) => chrome.notifications.getAll(resolve));
+      await Promise.all(Object.keys(notifications).map((notificationId) => new Promise<void>((resolve) => {
+        chrome.notifications.clear(notificationId, () => resolve());
+      })));
+    },
+    removeNotificationPermission: () => chrome.permissions?.remove
+      ? chrome.permissions.remove({ permissions: ["notifications"] })
+      : Promise.resolve(false),
+    clearLocalStorage: () => chrome.storage.local.clear(),
+    clearSessionStorage: () => chrome.storage.session.clear(),
+    clearAlarms: () => chrome.alarms?.clearAll ? chrome.alarms.clearAll() : Promise.resolve(false),
+    clearActionBadge: () => chrome.action?.setBadgeText ? chrome.action.setBadgeText({ text: "" }) : Promise.resolve()
+  });
 }
 
 async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]> {

@@ -46,7 +46,7 @@ describe("Microsoft Edge Add-ons publisher", () => {
     expect(message).not.toContain("token-value");
   });
 
-  test("release workflow deploys Edge updates from the Edge package", () => {
+  test("release workflow deploys Edge updates from the shared Chromium package", () => {
     const workflow = readFileSync(".github/workflows/release.yml", "utf8");
     expect(workflow).toContain("Publish to Microsoft Edge Add-ons");
     expect(workflow).toContain("environment: microsoft-edge-add-ons");
@@ -58,6 +58,6 @@ describe("Microsoft Edge Add-ons publisher", () => {
       "EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name)"
     );
     expect(workflow).not.toContain("EDGE_ADDONS_MANUAL_SUBMISSION_TAG != env.RELEASE_TAG");
-    expect(workflow).toContain("quickpim-plusplus-${{ env.RELEASE_TAG }}-edge-addons.zip");
+    expect(workflow).toContain("quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip");
   });
 });

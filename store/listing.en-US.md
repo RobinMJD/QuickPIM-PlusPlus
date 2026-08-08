@@ -66,7 +66,10 @@ QuickPIM++ stores tokens and settings in the local browser profile and does not 
 ## Assets
 
 - Store icon: `assets/icon-300.png` (300 x 300)
-- Screenshot 1: `assets/screenshot-01-access-setup-1280x800.png` (1280 x 800)
-- Screenshot 2: `assets/screenshot-02-preferences-1280x800.png` (1280 x 800)
+- Screenshot 1: `assets/screenshot-01-popup-roles-1280x800.png` (1280 x 800) - browse eligible roles in the popup
+- Screenshot 2: `assets/screenshot-02-popup-activation-1280x800.png` (1280 x 800) - policy-aware activation review
+- Screenshot 3: `assets/screenshot-03-popup-bundles-1280x800.png` (1280 x 800) - repeatable bundle activation
+- Screenshot 4: `assets/screenshot-04-popup-active-1280x800.png` (1280 x 800) - active PIM countdown and early disable
+- Screenshot 5: `assets/screenshot-05-settings-appearance-1280x800.png` (1280 x 800) - popup and appearance preferences
 - Small promotional tile: `assets/small-promo-440x280.png` (440 x 280)
 - Large promotional tile: `assets/large-promo-1400x560.png` (1400 x 560)

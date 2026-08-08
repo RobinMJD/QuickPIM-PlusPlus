@@ -63,6 +63,9 @@ jobs:
       - name: Verify tag and all version consumers
         run: node scripts/check-version-sync.mjs "$RELEASE_TAG"
 
+      - name: Check Microsoft Edge compatibility
+        run: npm run check:edge
+
       - name: Type check
         run: npm run type-check
 
@@ -81,16 +84,14 @@ jobs:
       - name: Browser visual contracts
         run: npm run test:e2e
 
-      - name: Package and verify both Store ZIPs
+      - name: Package and verify Chromium Store ZIP
         run: npm run package:stores
 
-      - name: Upload verified Store ZIP artifacts
+      - name: Upload verified Store ZIP artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: browser-store-zips-${{ env.RELEASE_TAG }}
-          path: |
-            release/quickpim-plusplus-v*-chrome-webstore.zip
-            release/quickpim-plusplus-v*-edge-addons.zip
+          name: browser-store-package-${{ env.RELEASE_TAG }}
+          path: release/quickpim-plusplus-v*-chromium-stores.zip
           if-no-files-found: error
 
   github-release:
@@ -100,10 +101,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download verified Store ZIPs
+      - name: Download verified Store ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: browser-store-zips-${{ env.RELEASE_TAG }}
+          name: browser-store-package-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Create immutable GitHub release asset
@@ -111,10 +112,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${RELEASE_TAG#v}"
-          ASSETS=(
-            "quickpim-plusplus-v${VERSION}-chrome-webstore.zip"
-            "quickpim-plusplus-v${VERSION}-edge-addons.zip"
-          )
+          ASSETS=("quickpim-plusplus-v${VERSION}-chromium-stores.zip")
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             for ZIP in "${ASSETS[@]}"; do
               LOCAL="release/${ZIP}"
@@ -149,10 +147,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Download verified Store ZIPs
+      - name: Download verified Store ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: browser-store-zips-${{ env.RELEASE_TAG }}
+          name: browser-store-package-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Publish to Chrome Web Store
@@ -163,7 +161,7 @@ jobs:
           CHROME_WEBSTORE_REFRESH_TOKEN: ${{ secrets.CHROME_WEBSTORE_REFRESH_TOKEN }}
           CHROME_WEBSTORE_PUBLISHER_ID: ${{ secrets.CHROME_WEBSTORE_PUBLISHER_ID }}
           CHROME_WEBSTORE_EXTENSION_ID: ${{ secrets.CHROME_WEBSTORE_EXTENSION_ID }}
-          CHROME_WEBSTORE_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chrome-webstore.zip
+          CHROME_WEBSTORE_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip
 
   microsoft-edge-add-ons:
     needs: [verify-package, github-release]
@@ -184,10 +182,10 @@ jobs:
         with:
           node-version: 24
 
-      - name: Download verified Store ZIPs
+      - name: Download verified Store ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: browser-store-zips-${{ env.RELEASE_TAG }}
+          name: browser-store-package-${{ env.RELEASE_TAG }}
           path: release
 
       - name: Publish to Microsoft Edge Add-ons
@@ -196,5 +194,5 @@ jobs:
           EDGE_ADDONS_CLIENT_ID: ${{ secrets.EDGE_ADDONS_CLIENT_ID }}
           EDGE_ADDONS_API_KEY: ${{ secrets.EDGE_ADDONS_API_KEY }}
           EDGE_ADDONS_PRODUCT_ID: ${{ secrets.EDGE_ADDONS_PRODUCT_ID }}
-          EDGE_ADDONS_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-edge-addons.zip
+          EDGE_ADDONS_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip
           EDGE_ADDONS_CERTIFICATION_NOTES: ${{ vars.EDGE_ADDONS_CERTIFICATION_NOTES }}
