@@ -804,7 +804,7 @@ function SettingsApp() {
             {tab === "appearance" ? (
               <PreferencesPanel page="appearance" settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
             ) : null}
-            {tab === "backup" ? (
+            {tab === "backup" && isSettingsReady ? (
               <DataPanel
                 settings={settings}
                 exportText={exportText}
@@ -815,6 +815,12 @@ function SettingsApp() {
                 onClearMessage={() => setMessage("")}
                 onError={setError}
               />
+            ) : null}
+            {tab === "backup" && !isSettingsReady ? (
+              <section className="panel" aria-busy="true">
+                <h2>Backup & Restore</h2>
+                <p className="muted">Loading saved settings...</p>
+              </section>
             ) : null}
             {tab === "diagnostics" ? (
               <DiagnosticsPanel
