@@ -30,15 +30,34 @@ describe("browser Store assets", () => {
     expect(readPngDimensions(resolve("store/assets/large-promo-1400x560.png"))).toEqual({ width: 1400, height: 560 });
   });
 
-  it("leads GitHub documentation with the popup and keeps matching current captures", () => {
+  it("leads GitHub documentation with every current popup-first capture", () => {
     const readme = readFileSync(resolve("README.md"), "utf8");
-    const popupPath = "docs/images/screenshot-01-popup-roles-1280x800.png";
-    const settingsPath = "docs/images/screenshot-05-settings-appearance-1280x800.png";
+    const readmePaths = screenshotFiles.map((fileName) => `docs/images/${fileName}`);
+    const offsets = readmePaths.map((path) => readme.indexOf(path));
 
-    expect(readme.indexOf(popupPath)).toBeGreaterThan(0);
-    expect(readme.indexOf(settingsPath)).toBeGreaterThan(readme.indexOf(popupPath));
-    expect(readPngDimensions(resolve(popupPath))).toEqual({ width: 1280, height: 800 });
-    expect(readPngDimensions(resolve(settingsPath))).toEqual({ width: 1280, height: 800 });
+    expect(offsets.every((offset) => offset > 0)).toBe(true);
+    expect(offsets).toEqual([...offsets].sort((left, right) => left - right));
+    for (const [index, readmePath] of readmePaths.entries()) {
+      expect(readPngDimensions(resolve(readmePath))).toEqual({ width: 1280, height: 800 });
+      expect(readFileSync(resolve(readmePath))).toEqual(readFileSync(resolve("store/assets", screenshotFiles[index])));
+    }
+  });
+
+  it("uses official clickable browser Store badges and keeps release history out of README", () => {
+    const readme = readFileSync(resolve("README.md"), "utf8");
+
+    expect(readme).toContain("https://chromewebstore.google.com/detail/quickpim%2B%2B/knhfobbilpoaigbpondpadjdmikhdljn");
+    expect(readme).toContain("https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld");
+    expect(readPngDimensions(resolve("docs/images/store-badges/chrome-web-store.png"))).toEqual({
+      width: 340,
+      height: 96
+    });
+    expect(readPngDimensions(resolve("docs/images/store-badges/microsoft-edge-addons.png"))).toEqual({
+      width: 1178,
+      height: 312
+    });
+    expect(readme).not.toMatch(/^## Changelog$/m);
+    expect(readme).toContain("https://github.com/RobinMJD/QuickPIM-PlusPlus/releases");
   });
 
   it("generates captures from dist using fictional Store data", () => {

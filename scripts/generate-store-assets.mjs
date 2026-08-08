@@ -85,14 +85,12 @@ try {
     promoCss()
   );
 
-  copyFileSync(
-    resolve(OUTPUT_DIR, "screenshot-01-popup-roles-1280x800.png"),
-    resolve(DOCS_DIR, "screenshot-01-popup-roles-1280x800.png")
-  );
-  copyFileSync(
-    resolve(OUTPUT_DIR, "screenshot-05-settings-appearance-1280x800.png"),
-    resolve(DOCS_DIR, "screenshot-05-settings-appearance-1280x800.png")
-  );
+  for (const fileName of [
+    ...SCREENSHOTS.map((screenshot) => screenshot.fileName),
+    "screenshot-05-settings-appearance-1280x800.png"
+  ]) {
+    copyFileSync(resolve(OUTPUT_DIR, fileName), resolve(DOCS_DIR, fileName));
+  }
 } finally {
   await compositor.close();
 }
