@@ -1,4 +1,14 @@
-import type { AccessSetupTarget, ActivationDataResult, CachedActivationEntry, QuickPimDataCache, TargetActivationCache } from "./types";
+import type {
+  AccessDiagnostic,
+  AccessDiagnosticOperation,
+  AccessFailureKind,
+  AccessSetupTarget,
+  ActivationDataResult,
+  ActivationItem,
+  CachedActivationEntry,
+  QuickPimDataCache,
+  TargetActivationCache
+} from "./types";
 import { createStorageMutationLock } from "./storageMutation";
 
 export const DATA_CACHE_KEY = "quickPimDataCache.v1";
@@ -8,6 +18,36 @@ export const STALE_ELIGIBLE_CACHE_TTL_MS = 60 * 60 * 1000;
 export const CACHE_TARGETS: AccessSetupTarget[] = ["directoryRole", "pimGroup", "azureRole"];
 
 const withDataCacheMutationLock = createStorageMutationLock("quickPimDataCacheMutation");
+const MAX_CACHE_ITEMS = 1_000;
+const MAX_CACHE_ERRORS = 20;
+const MAX_CACHE_DIAGNOSTICS = 40;
+const MAX_CACHE_INPUT_ITEMS = MAX_CACHE_ITEMS * 4;
+const MAX_CACHE_INPUT_ERRORS = MAX_CACHE_ERRORS * 4;
+const MAX_CACHE_INPUT_DIAGNOSTICS = MAX_CACHE_DIAGNOSTICS * 4;
+const MAX_CACHE_STRING_LENGTH = 512;
+const MAX_CACHE_ERROR_LENGTH = 500;
+const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
+
+const ITEM_STATUSES = new Set(["eligible", "active", "pendingApproval"]);
+const ASSIGNMENT_TYPES = new Set(["activated", "assigned", "unknown"]);
+const DIAGNOSTIC_OPERATIONS = new Set<AccessDiagnosticOperation>([
+  "eligible",
+  "active",
+  "policy",
+  "nameLookup",
+  "activation",
+  "deactivation"
+]);
+const FAILURE_KINDS = new Set<AccessFailureKind>([
+  "missingToken",
+  "expiredToken",
+  "missingCapability",
+  "forbidden",
+  "claimsChallenge",
+  "network",
+  "unknown"
+]);
 
 type CacheBucket = "eligible" | "active";
 
@@ -54,7 +94,7 @@ export function formatCacheAge(fetchedAt: number | undefined, now = Date.now()):
 
 export async function loadDataCache(): Promise<QuickPimDataCache> {
   const result = await chrome.storage.local.get(DATA_CACHE_KEY);
-  return (result[DATA_CACHE_KEY] as QuickPimDataCache | undefined) || {};
+  return sanitizeDataCache(result[DATA_CACHE_KEY]);
 }
 
 export async function saveDataCache(cache: QuickPimDataCache): Promise<void> {
@@ -69,11 +109,27 @@ export async function clearDataCache(): Promise<void> {
 }
 
 export function mergeDataCachesForSave(current: QuickPimDataCache, incoming: QuickPimDataCache): QuickPimDataCache {
+  const safeCurrent = sanitizeDataCache(current);
+  const safeIncoming = sanitizeDataCache(incoming);
   return {
-    eligible: chooseCacheEntry(current.eligible, incoming.eligible),
-    active: chooseCacheEntry(current.active, incoming.active),
-    eligibleByTarget: mergeTargetCache(current.eligibleByTarget, incoming.eligibleByTarget),
-    activeByTarget: mergeTargetCache(current.activeByTarget, incoming.activeByTarget)
+    eligible: chooseCacheEntry(safeCurrent.eligible, safeIncoming.eligible),
+    active: chooseCacheEntry(safeCurrent.active, safeIncoming.active),
+    eligibleByTarget: mergeTargetCache(safeCurrent.eligibleByTarget, safeIncoming.eligibleByTarget),
+    activeByTarget: mergeTargetCache(safeCurrent.activeByTarget, safeIncoming.activeByTarget)
+  };
+}
+
+export function sanitizeDataCache(value: unknown, now = Date.now()): QuickPimDataCache {
+  if (!isRecord(value)) return {};
+  const eligible = sanitizeCacheEntry(value.eligible, undefined, now);
+  const active = sanitizeCacheEntry(value.active, undefined, now);
+  const eligibleByTarget = sanitizeTargetCache(value.eligibleByTarget, now);
+  const activeByTarget = sanitizeTargetCache(value.activeByTarget, now);
+  return {
+    ...(eligible ? { eligible } : {}),
+    ...(active ? { active } : {}),
+    ...(eligibleByTarget ? { eligibleByTarget } : {}),
+    ...(activeByTarget ? { activeByTarget } : {})
   };
 }
 
@@ -403,5 +459,165 @@ function isUsableCacheEntry(entry: CachedActivationEntry): boolean {
 }
 
 function getFiniteTimestamp(value: number | undefined): number | undefined {
-  return Number.isFinite(value) && Number(value) >= 0 ? Number(value) : undefined;
+  return Number.isFinite(value) && Number(value) >= 0 && Number(value) <= MAX_DATE_EPOCH_MS ? Number(value) : undefined;
+}
+
+function sanitizeTargetCache(value: unknown, now: number): TargetActivationCache | undefined {
+  if (!isRecord(value)) return undefined;
+  const entries = CACHE_TARGETS.flatMap((target) => {
+    const entry = sanitizeCacheEntry(value[target], target, now);
+    return entry ? [[target, entry] as const] : [];
+  });
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | undefined, now: number): CachedActivationEntry | undefined {
+  if (!isRecord(value) || !Array.isArray(value.items)) return undefined;
+  const fetchedAt = getFiniteTimestamp(typeof value.fetchedAt === "number" ? value.fetchedAt : undefined);
+  if (fetchedAt === undefined || fetchedAt > now + MAX_FUTURE_CLOCK_SKEW_MS) return undefined;
+
+  const seen = new Set<string>();
+  const items = value.items.slice(0, MAX_CACHE_INPUT_ITEMS).flatMap((candidate) => {
+    const item = sanitizeCachedActivationItem(candidate);
+    if (!item || (expectedTarget && item.type !== expectedTarget)) return [];
+    const key = item.id.toLowerCase();
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [item];
+  }).slice(0, MAX_CACHE_ITEMS);
+  const errors = Array.isArray(value.errors)
+    ? value.errors.slice(0, MAX_CACHE_INPUT_ERRORS).flatMap((error) => sanitizeOptionalString(error, MAX_CACHE_ERROR_LENGTH) || []).slice(0, MAX_CACHE_ERRORS)
+    : [];
+  const diagnostics = Array.isArray(value.diagnostics)
+    ? value.diagnostics.slice(-MAX_CACHE_INPUT_DIAGNOSTICS).flatMap((diagnostic) => sanitizeDiagnostic(diagnostic) || []).slice(-MAX_CACHE_DIAGNOSTICS)
+    : undefined;
+  const rawRefreshStartedAt = getFiniteTimestamp(typeof value.refreshStartedAt === "number" ? value.refreshStartedAt : undefined);
+  const refreshStartedAt = rawRefreshStartedAt !== undefined && rawRefreshStartedAt <= now + MAX_FUTURE_CLOCK_SKEW_MS
+    ? rawRefreshStartedAt
+    : undefined;
+  const cacheKey = sanitizeOptionalString(value.cacheKey, 1_024);
+  return {
+    items,
+    errors,
+    fetchedAt,
+    ...(refreshStartedAt !== undefined ? { refreshStartedAt } : {}),
+    ...(cacheKey ? { cacheKey } : {}),
+    ...(diagnostics?.length ? { diagnostics } : {})
+  };
+}
+
+function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefined {
+  if (!isRecord(value) || !ITEM_STATUSES.has(String(value.status))) return undefined;
+  const id = sanitizeRequiredString(value.id);
+  const sourceName = sanitizeRequiredString(value.sourceName);
+  const displayName = sanitizeRequiredString(value.displayName);
+  const principalId = typeof value.principalId === "string" ? value.principalId.trim().slice(0, MAX_CACHE_STRING_LENGTH) : undefined;
+  const scopeLabel = sanitizeRequiredString(value.scopeLabel);
+  if (!id || !sourceName || !displayName || principalId === undefined || !scopeLabel) return undefined;
+  const activationPolicyState = value.activationPolicyState === "pending" || value.activationPolicyState === "ready"
+    ? value.activationPolicyState as "pending" | "ready"
+    : undefined;
+
+  const common = {
+    id,
+    sourceName,
+    displayName,
+    principalId,
+    scopeLabel,
+    status: value.status as ActivationItem["status"],
+    ...(sanitizeOptionalString(value.sourceScopeLabel) ? { sourceScopeLabel: sanitizeOptionalString(value.sourceScopeLabel) } : {}),
+    ...(ASSIGNMENT_TYPES.has(String(value.activeAssignmentType)) ? { activeAssignmentType: value.activeAssignmentType as ActivationItem["activeAssignmentType"] } : {}),
+    ...(sanitizeTimestamp(value.activeUntil) ? { activeUntil: sanitizeTimestamp(value.activeUntil) } : {}),
+    ...(sanitizeOptionalString(value.assignmentScheduleId) ? { assignmentScheduleId: sanitizeOptionalString(value.assignmentScheduleId) } : {}),
+    ...(sanitizeOptionalString(value.assignmentScheduleInstanceId) ? { assignmentScheduleInstanceId: sanitizeOptionalString(value.assignmentScheduleInstanceId) } : {}),
+    ...(typeof value.isPrivileged === "boolean" ? { isPrivileged: value.isPrivileged } : {}),
+    ...(activationPolicyState ? { activationPolicyState } : {}),
+    ...(sanitizeActivationRequirements(value.activationRequirements) ? { activationRequirements: sanitizeActivationRequirements(value.activationRequirements) } : {})
+  };
+
+  if (value.type === "directoryRole") {
+    const roleDefinitionId = sanitizeRequiredString(value.roleDefinitionId);
+    const directoryScopeId = sanitizeRequiredString(value.directoryScopeId);
+    return roleDefinitionId && directoryScopeId ? { ...common, type: "directoryRole", roleDefinitionId, directoryScopeId } : undefined;
+  }
+  if (value.type === "pimGroup") {
+    const groupId = sanitizeRequiredString(value.groupId);
+    if (!groupId || (value.accessId !== "member" && value.accessId !== "owner")) return undefined;
+    return {
+      ...common,
+      type: "pimGroup",
+      groupId,
+      accessId: value.accessId,
+      ...(sanitizeOptionalString(value.memberType) ? { memberType: sanitizeOptionalString(value.memberType) } : {})
+    };
+  }
+  if (value.type === "azureRole") {
+    const roleDefinitionId = sanitizeRequiredString(value.roleDefinitionId);
+    const scope = sanitizeRequiredString(value.scope);
+    if (!roleDefinitionId || !scope) return undefined;
+    return {
+      ...common,
+      type: "azureRole",
+      roleDefinitionId,
+      scope,
+      ...(sanitizeOptionalString(value.subscriptionId) ? { subscriptionId: sanitizeOptionalString(value.subscriptionId) } : {}),
+      ...(sanitizeOptionalString(value.subscriptionName) ? { subscriptionName: sanitizeOptionalString(value.subscriptionName) } : {}),
+      ...(sanitizeOptionalString(value.roleEligibilityScheduleId) ? { roleEligibilityScheduleId: sanitizeOptionalString(value.roleEligibilityScheduleId) } : {})
+    };
+  }
+  return undefined;
+}
+
+function sanitizeActivationRequirements(value: unknown): ActivationItem["activationRequirements"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const maxDurationHours = Number(value.maxDurationHours);
+  const result: NonNullable<ActivationItem["activationRequirements"]> = {
+    ...(typeof value.justification === "boolean" ? { justification: value.justification } : {}),
+    ...(typeof value.ticket === "boolean" ? { ticket: value.ticket } : {}),
+    ...(typeof value.approval === "boolean" ? { approval: value.approval } : {}),
+    ...(Number.isFinite(maxDurationHours) && maxDurationHours >= 0.5 && maxDurationHours <= 24 ? { maxDurationHours } : {})
+  };
+  return Object.keys(result).length ? result : undefined;
+}
+
+function sanitizeDiagnostic(value: unknown): AccessDiagnostic | undefined {
+  if (!isRecord(value) || !CACHE_TARGETS.includes(value.target as AccessSetupTarget) || typeof value.success !== "boolean") return undefined;
+  const checkedAt = sanitizeTimestamp(value.checkedAt);
+  if (!checkedAt) return undefined;
+  const operation = DIAGNOSTIC_OPERATIONS.has(value.operation as AccessDiagnosticOperation)
+    ? value.operation as AccessDiagnosticOperation
+    : undefined;
+  const failureKind = FAILURE_KINDS.has(value.failureKind as AccessFailureKind)
+    ? value.failureKind as AccessFailureKind
+    : undefined;
+  return {
+    target: value.target as AccessSetupTarget,
+    success: value.success,
+    checkedAt,
+    ...(sanitizeOptionalString(value.error, MAX_CACHE_ERROR_LENGTH) ? { error: sanitizeOptionalString(value.error, MAX_CACHE_ERROR_LENGTH) } : {}),
+    ...(typeof value.fromCache === "boolean" ? { fromCache: value.fromCache } : {}),
+    ...(operation ? { operation } : {}),
+    ...(sanitizeOptionalString(value.endpointLabel, 120) ? { endpointLabel: sanitizeOptionalString(value.endpointLabel, 120) } : {}),
+    ...(failureKind ? { failureKind } : {})
+  };
+}
+
+function sanitizeTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
+}
+
+function sanitizeRequiredString(value: unknown): string | undefined {
+  return sanitizeOptionalString(value, MAX_CACHE_STRING_LENGTH);
+}
+
+function sanitizeOptionalString(value: unknown, maxLength = MAX_CACHE_STRING_LENGTH): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }

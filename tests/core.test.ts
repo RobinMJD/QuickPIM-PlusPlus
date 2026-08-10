@@ -63,6 +63,8 @@ describe("PIM item normalization", () => {
       roleName: "Global Reader"
     });
 
+    expect(item).not.toHaveProperty("raw");
+
     expect(item).toMatchObject({
       id: "directoryRole:reader:/",
       type: "directoryRole",
@@ -406,7 +408,7 @@ describe("settings helpers", () => {
       },
       savedJustifications: ["Patch window", "Patch window", "x".repeat(2000)],
       recentJustifications: ["Recent work", "x".repeat(2000)],
-      favoriteItemIds: ["directoryRole:reader:/", "x".repeat(400), "directoryRole:reader:/"],
+      favoriteItemIds: ["directoryRole:reader:/", "x".repeat(600), "directoryRole:reader:/"],
       bundles: [
         {
           id: "bundle:unsafe",
@@ -549,6 +551,13 @@ describe("activation request builders", () => {
         }
       })
     ).toBe("2026-05-18T15:00:00.000Z");
+    expect(
+      getActiveUntilFromScheduleInfo({
+        expiration: {
+          endDateTime: "not-a-date"
+        }
+      })
+    ).toBeUndefined();
   });
 
   test("maps policy requirements by full id, leaf id, and member owner aliases", () => {

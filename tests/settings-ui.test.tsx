@@ -193,13 +193,14 @@ describe("settings Home page", () => {
       "Justifications",
       "Bundles",
       "Activity & Usage",
+      "Browser Sync",
       "Diagnostics",
       "Backup & Restore",
       "Reset QuickPIM++",
       "About"
     ]);
     expect(navButtons.at(-1)).toBe("About");
-    expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(12);
+    expect(document.querySelectorAll(".settings-nav-icon")).toHaveLength(13);
     expect(fetchMock.mock.calls[0][0]).toBe(`https://api.github.com/repos/RobinMJD/QuickPIM-PlusPlus/releases/tags/${TEST_RELEASE_TAG}`);
   });
 
@@ -1554,6 +1555,8 @@ describe("settings Activity page", () => {
       updatedAt: "2026-07-14T09:01:00.000Z",
       durationHours: 4,
       justification: "Investigate production incident INC12345",
+      sourceInstallationId: "87654321-abcd-4def-8abc-1234567890ab",
+      sourceDeviceName: "Admin laptop",
       checkCount: 1
     };
     const storageData: Record<string, unknown> = {
@@ -1609,9 +1612,12 @@ describe("settings Activity page", () => {
     await import("../src/settings/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Global Administrator"));
+    expect(document.body.textContent).toContain("From Admin laptop");
+    expect(document.body.textContent).toContain("QP-87654321");
     expect(document.querySelector(".request-row time")?.textContent).toBe(formatLocalDateTime(request.requestedAt));
     clickButton("Global Administrator");
     await waitFor(() => expect(document.body.textContent).toContain("Investigate production incident INC12345"));
+    expect(document.body.textContent).toContain("Source computerAdmin laptop");
     expect(document.body.textContent).toContain("request-1");
     expect(document.body.textContent).toContain("Pending approval");
     expect(document.body.textContent).toContain(formatLocalDateTime(request.requestedAt));
@@ -2703,6 +2709,76 @@ describe("settings dark mode", () => {
     expect(document.body.textContent).not.toContain("6/12/2026");
   });
 
+  test("shows the renamed source installation in history and per-device usage", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#activity");
+    const settings = createDefaultSettings();
+    const installationId = "12345678-abcd-4def-8abc-1234567890ab";
+    settings.activityHistory = [{
+      id: "operation-1:activate:directoryRole:reader:/:success",
+      action: "activate",
+      result: "success",
+      itemId: "directoryRole:reader:/",
+      itemName: "Reader",
+      itemType: "directoryRole",
+      requestedAt: "2026-08-10T10:00:00.000Z",
+      completedAt: "2026-08-10T10:00:01.000Z",
+      sourceInstallationId: installationId,
+      sourceDeviceName: "Old name"
+    }];
+    settings.usageStatsByItemId = {
+      "directoryRole:reader:/": {
+        activationCount: 2,
+        byInstallationId: { [installationId]: { activationCount: 2 } }
+      }
+    };
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const runtime = chromeMock.runtime as { sendMessage: (message: { action: string }) => Promise<unknown> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus") {
+        return { success: true, data: {
+          capability: "available",
+          supported: true,
+          enabled: true,
+          browserLabel: "Google Chrome",
+          sourceLabel: "Chrome Web Store",
+          ecosystemLabel: "Chrome Sync",
+          installationId: "current-device-id",
+          deviceName: "Current PC",
+          platform: "Windows",
+          reminderMode: "daily",
+          reminderDue: false,
+          suspendedByPurge: false,
+          omittedCategories: [],
+          devices: [{
+            installationId,
+            name: "Admin workstation",
+            browser: "Google Chrome",
+            platform: "Windows",
+            appVersion: TEST_MANIFEST.version,
+            lastSyncAt: Date.now(),
+            syncEnabled: true,
+            nameUpdatedAt: Date.now()
+          }]
+        } };
+      }
+      if (message.action === "getTokenStatus") return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      if (message.action === "getActivationSnapshot") return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      return { success: true, data: { items: [], errors: [], diagnostics: [] } };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Activity & Usage"));
+    clickExactButton("History");
+    await waitFor(() => expect(document.body.textContent).toContain("From Admin workstation"));
+    expect(document.body.textContent).toContain("QP-12345678");
+    clickExactButton("Usage");
+    await waitFor(() => expect(document.body.textContent).toContain("Admin workstation (QP-12345678): 2"));
+  });
+
   test("saves enabled feature preferences", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#display");
@@ -2843,6 +2919,7 @@ describe("settings journey safeguards", () => {
     vi.stubGlobal("chrome", createBasicSettingsChrome(storageData));
     vi.resetModules();
     await import("../src/settings/main");
+    await waitFor(() => expect(document.querySelector(".settings-layout")?.getAttribute("aria-busy")).toBe("false"));
 
     const routes: Array<[string, string]> = [
       ["#access", "Role Access"],
@@ -2859,7 +2936,10 @@ describe("settings journey safeguards", () => {
     for (const [hash, heading] of routes) {
       window.history.replaceState(null, "", hash);
       window.dispatchEvent(new Event("hashchange"));
-      await waitFor(() => expect([...document.querySelectorAll("h2")].some((item) => item.textContent === heading)).toBe(true));
+      await waitFor(() => expect(
+        [...document.querySelectorAll("h2")].some((item) => item.textContent === heading),
+        `${hash} should render ${heading}`
+      ).toBe(true));
     }
   });
 

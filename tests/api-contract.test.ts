@@ -42,6 +42,19 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).not.toContain("void closeExpiredPortalRecoveryTabs(getPortalRecoveryApis());");
   });
 
+  test("keeps bearer requests on allowlisted Microsoft endpoints without ambient credentials or redirects", () => {
+    expect(background).toContain("assertAllowedApiUrl(url);");
+    expect(background).toContain('credentials: "omit"');
+    expect(background).toContain('redirect: "error"');
+    expect(background).toContain('referrerPolicy: "no-referrer"');
+  });
+
+  test("reacts to per-installation browser sync records and queues local edits made during sync", () => {
+    expect(background).toContain("Object.keys(changes).some(isBrowserSyncDeviceStorageKey)");
+    expect(background).toContain("runBrowserSync(true)");
+    expect(background).toContain("browserSyncFollowUpRequested = true");
+  });
+
   test("tracks submitted requests with bounded Microsoft status checks", () => {
     expect(background).toContain("persistTrackedSubmissionsBestEffort");
     expect(background).toContain("roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')");

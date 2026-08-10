@@ -19,6 +19,18 @@ export type ActivationPolicyState = "pending" | "ready";
 export interface UsageStats {
   activationCount: number;
   lastUsedAt?: string;
+  legacyActivationCount?: number;
+  byInstallationId?: Record<string, InstallationUsageStats>;
+}
+
+export interface InstallationUsageStats {
+  activationCount: number;
+  lastUsedAt?: string;
+}
+
+export interface ActivitySource {
+  installationId: string;
+  deviceName: string;
 }
 
 export interface TicketInfo {
@@ -120,6 +132,8 @@ export interface ActivityHistoryEntry {
   bundleName?: string;
   justification?: string;
   error?: string;
+  sourceInstallationId?: string;
+  sourceDeviceName?: string;
 }
 
 export interface TrackedPimRequest {
@@ -164,6 +178,8 @@ export interface TrackedPimRequest {
   lastError?: string;
   notifiedStatus?: TrackedPimRequestStatus;
   expiryReminderSentAt?: string;
+  sourceInstallationId?: string;
+  sourceDeviceName?: string;
 }
 
 export interface TrackedPimRequestStore {
@@ -334,6 +350,8 @@ export interface ActivationResponse {
   success: boolean;
   results: ActivationResult[];
   errors: ActivationResult[];
+  sourceInstallationId?: string;
+  sourceDeviceName?: string;
 }
 
 export interface TrackedRequestExtensionResult {
@@ -359,7 +377,10 @@ export interface RequestOperationRecord {
   updatedAt: number;
   durationHours?: number;
   justification?: string;
+  ticketInfo?: TicketInfo;
   bundleName?: string;
+  sourceInstallationId?: string;
+  sourceDeviceName?: string;
   response?: ActivationResponse;
   error?: string;
 }

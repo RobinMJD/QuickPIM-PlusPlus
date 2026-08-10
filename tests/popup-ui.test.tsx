@@ -7,15 +7,82 @@ import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 import type { ActivationItem, RequestOperationRecord } from "../src/lib/types";
+import { CHROME_WEB_STORE_EXTENSION_ID, EDGE_ADDONS_URL } from "../src/lib/distribution";
 
 afterEach(() => {
   const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
   cleanupWindow.__quickPimPopupUnmount?.();
   cleanupWindow.__quickPimPopupUnmount = undefined;
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   document.body.innerHTML = "";
   document.body.className = "";
 });
+
+describe("Edge Chrome Web Store migration guard", () => {
+  test("blocks role access and hides migration export for an unused profile", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 Chrome/140.0 Safari/537.36 Edg/140.0");
+    vi.stubGlobal("chrome", createBlockedEdgeChrome(DEFAULT_SETTINGS));
+
+    vi.resetModules();
+    await import("../src/popup/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Use the Edge Add-ons edition"));
+
+    expect(document.querySelector('[role="tablist"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Download settings and history");
+    expect(document.querySelector<HTMLAnchorElement>(`a[href="${EDGE_ADDONS_URL}"]`)).toBeTruthy();
+    expect(document.body.textContent).toContain("Extensions > Manage extensions");
+  });
+
+  test("offers an importable backup when the Chrome Store copy has local user data", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 Chrome/140.0 Safari/537.36 Edg/140.0");
+    vi.stubGlobal("chrome", createBlockedEdgeChrome({
+      ...structuredClone(DEFAULT_SETTINGS),
+      activityHistory: [{
+        id: "history-1",
+        action: "activate",
+        itemId: "directoryRole:one:/",
+        itemName: "Role one",
+        itemType: "directoryRole",
+        scopeLabel: "Tenant",
+        result: "success",
+        requestedAt: "2026-08-10T10:00:00.000Z",
+        completedAt: "2026-08-10T10:00:01.000Z"
+      }]
+    }));
+
+    vi.resetModules();
+    await import("../src/popup/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Download settings and history"));
+
+    expect(document.body.textContent).toContain("Backup & Restore");
+  });
+});
+
+function createBlockedEdgeChrome(settings: typeof DEFAULT_SETTINGS) {
+  return {
+    runtime: {
+      id: CHROME_WEB_STORE_EXTENSION_ID,
+      getURL: (path: string) => `chrome-extension://${CHROME_WEB_STORE_EXTENSION_ID}/${path}`
+    },
+    management: {
+      getSelf: vi.fn(async () => ({
+        id: CHROME_WEB_STORE_EXTENSION_ID,
+        installType: "normal",
+        updateUrl: "https://clients2.google.com/service/update2/crx"
+      }))
+    },
+    storage: {
+      local: {
+        get: vi.fn(async (key: string) => ({ [key]: key === SETTINGS_KEY ? settings : undefined })),
+        set: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined)
+      }
+    }
+  };
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -496,6 +563,8 @@ describe("popup loading UI", () => {
     expect(document.body.textContent).not.toContain("Refresh completed with an issue");
     expect(document.body.textContent).not.toContain("Microsoft Graph access is limited in the captured portal token");
     expect(document.body.textContent).toContain("One role source needs a refresh.");
+    expect(document.querySelector(".token-status-summary.warn")?.textContent).toContain("Limited access");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Entra RolesLimited");
   });
 });
 
@@ -1084,8 +1153,10 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Load your PIM roles"));
     expect(document.body.textContent).toContain("Use the highlighted Refresh button above.");
-    expect(document.body.textContent).toContain("Graph access needed");
-    expect(document.body.textContent).toContain("Azure access needed");
+    expect(document.querySelector(".token-status-summary")?.textContent).toContain("Access needed");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Entra RolesAccess needed");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("PIM GroupsAccess needed");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Azure RolesAccess needed");
     expect(document.body.textContent).not.toContain("Some QuickPIM++ data is missing or stale.");
     expect(document.body.textContent).not.toContain("Fix access");
     expect(document.body.textContent).not.toContain("Graph token is missing.");
@@ -2406,6 +2477,11 @@ describe("popup compact controls", () => {
     expect(backButton).toBeTruthy();
     expect(backButton?.title).toBe("Back to role selection");
     expect(backButton?.parentElement?.classList.contains("activation-review-actions")).toBe(true);
+    const reviewScroll = document.querySelector<HTMLElement>(".activation-review-scroll");
+    const activationBar = document.querySelector<HTMLElement>(".activation-bar");
+    expect(reviewScroll).toBeTruthy();
+    expect(reviewScroll?.contains(backButton || null)).toBe(false);
+    expect(backButton?.parentElement?.parentElement).toBe(activationBar);
     backButton?.click();
 
     await waitFor(() => expect(document.body.textContent).toContain("Continue"));
@@ -4120,9 +4196,10 @@ describe("popup draft persistence", () => {
     expect(document.querySelector(".account-popover-panel")?.textContent).toContain("tenant-1");
     expect(document.querySelectorAll(".account-detail-row")).toHaveLength(2);
     expect(document.querySelector(".token-status-summary")?.textContent).toContain("Access ready");
-    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Graph ready (1 min ago)");
-    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Azure Not needed");
-    expect(document.querySelector(".token-source-row.not-needed")?.textContent).toContain("Azure Not needed");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("PIM GroupsReady (1 min ago)");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Entra RolesNot needed");
+    expect(document.querySelector(".token-status-panel")?.textContent).toContain("Azure RolesNot needed");
+    expect(document.querySelectorAll(".token-source-row.not-needed")).toHaveLength(2);
     expect(document.querySelector('.header-actions [aria-label^="Open "]')).toBeNull();
     expect(document.querySelector('[aria-label="Open PIM Groups in Microsoft Entra"]')).toBeTruthy();
 
@@ -4318,7 +4395,8 @@ describe("popup role row styling", () => {
     const headerActionsRule = css.match(/\.header-actions\s*\{[^}]+\}/)?.[0] || "";
     const activationButtonRule = css.match(/\.activation-bar\s+\.button-row\s*\{[^}]+\}/)?.[0] || "";
 
-    expect(headerActionsRule).toContain("justify-content: flex-end;");
+    expect(headerActionsRule).toContain("grid-template-columns: 36px minmax(0, auto) 36px;");
+    expect(headerActionsRule).toContain("justify-content: end;");
     expect(toolbarRule).toContain("grid-template-columns: minmax(0, 30ch) minmax(120px, 1fr) 84px;");
     expect(toolbarRule).toContain("align-items: stretch;");
     expect(activationButtonRule).toContain("margin-top: 0;");
@@ -4370,13 +4448,17 @@ describe("popup role row styling", () => {
     expect(textareaRule).toContain("resize: none;");
   });
 
-  test("uses a three-zone header and reserves portal actions for the selected tab", () => {
+  test("centers access status between equal account and refresh controls", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const headerRule = css.match(/\.app-header\s*\{[^}]+\}/)?.[0] || "";
     const accountRule = css.match(/\.header-account-slot\s*\{[^}]+\}/)?.[0] || "";
     const tabPortalRule = css.match(/\.tab-portal-button\s*\{[^}]+\}/)?.[0] || "";
 
-    expect(headerRule).toContain("grid-template-columns: minmax(0, 1fr) 38px auto;");
+    const actionsRule = css.match(/\.header-actions\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(headerRule).toContain("grid-template-columns: minmax(0, 1fr) auto;");
+    expect(actionsRule).toContain("grid-template-columns: 36px minmax(0, auto) 36px;");
+    expect(actionsRule).toContain("gap: 6px;");
     expect(accountRule).toContain("justify-content: center;");
     expect(tabPortalRule).toContain("position: absolute;");
     expect(tabPortalRule).toContain("right: 5px;");
@@ -4421,9 +4503,12 @@ describe("popup role row styling", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
     const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
+    const reviewContentRule = css.match(/\.app-shell\.activation-review-open > \.content\s*\{[^}]+\}/)?.[0] || "";
     const toolbarRule = css.match(/\.toolbar\s*\{[^}]+\}/)?.[0] || "";
     const activeFilterRule = css.match(/\.active-filter-switch\s*\{[^}]+\}/)?.[0] || "";
     const activationRule = css.match(/\.activation-bar\s*\{[^}]+\}/)?.[0] || "";
+    const activationReviewRule = css.match(/\.activation-review-scroll\s*\{[^}]+\}/)?.[0] || "";
+    const activationFooterRule = css.match(/\.activation-bar \.activation-footer-actions\s*\{[^}]+\}/)?.[0] || "";
     const activationButtonRule = css.match(/\.activation-bar \.btn\s*\{[^}]+\}/)?.[0] || "";
 
     expect(shellRule).toContain("display: flex;");
@@ -4434,6 +4519,7 @@ describe("popup role row styling", () => {
     expect(contentRule).toContain("flex: 1 1 auto;");
     expect(contentRule).toContain("min-height: 0;");
     expect(contentRule).toContain("overflow-y: auto;");
+    expect(reviewContentRule).toContain("flex-shrink: 999;");
     expect(toolbarRule).toContain("flex-shrink: 0;");
     expect(toolbarRule).toContain("grid-template-columns: minmax(0, 30ch) minmax(120px, 1fr) 84px;");
     expect(activeFilterRule).toContain("min-height: 40px;");
@@ -4441,10 +4527,18 @@ describe("popup role row styling", () => {
     expect(contentRule).not.toContain("padding-bottom: 248px;");
     expect(activationRule).toContain("position: relative;");
     expect(activationRule).toContain("z-index: 20;");
-    expect(activationRule).toContain("flex-shrink: 0;");
-    expect(activationRule).toContain("overflow-y: auto;");
+    expect(activationRule).toContain("display: flex;");
+    expect(activationRule).toContain("flex: 0 1 auto;");
+    expect(activationRule).toContain("flex-direction: column;");
+    expect(activationRule).toContain("min-height: 47px;");
+    expect(activationRule).toContain("overflow: hidden;");
     expect(activationRule).not.toContain("position: fixed;");
     expect(activationRule).not.toContain("position: sticky;");
+    expect(activationReviewRule).toContain("flex: 1 1 auto;");
+    expect(activationReviewRule).toContain("min-height: 0;");
+    expect(activationReviewRule).toContain("overflow-y: auto;");
+    expect(activationReviewRule).toContain("overscroll-behavior: contain;");
+    expect(activationFooterRule).toContain("flex: 0 0 auto;");
     expect(activationButtonRule).toContain("min-height: 30px;");
     expect(activationButtonRule).toContain("font-size: 12px;");
   });

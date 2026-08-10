@@ -1,11 +1,14 @@
 import type { ActivationItem, ReferenceDataCache, ReferenceValue } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
+import { isSafeRecordKey } from "./security";
 
 export const REFERENCE_DATA_KEY = "quickPimReferenceData.v1";
 
 const MAX_REFERENCE_ITEMS = 300;
+const MAX_REFERENCE_INPUT_ITEMS = MAX_REFERENCE_ITEMS * 4;
 const MAX_REFERENCE_KEY_LENGTH = 256;
 const MAX_REFERENCE_NAME_LENGTH = 120;
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const withReferenceDataMutationLock = createStorageMutationLock("quickPimReferenceDataMutation");
 
 export const DEFAULT_REFERENCE_DATA: ReferenceDataCache = {
@@ -54,16 +57,16 @@ export function mergeReferenceDataForSave(
   });
 }
 
-export function mergeReferenceData(input: unknown): ReferenceDataCache {
+export function mergeReferenceData(input: unknown, now = Date.now()): ReferenceDataCache {
   const source = isRecord(input) ? input : {};
   return {
     version: 1,
-    directoryRoleDefinitions: sanitizeReferenceMap(source.directoryRoleDefinitions),
-    pimGroups: sanitizeReferenceMap(source.pimGroups),
-    azureRoleDefinitions: sanitizeReferenceMap(source.azureRoleDefinitions),
-    azureSubscriptions: sanitizeReferenceMap(source.azureSubscriptions),
-    scopes: sanitizeReferenceMap(source.scopes),
-    directoryScopes: sanitizeReferenceMap(source.directoryScopes)
+    directoryRoleDefinitions: sanitizeReferenceMap(source.directoryRoleDefinitions, now),
+    pimGroups: sanitizeReferenceMap(source.pimGroups, now),
+    azureRoleDefinitions: sanitizeReferenceMap(source.azureRoleDefinitions, now),
+    azureSubscriptions: sanitizeReferenceMap(source.azureSubscriptions, now),
+    scopes: sanitizeReferenceMap(source.scopes, now),
+    directoryScopes: sanitizeReferenceMap(source.directoryScopes, now)
   };
 }
 
@@ -172,7 +175,7 @@ function isResolvedAzureRoleName(item: Extract<ActivationItem, { type: "azureRol
 function setReference(target: Record<string, ReferenceValue>, key: string | undefined, name: string | undefined, updatedAt: string): void {
   const safeKey = sanitizeString(key, MAX_REFERENCE_KEY_LENGTH);
   const safeName = sanitizeString(name, MAX_REFERENCE_NAME_LENGTH);
-  if (!safeKey || !safeName) {
+  if (!safeKey || !isSafeRecordKey(safeKey) || !safeName) {
     return;
   }
   if (target[safeKey]?.name === safeName) {
@@ -187,6 +190,7 @@ function mergeReferenceMaps(
 ): Record<string, ReferenceValue> {
   const merged = { ...current };
   for (const [key, value] of Object.entries(incoming)) {
+    if (!isSafeRecordKey(key)) continue;
     const existing = merged[key];
     if (!existing || Date.parse(value.updatedAt) >= Date.parse(existing.updatedAt)) {
       merged[key] = value;
@@ -195,12 +199,19 @@ function mergeReferenceMaps(
   return merged;
 }
 
-function sanitizeReferenceMap(value: unknown): Record<string, ReferenceValue> {
+function sanitizeReferenceMap(value: unknown, now: number): Record<string, ReferenceValue> {
   if (!isRecord(value)) {
     return {};
   }
 
-  const entries = Object.entries(value)
+  const rawEntries: Array<[string, unknown]> = [];
+  for (const key in value) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (rawEntries.length >= MAX_REFERENCE_INPUT_ITEMS) return {};
+    rawEntries.push([key, value[key]]);
+  }
+
+  const entries = rawEntries
     .flatMap(([key, entry]) => {
       if (!isRecord(entry)) {
         return [];
@@ -208,8 +219,12 @@ function sanitizeReferenceMap(value: unknown): Record<string, ReferenceValue> {
       const safeKey = sanitizeString(key, MAX_REFERENCE_KEY_LENGTH);
       const safeName = sanitizeString(entry.name, MAX_REFERENCE_NAME_LENGTH);
       const rawUpdatedAt = sanitizeString(entry.updatedAt, 64);
-      const updatedAt = rawUpdatedAt && Number.isFinite(Date.parse(rawUpdatedAt)) ? new Date(rawUpdatedAt).toISOString() : new Date(0).toISOString();
-      return safeKey && safeName ? [[safeKey, { name: safeName, updatedAt }] as const] : [];
+      const timestamp = rawUpdatedAt ? Date.parse(rawUpdatedAt) : Number.NaN;
+      if (!Number.isFinite(timestamp) || timestamp > now + MAX_FUTURE_CLOCK_SKEW_MS) {
+        return [];
+      }
+      const updatedAt = new Date(timestamp).toISOString();
+      return safeKey && isSafeRecordKey(safeKey) && safeName ? [[safeKey, { name: safeName, updatedAt }] as const] : [];
     })
     .sort((a, b) => Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt))
     .slice(0, MAX_REFERENCE_ITEMS);

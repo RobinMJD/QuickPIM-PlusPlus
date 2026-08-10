@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 export const EDGE_REVIEWED_EXTENSION_APIS = Object.freeze([
   "action",
   "alarms",
+  "management",
   "notifications",
   "permissions",
   "runtime",

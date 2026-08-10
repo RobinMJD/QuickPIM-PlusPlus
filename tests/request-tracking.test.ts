@@ -311,6 +311,36 @@ describe("tracked PIM requests", () => {
     expect(store.requests[0].justification).toHaveLength(1024);
   });
 
+  test("rejects impossible request chronology and repairs stalled future checks", () => {
+    const valid = createRequest();
+    const future = createRequest({
+      id: "future",
+      requestId: "future",
+      requestedAt: new Date(NOW + 6 * 60_000).toISOString(),
+      updatedAt: new Date(NOW + 6 * 60_000).toISOString()
+    });
+    const reversed = createRequest({
+      id: "reversed",
+      requestId: "reversed",
+      updatedAt: new Date(NOW - 1).toISOString()
+    });
+    const stalled = createRequest({
+      id: "stalled",
+      requestId: "stalled",
+      nextCheckAt: "2099-01-01T00:00:00.000Z",
+      lastCheckedAt: "2099-01-01T00:00:00.000Z"
+    });
+
+    const store = sanitizeTrackedRequestStore({ version: 1, requests: [valid, future, reversed, stalled] }, NOW);
+
+    expect(store.requests.map((request) => request.id).sort()).toEqual(["directoryRole:request-1", "stalled"]);
+    expect(store.requests.find((request) => request.id === "stalled")).toMatchObject({
+      nextCheckAt: undefined,
+      lastCheckedAt: undefined
+    });
+    expect(getDueTrackedRequests(store, NOW).map((request) => request.id)).toContain("stalled");
+  });
+
   test("serializes concurrent local mutations so submissions are not lost", async () => {
     const storage = createStorage();
     const first = createRequest({ id: "first", requestId: "first" });

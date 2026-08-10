@@ -5,6 +5,14 @@ import { MAX_USER_JUSTIFICATION_LENGTH } from "./justifications";
 
 export type QuickPimMessage =
   | { action: "getTokenStatus" }
+  | { action: "getBrowserSyncStatus" }
+  | { action: "getBrowserSyncPopupStatus" }
+  | { action: "syncBrowserData" }
+  | { action: "purgeBrowserSyncData" }
+  | { action: "setBrowserSyncEnabled"; enabled: boolean }
+  | { action: "updateBrowserSyncDeviceName"; name: string }
+  | { action: "renameBrowserSyncDevice"; installationId: string; name: string }
+  | { action: "dismissBrowserSyncReminder"; mode: "daily" | "never" }
   | { action: "refreshPortalTokens" }
   | { action: "getPortalRecoveryStatus" }
   | { action: "focusPortalRecoveryTabs" }
@@ -40,6 +48,10 @@ export type QuickPimMessage =
 
 const SIMPLE_ACTIONS = new Set([
   "getTokenStatus",
+  "getBrowserSyncStatus",
+  "getBrowserSyncPopupStatus",
+  "syncBrowserData",
+  "purgeBrowserSyncData",
   "refreshPortalTokens",
   "getPortalRecoveryStatus",
   "focusPortalRecoveryTabs",
@@ -78,6 +90,41 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
         ? { detail: message.detail }
         : {})
     } as QuickPimMessage;
+  }
+
+  if (message.action === "setBrowserSyncEnabled") {
+    if (typeof message.enabled !== "boolean") {
+      throw new Error("Browser sync preference must be true or false.");
+    }
+    return { action: "setBrowserSyncEnabled", enabled: message.enabled };
+  }
+
+  if (message.action === "updateBrowserSyncDeviceName") {
+    if (typeof message.name !== "string" || !message.name.trim() || message.name.trim().length > 60) {
+      throw new Error("Sync installation name must contain between 1 and 60 characters.");
+    }
+    return { action: "updateBrowserSyncDeviceName", name: message.name.trim() };
+  }
+
+  if (message.action === "renameBrowserSyncDevice") {
+    if (typeof message.installationId !== "string" || !/^[a-zA-Z0-9-]{8,80}$/.test(message.installationId)) {
+      throw new Error("Sync installation identifier is invalid.");
+    }
+    if (typeof message.name !== "string" || !message.name.trim() || message.name.trim().length > 60) {
+      throw new Error("Sync installation name must contain between 1 and 60 characters.");
+    }
+    return {
+      action: "renameBrowserSyncDevice",
+      installationId: message.installationId,
+      name: message.name.trim()
+    };
+  }
+
+  if (message.action === "dismissBrowserSyncReminder") {
+    if (message.mode !== "daily" && message.mode !== "never") {
+      throw new Error("Browser sync reminder choice is invalid.");
+    }
+    return { action: "dismissBrowserSyncReminder", mode: message.mode };
   }
 
   if (message.action === "openPortalRecoveryTabs" || message.action === "closePortalRecoveryTabs") {

@@ -8,6 +8,7 @@ function createApis(overrides: Partial<ExtensionResetApis> = {}): ExtensionReset
     closePortalRecoveryTabs: vi.fn(async () => undefined),
     clearNotifications: vi.fn(async () => undefined),
     removeNotificationPermission: vi.fn(async () => false),
+    purgeSyncedData: vi.fn(async () => undefined),
     clearLocalStorage: vi.fn(async () => undefined),
     clearSessionStorage: vi.fn(async () => undefined),
     clearAlarms: vi.fn(async () => false),
@@ -35,10 +36,21 @@ describe("full extension reset", () => {
     expect(apis.closePortalRecoveryTabs).toHaveBeenCalledOnce();
     expect(apis.clearNotifications).toHaveBeenCalledOnce();
     expect(apis.removeNotificationPermission).toHaveBeenCalledOnce();
+    expect(apis.purgeSyncedData).toHaveBeenCalledOnce();
     expect(apis.clearLocalStorage).toHaveBeenCalledOnce();
     expect(apis.clearSessionStorage).toHaveBeenCalledOnce();
     expect(apis.clearAlarms).toHaveBeenCalledOnce();
     expect(apis.clearActionBadge).toHaveBeenCalledOnce();
+  });
+
+  test("does not claim a full reset when synchronized data cannot be purged", async () => {
+    const apis = createApis({
+      purgeSyncedData: vi.fn(async () => { throw new Error("sync unavailable"); })
+    });
+
+    await expect(resetExtensionData(apis)).rejects.toThrow("sync unavailable");
+    expect(apis.clearLocalStorage).not.toHaveBeenCalled();
+    expect(apis.clearSessionStorage).not.toHaveBeenCalled();
   });
 
   test("still clears storage when optional browser cleanup fails", async () => {

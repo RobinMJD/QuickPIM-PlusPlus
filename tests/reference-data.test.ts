@@ -82,6 +82,45 @@ describe("reference data cache", () => {
     expect(imported.pimGroups).toHaveProperty("group-300");
   });
 
+  test("rejects reference maps that exceed the raw processing budget", () => {
+    const imported = mergeReferenceData({
+      pimGroups: Object.fromEntries(Array.from({ length: 1_201 }, (_, index) => [
+        `group-${index}`,
+        { name: `Group ${index}`, updatedAt: "2026-05-18T12:00:00.000Z" }
+      ]))
+    });
+
+    expect(imported.pimGroups).toEqual({});
+  });
+
+  test("drops prototype-sensitive reference keys", () => {
+    const imported = mergeReferenceData({
+      pimGroups: JSON.parse(`{
+        "group-safe": {"name": "Safe group", "updatedAt": "2026-05-18T12:00:00.000Z"},
+        "__proto__": {"name": "Ignored", "updatedAt": "2026-05-18T12:00:00.000Z"},
+        "constructor": {"name": "Ignored", "updatedAt": "2026-05-18T12:00:00.000Z"}
+      }`)
+    });
+
+    expect(imported.pimGroups).toEqual({
+      "group-safe": { name: "Safe group", updatedAt: "2026-05-18T12:00:00.000Z" }
+    });
+  });
+
+  test("drops future-dated learned names so they cannot override later Microsoft data", () => {
+    const now = Date.parse("2026-05-18T12:00:00.000Z");
+    const imported = mergeReferenceData({
+      pimGroups: {
+        "group-1": { name: "Future stale name", updatedAt: "2026-05-18T12:10:00.000Z" },
+        "group-2": { name: "Current name", updatedAt: "2026-05-18T12:00:00.000Z" }
+      }
+    }, now);
+
+    expect(imported.pimGroups).toEqual({
+      "group-2": { name: "Current name", updatedAt: "2026-05-18T12:00:00.000Z" }
+    });
+  });
+
   test("learns and reapplies directory scope names for admin units and devices", () => {
     const scopedRole: ActivationItem = {
       ...rawDirectoryRole,

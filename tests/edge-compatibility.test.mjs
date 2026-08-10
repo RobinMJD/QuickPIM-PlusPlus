@@ -13,6 +13,7 @@ describe("Microsoft Edge compatibility gate", () => {
     expect(result.usedApis).toEqual([
       "action",
       "alarms",
+      "management",
       "notifications",
       "permissions",
       "runtime",

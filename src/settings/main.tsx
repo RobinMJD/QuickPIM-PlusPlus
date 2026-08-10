@@ -44,6 +44,20 @@ import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
 import { EXTENSION_DURATION_OPTIONS, buildTrackedRequestExtensionPlan, formatExtensionDuration } from "../lib/requestExtension";
 import { getIdentityContext } from "../lib/identityContext";
 import { stringifySupportReport } from "../lib/supportReport";
+import {
+  CHROME_WEB_STORE_URL,
+  EDGE_ADDONS_URL,
+  browserFamilyLabel,
+  distributionLabel,
+  getExtensionDistributionInfo,
+  type ExtensionDistributionInfo
+} from "../lib/distribution";
+import {
+  formatBrowserSyncInstallationId,
+  sanitizeBrowserSyncStatus,
+  type BrowserSyncDevice,
+  type BrowserSyncStatus
+} from "../lib/browserSync";
 import { MAX_SETTINGS_BACKUP_BYTES, buildSettingsExportFileName, validateSettingsBackup } from "../lib/settingsBackup";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
@@ -65,7 +79,7 @@ import {
 } from "../lib/requestTracking";
 import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore, TrackedRequestExtensionResult } from "../lib/types";
 
-type SettingsTab = "home" | "role-access" | "appearance" | "aliases" | "activation" | "justifications" | "bundles" | "activity" | "diagnostics" | "backup" | "reset" | "about";
+type SettingsTab = "home" | "role-access" | "appearance" | "aliases" | "activation" | "justifications" | "bundles" | "activity" | "sync" | "diagnostics" | "backup" | "reset" | "about";
 type PreferencePage = "appearance" | "activation";
 
 const CONCEPT_CREATOR = "Daniel Bradley";
@@ -97,7 +111,7 @@ const NAV_SECTIONS: Array<{ title: string; tabs: SettingsTab[] }> = [
   { title: "Personalization", tabs: ["appearance", "aliases"] },
   { title: "Activation", tabs: ["activation", "justifications", "bundles"] },
   { title: "Review", tabs: ["activity"] },
-  { title: "Data & Support", tabs: ["diagnostics", "backup", "reset"] },
+  { title: "Data & Support", tabs: ["sync", "diagnostics", "backup", "reset"] },
   { title: "Product", tabs: ["about"] }
 ];
 
@@ -830,6 +844,7 @@ function SettingsApp() {
                 trackedRequests={trackedRequests}
               />
             ) : null}
+            {tab === "sync" ? <BrowserSyncPanel /> : null}
             {tab === "reset" ? <ResetDataPanel onNavigate={selectTab} onReset={resetExtensionData} /> : null}
           </div>
         </div>
@@ -951,6 +966,7 @@ function SettingsNavIcon({ tab }: { tab: SettingsTab }) {
     aliases: ["M4 7h16", "M7 4v6", "M17 4v6", "M6 14h7", "M6 18h11"],
     justifications: ["M6 4h9l3 3v13H6z", "M14 4v4h4", "M9 12h6", "M9 16h6"],
     bundles: ["M5 7h14v5H5z", "M7 12v5h10v-5", "M9 7V5h6v2"],
+    sync: ["M7 7a5 5 0 0 1 8.6-3.5L18 6", "M17 17a5 5 0 0 1-8.6 3.5L6 18", "M18 2v4h-4", "M6 22v-4h4"],
     diagnostics: ["M4 5h16", "M4 12h16", "M4 19h16", "M8 5v14", "M16 5v14"],
     backup: ["M5 5h14v14H5z", "M8 9h8", "M8 13h8", "M8 17h5"],
     reset: ["M4 7h16", "M9 7V4h6v3", "M7 7l1 14h8l1-14", "M10 11v6", "M14 11v6"],
@@ -1458,6 +1474,7 @@ function ActivityPanel({
   const [resultFilter, setResultFilter] = useState<ActivityResult | "all">("all");
   const [typeFilter, setTypeFilter] = useState<ActivationItem["type"] | "all">("all");
   const [historyLimit, setHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
+  const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
   const now = Date.now();
   const selectedRequest = trackedRequests.requests.find((request) => request.id === selectedRequestId);
   const filteredRequests = useMemo(() => {
@@ -1466,10 +1483,11 @@ function ActivityPanel({
       const status = getEffectiveTrackedRequestStatus(request);
       if (!matchesTrackedRequestFilter(status, requestStatusFilter)) return false;
       if (!term) return true;
-      return [request.itemName, request.scopeLabel, request.bundleName, request.justification, request.requestId, trackedRequestStatusLabel(status)]
+      const source = resolveActivitySource(request.sourceInstallationId, request.sourceDeviceName, browserSyncStatus);
+      return [request.itemName, request.scopeLabel, request.bundleName, request.justification, request.requestId, trackedRequestStatusLabel(status), source?.name, source?.shortId]
         .some((value) => value?.toLowerCase().includes(term));
     });
-  }, [requestSearch, requestStatusFilter, trackedRequests.requests]);
+  }, [browserSyncStatus, requestSearch, requestStatusFilter, trackedRequests.requests]);
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     return settings.activityHistory.filter((entry) => {
@@ -1477,11 +1495,12 @@ function ActivityPanel({
       if (resultFilter !== "all" && entry.result !== resultFilter) return false;
       if (typeFilter !== "all" && entry.itemType !== typeFilter) return false;
       if (!term) return true;
-      return [entry.itemName, entry.scopeLabel, entry.bundleName, entry.justification, entry.error].some((value) =>
+      const source = resolveActivitySource(entry.sourceInstallationId, entry.sourceDeviceName, browserSyncStatus);
+      return [entry.itemName, entry.scopeLabel, entry.bundleName, entry.justification, entry.error, source?.name, source?.shortId].some((value) =>
         value?.toLowerCase().includes(term)
       );
     });
-  }, [actionFilter, resultFilter, search, settings.activityHistory, typeFilter]);
+  }, [actionFilter, browserSyncStatus, resultFilter, search, settings.activityHistory, typeFilter]);
   const usageEntries = useMemo(() => {
     const itemsById = new Map(items.map((item) => [item.id, item]));
     const historyNamesById = new Map<string, string>();
@@ -1504,6 +1523,20 @@ function ActivityPanel({
   useEffect(() => {
     setHistoryLimit(settings.preferences.activityHistoryLimit);
   }, [settings.preferences.activityHistoryLimit]);
+
+  useEffect(() => {
+    let active = true;
+    void sendMessage<BrowserSyncStatus>(
+      { action: "getBrowserSyncStatus" },
+      { timeoutMs: 4_000, timeoutMessage: "Browser sync device lookup timed out." }
+    ).then((value) => {
+      const next = sanitizeBrowserSyncStatus(value);
+      if (active && next) setBrowserSyncStatus(next);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedRequestId && !trackedRequests.requests.some((request) => request.id === selectedRequestId)) {
@@ -1668,6 +1701,11 @@ function ActivityPanel({
                     <span className="request-row-main">
                       <strong>{request.itemName}</strong>
                       <span className="muted">{request.continuationOfRequestId ? "Extend" : request.action === "activate" ? "Enable" : "Disable"} / {popupTabLabel(request.itemType)}{request.scopeLabel ? ` / ${request.scopeLabel}` : ""}</span>
+                      <ActivitySourceLabel
+                        installationId={request.sourceInstallationId}
+                        savedName={request.sourceDeviceName}
+                        status={browserSyncStatus}
+                      />
                     </span>
                     <span className="request-row-side">
                       <span className={`request-status ${status}`}>{trackedRequestStatusLabel(status)}</span>
@@ -1684,6 +1722,7 @@ function ActivityPanel({
                 isRefreshing={isRefreshingRequests}
                 isExtending={extendingRequestId === selectedRequest.id}
                 preferredExtensionDurationHours={settings.preferences.defaultExtensionDurationHours}
+                browserSyncStatus={browserSyncStatus}
                 onRefresh={() => void refreshRequestStatuses([selectedRequest.id])}
                 onOpenPortal={() => openMatchingPortal(selectedRequest)}
                 onPrepare={(mode) => void prepareRequestInPopup(selectedRequest, mode)}
@@ -1750,6 +1789,11 @@ function ActivityPanel({
                     </div>
                   ) : null}
                   {entry.error ? <p className="message error settings-inline-message">{entry.error}</p> : null}
+                  <ActivitySourceLabel
+                    installationId={entry.sourceInstallationId}
+                    savedName={entry.sourceDeviceName}
+                    status={browserSyncStatus}
+                  />
                 </div>
                 <div className="activity-time">
                   <ActivityTimestamp value={entry.completedAt || entry.requestedAt} />
@@ -1778,6 +1822,21 @@ function ActivityPanel({
                 <span className="muted">activation{stats.activationCount === 1 ? "" : "s"}</span>
                 {formatDateOnly(stats.lastUsedAt) ? <span className="muted">Last used {formatDateOnly(stats.lastUsedAt)}</span> : null}
               </span>
+              {stats.byInstallationId && Object.keys(stats.byInstallationId).length ? (
+                <div className="usage-device-breakdown">
+                  {Object.entries(stats.byInstallationId)
+                    .sort(([left], [right]) => resolveActivitySource(left, undefined, browserSyncStatus)!.name.localeCompare(resolveActivitySource(right, undefined, browserSyncStatus)!.name))
+                    .map(([installationId, sourceStats]) => {
+                      const source = resolveActivitySource(installationId, undefined, browserSyncStatus)!;
+                      return (
+                        <span key={installationId} title={installationId}>
+                          <strong>{source.name}</strong> ({source.shortId}): {sourceStats.activationCount}
+                        </span>
+                      );
+                    })}
+                  {stats.legacyActivationCount ? <span>Earlier activity (source unavailable): {stats.legacyActivationCount}</span> : null}
+                </div>
+              ) : null}
             </div>
           ))}
           {!usageEntries.length ? <p className="muted">No local usage counters recorded.</p> : null}
@@ -1792,6 +1851,7 @@ function TrackedRequestDetails({
   isRefreshing,
   isExtending,
   preferredExtensionDurationHours,
+  browserSyncStatus,
   onRefresh,
   onOpenPortal,
   onPrepare,
@@ -1802,6 +1862,7 @@ function TrackedRequestDetails({
   isRefreshing: boolean;
   isExtending: boolean;
   preferredExtensionDurationHours: number;
+  browserSyncStatus: BrowserSyncStatus | null;
   onRefresh: () => void;
   onOpenPortal: () => void;
   onPrepare: (mode: "activate" | "deactivate") => void;
@@ -1839,6 +1900,12 @@ function TrackedRequestDetails({
         {request.continuationOfRequestId ? <div className="request-detail-wide"><dt>Continuation of</dt><dd className="monospace wrap-anywhere">{request.continuationOfRequestId}</dd></div> : null}
         {request.extensionAttemptState ? <div><dt>Extension</dt><dd>{request.extensionAttemptState === "queued" ? "Queued" : request.extensionAttemptState === "uncertain" ? "Outcome unknown" : "Submitting"}</dd></div> : null}
         {request.bundleName ? <div><dt>Bundle</dt><dd>{request.bundleName}</dd></div> : null}
+        {request.sourceInstallationId ? (
+          <div className="request-detail-wide">
+            <dt>Source computer</dt>
+            <dd><ActivitySourceLabel installationId={request.sourceInstallationId} savedName={request.sourceDeviceName} status={browserSyncStatus} includePrefix={false} /></dd>
+          </div>
+        ) : null}
         {request.rawStatus ? <div><dt>Microsoft status</dt><dd>{request.rawStatus}</dd></div> : null}
         <div className="request-detail-wide"><dt>Request ID</dt><dd className="monospace wrap-anywhere">{request.requestId}</dd></div>
         {request.approvalId ? <div className="request-detail-wide"><dt>Approval ID</dt><dd className="monospace wrap-anywhere">{request.approvalId}</dd></div> : null}
@@ -1873,6 +1940,40 @@ function ActivityTimestamp({ value, className }: { value: string | undefined; cl
   if (!value) return null;
   if (!formatted) return <span className={className}>{value}</span>;
   return <time className={className} dateTime={value} title={formatUtcDateTime(value)}>{formatted}</time>;
+}
+
+function ActivitySourceLabel({
+  installationId,
+  savedName,
+  status,
+  includePrefix = true
+}: {
+  installationId?: string;
+  savedName?: string;
+  status: BrowserSyncStatus | null;
+  includePrefix?: boolean;
+}) {
+  const source = resolveActivitySource(installationId, savedName, status);
+  if (!source) return null;
+  return (
+    <span className="activity-source" title={installationId}>
+      {includePrefix ? "From " : ""}{source.name} <span className="activity-source-id">{source.shortId}</span>
+    </span>
+  );
+}
+
+function resolveActivitySource(
+  installationId: string | undefined,
+  savedName: string | undefined,
+  status: BrowserSyncStatus | null
+): { name: string; shortId: string } | undefined {
+  if (!installationId) return undefined;
+  const device = status?.devices.find((entry) => entry.installationId === installationId);
+  const isCurrent = status?.installationId === installationId;
+  return {
+    name: device?.name || (isCurrent ? status?.deviceName : undefined) || savedName || "QuickPIM++ installation",
+    shortId: formatBrowserSyncInstallationId(installationId)
+  };
 }
 
 function CopyTextButton({ text, label }: { text: string; label: string }) {
@@ -1937,6 +2038,283 @@ function matchesTrackedRequestFilter(
   return status === "completed" || status === "expired";
 }
 
+function BrowserSyncPanel() {
+  const [status, setStatus] = useState<BrowserSyncStatus | null>(null);
+  const [deviceName, setDeviceName] = useState("");
+  const [isBusy, setIsBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [confirmingPurge, setConfirmingPurge] = useState(false);
+  const lastSavedDeviceName = useRef("");
+
+  async function loadStatus() {
+    try {
+      const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
+        { action: "getBrowserSyncStatus" },
+        { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
+      ));
+      if (next) {
+        setStatus(next);
+        setDeviceName(next.deviceName);
+        lastSavedDeviceName.current = next.deviceName;
+      }
+    } catch (statusError) {
+      setError(statusError instanceof Error ? statusError.message : String(statusError));
+    }
+  }
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  useEffect(() => {
+    const trimmed = deviceName.trim();
+    if (!status?.supported || !trimmed || trimmed === lastSavedDeviceName.current) return;
+    const timer = window.setTimeout(() => {
+      void runAction(
+        { action: "updateBrowserSyncDeviceName", name: trimmed },
+        "Installation name saved."
+      );
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [deviceName, status?.supported]);
+
+  async function runAction(request: Record<string, unknown>, successMessage: string): Promise<boolean> {
+    setIsBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
+        request,
+        { timeoutMs: 15_000, timeoutMessage: "Browser sync did not finish in time. It will retry in the background." }
+      ));
+      if (next) {
+        setStatus(next);
+        setDeviceName((current) => request.action === "updateBrowserSyncDeviceName"
+          && current.trim() !== request.name
+          ? current
+          : next.deviceName);
+        lastSavedDeviceName.current = next.deviceName;
+      }
+      setMessage(successMessage);
+      return true;
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      return false;
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function purgeSyncedData() {
+    await runAction({ action: "purgeBrowserSyncData" }, "Synced settings and history were deleted. Sync is now off on this installation.");
+    setConfirmingPurge(false);
+  }
+
+  const otherDevices = status?.devices.filter((device) => device.installationId !== status.installationId) || [];
+  const storeUrl = status?.browserLabel === "Microsoft Edge" ? EDGE_ADDONS_URL : CHROME_WEB_STORE_URL;
+  const storeLabel = status?.browserLabel === "Microsoft Edge" ? "Microsoft Edge Add-ons" : "Chrome Web Store";
+  const showBothStoreOptions = status?.browserLabel !== "Microsoft Edge" && status?.browserLabel !== "Google Chrome";
+
+  return (
+    <section className="panel browser-sync-panel">
+      <div className="preferences-title-row">
+        <div>
+          <h2>Browser Sync</h2>
+          <p className="muted">Keep useful QuickPIM++ settings and local activity available on your other signed-in browser installations.</p>
+        </div>
+        {status ? <span className={`sync-capability-badge ${status.supported ? status.enabled ? "ready" : "off" : "limited"}`}>
+          {status.supported ? status.enabled ? "Sync on" : "Sync off" : "Limited"}
+        </span> : null}
+      </div>
+
+      {!status ? <div className="settings-subsection"><p className="muted">Checking browser sync...</p></div> : null}
+      {status && !status.supported ? (
+        <div className="settings-subsection sync-limitation-card">
+          <h3>Native sync is unavailable for this installation</h3>
+          <p>{status.reason}</p>
+          <p className="muted">Detected: {status.browserLabel} / {status.sourceLabel}.</p>
+          {showBothStoreOptions ? <p className="muted">For native sync, use the matching official QuickPIM++ edition in Google Chrome or Microsoft Edge. Otherwise, use Backup &amp; Restore.</p> : null}
+          <div className="button-row">
+            {showBothStoreOptions ? (
+              <>
+                <a className="btn primary" href={CHROME_WEB_STORE_URL} target="_blank" rel="noreferrer">Chrome edition</a>
+                <a className="btn primary" href={EDGE_ADDONS_URL} target="_blank" rel="noreferrer">Edge edition</a>
+              </>
+            ) : <a className="btn primary" href={storeUrl} target="_blank" rel="noreferrer">Open {storeLabel}</a>}
+            <button className="btn" disabled={isBusy} onClick={() => void runAction({ action: "dismissBrowserSyncReminder", mode: "daily" }, "The popup reminder will return tomorrow.")}>Remind me tomorrow</button>
+            <button className="btn subtle" disabled={isBusy || status.reminderMode === "never"} onClick={() => void runAction({ action: "dismissBrowserSyncReminder", mode: "never" }, "The popup reminder is off for this installation.")}>Do not remind me</button>
+          </div>
+        </div>
+      ) : null}
+
+      {status?.supported ? (
+        <>
+          <div className="settings-subsection sync-overview-section">
+            <label className="preference-toggle sync-master-toggle">
+              <input
+                type="checkbox"
+                checked={status.enabled}
+                disabled={isBusy}
+                onChange={(event) => void runAction(
+                  { action: "setBrowserSyncEnabled", enabled: event.target.checked },
+                  event.target.checked ? "Browser sync enabled." : "Browser sync disabled on this installation."
+                )}
+              />
+              <span className="preference-toggle-copy">
+                <strong>Sync settings and activity</strong>
+                <span className="muted">Enabled by default. Uses {status.ecosystemLabel}; Chrome and Edge sync separately.</span>
+              </span>
+            </label>
+            <div className="sync-status-grid">
+              <div><strong>Last successful sync</strong><span>{formatSyncTimestamp(status.lastSuccessAt)}</span></div>
+              <div><strong>Sync service</strong><span>{status.ecosystemLabel || "Browser sync"}</span></div>
+              <div><strong>Installation</strong><span>{status.sourceLabel}</span></div>
+            </div>
+            {status.lastError ? <p className="message error settings-inline-message">{status.lastError}</p> : null}
+            {status.omittedCategories.length ? (
+              <p className="message settings-inline-message">The browser quota excluded: {status.omittedCategories.join(", ")}. Core settings still sync; use Backup &amp; Restore for the complete dataset.</p>
+            ) : null}
+            <div className="button-row">
+              <button className="btn primary" disabled={isBusy || !status.enabled} onClick={() => void runAction({ action: "syncBrowserData" }, "Browser sync completed.") }>{isBusy ? "Working..." : "Sync now"}</button>
+            </div>
+          </div>
+
+          <div className="settings-subsection">
+            <h3>This installation</h3>
+            <p className="muted">Use a recognizable name because browser extension APIs do not expose the computer hostname.</p>
+            <div className="form-grid sync-device-name-row">
+              <div className="field">
+                <label htmlFor="sync-device-name">Installation name</label>
+                <input id="sync-device-name" className="input" value={deviceName} maxLength={60} disabled={isBusy} onChange={(event) => setDeviceName(event.target.value)} />
+              </div>
+              <div className="sync-current-device-summary">
+                <strong>{status.browserLabel} / {status.platform}</strong>
+                <span>QuickPIM++ {APP_VERSION}</span>
+                <span className="sync-installation-id" title={status.installationId}>
+                  ID {formatBrowserSyncInstallationId(status.installationId)}
+                  <CopyTextButton text={status.installationId} label="installation ID" />
+                </span>
+              </div>
+            </div>
+            <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
+          </div>
+
+          <div className="settings-subsection">
+            <h3>Other installations</h3>
+            <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>
+            <div className="sync-device-list">
+              {otherDevices.map((device) => (
+                <BrowserSyncDeviceEditor
+                  key={device.installationId}
+                  device={device}
+                  disabled={isBusy || !status.enabled}
+                  onRename={(name) => runAction(
+                    { action: "renameBrowserSyncDevice", installationId: device.installationId, name },
+                    `${formatBrowserSyncInstallationId(device.installationId)} renamed.`
+                  )}
+                />
+              ))}
+              {!otherDevices.length ? <p className="muted">No other installation has synced yet.</p> : null}
+            </div>
+          </div>
+
+          <div className="settings-subsection sync-data-scope">
+            <h3>What syncs</h3>
+            <div className="sync-scope-grid">
+              <div><strong>Included</strong><p>Popup and activation preferences, enabled tabs, aliases, favorites, saved and recent justifications, bundles, usage counters, and recent activity history.</p></div>
+              <div><strong>Always local</strong><p>Microsoft tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission.</p></div>
+            </div>
+            <p className="muted">Chrome Sync and Microsoft Edge Sync are separate services. Use Backup &amp; Restore when moving data between Chrome and Edge.</p>
+            <p className="muted">Activity events and counters from installations used at the same time are merged without double-counting. Microsoft remains authoritative if two installations submit the same role request simultaneously.</p>
+          </div>
+
+          <div className="settings-danger-zone sync-purge-zone">
+            <div><h3>Delete browser-synced data</h3><p className="muted">Keeps this installation&apos;s local data, deletes the cloud copy, and pauses sync. Other installations pause when they receive the deletion marker.</p></div>
+            <button className="btn danger" disabled={isBusy} onClick={() => setConfirmingPurge(true)}>Delete synced data</button>
+          </div>
+          {confirmingPurge ? (
+            <div className="settings-confirmation danger" role="alertdialog" aria-label="Delete browser-synced QuickPIM++ data">
+              <span>Delete synced settings, history, and the installation list? Local data on this computer will remain.</span>
+              <div className="button-row nowrap">
+                <button className="btn danger" disabled={isBusy} onClick={() => void purgeSyncedData()}>Delete synced data</button>
+                <button className="btn" disabled={isBusy} onClick={() => setConfirmingPurge(false)}>Cancel</button>
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+
+      {message ? <p className="message success settings-inline-message" role="status">{message}</p> : null}
+      {error ? <p className="message error settings-inline-message" role="alert">{error}</p> : null}
+    </section>
+  );
+}
+
+function BrowserSyncDeviceEditor({
+  device,
+  disabled,
+  onRename
+}: {
+  device: BrowserSyncDevice;
+  disabled: boolean;
+  onRename: (name: string) => Promise<boolean>;
+}) {
+  const [name, setName] = useState(device.name);
+  const trimmed = name.trim();
+  const unchanged = trimmed === device.name;
+  const lastSyncIso = toIsoTimestamp(device.lastSyncAt);
+
+  useEffect(() => setName(device.name), [device.name]);
+
+  return (
+    <div className="sync-device-row">
+      <div className="sync-device-editor-main">
+        <label htmlFor={`sync-device-${device.installationId}`}>Installation name</label>
+        <div className="sync-device-editor-control">
+          <input
+            id={`sync-device-${device.installationId}`}
+            className="input"
+            value={name}
+            maxLength={60}
+            disabled={disabled}
+            onChange={(event) => setName(event.target.value)}
+          />
+          <button
+            className="btn compact"
+            disabled={disabled || !trimmed || unchanged}
+            onClick={() => void onRename(trimmed)}
+          >
+            Rename
+          </button>
+        </div>
+        <span>{device.browser} / {device.platform} / QuickPIM++ {device.appVersion}</span>
+      </div>
+      <div className="sync-device-meta">
+        <span className="sync-installation-id" title={device.installationId}>
+          {formatBrowserSyncInstallationId(device.installationId)}
+          <CopyTextButton text={device.installationId} label="installation ID" />
+        </span>
+        <span>{device.syncEnabled ? "Sync enabled" : "Sync off"}</span>
+        {lastSyncIso
+          ? <time dateTime={lastSyncIso}>{formatSyncTimestamp(device.lastSyncAt)}</time>
+          : <span>Not yet</span>}
+      </div>
+    </div>
+  );
+}
+
+function formatSyncTimestamp(value: number | undefined): string {
+  const iso = toIsoTimestamp(value);
+  return iso ? formatLocalDateTime(iso) || "Not yet" : "Not yet";
+}
+
+function toIsoTimestamp(value: number | undefined): string | undefined {
+  if (!value || !Number.isFinite(value)) return undefined;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
 function DiagnosticsPanel({
   tokenStatus,
   dataCache,
@@ -1949,7 +2327,16 @@ function DiagnosticsPanel({
   trackedRequests: TrackedPimRequestStore;
 }) {
   const [reportStatus, setReportStatus] = useState("");
+  const [distributionInfo, setDistributionInfo] = useState<ExtensionDistributionInfo | null>(null);
+  const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
   const identity = getIdentityContext(tokenStatus);
+  useEffect(() => {
+    void getExtensionDistributionInfo().then(setDistributionInfo).catch(() => setDistributionInfo(null));
+    void sendMessage<BrowserSyncStatus>(
+      { action: "getBrowserSyncStatus" },
+      { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
+    ).then((value) => setBrowserSyncStatus(sanitizeBrowserSyncStatus(value))).catch(() => setBrowserSyncStatus(null));
+  }, []);
   const diagnostics = useMemo(() => {
     const allDiagnostics = [
       dataCache.eligible,
@@ -1982,6 +2369,8 @@ function DiagnosticsPanel({
       tokenStatus,
       dataCache,
       trackedRequests,
+      distribution: distributionInfo,
+      browserSync: browserSyncStatus,
       userAgent: navigator.userAgent
     });
   }
@@ -2034,6 +2423,17 @@ function DiagnosticsPanel({
       </div>
       <div className="permission-detail-grid settings-section-gap">
         <div>
+          <strong>Installation</strong>
+          <p>
+            {distributionInfo
+              ? `${browserFamilyLabel(distributionInfo.browser)} / ${distributionLabel(distributionInfo.distribution)}`
+              : "Checking browser and Store source..."}
+          </p>
+          {distributionInfo?.blockedInEdge ? (
+            <p className="diagnostic-warning">Unsupported combination: install the Microsoft Edge Add-ons edition.</p>
+          ) : null}
+        </div>
+        <div>
           <strong>Current account</strong>
           <p title={identity.detail}>{identity.label || "No signed-in token context"}</p>
           {identity.mismatch ? <p className="diagnostic-warning">Tokens belong to different accounts or tenants.</p> : null}
@@ -2045,6 +2445,20 @@ function DiagnosticsPanel({
         <div>
           <strong>Azure token</strong>
           <p>{tokenStatus?.azureManagement.hasToken ? "Captured in this browser session" : "Missing"}</p>
+        </div>
+        <div>
+          <strong>Browser Sync</strong>
+          <p>{browserSyncStatus
+            ? browserSyncStatus.supported
+              ? browserSyncStatus.enabled ? `Enabled via ${browserSyncStatus.ecosystemLabel || "browser sync"}` : "Available but disabled on this installation"
+              : `Limited: ${browserSyncStatus.sourceLabel}`
+            : "Checking sync capability..."}</p>
+          {browserSyncStatus?.installationId ? (
+            <p title={browserSyncStatus.installationId}>
+              Source ID: {formatBrowserSyncInstallationId(browserSyncStatus.installationId)}
+            </p>
+          ) : null}
+          {browserSyncStatus?.lastError ? <p className="diagnostic-warning">Last sync did not complete successfully.</p> : null}
         </div>
       </div>
       <div className="activity-list">
@@ -3440,6 +3854,7 @@ function tabLabel(tab: SettingsTab): string {
     justifications: "Justifications",
     bundles: "Bundles",
     activity: "Activity & Usage",
+    sync: "Browser Sync",
     diagnostics: "Diagnostics",
     backup: "Backup & Restore",
     reset: "Reset QuickPIM++",
@@ -3466,7 +3881,7 @@ function tabFromHash(): SettingsTab {
   if (value === "reset-data") {
     return "reset";
   }
-  if (["home", "role-access", "appearance", "aliases", "activation", "justifications", "bundles", "activity", "diagnostics", "backup", "reset", "about"].includes(value)) {
+  if (["home", "role-access", "appearance", "aliases", "activation", "justifications", "bundles", "activity", "sync", "diagnostics", "backup", "reset", "about"].includes(value)) {
     return value as SettingsTab;
   }
   return "home";

@@ -1,5 +1,7 @@
 import { sanitizeErrorMessage } from "./security";
 import { getIdentityContext } from "./identityContext";
+import { browserFamilyLabel, distributionLabel, type ExtensionDistributionInfo } from "./distribution";
+import type { BrowserSyncStatus } from "./browserSync";
 import type {
   ActivationItem,
   CachedActivationEntry,
@@ -17,6 +19,8 @@ export interface SupportReportInput {
   tokenStatus: TokenStatus | null;
   dataCache: QuickPimDataCache;
   trackedRequests: TrackedPimRequestStore;
+  distribution?: ExtensionDistributionInfo | null;
+  browserSync?: BrowserSyncStatus | null;
   userAgent?: string;
   now?: Date;
 }
@@ -37,7 +41,13 @@ export function buildSupportReport(input: SupportReportInput): Record<string, un
     application: {
       version: input.appVersion,
       buildTimestamp: input.buildTimestamp,
-      userAgent: sanitizeUserAgent(input.userAgent)
+      userAgent: sanitizeUserAgent(input.userAgent),
+      installation: input.distribution ? {
+        browser: browserFamilyLabel(input.distribution.browser),
+        source: distributionLabel(input.distribution.distribution),
+        installType: input.distribution.installType,
+        supported: !input.distribution.blockedInEdge
+      } : undefined
     },
     identity: {
       available: identity.identityCount > 0,
@@ -64,6 +74,17 @@ export function buildSupportReport(input: SupportReportInput): Record<string, un
         activityHistory: input.settings.activityHistory.length
       }
     },
+    browserSync: input.browserSync ? {
+      capability: input.browserSync.capability,
+      supported: input.browserSync.supported,
+      enabled: input.browserSync.enabled,
+      ecosystem: input.browserSync.ecosystemLabel,
+      lastSuccessAt: input.browserSync.lastSuccessAt,
+      hasError: Boolean(input.browserSync.lastError),
+      suspendedByPurge: input.browserSync.suspendedByPurge,
+      knownInstallationCount: input.browserSync.devices.length,
+      omittedCategories: input.browserSync.omittedCategories
+    } : undefined,
     cache: {
       entryCount: cacheEntries.length,
       itemCounts: countItems(cachedItems),
@@ -84,9 +105,20 @@ function summarizeToken(status: TokenStatusEntry | undefined): Record<string, un
     expired: Boolean(status?.isExpired),
     tokenAgeMinutes: status?.tokenAge,
     expiresInMinutes: status?.expiresInMinutes,
-    source: status?.source ? sanitizeReportText(status.source) : undefined,
+    source: summarizeTokenSource(status?.source),
     grantedScopes: status?.grantedScopes || []
   };
+}
+
+function summarizeTokenSource(source: string | undefined): string | undefined {
+  if (!source) return undefined;
+  if (source === "Microsoft Entra portal storage" || source.startsWith("entra.microsoft.com storage")) {
+    return "Microsoft Entra portal storage";
+  }
+  if (source === "Microsoft Entra portal request" || source.startsWith("https://entra.microsoft.com")) {
+    return "Microsoft Entra portal request";
+  }
+  return "Captured Microsoft portal token";
 }
 
 function summarizeCacheEntry(entry: CachedActivationEntry): Record<string, unknown> {

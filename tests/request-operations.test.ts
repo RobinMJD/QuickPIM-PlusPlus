@@ -6,12 +6,44 @@ import {
   completeRequestOperation,
   dismissRequestOperations,
   failRequestOperation,
-  loadRequestOperations
+  getRequestOperationFingerprint,
+  loadRequestOperations,
+  sanitizeRequestOperations
 } from "../src/lib/requestOperations";
 
 const NOW = Date.parse("2026-07-22T10:00:00.000Z");
 
 describe("background request operation journal", () => {
+  test("matches safe retries but distinguishes reused IDs with different work", () => {
+    const original = {
+      id: "request_operation_identity",
+      action: "activate" as const,
+      itemIds: ["pimGroup:group-2:member", "pimGroup:group-1:member"],
+      targets: ["pimGroup" as const],
+      durationHours: 2,
+      justification: "Approved change"
+    };
+    expect(getRequestOperationFingerprint({
+      ...original,
+      itemIds: [...original.itemIds].reverse()
+    })).toBe(getRequestOperationFingerprint(original));
+    expect(getRequestOperationFingerprint({
+      ...original,
+      action: "deactivate"
+    })).not.toBe(getRequestOperationFingerprint(original));
+    expect(getRequestOperationFingerprint({
+      ...original,
+      itemIds: ["pimGroup:another-group:member"]
+    })).not.toBe(getRequestOperationFingerprint(original));
+    expect(getRequestOperationFingerprint({
+      ...original,
+      ticketInfo: { ticketSystem: "ServiceNow", ticketNumber: "INC-123" }
+    })).not.toBe(getRequestOperationFingerprint(original));
+    expect(getRequestOperationFingerprint({ ...original, ticketInfo: {} })).toBe(
+      getRequestOperationFingerprint(original)
+    );
+  });
+
   test("persists a running request and its completed response until the popup acknowledges it", async () => {
     const data: Record<string, unknown> = {};
     const storage = makeStorage(data);
@@ -157,11 +189,37 @@ describe("background request operation journal", () => {
       startedAt: NOW
     }, { storage, now: NOW });
     releaseInitialRead?.({ [REQUEST_OPERATIONS_SESSION_KEY]: staleValue });
-    await loading;
+    await expect(loading).resolves.toEqual([
+      expect.objectContaining({ id: "request_operation_race", state: "running" })
+    ]);
 
     expect(await loadRequestOperations({ storage, now: NOW })).toEqual([
       expect.objectContaining({ id: "request_operation_race", state: "running" })
     ]);
+  });
+
+  test("drops impossible timestamps and unsafe optional activation fields during recovery", () => {
+    const base = {
+      id: "request_operation_sanitize",
+      action: "activate",
+      itemIds: ["  directoryRole:reader:/  ", "   "],
+      targets: ["directoryRole"],
+      state: "running",
+      startedAt: NOW,
+      updatedAt: NOW
+    };
+
+    expect(sanitizeRequestOperations([{ ...base, startedAt: Number.MAX_VALUE }], NOW)).toEqual([]);
+    expect(sanitizeRequestOperations([{ ...base, updatedAt: NOW + 10 * 60_000 }], NOW)).toEqual([]);
+    expect(sanitizeRequestOperations([{ ...base, startedAt: NOW, updatedAt: NOW - 1 }], NOW)).toEqual([]);
+    expect(sanitizeRequestOperations([{ ...base, itemIds: ["   "] }], NOW)).toEqual([]);
+
+    expect(sanitizeRequestOperations([{ ...base, durationHours: 100 }], NOW)).toEqual([
+      expect.objectContaining({
+        itemIds: ["directoryRole:reader:/"]
+      })
+    ]);
+    expect(sanitizeRequestOperations([{ ...base, durationHours: 100 }], NOW)[0]).not.toHaveProperty("durationHours");
   });
 });
 

@@ -7,6 +7,8 @@ const API_HOSTS: Record<TokenKind, string> = {
   azureManagement: "management.azure.com"
 };
 const PORTAL_TOKEN_HOSTS = new Set(["entra.microsoft.com"]);
+const UNSAFE_RECORD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const TOKEN_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const GRAPH_AUDIENCES = new Set([
   "https://graph.microsoft.com",
@@ -72,6 +74,16 @@ export function validateCapturedToken(token: string, tokenKind: TokenKind, now =
     return { ok: false, reason: "Token is expired." };
   }
 
+  if (decoded.nbf !== undefined) {
+    const nbf = Number(decoded.nbf);
+    if (!Number.isFinite(nbf) || nbf <= 0) {
+      return { ok: false, reason: "Token does not contain a usable not-before time." };
+    }
+    if (nbf * 1000 > now + TOKEN_CLOCK_SKEW_MS) {
+      return { ok: false, reason: "Token is not valid yet." };
+    }
+  }
+
   if (!isAllowedAudience(decoded.aud, tokenKind)) {
     return { ok: false, reason: "Token audience does not match the requested API." };
   }
@@ -80,6 +92,10 @@ export function validateCapturedToken(token: string, tokenKind: TokenKind, now =
   }
 
   return { ok: true, decoded };
+}
+
+export function isSafeRecordKey(value: string): boolean {
+  return Boolean(value) && !UNSAFE_RECORD_KEYS.has(value.toLowerCase());
 }
 
 export function sanitizeErrorMessage(error: unknown, maxLength = 240): string {

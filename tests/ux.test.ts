@@ -10,6 +10,7 @@ import {
   getTargetEntriesFromCache,
   isCacheEntryFresh,
   mergeDataCachesForSave,
+  sanitizeDataCache,
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../src/lib/cache";
@@ -27,8 +28,8 @@ import {
   getActivatableItems,
   getDeactivatableItems,
   getActiveStatusTitle,
-  getPopupTokenSourceStatuses,
-  getPopupTokenStatusSummary,
+  getPopupAccessSourceStatuses,
+  getPopupAccessStatusSummary,
   isHighPrivilegeItem,
   mergeEligibleWithActive,
   tokenStatusText
@@ -63,6 +64,75 @@ const azureRole: ActivationItem = {
 };
 
 describe("popup cache helpers", () => {
+  test("drops malformed cached data and strips unused raw API payloads", () => {
+    const now = Date.parse("2026-05-18T12:00:00.000Z");
+    const cache = sanitizeDataCache({
+      eligible: {
+        items: [
+          { ...directoryRole, raw: { expandedProperties: { unnecessary: true } } },
+          { id: "missing-required-fields", type: "directoryRole", status: "eligible" }
+        ],
+        errors: ["Graph warning", 42],
+        fetchedAt: now,
+        diagnostics: [
+          { target: "directoryRole", success: true, checkedAt: new Date(now).toISOString(), endpointLabel: "Directory roles" },
+          { target: "invalid", success: false, checkedAt: "not-a-date" }
+        ]
+      },
+      active: { items: "not-an-array", fetchedAt: now },
+      eligibleByTarget: {
+        directoryRole: {
+          items: [azureRole, directoryRole],
+          errors: [],
+          fetchedAt: now
+        }
+      }
+    });
+
+    expect(cache.eligible?.items).toEqual([directoryRole]);
+    expect(cache.eligible?.items[0]).not.toHaveProperty("raw");
+    expect(cache.eligible?.errors).toEqual(["Graph warning"]);
+    expect(cache.eligible?.diagnostics).toEqual([
+      expect.objectContaining({ target: "directoryRole", success: true })
+    ]);
+    expect(cache).not.toHaveProperty("active");
+    expect(cache.eligibleByTarget?.directoryRole?.items).toEqual([directoryRole]);
+  });
+
+  test("rejects future-dated cache entries so a bad clock cannot pin stale role data", () => {
+    const now = Date.parse("2026-05-18T12:00:00.000Z");
+    expect(sanitizeDataCache({
+      eligible: {
+        items: [directoryRole],
+        errors: [],
+        fetchedAt: now + 10 * 60_000,
+        cacheKey: "stale-account"
+      }
+    }, now)).toEqual({});
+  });
+
+  test("bounds malformed cache arrays before normalizing their contents", () => {
+    const now = Date.parse("2026-05-18T12:00:00.000Z");
+    const cache = sanitizeDataCache({
+      eligible: {
+        items: [...Array.from({ length: 4_000 }, () => null), directoryRole],
+        errors: [...Array.from({ length: 80 }, () => null), "late error"],
+        diagnostics: [
+          { target: "directoryRole", success: true, checkedAt: new Date(now).toISOString() },
+          ...Array.from({ length: 160 }, () => null),
+          { target: "pimGroup", success: true, checkedAt: new Date(now).toISOString() }
+        ],
+        fetchedAt: now
+      }
+    }, now);
+
+    expect(cache.eligible?.items).toEqual([]);
+    expect(cache.eligible?.errors).toEqual([]);
+    expect(cache.eligible?.diagnostics).toEqual([
+      expect.objectContaining({ target: "pimGroup", success: true })
+    ]);
+  });
+
   test("uses separate freshness windows for eligible and active data", () => {
     const now = Date.parse("2026-05-18T12:00:00.000Z");
 
@@ -417,7 +487,7 @@ describe("popup model helpers", () => {
     expect(tokenStatusText("Graph", { hasToken: true, isExpired: true })).toBe("Graph refresh needed");
   });
 
-  test("summarizes only token sources required by enabled role features", () => {
+  test("summarizes role-source capability rather than token presence alone", () => {
     const tokenStatus = {
       graph: { hasToken: true, tokenAge: 3, isExpired: false },
       graphTargets: {
@@ -425,17 +495,74 @@ describe("popup model helpers", () => {
       },
       azureManagement: { hasToken: false }
     };
-    const sources = getPopupTokenSourceStatuses(["pimGroup"], tokenStatus);
+    const sources = getPopupAccessSourceStatuses(["pimGroup"], tokenStatus, [{
+      target: "pimGroup",
+      label: "PIM Groups",
+      status: "ready",
+      detail: "Last API check succeeded."
+    }]);
 
     expect(sources).toMatchObject([
-      { id: "graph", needed: true, status: { hasToken: true } },
-      { id: "azureManagement", needed: false }
+      { id: "directoryRole", label: "Entra Roles", needed: false, state: "notNeeded", value: "Not needed" },
+      { id: "pimGroup", label: "PIM Groups", needed: true, state: "ready", value: "Ready (3 min ago)" },
+      { id: "azureRole", label: "Azure Roles", needed: false, state: "notNeeded", value: "Not needed" }
     ]);
-    expect(getPopupTokenStatusSummary(sources, true)).toEqual({ label: "Access ready", tone: "ok" });
-    expect(getPopupTokenStatusSummary(getPopupTokenSourceStatuses([], tokenStatus), true)).toEqual({
+    expect(getPopupAccessStatusSummary(sources)).toEqual({ label: "Access ready", tone: "ok" });
+    expect(getPopupAccessStatusSummary(getPopupAccessSourceStatuses([], tokenStatus, []))).toEqual({
       label: "Access not needed",
       tone: "idle"
     });
+  });
+
+  test("surfaces a limited PIM Groups capability even when its Graph token is valid", () => {
+    const tokenStatus = {
+      graph: { hasToken: true, tokenAge: 0, isExpired: false },
+      graphTargets: {
+        directoryRole: { hasToken: true, tokenAge: 0, isExpired: false },
+        pimGroup: { hasToken: true, tokenAge: 0, isExpired: false }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const sources = getPopupAccessSourceStatuses(["directoryRole", "pimGroup"], tokenStatus, [
+      { target: "directoryRole", label: "Entra Roles", status: "ready", detail: "Last API check succeeded." },
+      { target: "pimGroup", label: "PIM Groups", status: "limited", detail: "Activation scope is missing." }
+    ]);
+
+    expect(getPopupAccessStatusSummary(sources)).toEqual({ label: "Limited access", tone: "warn" });
+    expect(sources.find((source) => source.id === "directoryRole")).toMatchObject({ state: "ready", tone: "ok" });
+    expect(sources.find((source) => source.id === "pimGroup")).toMatchObject({
+      state: "limited",
+      value: "Limited",
+      tone: "warn",
+      detail: "Activation scope is missing."
+    });
+    expect(sources.find((source) => source.id === "azureRole")).toMatchObject({ state: "notNeeded", tone: "idle" });
+  });
+
+  test("prioritizes missing and expired access above capability limitations", () => {
+    const capabilities = [
+      { target: "directoryRole" as const, label: "Entra Roles", status: "limited" as const, detail: "Limited." },
+      { target: "pimGroup" as const, label: "PIM Groups", status: "needsPortalRefresh" as const, detail: "Refresh." }
+    ];
+    const missingSources = getPopupAccessSourceStatuses(["directoryRole", "pimGroup"], {
+      graph: { hasToken: true, isExpired: false },
+      graphTargets: {
+        directoryRole: { hasToken: true, isExpired: false },
+        pimGroup: { hasToken: false }
+      },
+      azureManagement: { hasToken: false }
+    }, capabilities);
+    expect(getPopupAccessStatusSummary(missingSources)).toEqual({ label: "Access needed", tone: "warn" });
+
+    const expiredSources = getPopupAccessSourceStatuses(["directoryRole", "pimGroup"], {
+      graph: { hasToken: true, isExpired: false },
+      graphTargets: {
+        directoryRole: { hasToken: true, isExpired: false },
+        pimGroup: { hasToken: true, isExpired: true }
+      },
+      azureManagement: { hasToken: false }
+    }, capabilities);
+    expect(getPopupAccessStatusSummary(expiredSources)).toEqual({ label: "Refresh needed", tone: "warn" });
   });
 
   test("explains Microsoft's five-minute deactivation minimum", () => {

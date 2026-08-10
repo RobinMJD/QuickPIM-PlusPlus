@@ -169,8 +169,7 @@ export function normalizeDirectoryRole(role: DirectoryRoleApi): DirectoryRoleIte
     activationRequirements: {
       justification: true,
       ticket: false
-    },
-    raw: role
+    }
   };
 }
 
@@ -207,8 +206,7 @@ export function normalizeAzureRole(role: AzureRoleApi): AzureRoleItem {
     activationRequirements: {
       justification: true,
       ticket: false
-    },
-    raw: role
+    }
   };
 }
 
@@ -232,8 +230,7 @@ export function normalizePimGroup(group: PimGroupApi, groupInfo: GroupInfo = {})
     activationRequirements: {
       justification: true,
       ticket: false
-    },
-    raw: group
+    }
   };
 }
 

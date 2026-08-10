@@ -36,13 +36,11 @@ import {
   getRowActionState,
   mergeEligibleWithActive,
   getPortalUrlForTab,
-  getPopupTokenSourceStatuses,
-  getPopupTokenStatusSummary,
+  getPopupAccessSourceStatuses,
+  getPopupAccessStatusSummary,
   tabLabel,
-  tokenStatusText,
-  tokenStatusTone,
-  type PopupTokenSourceStatus,
-  type PopupTokenStatusSummary,
+  type PopupAccessSourceStatus,
+  type PopupAccessStatusSummary,
   type QuickFilter,
   type PopupTab,
   type RoleTab
@@ -60,8 +58,7 @@ import {
   getScopeLabel,
   loadSettings,
   mutateSettings,
-  recordActivityResults,
-  recordActivations,
+  recordOperationActivity,
   sortItems
 } from "../lib/settings";
 import {
@@ -80,6 +77,21 @@ import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { getActivationItemIdentity } from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
+import {
+  EDGE_ADDONS_URL,
+  getExtensionDistributionInfo,
+  type ExtensionDistributionInfo
+} from "../lib/distribution";
+import {
+  sanitizeBrowserSyncStatus,
+  type BrowserSyncReminderMode,
+  type BrowserSyncStatus
+} from "../lib/browserSync";
+import {
+  buildSettingsExportFileName,
+  hasPortableSettingsData,
+  stringifySettingsBackup
+} from "../lib/settingsBackup";
 import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
@@ -99,6 +111,7 @@ import {
 } from "../lib/popupDraft";
 import type {
   AccessSetupTarget,
+  ActivitySource,
   ActivationSnapshot,
   ActivationItem,
   ActivationResponse,
@@ -328,6 +341,9 @@ function PopupApp() {
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
+  const [distributionInfo, setDistributionInfo] = useState<ExtensionDistributionInfo | null>(null);
+  const [portableDataAvailable, setPortableDataAvailable] = useState(false);
+  const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -342,7 +358,7 @@ function PopupApp() {
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
-    void initializePopup();
+    void initializePopupForDistribution();
   }, []);
 
   useEffect(() => {
@@ -420,13 +436,13 @@ function PopupApp() {
   const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
   const identityContext = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
-  const tokenSourceStatuses = useMemo(
-    () => getPopupTokenSourceStatuses(enabledRoleFeatures, tokenStatus),
-    [enabledRoleFeatures.join("|"), tokenStatus]
+  const accessSourceStatuses = useMemo(
+    () => getPopupAccessSourceStatuses(enabledRoleFeatures, tokenStatus, accessCapabilities),
+    [accessCapabilities, enabledRoleFeatures.join("|"), tokenStatus]
   );
-  const tokenStatusSummary = useMemo(
-    () => getPopupTokenStatusSummary(tokenSourceStatuses, tokenStatus !== null),
-    [tokenSourceStatuses, tokenStatus]
+  const accessStatusSummary = useMemo(
+    () => getPopupAccessStatusSummary(accessSourceStatuses),
+    [accessSourceStatuses]
   );
   const showInitialAccessState = hasActivationDataLoaded
     && !isLoading
@@ -738,6 +754,41 @@ function PopupApp() {
     } finally {
       setIsPopupDraftReady(true);
       void refresh({ force: false, quietWhenCached: true });
+    }
+  }
+
+  async function initializePopupForDistribution() {
+    const distribution = await getExtensionDistributionInfo();
+    setDistributionInfo(distribution);
+    if (distribution.blockedInEdge) {
+      const loadedSettings = await loadSettings();
+      setSettings(loadedSettings);
+      setPortableDataAvailable(hasPortableSettingsData(loadedSettings));
+      setIsLoading(false);
+      setIsPopupDraftReady(true);
+      return;
+    }
+    void sendMessage<BrowserSyncStatus>(
+        { action: "getBrowserSyncPopupStatus" },
+        { timeoutMs: 2_500, timeoutMessage: "Browser sync status check timed out." }
+      )
+      .then((value) => {
+        const syncStatus = sanitizeBrowserSyncStatus(value);
+        setBrowserSyncStatus(syncStatus);
+      })
+      .catch(() => undefined);
+    await initializePopup();
+  }
+
+  async function dismissSyncReminder(mode: BrowserSyncReminderMode) {
+    try {
+      const status = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
+        { action: "dismissBrowserSyncReminder", mode },
+        { timeoutMs: 2_500, timeoutMessage: "Browser sync reminder could not be updated." }
+      ));
+      setBrowserSyncStatus(status);
+    } catch {
+      setBrowserSyncStatus((current) => current ? { ...current, reminderDue: false } : current);
     }
   }
 
@@ -1402,6 +1453,32 @@ function PopupApp() {
     setActivationProgress((current) => current?.status === "error" ? null : current);
   }
 
+  async function recordCompletedOperationActivity(
+    operation: RequestOperationRecord,
+    operationItems: ActivationItem[],
+    response: ActivationResponse
+  ): Promise<void> {
+    const completedAt = new Date(operation.updatedAt).toISOString();
+    await mutatePopupSettings((latest) => {
+      let updated = operation.justification
+        ? addRecentJustification(latest, operation.justification)
+        : latest;
+      updated = recordOperationActivity(updated, {
+        operationId: operation.id,
+        action: operation.action,
+        items: operationItems,
+        response,
+        requestedAt: new Date(operation.startedAt).toISOString(),
+        completedAt,
+        durationHours: operation.durationHours,
+        justification: operation.justification,
+        bundleName: operation.bundleName,
+        source: getActivitySource(response, operation)
+      });
+      return updated;
+    });
+  }
+
   async function reconcileDetachedRequestOperation(operation: RequestOperationRecord): Promise<void> {
     const operationLabel = operation.action === "activate" ? "activation" : "deactivation";
     const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
@@ -1473,6 +1550,8 @@ function PopupApp() {
         return next;
       });
       setMessage(formatRequestConfirmation(operationLabel, successCount, response.errors.length));
+
+      await recordCompletedOperationActivity(operation, operationItems, response);
 
       const reconciliationTargets = getRequestReconciliationTargets(response.results, operationItems);
 
@@ -1675,16 +1754,19 @@ function PopupApp() {
 
       await mutatePopupSettings((latest) => {
         let updatedSettings = addRecentJustification(latest, effectiveJustification);
-        updatedSettings = recordActivations(updatedSettings, successItems, new Date().toISOString(), bundle?.name);
-        return recordActivityResults(updatedSettings, {
+        const completedAt = new Date().toISOString();
+        const source = getActivitySource(response);
+        return recordOperationActivity(updatedSettings, {
+          operationId: operationIds[0],
           action: "activate",
           items: activatableItems,
           response,
           requestedAt,
-          completedAt: new Date().toISOString(),
+          completedAt,
           durationHours: effectiveDuration,
           justification: effectiveJustification,
-          bundleName: bundle?.name
+          bundleName: bundle?.name,
+          source
         });
       });
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
@@ -1824,22 +1906,26 @@ function PopupApp() {
       if (justification.trim()) {
         await mutatePopupSettings((latest) => {
           const updatedSettings = addRecentJustification(latest, justification);
-          return recordActivityResults(updatedSettings, {
+          return recordOperationActivity(updatedSettings, {
+            operationId: operationIds[0],
             action: "deactivate",
             items: deactivatableItems,
             response,
             requestedAt,
             completedAt: new Date().toISOString(),
-            justification
+            justification,
+            source: getActivitySource(response)
           });
         });
       } else {
-        await mutatePopupSettings((latest) => recordActivityResults(latest, {
+        await mutatePopupSettings((latest) => recordOperationActivity(latest, {
+          operationId: operationIds[0],
           action: "deactivate",
           items: deactivatableItems,
           response,
           requestedAt,
-          completedAt: new Date().toISOString()
+          completedAt: new Date().toISOString(),
+          source: getActivitySource(response)
         }));
       }
 
@@ -1970,7 +2056,7 @@ function PopupApp() {
     return results.filter(Boolean).length;
   }
 
-  async function openSettingsSection(section: "role-access" | "bundles" | "activation") {
+  async function openSettingsSection(section: "role-access" | "bundles" | "activation" | "sync") {
     await flushPopupDraft();
     const url = chrome.runtime.getURL(`settings.html#${section}`);
     if (chrome.tabs?.create) {
@@ -1989,6 +2075,18 @@ function PopupApp() {
         permissionWarningIgnoredAt: new Date().toISOString()
       }
     }));
+  }
+
+  function downloadPortableData() {
+    const blob = new Blob([stringifySettingsBackup(settings)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = buildSettingsExportFileName(new Date());
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   async function mutatePopupSettings(updater: (latest: QuickPimSettings) => QuickPimSettings): Promise<QuickPimSettings> {
@@ -2011,8 +2109,64 @@ function PopupApp() {
     : "Refresh all enabled data and recover missing portal access";
   const needsRefreshAttention = showInitialAccessState || showPermissionWarning;
 
+  if (!distributionInfo) {
+    return (
+      <main className="app-shell distribution-check-shell" aria-busy="true">
+        <div className="loading-spinner" aria-hidden="true" />
+        <p>Checking installation...</p>
+      </main>
+    );
+  }
+
+  if (distributionInfo.blockedInEdge) {
+    return (
+      <main className="app-shell edge-store-blocked-shell">
+        <header className="app-header blocked-install-header">
+          <div className="brand">
+            <img src="/img/QuickPim48.png" alt="" />
+            <div>
+              <h1>QuickPIM++</h1>
+              <p>Move to the Microsoft Edge edition</p>
+            </div>
+          </div>
+        </header>
+        <section className="edge-store-migration" aria-labelledby="edge-store-migration-title">
+          <div className="edge-store-migration-icon" aria-hidden="true">E</div>
+          <h2 id="edge-store-migration-title">Use the Edge Add-ons edition</h2>
+          <p>
+            This copy came from the Chrome Web Store. QuickPIM++ disables it in Microsoft Edge so you do not keep two separate installations with different updates and local data.
+          </p>
+          {portableDataAvailable ? (
+            <div className="migration-backup-step">
+              <strong>1. Back up your existing data</strong>
+              <p>Your settings, aliases, favorites, bundles, justifications, counters, and activity history can be imported into the Edge edition.</p>
+              <button className="btn" onClick={downloadPortableData}>Download settings and history</button>
+            </div>
+          ) : null}
+          <div className="migration-steps">
+            <div>
+              <strong>{portableDataAvailable ? "2" : "1"}. Install from Microsoft Edge Add-ons</strong>
+              <p>This gives Edge the correct Store identity and update channel.</p>
+            </div>
+            <a className="btn primary" href={EDGE_ADDONS_URL} target="_blank" rel="noreferrer">Install Edge version</a>
+            {portableDataAvailable ? (
+              <div>
+                <strong>3. Restore and verify</strong>
+                <p>In the new extension, open Settings &gt; Backup &amp; Restore, load the JSON file, then save it.</p>
+              </div>
+            ) : null}
+            <div>
+              <strong>{portableDataAvailable ? "4" : "2"}. Remove this copy</strong>
+              <p>After checking the Edge edition, open Edge menu &gt; Extensions &gt; Manage extensions, find this Chrome Web Store copy, and select Remove.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${isActivationReviewOpen && selectedItems.length ? "activation-review-open" : ""}`}>
       <header className="app-header">
         <div className="brand">
           <img src="/img/QuickPim48.png" alt="" />
@@ -2023,11 +2177,11 @@ function PopupApp() {
             </p>
           </div>
         </div>
-        <div className="header-account-slot">
-          <AccountMenu identity={identityContext} />
-        </div>
         <div className="header-actions" aria-label="Popup actions">
-          <TokenStatusMenu sources={tokenSourceStatuses} summary={tokenStatusSummary} />
+          <div className="header-account-slot">
+            <AccountMenu identity={identityContext} />
+          </div>
+          <AccessStatusMenu sources={accessSourceStatuses} summary={accessStatusSummary} />
           <button
             className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
             onClick={() => {
@@ -2059,6 +2213,14 @@ function PopupApp() {
           </button>
         </div>
       </header>
+
+      {browserSyncStatus?.reminderDue ? (
+        <BrowserSyncLimitationBanner
+          status={browserSyncStatus}
+          onDetails={() => void openSettingsSection("sync")}
+          onDismiss={(mode) => void dismissSyncReminder(mode)}
+        />
+      ) : null}
 
       {identityContext.mismatch && identityContext.detail !== dismissedIdentityMismatchDetail ? (
         <DismissibleErrorMessage
@@ -2357,6 +2519,31 @@ function PopupApp() {
   );
 }
 
+function BrowserSyncLimitationBanner({
+  status,
+  onDetails,
+  onDismiss
+}: {
+  status: BrowserSyncStatus;
+  onDetails: () => void;
+  onDismiss: (mode: BrowserSyncReminderMode) => void;
+}) {
+  return (
+    <section className="browser-sync-reminder" role="status">
+      <div>
+        <strong>Browser sync is limited in this installation.</strong>
+        <p>{status.reason}</p>
+        <p className="muted">Chrome and Edge use separate sync services. Backup &amp; Restore can move data between them.</p>
+      </div>
+      <div className="button-row browser-sync-reminder-actions">
+        <button className="btn primary" onClick={onDetails}>Sync options</button>
+        <button className="btn" onClick={() => onDismiss("daily")}>Remind me tomorrow</button>
+        <button className="btn subtle" onClick={() => onDismiss("never")}>Do not remind me</button>
+      </div>
+    </section>
+  );
+}
+
 function PermissionWarningBanner({
   missingCount,
   signInRequired,
@@ -2562,19 +2749,19 @@ function copyFieldLabel(field: AccountCopyField): string {
   return field === "account" ? "account" : "tenant ID";
 }
 
-function TokenStatusMenu({
+function AccessStatusMenu({
   sources,
   summary
 }: {
-  sources: PopupTokenSourceStatus[];
-  summary: PopupTokenStatusSummary;
+  sources: PopupAccessSourceStatus[];
+  summary: PopupAccessStatusSummary;
 }) {
   return (
     <details className="header-popover token-status-popover" name="quickpim-header-popover">
       <summary
         className={`token-status-summary ${summary.tone}`}
-        title="Show token status"
-        aria-label={`Token status: ${summary.label}. Show details`}
+        title="Show role access status"
+        aria-label={`Role access status: ${summary.label}. Show details`}
       >
         <span>{summary.label}</span>
         <ChevronDownIcon />
@@ -2582,14 +2769,12 @@ function TokenStatusMenu({
       <div className="header-popover-panel token-status-panel">
         {sources.map((source) => (
           <div
-            className={`token-source-row ${source.needed ? tokenStatusTone(source.status) : "not-needed"}`}
+            className={`token-source-row ${source.needed ? source.tone : "not-needed"}`}
             key={source.id}
+            title={source.detail}
           >
             <span className="token-source-label">{source.label}</span>
-            {" "}
-            <span className="token-source-value">
-              {source.needed ? tokenStatusText(source.label, source.status).replace(`${source.label} `, "") : "Not needed"}
-            </span>
+            <span className="token-source-value">{source.value}</span>
           </div>
         ))}
       </div>
@@ -2805,107 +2990,111 @@ function ActivationBar(props: {
           </button>
         </div>
       ) : null}
-      {hasSelection && props.isReviewOpen && isActivateMode && props.selectedDirectoryRoleCount > 4 ? (
-        <div className="practice-warning" role="status">
-          <strong>Select only what you need.</strong>
-          <span>
-            PIM works best when roles are activated only for a specific need. Selecting many Entra roles by default reduces the value of just-in-time access.
-          </span>
-        </div>
-      ) : null}
-      {hasSelection && props.isReviewOpen && isActivateMode && props.durationOptions.length ? (
-        <div className="field">
-          <label>Activation time</label>
-          <select
-            className="select"
-            value={String(selectedDuration)}
-            onChange={(event) => props.setDurationHours(Number(event.target.value))}
-            title="Activation duration"
-          >
-            {props.durationOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      ) : null}
-      {hasSelection && props.isReviewOpen && showJustificationField ? (
-        <div className="field activation-form-field">
-          <label>
-            {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
-          </label>
-          <div className="justification-input-wrapper">
-            <textarea
-              className="textarea justification-textarea"
-              rows={2}
-              maxLength={MAX_USER_JUSTIFICATION_LENGTH}
-              value={props.justification}
-              onChange={(event) => props.setJustification(event.target.value)}
-              placeholder={isDeactivateMode ? "Why are you disabling this access early?" : "Why do you need this activation?"}
-            />
-            <button
-              className="btn icon-btn save-justification-button justification-save-overlay"
-              type="button"
-              onClick={props.onSaveJustification}
-              disabled={!props.justification.trim()}
-              title="Save this justification for reuse"
-              aria-label="Save justification"
-            >
-              <SaveIcon />
-            </button>
-          </div>
-        </div>
-      ) : null}
-      {hasSelection && props.isReviewOpen && showJustificationShortcuts ? (
-        <div className="justification-shortcuts">
-          <div className="justification-view-switch" role="tablist" aria-label="Justification source">
-            <button
-              className={justificationView === "history" ? "active" : ""}
-              type="button"
-              role="tab"
-              aria-selected={justificationView === "history"}
-              aria-controls="justification-picker-list"
-              disabled={!recentJustifications.length}
-              onClick={() => setPreferredJustificationView("history")}
-            >
-              History
-            </button>
-            <button
-              className={justificationView === "saved" ? "active" : ""}
-              type="button"
-              role="tab"
-              aria-selected={justificationView === "saved"}
-              aria-controls="justification-picker-list"
-              disabled={!savedJustifications.length}
-              onClick={() => setPreferredJustificationView("saved")}
-            >
-              Saved
-            </button>
-          </div>
-          <div
-            className="justification-picker-list"
-            id="justification-picker-list"
-            role="tabpanel"
-            aria-label={justificationView === "saved" ? "Saved justifications" : "Justification history"}
-          >
-            {visibleJustifications.map((item) => (
-              <button
-                className="justification-picker-option"
-                type="button"
-                key={`${justificationView}:${item}`}
-                onClick={() => props.setJustification(item)}
+      {hasSelection && props.isReviewOpen ? (
+        <div className="activation-review-scroll">
+          {isActivateMode && props.selectedDirectoryRoleCount > 4 ? (
+            <div className="practice-warning" role="status">
+              <strong>Select only what you need.</strong>
+              <span>
+                PIM works best when roles are activated only for a specific need. Selecting many Entra roles by default reduces the value of just-in-time access.
+              </span>
+            </div>
+          ) : null}
+          {isActivateMode && props.durationOptions.length ? (
+            <div className="field">
+              <label>Activation time</label>
+              <select
+                className="select"
+                value={String(selectedDuration)}
+                onChange={(event) => props.setDurationHours(Number(event.target.value))}
+                title="Activation duration"
               >
-                {item}
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
-      {hasSelection && props.isReviewOpen && isActivateMode && props.requirements.needsTicket ? (
-        <div className="activation-grid">
-          <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
-          <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
+                {props.durationOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+          {showJustificationField ? (
+            <div className="field activation-form-field">
+              <label>
+                {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
+              </label>
+              <div className="justification-input-wrapper">
+                <textarea
+                  className="textarea justification-textarea"
+                  rows={2}
+                  maxLength={MAX_USER_JUSTIFICATION_LENGTH}
+                  value={props.justification}
+                  onChange={(event) => props.setJustification(event.target.value)}
+                  placeholder={isDeactivateMode ? "Why are you disabling this access early?" : "Why do you need this activation?"}
+                />
+                <button
+                  className="btn icon-btn save-justification-button justification-save-overlay"
+                  type="button"
+                  onClick={props.onSaveJustification}
+                  disabled={!props.justification.trim()}
+                  title="Save this justification for reuse"
+                  aria-label="Save justification"
+                >
+                  <SaveIcon />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {showJustificationShortcuts ? (
+            <div className="justification-shortcuts">
+              <div className="justification-view-switch" role="tablist" aria-label="Justification source">
+                <button
+                  className={justificationView === "history" ? "active" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={justificationView === "history"}
+                  aria-controls="justification-picker-list"
+                  disabled={!recentJustifications.length}
+                  onClick={() => setPreferredJustificationView("history")}
+                >
+                  History
+                </button>
+                <button
+                  className={justificationView === "saved" ? "active" : ""}
+                  type="button"
+                  role="tab"
+                  aria-selected={justificationView === "saved"}
+                  aria-controls="justification-picker-list"
+                  disabled={!savedJustifications.length}
+                  onClick={() => setPreferredJustificationView("saved")}
+                >
+                  Saved
+                </button>
+              </div>
+              <div
+                className="justification-picker-list"
+                id="justification-picker-list"
+                role="tabpanel"
+                aria-label={justificationView === "saved" ? "Saved justifications" : "Justification history"}
+              >
+                {visibleJustifications.map((item) => (
+                  <button
+                    className="justification-picker-option"
+                    type="button"
+                    key={`${justificationView}:${item}`}
+                    onClick={() => props.setJustification(item)}
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {isActivateMode && props.requirements.needsTicket ? (
+            <div className="activation-grid">
+              <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
+              <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
+            </div>
+          ) : null}
         </div>
       ) : null}
       {props.isReviewOpen || !hasSelection ? (
@@ -3095,6 +3284,18 @@ function applyDisplayData(
       scopeLabel: getScopeLabel(canonical, referenceData)
     } as ActivationItem;
   });
+}
+
+function getActivitySource(
+  response: ActivationResponse,
+  operation?: RequestOperationRecord
+): ActivitySource | undefined {
+  const installationId = response.sourceInstallationId || operation?.sourceInstallationId;
+  if (!installationId) return undefined;
+  return {
+    installationId,
+    deviceName: response.sourceDeviceName || operation?.sourceDeviceName || "QuickPIM++ installation"
+  };
 }
 
 function formatBundleDuration(durationHours: number | undefined): string {

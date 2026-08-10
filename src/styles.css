@@ -61,6 +61,99 @@ button {
   background: #f7f8fa;
 }
 
+.distribution-check-shell {
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #52637a;
+  font-size: 13px;
+}
+
+.blocked-install-header .brand img,
+.edge-store-blocked-shell .brand img {
+  filter: grayscale(1);
+  opacity: 0.72;
+}
+
+.edge-store-migration {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  min-height: 0;
+  padding: 20px 24px;
+  overflow-y: auto;
+  text-align: center;
+}
+
+.edge-store-migration > h2,
+.edge-store-migration > p,
+.edge-store-migration p {
+  margin: 0;
+}
+
+.edge-store-migration > p {
+  max-width: 430px;
+  color: #52637a;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.edge-store-migration-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background: #e5e7eb;
+  color: #475569;
+  font-size: 20px;
+  font-weight: 800;
+}
+
+.migration-backup-step,
+.migration-steps {
+  width: min(100%, 440px);
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  background: #fff;
+  text-align: left;
+}
+
+.migration-backup-step {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+}
+
+.migration-backup-step p,
+.migration-steps p {
+  color: #52637a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.migration-backup-step .btn {
+  justify-self: start;
+}
+
+.migration-steps {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.migration-steps > div {
+  display: grid;
+  gap: 3px;
+}
+
+.migration-steps > .btn {
+  justify-content: center;
+  text-align: center;
+}
+
 .settings-shell {
   --settings-page-bg: #eef2f6;
   --settings-surface: #ffffff;
@@ -83,7 +176,7 @@ button {
 .app-header {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 38px auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   padding: 18px 20px 14px;
@@ -134,10 +227,11 @@ button {
 }
 
 .header-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: 36px minmax(0, auto) 36px;
   align-items: center;
   gap: 6px;
-  justify-content: flex-end;
+  justify-content: end;
 }
 
 .header-popover {
@@ -251,7 +345,7 @@ button {
 
 .token-status-panel {
   right: 0;
-  width: 220px;
+  width: 240px;
 }
 
 .popover-label {
@@ -472,6 +566,40 @@ button {
 
 .permission-actions {
   justify-content: flex-end;
+}
+
+.browser-sync-reminder {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 12px;
+  border-bottom: 1px solid #fcd34d;
+  background: #fffbeb;
+  color: #475569;
+}
+
+.browser-sync-reminder strong {
+  display: block;
+  color: #92400e;
+  font-size: 12px;
+}
+
+.browser-sync-reminder p {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  line-height: 1.3;
+}
+
+.browser-sync-reminder-actions {
+  max-width: 220px;
+  justify-content: flex-end;
+}
+
+.browser-sync-reminder .btn {
+  min-height: 28px;
+  padding: 5px 8px;
+  font-size: 10.5px;
 }
 
 .tab-bar {
@@ -834,6 +962,10 @@ body.dark-mode .field-clear-button:focus-visible {
   overflow-y: auto;
   padding: 12px;
   padding-bottom: 12px;
+}
+
+.app-shell.activation-review-open > .content {
+  flex-shrink: 999;
 }
 
 .settings-content {
@@ -1544,6 +1676,192 @@ a.btn {
   gap: 16px;
 }
 
+.browser-sync-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.browser-sync-panel > .settings-subsection,
+.browser-sync-panel > .settings-danger-zone,
+.browser-sync-panel > .settings-confirmation {
+  margin: 0;
+}
+
+.sync-capability-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 14px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.sync-capability-badge.ready {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #166534;
+}
+
+.sync-capability-badge.limited {
+  border-color: #fcd34d;
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.sync-limitation-card {
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+
+.sync-limitation-card > p {
+  margin: 4px 0 10px;
+}
+
+.sync-master-toggle {
+  margin-bottom: 12px;
+}
+
+.sync-status-grid,
+.sync-scope-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.sync-status-grid > div,
+.sync-scope-grid > div,
+.sync-current-device-summary {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--settings-border-soft);
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-status-grid strong,
+.sync-scope-grid strong,
+.sync-current-device-summary strong {
+  color: var(--settings-text);
+  font-size: 11px;
+}
+
+.sync-status-grid span,
+.sync-current-device-summary span,
+.sync-scope-grid p {
+  margin: 0;
+  color: var(--settings-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.sync-scope-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.sync-device-name-row {
+  grid-template-columns: minmax(240px, 1fr) minmax(220px, 0.7fr);
+  align-items: end;
+}
+
+.sync-current-device-summary {
+  min-height: 38px;
+  align-content: center;
+}
+
+.sync-installation-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--settings-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+}
+
+.sync-installation-id .inline-copy-button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+.sync-id-help {
+  margin: 8px 0 0;
+}
+
+.sync-device-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.sync-device-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 1px solid var(--settings-border-soft);
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-device-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sync-device-row > div:last-child {
+  justify-items: end;
+  color: var(--settings-muted);
+  font-size: 11px;
+}
+
+.sync-device-editor-main label {
+  color: var(--settings-muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.sync-device-editor-control {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 8px;
+}
+
+.sync-device-editor-control .input,
+.sync-device-editor-control .btn {
+  min-height: 34px;
+}
+
+.sync-device-meta {
+  min-width: 155px;
+}
+
+.sync-device-row strong {
+  overflow: hidden;
+  color: var(--settings-text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-device-row span {
+  color: var(--settings-muted);
+  font-size: 11px;
+}
+
+.sync-data-scope > .muted {
+  margin-bottom: 0;
+}
+
 .theme-preference-copy {
   min-width: 0;
 }
@@ -1816,16 +2134,29 @@ a.btn {
 .activation-bar {
   position: relative;
   z-index: 20;
-  flex-shrink: 0;
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
   width: 100%;
+  min-height: 47px;
   max-height: min(340px, calc(100vh - 112px));
-  display: grid;
   gap: 8px;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 8px 12px;
   background: #ffffff;
   border-top: 1px solid #e5e7eb;
   box-shadow: 0 -10px 24px rgba(15, 23, 42, 0.1);
+}
+
+.activation-review-scroll {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .activation-bar .button-row {
@@ -1835,6 +2166,7 @@ a.btn {
 }
 
 .activation-bar .activation-footer-actions {
+  flex: 0 0 auto;
   width: 100%;
   min-height: 30px;
   align-items: stretch;
@@ -3212,6 +3544,25 @@ a.btn {
   overflow-wrap: anywhere;
 }
 
+.activity-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 4px;
+  color: var(--settings-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.activity-source-id {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--settings-field);
+  color: var(--settings-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 9px;
+}
+
 .activity-time {
   display: grid;
   gap: 3px;
@@ -3264,6 +3615,25 @@ a.btn {
 .usage-summary > strong {
   font-size: 15px;
   line-height: 1.1;
+}
+
+.usage-device-breakdown {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  padding-top: 7px;
+  border-top: 1px solid var(--settings-border-soft);
+  color: var(--settings-muted);
+  font-size: 10px;
+}
+
+.usage-device-breakdown > span {
+  white-space: nowrap;
+}
+
+.usage-device-breakdown strong {
+  color: var(--settings-text);
 }
 
 .backup-panel {
@@ -3356,6 +3726,24 @@ body.dark-mode {
 body.dark-mode .app-shell,
 body.dark-mode .settings-shell {
   background: #0f172a;
+}
+
+body.dark-mode .migration-backup-step,
+body.dark-mode .migration-steps {
+  border-color: #334155;
+  background: #111827;
+}
+
+body.dark-mode .edge-store-migration > p,
+body.dark-mode .migration-backup-step p,
+body.dark-mode .migration-steps p,
+body.dark-mode .distribution-check-shell {
+  color: #a8b5c7;
+}
+
+body.dark-mode .edge-store-migration-icon {
+  background: #334155;
+  color: #cbd5e1;
 }
 
 body.dark-mode .settings-shell {
@@ -3619,6 +4007,36 @@ body.dark-mode .permission-banner {
 body.dark-mode .permission-banner strong,
 body.dark-mode .initial-access-copy h2 {
   color: #f8fafc;
+}
+
+body.dark-mode .browser-sync-reminder,
+body.dark-mode .sync-limitation-card {
+  border-color: #a16207;
+  background: #422006;
+  color: #fde68a;
+}
+
+body.dark-mode .browser-sync-reminder strong,
+body.dark-mode .sync-limitation-card h3 {
+  color: #fef3c7;
+}
+
+body.dark-mode .sync-capability-badge.off {
+  border-color: #475569;
+  background: #1e293b;
+  color: #cbd5e1;
+}
+
+body.dark-mode .sync-capability-badge.ready {
+  border-color: #16a34a;
+  background: #14532d;
+  color: #dcfce7;
+}
+
+body.dark-mode .sync-capability-badge.limited {
+  border-color: #a16207;
+  background: #422006;
+  color: #fef3c7;
 }
 
 body.dark-mode .initial-access-arrow {
@@ -4110,6 +4528,30 @@ body.dark-mode .autosave-status.error {
   .activity-view-switch {
     width: 100%;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .browser-sync-reminder {
+    grid-template-columns: 1fr;
+  }
+
+  .browser-sync-reminder-actions {
+    max-width: none;
+    justify-content: flex-start;
+  }
+
+  .sync-status-grid,
+  .sync-scope-grid,
+  .sync-device-name-row,
+  .sync-device-row {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-device-row > div:last-child {
+    justify-items: start;
+  }
+
+  .sync-device-editor-control {
+    grid-template-columns: 1fr;
   }
 
   .usage-row {

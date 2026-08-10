@@ -2,16 +2,17 @@ import type { PopupRequestMode, PopupTab, SortDirection, SortMode } from "./type
 import type { QuickFilter } from "./popupModel";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { sanitizeUserJustification } from "./justifications";
+import { createStorageMutationLock } from "./storageMutation";
 
 export const POPUP_DRAFT_KEY = "quickPimPopupDraft.v1";
 
 const POPUP_DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SELECTED_IDS = 100;
-const MAX_ITEM_ID_LENGTH = 256;
+const MAX_ITEM_ID_LENGTH = 512;
 const MAX_SEARCH_LENGTH = 120;
 const MAX_TICKET_FIELD_LENGTH = 120;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
-let popupDraftMutationQueue: Promise<void> = Promise.resolve();
+const withPopupDraftMutationLock = createStorageMutationLock("quickPimPopupDraftMutation");
 
 const POPUP_TABS: PopupTab[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
 const SORT_MODES: SortMode[] = ["name", "lastUsed", "activationCount", "scope"];
@@ -48,7 +49,7 @@ export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | und
 export async function savePopupDraft(draft: PopupDraftInput, now = Date.now()): Promise<void> {
   const safeDraft = sanitizePopupDraft({ ...draft, updatedAt: now }, now);
   const storage = chrome.storage.local;
-  return enqueuePopupDraftMutation(async () => {
+  return withPopupDraftMutationLock(async () => {
     if (!safeDraft || !hasPopupDraftContent(safeDraft)) {
       await storage.remove(POPUP_DRAFT_KEY);
       return;
@@ -59,7 +60,7 @@ export async function savePopupDraft(draft: PopupDraftInput, now = Date.now()): 
 
 export async function clearPopupDraft(): Promise<void> {
   const storage = chrome.storage.local;
-  return enqueuePopupDraftMutation(() => storage.remove(POPUP_DRAFT_KEY));
+  return withPopupDraftMutationLock(() => storage.remove(POPUP_DRAFT_KEY));
 }
 
 export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft | undefined {
@@ -140,12 +141,6 @@ function sanitizeDuration(value: unknown): number {
     MAX_ACTIVATION_DURATION_HOURS,
     Math.max(MIN_ACTIVATION_DURATION_HOURS, Math.round(numeric * 2) / 2)
   );
-}
-
-function enqueuePopupDraftMutation(operation: () => Promise<void>): Promise<void> {
-  const result = popupDraftMutationQueue.then(operation);
-  popupDraftMutationQueue = result.catch(() => undefined);
-  return result;
 }
 
 function sanitizeString(value: unknown, maxLength: number): string {

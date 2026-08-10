@@ -1,6 +1,6 @@
 # QuickPIM++ Privacy Policy
 
-Effective date: May 19, 2026
+Effective date: August 10, 2026
 
 QuickPIM++ is a local-first browser extension for activating Microsoft Entra Privileged Identity Management roles, Azure resource roles, and PIM-enabled groups.
 
@@ -13,6 +13,7 @@ QuickPIM++ may process the following data in your browser profile:
 - Role, group, subscription, administrative unit, device, and scope display names learned from Microsoft APIs.
 - Local aliases, favorites, bundles, saved justifications, recent justification history, usage counters, preferences, enabled feature choices, and cached activation data.
 - Bounded request identifiers, lifecycle status, item metadata, local justification and ticket text, continuation links, and sanitized errors for PIM requests submitted through QuickPIM++.
+- A random installation identifier, user-editable installation label, browser/platform label, app version, last-sync time, and source attribution for synchronized activity and usage.
 
 ## How Data Is Used
 
@@ -25,13 +26,16 @@ QuickPIM++ uses this data only to:
 - Check unresolved QuickPIM++ request status and display clickable local request details.
 - Optionally show browser notifications for request state changes and approaching activation expiry when you explicitly enable that setting.
 - Store local preferences and convenience data such as aliases, favorites, justifications, bundles, and enabled features.
+- Optionally synchronize a bounded subset of preferences, aliases, favorites, justifications, bundles, usage counters, and recent activity through Chrome Sync or Microsoft Edge Sync.
 - Display public changelog information from the QuickPIM++ GitHub repository in Settings.
 
 QuickPIM++ avoids fetching feature areas that are disabled in Preferences, and Access Setup only checks portal access required by enabled role features.
 
 ## Data Storage
 
-Captured tokens are stored only in session storage and are cleared when the local browser session ends. Settings, learned names, aliases, favorites, justifications, bundles, cached role data, activity history, and bounded tracked-request records use local Chrome extension storage.
+Captured tokens are stored only in session storage and are cleared when the local browser session ends. Settings, learned names, aliases, favorites, justifications, bundles, cached role data, activity history, and bounded tracked-request records use local extension storage.
+
+On official Store installations, browser sync is enabled by default. A bounded subset of non-token convenience data may be stored in the signed-in browser account's extension sync service. Chrome Sync and Microsoft Edge Sync are separate services and do not synchronize directly with each other. Tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission are never included. Sync can be disabled for each installation and its cloud copy can be deleted from Settings.
 
 QuickPIM++ does not operate a developer-controlled backend service and does not send this local extension data to the developer.
 
@@ -47,7 +51,7 @@ QuickPIM++ does not sell, rent, or transfer user data to third parties.
 
 QuickPIM++ requests the minimum browser permissions needed for its purpose:
 
-- `storage` to keep local settings, aliases, learned names, cached data, session-only captured portal tokens, and the identifiers of temporary recovery tabs.
+- `storage` to keep local settings, aliases, learned names, cached data, session-only captured portal tokens, temporary recovery-tab identifiers, and the optional browser-account sync payload.
 - `webRequest` to detect Microsoft portal requests containing usable Microsoft Graph or Azure Management bearer tokens.
 - `tabGroups` to place extension-created portal-recovery pages in a labeled collapsed group; QuickPIM++ does not use it to reorganize unrelated tabs.
 - `alarms` to refresh stale role data and check unresolved QuickPIM++ request status with bounded one-shot schedules.
@@ -61,6 +65,10 @@ QuickPIM++ requests the minimum browser permissions needed for its purpose:
 You can enable or disable QuickPIM++ feature areas from Preferences. Disabled role features are hidden from the popup, skipped during data refreshes, and omitted from Access Setup checks.
 
 You can clear captured tokens, learned names, tracked requests, recent justification history, and usage metrics from the Settings page.
+
+You can disable Browser Sync independently on each installation, rename any installation shown in the sync list by its generated static ID, and delete the synchronized cloud copy. Backup & Restore remains available for moving data between Chrome and Edge or installations without native extension sync.
+
+The full reset action purges the synchronized cloud copy before clearing local and session data. If the browser cannot confirm the cloud purge, QuickPIM++ leaves local data intact and reports the problem rather than completing a partial reset.
 
 You can also remove all local extension data by uninstalling QuickPIM++ from the browser.
 

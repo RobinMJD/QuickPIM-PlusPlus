@@ -1,5 +1,6 @@
 import { parseIsoDurationMs } from "./pim";
 import { sanitizeErrorMessage, validateCapturedToken } from "./security";
+import { createStorageMutationLock } from "./storageMutation";
 import type {
   ActivationItem,
   ActivityAction,
@@ -26,6 +27,7 @@ const MAX_BUNDLE_NAME_LENGTH = 80;
 const MAX_TICKET_FIELD_LENGTH = 128;
 const MAX_CHECK_COUNT = 30;
 const ACCESS_RETRY_DELAY_MS = 10 * 60 * 1000;
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const POLL_DELAYS_MS = [30_000, 60_000, 2 * 60_000, 5 * 60_000, 10 * 60_000] as const;
 const EMPTY_REQUEST_STORE: TrackedPimRequestStore = { version: 1, requests: [] };
 
@@ -51,7 +53,7 @@ interface CreateTrackedRequestInput {
   now?: number;
 }
 
-let requestStoreMutationQueue: Promise<void> = Promise.resolve();
+const withTrackedRequestMutationLock = createStorageMutationLock("quickPimTrackedRequestMutation");
 
 export async function loadTrackedRequests(storage: StorageAreaLike = chrome.storage.local): Promise<TrackedPimRequestStore> {
   const result = await storage.get(REQUEST_TRACKING_KEY);
@@ -62,6 +64,13 @@ export async function saveTrackedRequests(
   store: TrackedPimRequestStore,
   storage: StorageAreaLike = chrome.storage.local
 ): Promise<TrackedPimRequestStore> {
+  return withTrackedRequestMutationLock(() => saveTrackedRequestsUnlocked(store, storage));
+}
+
+async function saveTrackedRequestsUnlocked(
+  store: TrackedPimRequestStore,
+  storage: StorageAreaLike
+): Promise<TrackedPimRequestStore> {
   const sanitized = sanitizeTrackedRequestStore(store);
   await storage.set({ [REQUEST_TRACKING_KEY]: sanitized });
   return sanitized;
@@ -71,20 +80,14 @@ export async function mutateTrackedRequests(
   mutator: (current: TrackedPimRequestStore) => TrackedPimRequestStore,
   storage: StorageAreaLike = chrome.storage.local
 ): Promise<TrackedPimRequestStore> {
-  let result = EMPTY_REQUEST_STORE;
-  const mutation = requestStoreMutationQueue.then(async () => {
+  return withTrackedRequestMutationLock(async () => {
     const current = await loadTrackedRequests(storage);
-    result = await saveTrackedRequests(mutator(current), storage);
+    return saveTrackedRequestsUnlocked(mutator(current), storage);
   });
-  requestStoreMutationQueue = mutation.catch(() => undefined);
-  await mutation;
-  return result;
 }
 
 export async function clearTrackedRequests(storage: StorageAreaLike = chrome.storage.local): Promise<void> {
-  const mutation = requestStoreMutationQueue.then(() => storage.remove(REQUEST_TRACKING_KEY));
-  requestStoreMutationQueue = mutation.catch(() => undefined);
-  await mutation;
+  await withTrackedRequestMutationLock(() => storage.remove(REQUEST_TRACKING_KEY));
 }
 
 export function createTrackedPimRequest(input: CreateTrackedRequestInput): TrackedPimRequest | undefined {
@@ -147,7 +150,7 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
     base.roleEligibilityScheduleId = input.item.roleEligibilityScheduleId;
   }
 
-  return sanitizeTrackedRequest(base);
+  return sanitizeTrackedRequest(base, now);
 }
 
 export function upsertTrackedRequests(
@@ -197,7 +200,7 @@ export function updateTrackedRequestFromPayload(
     nextCheckAt: canContinue ? new Date(now + getRequestPollDelayMs(checkCount)).toISOString() : undefined,
     checkCount,
     lastError: undefined
-  }) || request;
+  }, now) || request;
 }
 
 export function markTrackedRequestCheckFailure(
@@ -217,7 +220,7 @@ export function markTrackedRequestCheckFailure(
     nextCheckAt: trackingExpired ? undefined : new Date(now + nextDelay).toISOString(),
     checkCount,
     lastError: sanitizeErrorMessage(error)
-  }) || request;
+  }, now) || request;
 }
 
 export function getDueTrackedRequests(
@@ -460,14 +463,14 @@ export function getActivationRequestItemStatus(
   return undefined;
 }
 
-export function sanitizeTrackedRequestStore(value: unknown): TrackedPimRequestStore {
+export function sanitizeTrackedRequestStore(value: unknown, now = Date.now()): TrackedPimRequestStore {
   if (!isRecord(value) || !Array.isArray(value.requests)) {
     return EMPTY_REQUEST_STORE;
   }
   const seen = new Set<string>();
   const requests: TrackedPimRequest[] = [];
   for (const valueRequest of value.requests) {
-    const request = sanitizeTrackedRequest(valueRequest);
+    const request = sanitizeTrackedRequest(valueRequest, now);
     if (!request || seen.has(request.id)) continue;
     seen.add(request.id);
     requests.push(request);
@@ -477,7 +480,7 @@ export function sanitizeTrackedRequestStore(value: unknown): TrackedPimRequestSt
   return { version: 1, requests };
 }
 
-function sanitizeTrackedRequest(value: unknown): TrackedPimRequest | undefined {
+function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimRequest | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
@@ -495,6 +498,27 @@ function sanitizeTrackedRequest(value: unknown): TrackedPimRequest | undefined {
   if (!requestId || !itemId || !itemName || !principalId || !requestedAt || !updatedAt || !action || !itemType || !status) {
     return undefined;
   }
+  const requestedAtMs = Date.parse(requestedAt);
+  const updatedAtMs = Date.parse(updatedAt);
+  if (
+    requestedAtMs > now + MAX_FUTURE_CLOCK_SKEW_MS
+    || updatedAtMs > now + MAX_FUTURE_CLOCK_SKEW_MS
+    || updatedAtMs < requestedAtMs
+  ) {
+    return undefined;
+  }
+
+  const completedAt = sanitizeRequestMetadataTimestamp(value.completedAt, requestedAtMs, now);
+  const extensionRequestedAt = sanitizeRequestMetadataTimestamp(value.extensionRequestedAt, requestedAtMs, now);
+  const lastCheckedAt = sanitizeRequestMetadataTimestamp(value.lastCheckedAt, requestedAtMs, now);
+  const expiryReminderSentAt = sanitizeRequestMetadataTimestamp(value.expiryReminderSentAt, requestedAtMs, now);
+  const parsedNextCheckAt = sanitizeTimestamp(value.nextCheckAt);
+  const nextCheckAtMs = parsedNextCheckAt ? Date.parse(parsedNextCheckAt) : Number.NaN;
+  const nextCheckAt = Number.isFinite(nextCheckAtMs)
+    && nextCheckAtMs >= requestedAtMs
+    && nextCheckAtMs <= now + ACCESS_RETRY_DELAY_MS + MAX_FUTURE_CLOCK_SKEW_MS
+      ? parsedNextCheckAt
+      : undefined;
 
   const id = sanitizeString(value.id, MAX_ID_LENGTH) || `${itemType}:${requestId}`;
   return {
@@ -516,7 +540,7 @@ function sanitizeTrackedRequest(value: unknown): TrackedPimRequest | undefined {
     rawStatus: sanitizeString(value.rawStatus, 80),
     requestedAt,
     updatedAt,
-    completedAt: sanitizeTimestamp(value.completedAt),
+    completedAt,
     activeUntil: sanitizeTimestamp(value.activeUntil),
     activeFrom: sanitizeTimestamp(value.activeFrom),
     durationHours: normalizeDuration(value.durationHours),
@@ -530,22 +554,35 @@ function sanitizeTrackedRequest(value: unknown): TrackedPimRequest | undefined {
     extensionAttemptState: value.extensionAttemptState === "submitting" || value.extensionAttemptState === "queued" || value.extensionAttemptState === "uncertain"
       ? value.extensionAttemptState
       : undefined,
-    extensionRequestedAt: sanitizeTimestamp(value.extensionRequestedAt),
+    extensionRequestedAt,
     extensionRequestId: sanitizeString(value.extensionRequestId, MAX_ID_LENGTH),
     extensionLastError: typeof value.extensionLastError === "string"
       ? sanitizeErrorMessage(value.extensionLastError, MAX_ERROR_LENGTH) || undefined
       : undefined,
     approvalId: sanitizeString(value.approvalId, MAX_ID_LENGTH),
     targetScheduleId: sanitizeString(value.targetScheduleId, MAX_ID_LENGTH),
-    lastCheckedAt: sanitizeTimestamp(value.lastCheckedAt),
-    nextCheckAt: sanitizeTimestamp(value.nextCheckAt),
+    lastCheckedAt,
+    nextCheckAt,
     checkCount: clampInteger(value.checkCount, 0, MAX_CHECK_COUNT, 0),
     lastError: typeof value.lastError === "string"
       ? sanitizeErrorMessage(value.lastError, MAX_ERROR_LENGTH) || undefined
       : undefined,
     notifiedStatus: isTrackedStatus(value.notifiedStatus) ? value.notifiedStatus : undefined,
-    expiryReminderSentAt: sanitizeTimestamp(value.expiryReminderSentAt)
+    expiryReminderSentAt,
+    sourceInstallationId: sanitizeString(value.sourceInstallationId, 80),
+    sourceDeviceName: sanitizeString(value.sourceDeviceName, 60)
   };
+}
+
+function sanitizeRequestMetadataTimestamp(value: unknown, requestedAtMs: number, now: number): string | undefined {
+  const timestamp = sanitizeTimestamp(value);
+  if (!timestamp) {
+    return undefined;
+  }
+  const timestampMs = Date.parse(timestamp);
+  return timestampMs >= requestedAtMs && timestampMs <= now + MAX_FUTURE_CLOCK_SKEW_MS
+    ? timestamp
+    : undefined;
 }
 
 function getRequestPayloadDetails(

@@ -3,6 +3,7 @@ import { getIdentityContext } from "../src/lib/identityContext";
 import { stringifySupportReport } from "../src/lib/supportReport";
 import { DEFAULT_SETTINGS } from "../src/lib/settings";
 import { makeTokenStatus } from "../src/lib/token";
+import { EDGE_ADDONS_EXTENSION_ID } from "../src/lib/distribution";
 import type { ActivationItem, QuickPimDataCache, TokenStatus, TrackedPimRequestStore } from "../src/lib/types";
 
 describe("safe account context", () => {
@@ -88,6 +89,13 @@ describe("sanitized support reports", () => {
       },
       dataCache: cache,
       trackedRequests,
+      distribution: {
+        browser: "edge",
+        distribution: "edgeAddons",
+        extensionId: EDGE_ADDONS_EXTENSION_ID,
+        installType: "normal",
+        blockedInEdge: false
+      },
       userAgent: "Browser/1.0 (private platform)"
     });
     expect(report).toContain('"directoryRole:eligible": 1');
@@ -96,6 +104,34 @@ describe("sanitized support reports", () => {
     expect(report).not.toContain(secretReason);
     expect(report).not.toContain("admin@example.test");
     expect(report).not.toContain("request-secret");
+    expect(report).toContain('"source": "Microsoft Edge Add-ons"');
+    expect(report).not.toContain(EDGE_ADDONS_EXTENSION_ID);
+  });
+
+  test("exports fixed token provenance without Entra URL fragments", () => {
+    const fragment = "#code=secret-auth-code&access_token=secret";
+    const report = stringifySupportReport({
+      appVersion: "9.9.9",
+      buildTimestamp: "2026-01-01T00:00:00.000Z",
+      settings: structuredClone(DEFAULT_SETTINGS),
+      tokenStatus: {
+        graph: {
+          hasToken: true,
+          source: `entra.microsoft.com storage: ${fragment}`
+        },
+        azureManagement: {
+          hasToken: true,
+          source: `https://entra.microsoft.com/${fragment}`
+        }
+      },
+      dataCache: {},
+      trackedRequests: { version: 1, requests: [] }
+    });
+
+    expect(report).toContain("Microsoft Entra portal storage");
+    expect(report).toContain("Microsoft Entra portal request");
+    expect(report).not.toContain(fragment);
+    expect(report).not.toContain("secret-auth-code");
   });
 });
 

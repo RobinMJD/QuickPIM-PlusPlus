@@ -106,6 +106,19 @@ describe("popup draft storage", () => {
     expect(draft?.justification).toHaveLength(MAX_USER_JUSTIFICATION_LENGTH);
   });
 
+  test("preserves a selected Azure resource ID up to the runtime message limit", () => {
+    const itemId = `azureRole:reader:/subscriptions/subscription-id/resourceGroups/${"scope".repeat(70)}`;
+    expect(itemId.length).toBeGreaterThan(256);
+    expect(itemId.length).toBeLessThanOrEqual(512);
+
+    expect(sanitizePopupDraft({
+      updatedAt: now,
+      tab: "azureRole",
+      selectedIds: [itemId],
+      isActivationReviewOpen: true
+    }, now)).toMatchObject({ selectedIds: [itemId], isActivationReviewOpen: true });
+  });
+
   test("serializes save and clear mutations so an older save cannot resurrect a cleared draft", async () => {
     const values: Record<string, unknown> = {};
     const operations: string[] = [];

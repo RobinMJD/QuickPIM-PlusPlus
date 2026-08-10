@@ -50,6 +50,16 @@ describe("security allowlists and token validation", () => {
       ok: false
     });
     expect(validateCapturedToken("not-a-jwt", "graph", now)).toMatchObject({ ok: false });
+    expect(validateCapturedToken(makeToken({
+      aud: "https://graph.microsoft.com",
+      exp: Math.floor((now + 10 * 60_000) / 1000),
+      nbf: Math.floor((now + 10 * 60_000) / 1000)
+    }), "graph", now)).toMatchObject({ ok: false, reason: "Token is not valid yet." });
+    expect(validateCapturedToken(makeToken({
+      aud: "https://graph.microsoft.com",
+      exp: Math.floor((now + 10 * 60_000) / 1000),
+      nbf: Math.floor((now + 60_000) / 1000)
+    }), "graph", now)).toMatchObject({ ok: true });
     expect(
       validateCapturedToken(
         makeToken({
@@ -144,6 +154,16 @@ describe("runtime message validation", () => {
     const operationId = "request_security_test";
     expect(validateQuickPimMessage({ action: "getTokenStatus" })).toEqual({ action: "getTokenStatus" });
     expect(validateQuickPimMessage({ action: "resetExtensionData" })).toEqual({ action: "resetExtensionData" });
+    expect(validateQuickPimMessage({ action: "getBrowserSyncStatus" })).toEqual({ action: "getBrowserSyncStatus" });
+    expect(validateQuickPimMessage({ action: "getBrowserSyncPopupStatus" })).toEqual({ action: "getBrowserSyncPopupStatus" });
+    expect(validateQuickPimMessage({ action: "setBrowserSyncEnabled", enabled: false })).toEqual({ action: "setBrowserSyncEnabled", enabled: false });
+    expect(validateQuickPimMessage({ action: "updateBrowserSyncDeviceName", name: " Office laptop " })).toEqual({ action: "updateBrowserSyncDeviceName", name: "Office laptop" });
+    expect(validateQuickPimMessage({ action: "renameBrowserSyncDevice", installationId: "abcd1234-efgh", name: " Admin laptop " })).toEqual({
+      action: "renameBrowserSyncDevice",
+      installationId: "abcd1234-efgh",
+      name: "Admin laptop"
+    });
+    expect(validateQuickPimMessage({ action: "dismissBrowserSyncReminder", mode: "never" })).toEqual({ action: "dismissBrowserSyncReminder", mode: "never" });
     expect(validateQuickPimMessage({ action: "refreshPortalTokens" })).toEqual({ action: "refreshPortalTokens" });
     expect(validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: ["pimGroup", "pimGroup", "azureRole"] })).toEqual({
       action: "openPortalRecoveryTabs",
@@ -186,6 +206,11 @@ describe("runtime message validation", () => {
       tokens: scopedTokens
     });
     expect(() => validateQuickPimMessage({ action: "manualSetToken", token: "abc" })).toThrow(/unsupported/i);
+    expect(() => validateQuickPimMessage({ action: "setBrowserSyncEnabled", enabled: "yes" })).toThrow(/true or false/i);
+    expect(() => validateQuickPimMessage({ action: "updateBrowserSyncDeviceName", name: "" })).toThrow(/between 1 and 60/i);
+    expect(() => validateQuickPimMessage({ action: "renameBrowserSyncDevice", installationId: "short", name: "Laptop" })).toThrow(/identifier/i);
+    expect(() => validateQuickPimMessage({ action: "renameBrowserSyncDevice", installationId: "abcd1234", name: "" })).toThrow(/between 1 and 60/i);
+    expect(() => validateQuickPimMessage({ action: "dismissBrowserSyncReminder", mode: "later" })).toThrow(/invalid/i);
     expect(() => validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: [] })).toThrow(/must not be empty/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);

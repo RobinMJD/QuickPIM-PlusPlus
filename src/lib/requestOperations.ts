@@ -5,12 +5,18 @@ import type {
   RequestOperationAction,
   RequestOperationRecord
 } from "./types";
+import { createStorageMutationLock } from "./storageMutation";
 
 export const REQUEST_OPERATIONS_SESSION_KEY = "quickPimRequestOperations.v1";
 export const REQUEST_OPERATION_TTL_MS = 30 * 60_000;
 
 const MAX_OPERATIONS = 20;
-let requestOperationMutationQueue: Promise<void> = Promise.resolve();
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
+const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
+const withRequestOperationMutationLock = createStorageMutationLock("quickPimRequestOperationMutation");
+
+export type RequestOperationIdentity = Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets"> &
+  Partial<Pick<RequestOperationRecord, "durationHours" | "justification" | "ticketInfo" | "bundleName">>;
 
 interface StorageAreaLike {
   get(key: string): Promise<Record<string, unknown>>;
@@ -29,14 +35,14 @@ export async function loadRequestOperations(
   if (Array.isArray(storedValue) && JSON.stringify(operations) !== JSON.stringify(storedValue)) {
     // Re-read inside the mutation queue so cleanup cannot overwrite an operation
     // that started after this read completed.
-    await mutateOperations(storage, now, (current) => current);
+    return mutateOperations(storage, now, (current) => current);
   }
   return operations;
 }
 
 export async function beginRequestOperation(
   operation: Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets" | "startedAt"> &
-    Partial<Pick<RequestOperationRecord, "durationHours" | "justification" | "bundleName">>,
+    Partial<Pick<RequestOperationRecord, "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName">>,
   options: { storage?: StorageAreaLike; now?: number } = {}
 ): Promise<void> {
   const storage = options.storage || chrome.storage.session;
@@ -49,6 +55,20 @@ export async function beginRequestOperation(
     },
     ...current.filter((item) => item.id !== operation.id)
   ]);
+}
+
+export function getRequestOperationFingerprint(operation: RequestOperationIdentity): string {
+  const ticketSystem = operation.ticketInfo?.ticketSystem?.trim() || null;
+  const ticketNumber = operation.ticketInfo?.ticketNumber?.trim() || null;
+  return JSON.stringify({
+    action: operation.action,
+    itemIds: [...new Set(operation.itemIds)].sort(),
+    targets: [...new Set(operation.targets)].sort(),
+    durationHours: operation.durationHours ?? null,
+    justification: operation.justification ?? null,
+    ticketInfo: ticketSystem || ticketNumber ? { ticketSystem, ticketNumber } : null,
+    bundleName: operation.bundleName ?? null
+  });
 }
 
 export async function completeRequestOperation(
@@ -101,14 +121,14 @@ async function mutateOperations(
   storage: StorageAreaLike,
   now: number,
   mutation: (current: RequestOperationRecord[]) => RequestOperationRecord[]
-): Promise<void> {
-  const operation = requestOperationMutationQueue.then(async () => {
+): Promise<RequestOperationRecord[]> {
+  return withRequestOperationMutationLock(async () => {
     const result = await storage.get(REQUEST_OPERATIONS_SESSION_KEY);
     const current = sanitizeRequestOperations(result[REQUEST_OPERATIONS_SESSION_KEY], now);
-    await saveOperations(storage, mutation(current).slice(0, MAX_OPERATIONS));
+    const next = sanitizeRequestOperations(mutation(current), now).slice(0, MAX_OPERATIONS);
+    await saveOperations(storage, next);
+    return next;
   });
-  requestOperationMutationQueue = operation.catch(() => undefined);
-  await operation;
 }
 
 async function saveOperations(storage: StorageAreaLike, operations: RequestOperationRecord[]): Promise<void> {
@@ -124,10 +144,15 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     return undefined;
   }
   if (value.state !== "running" && value.state !== "complete" && value.state !== "error") return undefined;
-  if (!Number.isFinite(value.startedAt) || !Number.isFinite(value.updatedAt)) return undefined;
-  const startedAt = Number(value.startedAt);
-  const updatedAt = Number(value.updatedAt);
-  if (now - updatedAt > REQUEST_OPERATION_TTL_MS || updatedAt > now + 5 * 60_000) return undefined;
+  const startedAt = sanitizeEpochMilliseconds(value.startedAt);
+  const updatedAt = sanitizeEpochMilliseconds(value.updatedAt);
+  if (startedAt === undefined || updatedAt === undefined) return undefined;
+  if (
+    now - updatedAt > REQUEST_OPERATION_TTL_MS
+    || updatedAt > now + MAX_FUTURE_CLOCK_SKEW_MS
+    || startedAt > now + MAX_FUTURE_CLOCK_SKEW_MS
+    || updatedAt < startedAt
+  ) return undefined;
   const itemIds = sanitizeStrings(value.itemIds, 100, 512);
   const targets = sanitizeTargets(value.targets);
   if (!itemIds.length || !targets.length) return undefined;
@@ -140,12 +165,28 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     state: value.state,
     startedAt,
     updatedAt,
-    ...(typeof value.durationHours === "number" && Number.isFinite(value.durationHours) ? { durationHours: value.durationHours } : {}),
+    ...(value.action === "activate"
+      && typeof value.durationHours === "number"
+      && Number.isFinite(value.durationHours)
+      && value.durationHours >= 0.5
+      && value.durationHours <= 24
+      ? { durationHours: value.durationHours }
+      : {}),
     ...(typeof value.justification === "string" ? { justification: value.justification.slice(0, 1_000) } : {}),
+    ...(sanitizeTicketInfo(value.ticketInfo) ? { ticketInfo: sanitizeTicketInfo(value.ticketInfo) } : {}),
     ...(typeof value.bundleName === "string" ? { bundleName: value.bundleName.slice(0, 80) } : {}),
+    ...(typeof value.sourceInstallationId === "string" ? { sourceInstallationId: value.sourceInstallationId.slice(0, 80) } : {}),
+    ...(typeof value.sourceDeviceName === "string" ? { sourceDeviceName: value.sourceDeviceName.slice(0, 60) } : {}),
     ...(response ? { response } : {}),
     ...(typeof value.error === "string" ? { error: value.error.slice(0, 1_000) } : {})
   };
+}
+
+function sanitizeTicketInfo(value: unknown): RequestOperationRecord["ticketInfo"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const ticketSystem = typeof value.ticketSystem === "string" ? value.ticketSystem.trim().slice(0, 128) : "";
+  const ticketNumber = typeof value.ticketNumber === "string" ? value.ticketNumber.trim().slice(0, 128) : "";
+  return ticketSystem || ticketNumber ? { ticketSystem, ticketNumber } : undefined;
 }
 
 function sanitizeTargets(value: unknown): AccessSetupTarget[] {
@@ -156,7 +197,17 @@ function sanitizeTargets(value: unknown): AccessSetupTarget[] {
 
 function sanitizeStrings(value: unknown, limit: number, maxLength: number): string[] {
   if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((item): item is string => typeof item === "string" && item.length > 0).map((item) => item.slice(0, maxLength)))].slice(0, limit);
+  return [...new Set(value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().slice(0, maxLength))
+    .filter(Boolean))].slice(0, limit);
+}
+
+function sanitizeEpochMilliseconds(value: unknown): number | undefined {
+  const timestamp = Number(value);
+  return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= MAX_DATE_EPOCH_MS
+    ? timestamp
+    : undefined;
 }
 
 function sanitizeActivationResponse(value: unknown): ActivationResponse | undefined {
@@ -169,7 +220,9 @@ function sanitizeActivationResponse(value: unknown): ActivationResponse | undefi
   return {
     success: errors.length === 0,
     results,
-    errors
+    errors,
+    ...(typeof value.sourceInstallationId === "string" ? { sourceInstallationId: value.sourceInstallationId.slice(0, 80) } : {}),
+    ...(typeof value.sourceDeviceName === "string" ? { sourceDeviceName: value.sourceDeviceName.slice(0, 60) } : {})
   };
 }
 

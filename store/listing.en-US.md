@@ -31,8 +31,9 @@ Highlights:
 - Activation bundles that skip already-active items and validate requirements before submission.
 - Policy-aware duration choices plus clear approval, justification, ticket, and active-until details.
 - Local activity history and optional request-status notifications.
+- Optional browser-account sync for useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity within Chrome or Edge.
 - Guided Access Setup that opens only the Microsoft portal pages needed to refresh access.
-- Session-only token storage and local storage for settings, learned names, and cached display data.
+- Session-only token storage, local-only access data, and bounded browser-account sync controls for non-token convenience data.
 - Dark mode, configurable tabs, import/export, and background cache refresh.
 
 QuickPIM++ does not require a dedicated app registration, manual token entry, or a developer-controlled backend. It works with validated Microsoft portal tokens available in the signed-in browser session. Tokens and extension settings are not sold or sent to the developer.
@@ -41,7 +42,7 @@ Full functionality requires a Microsoft Entra tenant with Privileged Identity Ma
 
 ## Privacy Disclosure
 
-QuickPIM++ handles authentication tokens, PIM assignment metadata, request identifiers, settings, aliases, favorites, justifications, bundles, activity history, and cached display names only to provide its extension functionality. Tokens use browser session storage. Other bounded convenience data uses local extension storage. Data is sent only to Microsoft Graph, Azure Management, and the public GitHub API as described in the privacy policy. No data is sold or sent to a developer-controlled server.
+QuickPIM++ handles authentication tokens, PIM assignment metadata, request identifiers, settings, aliases, favorites, justifications, bundles, activity history, and cached display names only to provide its extension functionality. Tokens use browser session storage. Other bounded convenience data uses local extension storage and, when Browser Sync is enabled, the signed-in browser account's extension sync service. Data is sent only to Microsoft Graph, Azure Management, the browser sync service, and the public GitHub API as described in the privacy policy. No data is sold or sent to a developer-controlled server.
 
 ## Certification Notes
 
@@ -61,7 +62,7 @@ Full activation review:
 4. Return to the popup.
 5. Select an eligible role or group, choose an allowed duration and justification, and submit the activation.
 
-QuickPIM++ stores tokens and settings in the local browser profile and does not send them to developer-controlled servers.
+QuickPIM++ stores tokens in browser session storage. Settings remain local or use the signed-in browser's extension sync service when Browser Sync is enabled; no data is sent to developer-controlled servers.
 
 ## Assets
 

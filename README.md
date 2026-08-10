@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.13.14**
+Current version: **v2.16.4**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -24,7 +24,9 @@ QuickPIM++ brings those eligible assignments into one focused popup. Search for 
 - **Policy-aware requests**: only valid durations are offered; justification, ticket, and approval requirements appear when relevant.
 - **Clear active access**: see live remaining time, local expiry, request status, and early-disable availability.
 - **Repeatable workflows**: favorites, aliases, saved reasons, recent history, and activation bundles reduce repetitive work.
+- **Browser-account sync**: useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity can follow official Chrome or Edge installations. Each installation has a stable generated ID that can be renamed, and activity records retain their source computer.
 - **Local-first design**: no dedicated app registration, manual token entry, or developer-controlled backend.
+- **Correct browser edition**: Edge users are guided to the Edge Add-ons edition with a direct, local settings-and-history migration path.
 
 ## See It In Action
 
@@ -69,6 +71,7 @@ Work with eligible Azure resource roles across subscriptions, resource groups, m
 - Optionally notify when a request changes state or active access is close to expiry.
 - Preserve popup selections and request inputs when the popup closes or Microsoft requires an interactive prompt.
 - Keep working from cached role data while stale sources refresh in the background.
+- Keep convenience data synchronized between signed-in installations of the same Store edition, with per-install controls, user-friendly device names, concurrent activity merging, and a cloud-data purge action.
 
 ## A Shorter Path To Activation
 
@@ -85,7 +88,9 @@ QuickPIM++ scans existing Microsoft portal tabs first. When more portal access i
 QuickPIM++ does not run a developer-controlled service and does not ask you to configure a separate OAuth application.
 
 - Validated Microsoft portal tokens stay in browser session storage and are cleared when the browser session ends.
-- Settings, aliases, favorites, bundles, learned names, cached display data, and bounded activity history stay in local extension storage.
+- Tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission stay local to the installation.
+- Useful preferences and bounded convenience data can use the browser account's extension sync service. Sync is enabled by default, can be disabled per installation, and can be purged from Settings.
+- Chrome Sync and Microsoft Edge Sync are separate services; Backup & Restore moves data between browser families.
 - Microsoft PIM operations go directly to Microsoft Graph or Azure Management.
 - The public GitHub API is used only to display project release information in Settings.
 - QuickPIM++ does not request browser cookie access and does not sell or send extension data to the developer.

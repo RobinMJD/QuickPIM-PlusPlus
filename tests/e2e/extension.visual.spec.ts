@@ -1,29 +1,28 @@
-import { chromium, expect, test, type BrowserContext, type Page } from "@playwright/test";
+import { chromium, expect, test, type BrowserContext, type Page, type Worker } from "@playwright/test";
 import path from "node:path";
 
 let context: BrowserContext;
 let extensionId: string;
+let serviceWorker: Worker;
 
-test.beforeAll(async () => {
+test.beforeEach(async () => {
   const extensionPath = path.resolve("dist");
   context = await chromium.launchPersistentContext("", {
     channel: "chromium",
     headless: true,
     args: [`--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`]
   });
-  let worker = context.serviceWorkers()[0];
-  if (!worker) worker = await context.waitForEvent("serviceworker");
-  extensionId = new URL(worker.url()).host;
+  serviceWorker = context.serviceWorkers()[0] || await context.waitForEvent("serviceworker");
+  extensionId = new URL(serviceWorker.url()).host;
 });
 
-test.afterAll(async () => {
+test.afterEach(async () => {
   await context.close();
 });
 
 test("popup stays within its fixed viewport and supports a keyboard selection flow", async ({}, testInfo) => {
+  await seedPopupRole(serviceWorker);
   const page = await openExtensionPage("popup.html", { width: 520, height: 600 });
-  await seedPopupRole(page);
-  await page.reload();
 
   await expect(page.getByRole("heading", { name: "QuickPIM++" })).toBeVisible();
   const idleFooter = page.locator(".activation-footer-actions");
@@ -115,15 +114,62 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   await page.getByRole("tab", { name: "Saved" }).click();
   await expect(page.getByRole("tabpanel", { name: "Saved justifications" })).toContainText("Saved visual reason");
   await expect(page.getByRole("tabpanel", { name: "Saved justifications" })).not.toContainText("Recent visual reason");
+  await page.getByRole("tab", { name: "History" }).click();
+  await page.evaluate(() => {
+    const toolbar = document.querySelector<HTMLElement>(".toolbar");
+    if (!toolbar) throw new Error("Popup toolbar is missing.");
+    const progress = document.createElement("section");
+    progress.className = "activation-progress-panel refresh-progress-panel smart-progress-panel";
+    progress.setAttribute("role", "status");
+    progress.innerHTML = `
+      <div class="progress-line"><span>Activation in progress</span><span class="progress-fraction">Step 1/3</span></div>
+      <p class="progress-detail">Sending activation request</p>
+      <span class="progress-track"><span class="progress-fill" style="width: 30%"></span></span>
+    `;
+    toolbar.before(progress);
+  });
+  const reviewGeometry = await page.evaluate(() => {
+    const shell = document.querySelector<HTMLElement>(".app-shell");
+    const activationBar = document.querySelector<HTMLElement>(".activation-bar");
+    const reviewScroll = document.querySelector<HTMLElement>(".activation-review-scroll");
+    const footer = document.querySelector<HTMLElement>(".activation-review-actions");
+    if (!shell || !activationBar || !reviewScroll || !footer) {
+      throw new Error("Activation review layout is incomplete.");
+    }
+    reviewScroll.scrollTop = reviewScroll.scrollHeight;
+    const shellRect = shell.getBoundingClientRect();
+    const activationRect = activationBar.getBoundingClientRect();
+    const reviewRect = reviewScroll.getBoundingClientRect();
+    const footerRect = footer.getBoundingClientRect();
+    return {
+      documentScrollHeight: document.documentElement.scrollHeight,
+      viewportHeight: window.innerHeight,
+      shellBottom: shellRect.bottom,
+      activationBottom: activationRect.bottom,
+      reviewBottom: reviewRect.bottom,
+      footerTop: footerRect.top,
+      footerBottom: footerRect.bottom,
+      reviewOverflowY: getComputedStyle(reviewScroll).overflowY,
+      reviewClientHeight: reviewScroll.clientHeight,
+      reviewScrollHeight: reviewScroll.scrollHeight
+    };
+  });
+  expect(reviewGeometry.documentScrollHeight).toBeLessThanOrEqual(reviewGeometry.viewportHeight);
+  expect(reviewGeometry.activationBottom).toBeLessThanOrEqual(reviewGeometry.viewportHeight);
+  expect(reviewGeometry.activationBottom).toBeCloseTo(reviewGeometry.shellBottom, 0);
+  expect(reviewGeometry.footerBottom).toBeLessThanOrEqual(reviewGeometry.shellBottom);
+  expect(reviewGeometry.shellBottom - reviewGeometry.footerBottom).toBeLessThanOrEqual(8);
+  expect(reviewGeometry.footerTop).toBeGreaterThanOrEqual(reviewGeometry.reviewBottom);
+  expect(reviewGeometry.reviewOverflowY).toBe("auto");
+  expect(reviewGeometry.reviewScrollHeight).toBeGreaterThan(reviewGeometry.reviewClientHeight);
   await assertNoHorizontalOverflow(page);
   await testInfo.attach("popup-selected", { body: await page.screenshot(), contentType: "image/png" });
   await page.close();
 });
 
 test("account details stay within the popup and keep copyable values on one line", async ({}, testInfo) => {
+  await seedPopupIdentity(serviceWorker);
   const page = await openExtensionPage("popup.html", { width: 520, height: 600 });
-  await seedPopupIdentity(page);
-  await page.reload();
 
   const accountButton = page.getByLabel("Show Microsoft account details");
   const closedColors = await accountButton.evaluate((element) => ({
@@ -166,9 +212,8 @@ test("account details stay within the popup and keep copyable values on one line
 });
 
 test("bundle cards stay compact while settings remain pinned at the bottom", async ({}, testInfo) => {
+  await seedPopupRole(serviceWorker);
   const page = await openExtensionPage("popup.html", { width: 520, height: 600 });
-  await seedPopupRole(page);
-  await page.reload();
   await page.getByRole("tab", { name: "Bundles" }).click();
 
   await expect(page.getByRole("heading", { name: "Visual privileged bundle" })).toBeVisible();
@@ -222,9 +267,8 @@ test("settings navigation and diagnostics remain aligned at desktop and compact 
 });
 
 test("settings pages follow the user-journey information architecture", async ({}, testInfo) => {
+  await seedPopupIdentity(serviceWorker);
   const page = await openExtensionPage("settings.html#display", { width: 1280, height: 900 });
-  await seedPopupIdentity(page);
-  await page.reload();
   await expect(page.getByRole("heading", { name: "Popup & Appearance" })).toBeVisible();
   await expect(page.locator(".settings-nav-heading")).toHaveText([
     "Overview",
@@ -235,7 +279,7 @@ test("settings pages follow the user-journey information architecture", async ({
     "Data & Support",
     "Product"
   ]);
-  await expect(page.locator(".settings-nav button")).toHaveCount(12);
+  await expect(page.locator(".settings-nav button")).toHaveCount(13);
   await expect(page.getByText("Enabled tabs", { exact: true })).toBeVisible();
   await expect(page.getByText("Refresh behavior", { exact: true })).toBeVisible();
 
@@ -266,6 +310,11 @@ test("settings pages follow the user-journey information architecture", async ({
   expect(compactContextGeometry.scrollWidth).toBeLessThanOrEqual(compactContextGeometry.clientWidth);
   await page.setViewportSize({ width: 1280, height: 900 });
 
+  await page.getByRole("button", { name: "Browser Sync", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Browser Sync" })).toBeVisible();
+  await expect(page.getByText("Native sync is unavailable for this installation")).toBeVisible();
+  await assertNoHorizontalOverflow(page);
+
   await page.getByRole("button", { name: "Reset QuickPIM++", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Reset QuickPIM++" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Open Backup & Restore" })).toBeVisible();
@@ -285,9 +334,8 @@ test("settings pages follow the user-journey information architecture", async ({
 });
 
 test("saved and recent justifications align and recent reasons are copyable", async ({}, testInfo) => {
+  await seedPopupRole(serviceWorker);
   const page = await openExtensionPage("settings.html#justifications", { width: 1000, height: 720 });
-  await seedPopupRole(page);
-  await page.reload();
 
   await expect(page.getByRole("heading", { name: "Justifications" })).toBeVisible();
   const columns = page.locator(".justification-columns > .settings-subsection");
@@ -359,8 +407,8 @@ async function openExtensionPage(route: string, viewport: { width: number; heigh
   return page;
 }
 
-async function seedPopupRole(page: Page): Promise<void> {
-  await page.evaluate(async () => {
+async function seedPopupRole(worker: Worker): Promise<void> {
+  await worker.evaluate(async () => {
     const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
@@ -387,7 +435,16 @@ async function seedPopupRole(page: Page): Promise<void> {
       [settingsKey]: {
         ...settings,
         savedJustifications: ["Saved visual reason"],
-        recentJustifications: ["Recent visual reason"],
+        recentJustifications: [
+          "Recent visual reason",
+          "Validate a production access request",
+          "Review privileged configuration",
+          "Complete an approved change",
+          "Investigate a service incident",
+          "Verify tenant security settings",
+          "Update an administrative policy",
+          "Perform a controlled support task"
+        ],
         bundles: [{
           id: "bundle:visual",
           name: "Visual privileged bundle",
@@ -435,8 +492,8 @@ async function seedPopupRole(page: Page): Promise<void> {
   });
 }
 
-async function seedPopupIdentity(page: Page): Promise<void> {
-  await page.evaluate(async () => {
+async function seedPopupIdentity(worker: Worker): Promise<void> {
+  await worker.evaluate(async () => {
     const encode = (value: Record<string, unknown>) => btoa(JSON.stringify(value))
       .replace(/\+/g, "-")
       .replace(/\//g, "_")

@@ -1,4 +1,5 @@
 import type {
+  ActivitySource,
   ActivationHistoryEntry,
   ActivationItem,
   ActivationResponse,
@@ -10,7 +11,8 @@ import type {
   ReferenceDataCache,
   QuickPimSettings,
   SortDirection,
-  SortMode
+  SortMode,
+  UsageStats
 } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
@@ -19,7 +21,7 @@ import {
   isGenericJustification,
   sanitizeUserJustification
 } from "./justifications";
-import { sanitizeErrorMessage } from "./security";
+import { isSafeRecordKey, sanitizeErrorMessage } from "./security";
 import { DEFAULT_EXTENSION_DURATION_HOURS, sanitizeExtensionDurationHours } from "./requestExtension";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
@@ -28,7 +30,8 @@ const MAX_ACTIVITY_HISTORY_ENTRIES = 200;
 const MAX_ALIASES = 300;
 const MAX_FAVORITES = 300;
 const MAX_ALIAS_LENGTH = 120;
-const MAX_ITEM_ID_LENGTH = 256;
+const MAX_ITEM_ID_LENGTH = 512;
+const MAX_ACTIVITY_EVENT_ID_LENGTH = 256;
 const MAX_SAVED_JUSTIFICATIONS = 100;
 const MAX_BUNDLES = 50;
 const MAX_BUNDLE_ITEMS = 100;
@@ -36,6 +39,11 @@ const MAX_BUNDLE_NAME_LENGTH = 80;
 export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "pimGroup", "azureRole"];
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 const withSettingsMutationLock = createStorageMutationLock("quickPimSettingsMutation");
+
+export interface SettingsStorageAreaLike {
+  get(key: string): Promise<Record<string, unknown>>;
+  set(items: Record<string, unknown>): Promise<void>;
+}
 
 export const DEFAULT_SETTINGS: QuickPimSettings = {
   version: 2,
@@ -94,19 +102,32 @@ export function mergeImportedSettings(current: QuickPimSettings, input: Partial<
 }
 
 export async function loadSettings(): Promise<QuickPimSettings> {
-  const result = await chrome.storage.local.get(SETTINGS_KEY);
-  return mergeSettings(result[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined);
+  return loadSettingsFromStorage(chrome.storage.local);
 }
 
 export async function mutateSettings(
   mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
 ): Promise<QuickPimSettings> {
+  return mutateSettingsInStorage(chrome.storage.local, mutator);
+}
+
+export async function mutateSettingsInStorage(
+  storage: SettingsStorageAreaLike,
+  mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
+): Promise<QuickPimSettings> {
   return withSettingsMutationLock(async () => {
-    const current = await loadSettings();
+    const current = await loadSettingsFromStorage(storage);
     const next = mergeSettings(await mutator(current));
-    await chrome.storage.local.set({ [SETTINGS_KEY]: next });
+    if (JSON.stringify(current) !== JSON.stringify(next)) {
+      await storage.set({ [SETTINGS_KEY]: next });
+    }
     return next;
   });
+}
+
+async function loadSettingsFromStorage(storage: SettingsStorageAreaLike): Promise<QuickPimSettings> {
+  const result = await storage.get(SETTINGS_KEY);
+  return mergeSettings(result[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined);
 }
 
 export function getDisplayName(
@@ -197,16 +218,37 @@ export function recordActivations(
   settings: QuickPimSettings,
   items: ActivationItem[],
   activatedAt = new Date().toISOString(),
-  bundleName?: string
+  bundleName?: string,
+  source?: ActivitySource
 ): QuickPimSettings {
   const usageStatsByItemId = { ...settings.usageStatsByItemId };
 
   for (const item of items) {
+    if (!isSafeRecordKey(item.id)) continue;
     const current = usageStatsByItemId[item.id] || { activationCount: 0 };
-    usageStatsByItemId[item.id] = {
-      activationCount: current.activationCount + 1,
-      lastUsedAt: activatedAt
-    };
+    if (source?.installationId && isSafeRecordKey(source.installationId)) {
+      const byInstallationId = { ...current.byInstallationId };
+      const currentSource = byInstallationId[source.installationId] || { activationCount: 0 };
+      byInstallationId[source.installationId] = {
+        activationCount: currentSource.activationCount + 1,
+        lastUsedAt: activatedAt
+      };
+      const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
+      const previousKnownTotal = Object.values(current.byInstallationId || {}).reduce((total, entry) => total + entry.activationCount, 0);
+      const legacyActivationCount = current.legacyActivationCount ?? Math.max(0, current.activationCount - previousKnownTotal);
+      usageStatsByItemId[item.id] = {
+        activationCount: legacyActivationCount + knownTotal,
+        lastUsedAt: latestIsoTimestamp(current.lastUsedAt, activatedAt),
+        ...(legacyActivationCount ? { legacyActivationCount } : {}),
+        byInstallationId
+      };
+    } else {
+      usageStatsByItemId[item.id] = {
+        ...current,
+        activationCount: current.activationCount + 1,
+        lastUsedAt: activatedAt
+      };
+    }
   }
 
   const activationHistory = [
@@ -232,6 +274,8 @@ export function recordActivityResults(
     durationHours?: number;
     justification?: string;
     bundleName?: string;
+    eventIdPrefix?: string;
+    source?: ActivitySource;
   }
 ): QuickPimSettings {
   const itemsById = new Map(input.items.map((item) => [item.id, item]));
@@ -239,7 +283,7 @@ export function recordActivityResults(
     const item = itemsById.get(result.itemId);
     const historyResult: ActivityResult = result.success ? "success" : "failed";
     return {
-      id: `${input.completedAt}:${input.action}:${result.itemId}:${historyResult}`,
+      id: buildActivityHistoryEntryId(input.eventIdPrefix || input.completedAt, input.action, result.itemId, historyResult),
       action: input.action,
       result: historyResult,
       itemId: result.itemId,
@@ -251,17 +295,77 @@ export function recordActivityResults(
       ...(input.durationHours && input.action === "activate" ? { durationHours: input.durationHours } : {}),
       ...(input.bundleName ? { bundleName: input.bundleName } : {}),
       ...(sanitizeUserJustification(input.justification) ? { justification: sanitizeUserJustification(input.justification) } : {}),
-      ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {})
+      ...(result.error ? { error: sanitizeErrorMessage(result.error) } : {}),
+      ...(input.source?.installationId ? { sourceInstallationId: input.source.installationId } : {}),
+      ...(input.source?.deviceName ? { sourceDeviceName: input.source.deviceName } : {})
     };
   });
+
+  const entryIds = new Set(entries.map((entry) => entry.id));
 
   return {
     ...settings,
     activityHistory: [
       ...entries,
-      ...settings.activityHistory
+      ...settings.activityHistory.filter((entry) => !entryIds.has(entry.id))
     ].slice(0, settings.preferences.activityHistoryLimit || DEFAULT_SETTINGS.preferences.activityHistoryLimit)
   };
+}
+
+export function recordOperationActivity(
+  settings: QuickPimSettings,
+  input: {
+    operationId: string;
+    action: "activate" | "deactivate";
+    items: ActivationItem[];
+    response: ActivationResponse;
+    requestedAt: string;
+    completedAt: string;
+    durationHours?: number;
+    justification?: string;
+    bundleName?: string;
+    source?: ActivitySource;
+  }
+): QuickPimSettings {
+  let updated = settings;
+  if (input.action === "activate") {
+    const existingIds = new Set(settings.activityHistory.map((entry) => entry.id));
+    const itemsById = new Map(input.items.map((item) => [item.id, item]));
+    const newlyCompletedItems = input.response.results.flatMap((result) => {
+      if (!result.success) return [];
+      const eventId = buildActivityHistoryEntryId(input.operationId, input.action, result.itemId, "success");
+      const item = itemsById.get(result.itemId);
+      return item && !existingIds.has(eventId) ? [item] : [];
+    });
+    updated = recordActivations(
+      updated,
+      newlyCompletedItems,
+      input.completedAt,
+      input.bundleName,
+      input.source
+    );
+  }
+  return recordActivityResults(updated, {
+    action: input.action,
+    items: input.items,
+    response: input.response,
+    requestedAt: input.requestedAt,
+    completedAt: input.completedAt,
+    durationHours: input.durationHours,
+    justification: input.justification,
+    bundleName: input.bundleName,
+    eventIdPrefix: input.operationId,
+    source: input.source
+  });
+}
+
+export function buildActivityHistoryEntryId(
+  eventIdPrefix: string,
+  action: "activate" | "deactivate",
+  itemId: string,
+  result: ActivityResult
+): string {
+  return buildBoundedEventId(`${eventIdPrefix}:${action}:${itemId}:${result}`);
 }
 
 export function createActivationHistoryEntries(
@@ -270,13 +374,30 @@ export function createActivationHistoryEntries(
   activatedAt: string
 ): ActivationHistoryEntry[] {
   return items.map((item) => ({
-    id: `${activatedAt}:${item.id}`,
+    id: buildBoundedEventId(`${activatedAt}:${item.id}`),
     itemId: item.id,
     itemName: item.displayName,
     itemType: item.type,
     bundleName,
     activatedAt
   }));
+}
+
+function buildBoundedEventId(value: string): string {
+  if (value.length <= MAX_ACTIVITY_EVENT_ID_LENGTH) return value;
+  const suffix = stableTextHash(value);
+  return `${value.slice(0, MAX_ACTIVITY_EVENT_ID_LENGTH - suffix.length - 1)}:${suffix}`;
+}
+
+function stableTextHash(value: string): string {
+  let first = 0x811c9dc5;
+  let second = 0x9e3779b9;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    first = Math.imul(first ^ code, 0x01000193);
+    second = Math.imul(second ^ code, 0x85ebca6b);
+  }
+  return `${(first >>> 0).toString(16).padStart(8, "0")}${(second >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): BundleExpansion {
@@ -307,7 +428,7 @@ function sanitizeAliases(value: unknown): Record<string, string> {
     .flatMap(([key, alias]) => {
       const safeKey = sanitizeString(key, MAX_ITEM_ID_LENGTH);
       const safeAlias = sanitizeString(alias, MAX_ALIAS_LENGTH);
-      return safeKey && safeAlias ? [[safeKey, safeAlias] as const] : [];
+      return safeKey && isSafeRecordKey(safeKey) && safeAlias ? [[safeKey, safeAlias] as const] : [];
     });
   return Object.fromEntries(entries);
 }
@@ -324,22 +445,50 @@ function sanitizeUsageStats(value: unknown): QuickPimSettings["usageStatsByItemI
         return [];
       }
       const safeKey = sanitizeString(key, MAX_ITEM_ID_LENGTH);
-      if (!safeKey) {
+      if (!safeKey || !isSafeRecordKey(safeKey)) {
         return [];
       }
       const activationCount = clampInteger(stats.activationCount, 0, 100000, 0);
       const lastUsedAt = sanitizeString(stats.lastUsedAt, 64);
+      const byInstallationId = sanitizeInstallationUsageStats(stats.byInstallationId);
+      const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
+      const legacyActivationCount = clampInteger(
+        stats.legacyActivationCount,
+        0,
+        100000,
+        Math.max(0, activationCount - knownTotal)
+      );
+      const normalizedTotal = Math.min(100000, legacyActivationCount + knownTotal);
       return [
         [
           safeKey,
           {
-            activationCount,
-            ...(lastUsedAt ? { lastUsedAt } : {})
+            activationCount: normalizedTotal,
+            ...(lastUsedAt ? { lastUsedAt } : {}),
+            ...(legacyActivationCount ? { legacyActivationCount } : {}),
+            ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
           }
         ] as const
       ];
     });
   return Object.fromEntries(entries);
+}
+
+function sanitizeInstallationUsageStats(value: unknown): NonNullable<UsageStats["byInstallationId"]> {
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value)
+      .slice(0, 20)
+      .flatMap(([installationId, entry]) => {
+        if (!isRecord(entry)) return [];
+        const safeId = sanitizeString(installationId, 80);
+        const activationCount = clampInteger(entry.activationCount, 0, 100000, 0);
+        const lastUsedAt = sanitizeString(entry.lastUsedAt, 64);
+        return safeId && isSafeRecordKey(safeId) && activationCount
+          ? [[safeId, { activationCount, ...(lastUsedAt ? { lastUsedAt } : {}) }] as const]
+          : [];
+      })
+  );
 }
 
 function sanitizeFavoriteItemIds(value: unknown): string[] {
@@ -571,10 +720,18 @@ function sanitizeActivityHistory(
         ...(durationHours ? { durationHours } : {}),
         ...(sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) ? { bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) } : {}),
         ...(sanitizeUserJustification(entry.justification) ? { justification: sanitizeUserJustification(entry.justification) } : {}),
-        ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {})
+        ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {}),
+        ...(sanitizeString(entry.sourceInstallationId, 80) ? { sourceInstallationId: sanitizeString(entry.sourceInstallationId, 80) } : {}),
+        ...(sanitizeString(entry.sourceDeviceName, 60) ? { sourceDeviceName: sanitizeString(entry.sourceDeviceName, 60) } : {})
       }
     ];
   });
+}
+
+function latestIsoTimestamp(left: string | undefined, right: string | undefined): string | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return left.localeCompare(right) >= 0 ? left : right;
 }
 
 function migrateActivationHistoryToActivity(value: unknown): ActivityHistoryEntry[] {

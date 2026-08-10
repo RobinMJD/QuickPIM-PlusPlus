@@ -9,6 +9,15 @@ afterEach(() => {
 });
 
 describe("portal token collector", () => {
+  test("bounds IndexedDB reads so one portal database cannot stall later scans", () => {
+    const collector = readFileSync(join(process.cwd(), "public/portalTokenCollector.js"), "utf8");
+
+    expect(collector).toContain("const INDEXED_DB_OPEN_TIMEOUT_MS = 1000;");
+    expect(collector).toContain("const INDEXED_DB_STORE_TIMEOUT_MS = 1500;");
+    expect(collector).toContain("timeout = setTimeout(() => finish(undefined), INDEXED_DB_OPEN_TIMEOUT_MS);");
+    expect(collector).toContain("}, INDEXED_DB_STORE_TIMEOUT_MS);");
+  });
+
   test("forced scans resubmit unchanged tokens and wait for background capture", async () => {
     const token = createJwt({
       aud: "https://graph.microsoft.com",
@@ -55,7 +64,8 @@ describe("portal token collector", () => {
     expect(sendResponse).not.toHaveBeenCalled();
     expect(runtimeSendMessage.mock.calls[1][0]).toMatchObject({
       action: "capturePortalTokens",
-      tokens: [token]
+      tokens: [token],
+      source: "Microsoft Entra portal storage"
     });
 
     pendingCaptureResponse?.({ success: true, data: { captured: ["graph"] } });
