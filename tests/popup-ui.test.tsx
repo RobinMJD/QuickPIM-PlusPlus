@@ -29,6 +29,7 @@ describe("Edge Chrome Web Store migration guard", () => {
     await import("../src/popup/main");
     await waitFor(() => expect(document.body.textContent).toContain("Use the Edge Add-ons edition"));
 
+    expect(document.querySelector(".edge-store-migration-icon")).toBeNull();
     expect(document.querySelector('[role="tablist"]')).toBeNull();
     expect(document.body.textContent).not.toContain("Download settings and history");
     expect(document.querySelector<HTMLAnchorElement>(`a[href="${EDGE_ADDONS_URL}"]`)).toBeTruthy();

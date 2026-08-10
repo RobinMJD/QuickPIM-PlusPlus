@@ -3179,10 +3179,10 @@ describe("settings journey safeguards", () => {
     } as unknown as File;
     Object.defineProperty(fileInput, "files", { configurable: true, value: [stagedFile] });
     fileInput.dispatchEvent(new Event("change", { bubbles: true }));
-    await waitFor(() => expect(document.body.textContent).toContain("loaded for review"));
+    await waitFor(() => expect(document.body.textContent).toContain("is loaded but has not been restored yet"));
     expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).preferences.darkMode).toBe(false);
     expect(editor.value).toContain('"darkMode": true');
-    clickExactButton("Save changes");
+    clickExactButton("Apply loaded backup");
     await waitFor(() => expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).preferences.darkMode).toBe(true));
     await waitFor(() => expect(getExactButton("Save changes").disabled).toBe(true));
 

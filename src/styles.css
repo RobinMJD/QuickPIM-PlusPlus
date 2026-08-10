@@ -100,18 +100,6 @@ button {
   line-height: 1.5;
 }
 
-.edge-store-migration-icon {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 50%;
-  background: #e5e7eb;
-  color: #475569;
-  font-size: 20px;
-  font-weight: 800;
-}
-
 .migration-backup-step,
 .migration-steps {
   width: min(100%, 440px);
@@ -1631,6 +1619,16 @@ a.btn {
   border-color: #fca5a5;
   background: #fef2f2;
   color: #991b1b;
+}
+
+.settings-confirmation.warning {
+  border-color: #fbbf24;
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.backup-staged-confirmation {
+  margin-top: 12px;
 }
 
 .role-access-page {
@@ -3741,11 +3739,6 @@ body.dark-mode .distribution-check-shell {
   color: #a8b5c7;
 }
 
-body.dark-mode .edge-store-migration-icon {
-  background: #334155;
-  color: #cbd5e1;
-}
-
 body.dark-mode .settings-shell {
   --settings-page-bg: #0b1220;
   --settings-surface: #172033;
@@ -3903,6 +3896,12 @@ body.dark-mode .settings-danger-zone {
   border-color: #dc2626;
   background: #450a0a;
   color: #fecaca;
+}
+
+body.dark-mode .settings-confirmation.warning {
+  border-color: #d97706;
+  background: #451a03;
+  color: #fde68a;
 }
 
 body.dark-mode .backup-dirty-state {

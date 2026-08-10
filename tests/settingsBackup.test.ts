@@ -76,4 +76,44 @@ describe("settings backup", () => {
     expect(hasPortableSettingsData(used)).toBe(true);
     expect(JSON.parse(stringifySettingsBackup(used)).savedJustifications).toEqual(["Approved change CHG0001"]);
   });
+
+  test("round-trips portable data and preserves disabled feature tabs", () => {
+    const configured = structuredClone(DEFAULT_SETTINGS);
+    configured.aliasesByItemId = { "directoryRole:role-1:/": "Daily admin" };
+    configured.favoriteItemIds = ["directoryRole:role-1:/"];
+    configured.savedJustifications = ["Approved maintenance CHG0001"];
+    configured.recentJustifications = ["Investigate incident INC0001"];
+    configured.bundles = [{
+      id: "bundle-1",
+      name: "Daily bundle",
+      itemIds: ["directoryRole:role-1:/"],
+      defaultDurationHours: 1,
+      defaultJustification: "Approved maintenance CHG0001"
+    }];
+    configured.usageStatsByItemId = {
+      "directoryRole:role-1:/": { activationCount: 3, legacyActivationCount: 3 }
+    };
+    configured.activityHistory = [{
+      id: "activity-1",
+      action: "activate",
+      itemId: "directoryRole:role-1:/",
+      itemName: "Application Administrator",
+      itemType: "directoryRole",
+      scopeLabel: "Tenant",
+      result: "success",
+      requestedAt: "2026-08-10T10:00:00.000Z",
+      completedAt: "2026-08-10T10:00:01.000Z"
+    }];
+    configured.preferences.enabledFeatures = ["directoryRole", "pimGroup", "bundles"];
+    configured.preferences.autoEnabledFeaturesInitialized = true;
+
+    const restored = validateSettingsBackup(
+      stringifySettingsBackup(configured),
+      structuredClone(DEFAULT_SETTINGS)
+    );
+
+    expect(restored.error).toBeUndefined();
+    expect(restored.settings).toEqual(configured);
+    expect(restored.settings?.preferences.enabledFeatures).not.toContain("azureRole");
+  });
 });

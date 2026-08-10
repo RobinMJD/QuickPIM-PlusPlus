@@ -2131,7 +2131,6 @@ function PopupApp() {
           </div>
         </header>
         <section className="edge-store-migration" aria-labelledby="edge-store-migration-title">
-          <div className="edge-store-migration-icon" aria-hidden="true">E</div>
           <h2 id="edge-store-migration-title">Use the Edge Add-ons edition</h2>
           <p>
             This copy came from the Chrome Web Store. QuickPIM++ disables it in Microsoft Edge so you do not keep two separate installations with different updates and local data.

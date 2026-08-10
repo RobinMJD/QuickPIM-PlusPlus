@@ -122,7 +122,7 @@ class ConcurrentDeviceStorage extends MemoryStorage {
         name: "Concurrent device",
         browser: "Google Chrome",
         platform: "Linux",
-        appVersion: "2.16.4",
+        appVersion: "2.16.5",
         lastSyncAt: 1_001,
         syncEnabled: true,
         nameUpdatedAt: 1_001
@@ -449,7 +449,7 @@ describe("native browser sync", () => {
         name: `Device ${index}`,
         browser: "Google Chrome",
         platform: "Windows",
-        appVersion: "2.16.4",
+        appVersion: "2.16.5",
         lastSyncAt: index + 1,
         syncEnabled: true,
         nameUpdatedAt: index + 1
@@ -471,7 +471,7 @@ describe("native browser sync", () => {
         name: "Invalid date device",
         browser: "Google Chrome",
         platform: "Windows",
-        appVersion: "2.16.4",
+        appVersion: "2.16.5",
         lastSyncAt: Number.MAX_VALUE,
         syncEnabled: true,
         nameUpdatedAt: Number.MAX_VALUE

@@ -1,8 +1,8 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.16.4.
+Reviewed for v2.16.5.
 
-## v2.16.4 Audit Outcome
+## v2.16.5 Audit Outcome
 
 The repository, built extension, browser permissions, token lifecycle, Microsoft API request paths, runtime messages, imported and synchronized data, reset behavior, release workflows, and dependencies were reviewed. The audit found and fixed:
 

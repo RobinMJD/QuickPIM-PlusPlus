@@ -3602,6 +3602,7 @@ function DataPanel({
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [actionMessage, setActionMessage] = useState("");
+  const [stagedFileName, setStagedFileName] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
   const validation = useMemo(() => validateSettingsBackup(exportText, settings), [exportText, settings]);
   const isDirty = exportText !== exportBaselineText;
@@ -3616,6 +3617,7 @@ function DataPanel({
     }
     if (await onSave(validation.settings, "Settings restored from JSON.")) {
       setExportText(JSON.stringify(validation.settings, null, 2), false);
+      setStagedFileName("");
     }
   }
 
@@ -3667,7 +3669,7 @@ function DataPanel({
       }
       const formatted = JSON.stringify(JSON.parse(text) as unknown, null, 2);
       setExportText(formatted, formatted !== exportBaselineText);
-      setActionMessage(`${file.name} loaded for review. Save changes to apply it.`);
+      setStagedFileName(file.name);
     } catch (fileError) {
       onError(fileError instanceof Error ? fileError.message : String(fileError));
     } finally {
@@ -3679,6 +3681,7 @@ function DataPanel({
     onClearMessage();
     onError("");
     setActionMessage("Saved settings reloaded.");
+    setStagedFileName("");
     setExportText(exportBaselineText, false);
   }
 
@@ -3687,6 +3690,7 @@ function DataPanel({
     if (await onSave(DEFAULT_SETTINGS, "Settings reset to defaults.")) {
       setExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2), false);
       setActionMessage("");
+      setStagedFileName("");
     }
   }
 
@@ -3695,7 +3699,7 @@ function DataPanel({
       <div className="panel-title-row">
         <div>
           <h2>Backup & Restore</h2>
-          <p className="muted">Copy, download, review, or restore the settings stored locally under {SETTINGS_KEY}.</p>
+          <p className="muted">Copy, download, review, or restore portable QuickPIM++ data. Backups include preferences, aliases, favorites, bundles, justifications, counters, and activity history. Access tokens and temporary caches are intentionally excluded.</p>
         </div>
         <span className={`backup-dirty-state ${isDirty ? "dirty" : "saved"}`}>{isDirty ? "Unsaved JSON changes" : "Matches saved settings"}</span>
       </div>
@@ -3721,6 +3725,15 @@ function DataPanel({
           aria-label="Load QuickPIM++ settings JSON file"
         />
       </div>
+      {stagedFileName && isDirty && validation.settings ? (
+        <div className="settings-confirmation warning backup-staged-confirmation" role="status">
+          <span><strong>{stagedFileName}</strong> is loaded but has not been restored yet.</span>
+          <button className="btn primary" onClick={() => void saveEditor()}>
+            <SaveIcon />
+            <span>Apply loaded backup</span>
+          </button>
+        </div>
+      ) : null}
       {externalChange && isDirty ? <p className="message warning settings-inline-message">Saved settings changed elsewhere. Reload to use the latest saved version, or save this editor to replace it.</p> : null}
       {validation.error ? <p className="message error settings-inline-message" role="alert">{validation.error}</p> : null}
       {actionMessage ? <p className="message success settings-inline-message" role="status">{actionMessage}</p> : null}
@@ -3731,9 +3744,12 @@ function DataPanel({
           className="textarea code-box"
           value={exportText}
           spellCheck={false}
-          onChange={(event) => setExportText(event.target.value, event.target.value !== exportBaselineText)}
+          onChange={(event) => {
+            setStagedFileName("");
+            setExportText(event.target.value, event.target.value !== exportBaselineText);
+          }}
         />
-        <p className="muted">This editor is not autosaved. Save changes to apply valid JSON to this browser.</p>
+        <p className="muted">Loading a file does not change this installation until you apply it. Manual editor changes are also not autosaved.</p>
       </div>
       <div className="button-row settings-form-actions backup-editor-actions">
         <button className="btn primary" disabled={!isDirty || !validation.settings} onClick={() => void saveEditor()}>
