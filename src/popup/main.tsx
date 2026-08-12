@@ -75,7 +75,7 @@ import {
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
-import { getActivationItemIdentity } from "../lib/activationIdentity";
+import { getActivationItemIdentity, normalizeActivationItemId } from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
 import {
   EDGE_ADDONS_URL,
@@ -401,7 +401,10 @@ function PopupApp() {
   );
   const activatableItemCount = useMemo(() => getActivatableItems(displayItems).length, [displayItems]);
   const itemsById = useMemo(() => new Map(
-    displayItems.flatMap((item) => [[item.id, item] as const, [item.id.toLowerCase(), item] as const])
+    displayItems.flatMap((item) => [
+      [item.id, item] as const,
+      [normalizeActivationItemId(item.id), item] as const
+    ])
   ), [displayItems]);
   const enabledFeatures = useMemo(() => new Set<QuickPimFeature>(settings.preferences.enabledFeatures || []), [settings.preferences.enabledFeatures]);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings.preferences.enabledFeatures]);
@@ -420,7 +423,10 @@ function PopupApp() {
     }
     return tabs;
   }, [enabledFeatures, roleTabs]);
-  const favoriteIds = useMemo(() => new Set(settings.favoriteItemIds || []), [settings.favoriteItemIds]);
+  const favoriteIds = useMemo(
+    () => new Set((settings.favoriteItemIds || []).map(normalizeActivationItemId)),
+    [settings.favoriteItemIds]
+  );
   const selectedItems = useMemo(
     () => {
       const items = [...selectedIds].map((id) => getItemByPersistedId(itemsById, id)).filter((item): item is ActivationItem => Boolean(item));
@@ -1434,12 +1440,13 @@ function PopupApp() {
   }
 
   async function toggleFavorite(itemId: string) {
+    const canonicalId = normalizeActivationItemId(itemId);
     try {
       await mutatePopupSettings((latest) => ({
         ...latest,
-        favoriteItemIds: latest.favoriteItemIds.includes(itemId)
-          ? latest.favoriteItemIds.filter((id) => id !== itemId)
-          : [itemId, ...latest.favoriteItemIds]
+        favoriteItemIds: latest.favoriteItemIds.some((id) => normalizeActivationItemId(id) === canonicalId)
+          ? latest.favoriteItemIds.filter((id) => normalizeActivationItemId(id) !== canonicalId)
+          : [canonicalId, ...latest.favoriteItemIds]
       }));
     } catch (saveError) {
       setActivationFailureNotice(null);
@@ -1529,11 +1536,13 @@ function PopupApp() {
       const operationItems = operation.itemIds
         .map((id) => getItemByPersistedId(itemsById, id))
         .filter((item): item is ActivationItem => Boolean(item));
-      const successfulIds = new Set(response.results.filter((result) => result.success).map((result) => result.itemId));
-      const failedIds = new Set(response.errors.map((result) => result.itemId));
+      const successfulIds = new Set(response.results
+        .filter((result) => result.success)
+        .map((result) => normalizeActivationItemId(result.itemId)));
+      const failedIds = new Set(response.errors.map((result) => normalizeActivationItemId(result.itemId)));
       const failedSelectionIds = operation.itemIds.flatMap((id) => {
         const item = getItemByPersistedId(itemsById, id);
-        return item && failedIds.has(id) ? [item.id] : [];
+        return item && failedIds.has(normalizeActivationItemId(id)) ? [item.id] : [];
       });
       const successCount = successfulIds.size;
       const failureNotice = response.errors.length
@@ -1544,12 +1553,17 @@ function PopupApp() {
       setActivationFailureNotice(failureNotice);
       setSelectedIds((current) => {
         const next = new Set(
-          [...current].filter((id) => !successfulIds.has(id))
+          [...current].filter((id) => !successfulIds.has(normalizeActivationItemId(id)))
         );
         failedSelectionIds.forEach((id) => next.add(id));
         return next;
       });
-      setMessage(formatRequestConfirmation(operationLabel, successCount, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        operationLabel,
+        successCount,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
 
       await recordCompletedOperationActivity(operation, operationItems, response);
 
@@ -1749,7 +1763,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => activatableItems.find((item) => item.id === result.itemId))
+        .map((result) => activatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
         .filter((item): item is ActivationItem => Boolean(item));
 
       await mutatePopupSettings((latest) => {
@@ -1797,7 +1811,12 @@ function PopupApp() {
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
-      setMessage(formatRequestConfirmation("activation", successItems.length, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        "activation",
+        successItems.length,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
       if (failureNotice) {
         setActivationProgress(null);
       } else {
@@ -1900,7 +1919,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => deactivatableItems.find((item) => item.id === result.itemId))
+        .map((result) => deactivatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
@@ -1957,7 +1976,12 @@ function PopupApp() {
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
-      setMessage(formatRequestConfirmation("deactivation", successItems.length, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        "deactivation",
+        successItems.length,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
       if (failureNotice) {
         setActivationProgress(null);
       } else {
@@ -3303,16 +3327,27 @@ function formatBundleDuration(durationHours: number | undefined): string {
   return `${durationHours} hour${durationHours === 1 ? "" : "s"}`;
 }
 
-function formatRequestConfirmation(requestType: "activation" | "deactivation", successCount: number, errorCount: number): string {
+function formatRequestConfirmation(
+  requestType: "activation" | "deactivation",
+  successCount: number,
+  errorCount: number,
+  trackingUnavailableCount = 0
+): string {
   const itemLabel = (count: number) => `item${count === 1 ? "" : "s"}`;
   const noun = requestType === "deactivation" ? "Deactivation" : "Activation";
   if (successCount && !errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.${formatTrackingUnavailable(trackingUnavailableCount)}`;
   }
   if (successCount && errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.${formatTrackingUnavailable(trackingUnavailableCount)}`;
   }
   return `${noun} failed for ${errorCount} ${itemLabel(errorCount)}.`;
+}
+
+function formatTrackingUnavailable(count: number): string {
+  return count > 0
+    ? ` Microsoft accepted ${count === 1 ? "it" : "them"}, but did not return ${count === 1 ? "a tracking ID" : "tracking IDs"}; verify status in Microsoft PIM.`
+    : "";
 }
 
 function scrollPopupToTop(): void {
@@ -3343,7 +3378,7 @@ function getItemByPersistedId(
   itemsById: ReadonlyMap<string, ActivationItem>,
   itemId: string
 ): ActivationItem | undefined {
-  return itemsById.get(itemId) || itemsById.get(itemId.toLowerCase());
+  return itemsById.get(itemId) || itemsById.get(normalizeActivationItemId(itemId));
 }
 
 function setsEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {

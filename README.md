@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.16.5**
+Current version: **v2.17.0**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -24,7 +24,7 @@ QuickPIM++ brings those eligible assignments into one focused popup. Search for 
 - **Policy-aware requests**: only valid durations are offered; justification, ticket, and approval requirements appear when relevant.
 - **Clear active access**: see live remaining time, local expiry, request status, and early-disable availability.
 - **Repeatable workflows**: favorites, aliases, saved reasons, recent history, and activation bundles reduce repetitive work.
-- **Browser-account sync**: useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity can follow official Chrome or Edge installations. Each installation has a stable generated ID that can be renamed, and activity records retain their source computer.
+- **Browser-account sync**: useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity can follow official Chrome or Edge installations. Each installation has a stable generated ID that can be renamed, concurrent field and event changes are reconciled without double-counting, and activity records retain their source computer.
 - **Local-first design**: no dedicated app registration, manual token entry, or developer-controlled backend.
 - **Correct browser edition**: Edge users are guided to the Edge Add-ons edition with a direct, local settings-and-history migration path.
 
@@ -89,7 +89,7 @@ QuickPIM++ does not run a developer-controlled service and does not ask you to c
 
 - Validated Microsoft portal tokens stay in browser session storage and are cleared when the browser session ends.
 - Tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission stay local to the installation.
-- Useful preferences and bounded convenience data can use the browser account's extension sync service. Sync is enabled by default, can be disabled per installation, and can be purged from Settings.
+- Useful preferences and bounded convenience data can use the browser account's extension sync service. Sync is enabled by default, can be disabled per installation, and can be purged from Settings. Complete generations are validated before use, concurrent writers are reconciled on a following pass, and quota-limited cloud snapshots never replace a complete local history with a truncated copy.
 - Chrome Sync and Microsoft Edge Sync are separate services; Backup & Restore moves data between browser families.
 - Microsoft PIM operations go directly to Microsoft Graph or Azure Management.
 - The public GitHub API is used only to display project release information in Settings.

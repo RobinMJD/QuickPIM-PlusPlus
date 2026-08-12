@@ -1,8 +1,8 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.16.5.
+Reviewed for v2.17.0.
 
-## v2.16.5 Audit Outcome
+## v2.17.0 Audit Outcome
 
 The repository, built extension, browser permissions, token lifecycle, Microsoft API request paths, runtime messages, imported and synchronized data, reset behavior, release workflows, and dependencies were reviewed. The audit found and fixed:
 
@@ -14,6 +14,8 @@ The repository, built extension, browser permissions, token lifecycle, Microsoft
 `npm audit --audit-level=low` reported zero known dependency vulnerabilities. No tracked credentials or private-key material were found.
 
 Browser Sync uses immutable activity event identifiers and per-installation monotonic counters to merge concurrent local activity without silently overwriting another installation. It is not a distributed lock: Microsoft remains authoritative when separate browsers submit the same role request at the same time.
+
+The v2.17.0 Browser Sync review additionally validates complete snapshot generations before applying them, accounts for the browser's real JSON storage quota, preserves complete local categories when the cloud copy is truncated, merges concurrent bundle fields and per-installation usage changes, and retries transient delivery failures without making Settings unavailable. A written generation is acknowledged only after it is read back, so a competing last-writer manifest is reconciled on the next pass instead of hiding a local edit.
 
 ## Threat Model
 
@@ -57,9 +59,9 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Popup draft mutations and learned reference-name mutations are serialized; learned names are merged by timestamp so concurrent refresh completion cannot restore stale data.
 - Captured tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission remain local to the installation.
 - Official Chrome and Edge Store editions can synchronize a bounded, sanitized subset of preferences, aliases, favorites, justifications, bundles, usage, and recent activity through the browser account's extension sync service. Chrome Sync and Microsoft Edge Sync remain separate ecosystems. Random per-installation IDs and user-defined device labels attribute activity without requesting a hostname.
-- Browser sync is enabled by default but controlled per installation. Synced data can be purged with a tombstone that pauses other installations before payload keys are removed, preventing an older installation from immediately recreating deleted data.
+- Browser sync is enabled by default but controlled per installation. Synced data can be purged with independent monotonic purge and resume markers that cannot overwrite each other at the storage-item level. Active purge markers pause other installations before payload keys are removed, reject stale snapshot epochs, and retire stale installation heartbeats on reconciliation.
 - A full extension reset requires that browser-sync data is purged first. If the cloud purge cannot be confirmed, local data is left intact and the reset reports an error instead of claiming completion.
-- Sync payloads use category timestamps, deterministic sanitization, bounded chunks, quota headroom for atomic-generation replacement, per-installation device records, event-union activity merging, and per-installation monotonic usage counters. Tokens and Microsoft request identifiers are never included.
+- Sync payloads use category timestamps, deferred three-way baselines, deterministic sanitization, bounded chunks, real JSON storage-byte accounting, quota headroom for atomic-generation replacement, per-installation device records, event-union activity merging, and per-installation monotonic usage counters. Clock revisions that cannot be ordered safely keep the local edit pending. Corrupt, partially delivered, stale-epoch, or unsupported generations and control records are rejected without replacing local settings. Tokens and Microsoft request identifiers are never included.
 - Tracked request records keep only bounded request identifiers, item metadata, lifecycle state, local justification and ticket text, continuation links, and sanitized diagnostics. Tokens and raw Microsoft API payloads are never persisted in request history.
 - Request records are matched to the captured tenant and principal before status calls are made. Microsoft API URLs remain constrained to the existing Graph and Azure Management allowlists.
 - Browser notifications require an optional permission requested only when the user enables request notifications; the feature is disabled by default and request tracking remains usable without it.
@@ -83,5 +85,6 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - QuickPIM++ intentionally relies on captured portal tokens. Session-only storage reduces persistence, but a compromised live browser profile or extension context could still expose current-session tokens.
 - QuickPIM++ does not download Microsoft signing keys or perform local JWT signature verification. Captured candidates remain provisional until Microsoft Graph or Azure Management accepts them; a forged storage value cannot gain Microsoft privileges, but could temporarily disrupt local token selection until it is rejected or replaced.
 - Browser extension sync storage is provided by the signed-in browser account and is not treated as encrypted secret storage. Synced data deliberately excludes tokens and live request state, but saved justifications and activity metadata may still be visible to that browser account's sync infrastructure.
+- Browser sync is eventually consistent and subject to the provider's transport, policy, and quota limits. Chrome Sync and Microsoft Edge Sync do not exchange extension data with each other; the extension preserves complete local data and exposes Backup & Restore when a bounded cloud category cannot be transported in full.
 - Azure RBAC authorization is enforced server-side by Azure; QuickPIM++ can detect captured Azure Management tokens but cannot prove every target scope has sufficient RBAC until an API call is made.
 - Authentication-context-protected activations may still require interactive portal steps outside the extension.

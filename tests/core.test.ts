@@ -472,6 +472,51 @@ describe("settings helpers", () => {
     expect(imported.preferences).not.toHaveProperty("showAdvancedSettings");
   });
 
+  test("counts valid imported entries instead of letting malformed values consume collection limits", () => {
+    const aliasesByItemId = Object.fromEntries([
+      ...Array.from({ length: 300 }, (_, index) => [`bad-${index}`, ""]),
+      ["DirectoryRole:VALID:/", "Valid alias"]
+    ]);
+    const bundles = [
+      ...Array.from({ length: 50 }, (_, index) => ({ id: `empty-${index}`, name: "", itemIds: [] })),
+      { id: "bundle:valid", name: "Valid", itemIds: ["PimGroup:GROUP-1:Member"] }
+    ];
+
+    const imported = mergeSettings({ aliasesByItemId, bundles });
+
+    expect(imported.aliasesByItemId).toEqual({ "directoryRole:valid:/": "Valid alias" });
+    expect(imported.bundles).toEqual([
+      expect.objectContaining({ id: "bundle:valid", itemIds: ["pimGroup:group-1:member"] })
+    ]);
+  });
+
+  test("normalizes case-insensitive role identifiers and rejects invalid imported timestamps", () => {
+    const imported = mergeSettings({
+      aliasesByItemId: {
+        "DirectoryRole:Reader:/": "First",
+        "directoryrole:reader:/": "Latest"
+      },
+      favoriteItemIds: ["DirectoryRole:Reader:/", "directoryrole:reader:/"],
+      usageStatsByItemId: {
+        "DirectoryRole:Reader:/": { activationCount: 2, lastUsedAt: "not-a-date" }
+      },
+      activityHistory: [{
+        id: "invalid-time",
+        action: "activate",
+        result: "success",
+        itemId: "DirectoryRole:Reader:/",
+        itemName: "Reader",
+        itemType: "directoryRole",
+        requestedAt: "not-a-date"
+      }]
+    });
+
+    expect(imported.aliasesByItemId).toEqual({ "directoryRole:reader:/": "Latest" });
+    expect(imported.favoriteItemIds).toEqual(["directoryRole:reader:/"]);
+    expect(imported.usageStatsByItemId["directoryRole:reader:/"]).toMatchObject({ activationCount: 2 });
+    expect(imported.activityHistory).toEqual([]);
+  });
+
   test("migrates a saved sorter without a direction to its natural direction", () => {
     const imported = mergeSettings({
       preferences: {

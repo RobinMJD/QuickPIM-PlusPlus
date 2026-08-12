@@ -1705,6 +1705,12 @@ a.btn {
   color: #166534;
 }
 
+.sync-capability-badge.waiting {
+  border-color: #93c5fd;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
 .sync-capability-badge.limited {
   border-color: #fcd34d;
   background: #fef3c7;
@@ -1720,8 +1726,138 @@ a.btn {
   margin: 4px 0 10px;
 }
 
+.sync-control-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+}
+
 .sync-master-toggle {
-  margin-bottom: 12px;
+  margin: 0;
+}
+
+.sync-verification-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--settings-border-soft);
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-verification-summary > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sync-verification-summary strong {
+  color: var(--settings-text);
+  font-size: 12px;
+}
+
+.sync-verification-summary span {
+  color: var(--settings-muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.sync-verification-summary.verified {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.sync-verification-summary.waiting {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.sync-verification-chip {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 10px !important;
+  font-weight: 800;
+}
+
+.sync-verification-chip.verified {
+  background: #dcfce7;
+  color: #166534 !important;
+}
+
+.sync-verification-chip.waiting {
+  background: #dbeafe;
+  color: #1d4ed8 !important;
+}
+
+.sync-verification-chip.off {
+  background: #e2e8f0;
+  color: #475569 !important;
+}
+
+.sync-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 12px;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-facts > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sync-facts dt {
+  color: var(--settings-muted);
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.sync-facts dd {
+  margin: 0;
+  color: var(--settings-text);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.sync-help-details {
+  margin-top: 10px;
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-help-details summary {
+  padding: 9px 12px;
+  color: var(--settings-text);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.sync-help-details > div {
+  padding: 0 12px 11px;
+  color: var(--settings-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.sync-help-details p,
+.sync-help-details ol {
+  margin: 0 0 7px;
+}
+
+.sync-help-details ol {
+  padding-left: 18px;
 }
 
 .sync-status-grid,
@@ -1790,6 +1926,24 @@ a.btn {
 
 .sync-id-help {
   margin: 8px 0 0;
+}
+
+.sync-other-installations {
+  margin-top: 14px;
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--settings-field);
+}
+
+.sync-other-installations h4,
+.sync-other-installations > p {
+  margin: 0;
+}
+
+.sync-other-installations h4 {
+  margin-bottom: 4px;
+  color: var(--settings-text);
+  font-size: 12px;
 }
 
 .sync-device-list {
@@ -4032,10 +4186,36 @@ body.dark-mode .sync-capability-badge.ready {
   color: #dcfce7;
 }
 
+body.dark-mode .sync-capability-badge.waiting {
+  border-color: #2563eb;
+  background: #172554;
+  color: #bfdbfe;
+}
+
 body.dark-mode .sync-capability-badge.limited {
   border-color: #a16207;
   background: #422006;
   color: #fef3c7;
+}
+
+body.dark-mode .sync-verification-summary.verified {
+  border-color: #15803d;
+  background: #052e16;
+}
+
+body.dark-mode .sync-verification-summary.waiting {
+  border-color: #1d4ed8;
+  background: #172554;
+}
+
+body.dark-mode .sync-verification-chip.verified {
+  background: #14532d;
+  color: #dcfce7 !important;
+}
+
+body.dark-mode .sync-verification-chip.waiting {
+  background: #1e3a8a;
+  color: #dbeafe !important;
 }
 
 body.dark-mode .initial-access-arrow {
@@ -4539,10 +4719,19 @@ body.dark-mode .autosave-status.error {
   }
 
   .sync-status-grid,
+  .sync-facts,
   .sync-scope-grid,
   .sync-device-name-row,
   .sync-device-row {
     grid-template-columns: 1fr;
+  }
+
+  .sync-control-header {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-control-header .btn {
+    width: max-content;
   }
 
   .sync-device-row > div:last-child {

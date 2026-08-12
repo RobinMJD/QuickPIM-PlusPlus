@@ -24,8 +24,10 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("assignmentType");
   });
 
-  test("keeps Azure roles from successful subscriptions when another subscription fails", () => {
-    expect(background).toContain("assertAtLeastOneSubscriptionSucceeded");
+  test("loads subscription and management-group Azure scopes while retaining partial results", () => {
+    expect(background).toContain("assertAtLeastOneAzureScopeSucceeded");
+    expect(background).toContain("/providers/Microsoft.Management/managementGroups?api-version=2020-05-01");
+    expect(background).toContain("PartialActivationDataError");
     expect(background).toContain('graphApiUrl("/v1.0/$batch")');
     expect(background).toContain("GRAPH_BATCH_REQUEST_LIMIT = 20");
     expect(background).toContain('results.every((result) => result.status === "rejected")');
@@ -50,13 +52,18 @@ describe("Microsoft PIM API contracts", () => {
   });
 
   test("reacts to per-installation browser sync records and queues local edits made during sync", () => {
-    expect(background).toContain("Object.keys(changes).some(isBrowserSyncDeviceStorageKey)");
+    expect(background).toContain("isBrowserSyncPayloadStorageKey(key)");
+    expect(background).toContain("isBrowserSyncDeviceStorageKey(key)");
     expect(background).toContain("runBrowserSync(true)");
     expect(background).toContain("browserSyncFollowUpRequested = true");
+    expect(background).toContain("BROWSER_SYNC_TRANSIENT_RETRY_MINUTES");
+    expect(background).toContain("isTransientBrowserSyncError(status.lastError)");
+    expect(background).not.toContain("await initializeBrowserSync();\n      return status;");
   });
 
   test("tracks submitted requests with bounded Microsoft status checks", () => {
     expect(background).toContain("persistTrackedSubmissionsBestEffort");
+    expect(background).toContain("getAllowedResponseLocation");
     expect(background).toContain("roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')");
     expect(background).toContain("privilegedAccess/group/assignmentScheduleRequests?");
     expect(background).toContain("REQUEST_TRACKING_AZURE_CONCURRENCY");

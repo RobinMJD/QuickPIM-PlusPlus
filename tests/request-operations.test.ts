@@ -8,7 +8,8 @@ import {
   failRequestOperation,
   getRequestOperationFingerprint,
   loadRequestOperations,
-  sanitizeRequestOperations
+  sanitizeRequestOperations,
+  touchRequestOperation
 } from "../src/lib/requestOperations";
 
 const NOW = Date.parse("2026-07-22T10:00:00.000Z");
@@ -42,6 +43,33 @@ describe("background request operation journal", () => {
     expect(getRequestOperationFingerprint({ ...original, ticketInfo: {} })).toBe(
       getRequestOperationFingerprint(original)
     );
+    expect(getRequestOperationFingerprint({
+      ...original,
+      itemIds: original.itemIds.map((itemId) => itemId.toUpperCase())
+    })).toBe(getRequestOperationFingerprint(original));
+  });
+
+  test("does not let a late heartbeat revert a completed operation", async () => {
+    const data: Record<string, unknown> = {};
+    const storage = makeStorage(data);
+    await beginRequestOperation({
+      id: "request_operation_heartbeat",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      startedAt: NOW
+    }, { storage, now: NOW });
+    await completeRequestOperation("request_operation_heartbeat", {
+      success: true,
+      results: [{ itemId: "directoryRole:reader:/", itemName: "Reader", success: true }],
+      errors: []
+    }, { storage, now: NOW + 1_000 });
+
+    await touchRequestOperation("request_operation_heartbeat", { storage, now: NOW + 2_000 });
+
+    expect(await loadRequestOperations({ storage, now: NOW + 2_000 })).toEqual([
+      expect.objectContaining({ state: "complete", updatedAt: NOW + 1_000 })
+    ]);
   });
 
   test("persists a running request and its completed response until the popup acknowledges it", async () => {

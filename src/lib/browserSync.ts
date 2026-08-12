@@ -15,19 +15,30 @@ import type { ActivityHistoryEntry, QuickPimPreferences, QuickPimSettings, Usage
 export const BROWSER_SYNC_ALARM_NAME = "quickPimBrowserSync";
 export const BROWSER_SYNC_LOCAL_STATE_KEY = "quickPimBrowserSyncState.v1";
 export const BROWSER_SYNC_CONTROL_KEY = "quickPimSync.control.v1";
+export const BROWSER_SYNC_PURGE_KEY = "quickPimSync.purge.v1";
+export const BROWSER_SYNC_EPOCH_KEY = "quickPimSync.epoch.v1";
 export const BROWSER_SYNC_MANIFEST_KEY = "quickPimSync.manifest.v1";
 export const BROWSER_SYNC_DEVICES_KEY = "quickPimSync.devices.v1";
 export const BROWSER_SYNC_KEY_PREFIX = "quickPimSync.";
 export const BROWSER_SYNC_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const BROWSER_SYNC_VERIFICATION_FRESHNESS_MS = 7 * 24 * 60 * 60 * 1000;
 
 const BROWSER_SYNC_CHUNK_PREFIX = "quickPimSync.chunk.v1.";
 const BROWSER_SYNC_DEVICE_PREFIX = "quickPimSync.device.v1.";
-const BROWSER_SYNC_CHUNK_BYTES = 7_000;
-const BROWSER_SYNC_ORPHAN_GRACE_MS = 5 * 60_000;
+const BROWSER_SYNC_ATOMIC_GENERATION_MARKER = "a1";
+// Chrome measures sync quota from the JSON-stringified value plus its key.
+// Keep each chunk below the 8 KiB per-item ceiling and the complete payload
+// small enough for the previous and next generations to coexist atomically.
+const BROWSER_SYNC_CHUNK_QUOTA_BYTES = 8_000;
+const BROWSER_SYNC_ORPHAN_GRACE_MS = 48 * 60 * 60_000;
+const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 10 * 60_000;
+const BROWSER_SYNC_READ_RETRY_DELAYS_MS = [50, 200] as const;
+const MAX_SYNC_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
+const SYNC_VERIFICATION_FUTURE_TOLERANCE_MS = 5 * 60_000;
 const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
 // Keep enough headroom for the previous generation, device registry, and
 // manifest while a replacement snapshot is being committed.
-const BROWSER_SYNC_PAYLOAD_BYTES = 44_000;
+const BROWSER_SYNC_PAYLOAD_QUOTA_BYTES = 42_000;
 const MAX_SYNC_DEVICES = 20;
 const MAX_DEVICE_NAME_LENGTH = 60;
 const MAX_SYNC_ACTIVITY_ENTRIES = 100;
@@ -105,6 +116,16 @@ interface BrowserSyncControl {
   epochAt?: number;
 }
 
+interface BrowserSyncPurgeMarker {
+  version: 1;
+  purgedAt: number;
+}
+
+interface BrowserSyncEpochMarker {
+  version: 1;
+  epochAt: number;
+}
+
 export interface BrowserSyncDevice {
   installationId: string;
   name: string;
@@ -136,7 +157,10 @@ export interface BrowserSyncLocalState {
   lastAppliedPurgeAt?: number;
   categoryHashes: Partial<Record<SyncCategoryName, string>>;
   categoryUpdatedAt: Partial<Record<SyncCategoryName, number>>;
+  categoryBaselines?: Partial<Record<SyncCategoryName, unknown>>;
+  pendingCategoryBaselines?: Partial<Record<SyncCategoryName, unknown>>;
   omittedCategories?: SyncCategoryName[];
+  incompleteCategories?: SyncCategoryName[];
 }
 
 export interface BrowserSyncInstallationIdentity {
@@ -162,6 +186,9 @@ export interface BrowserSyncStatus {
   reminderDue: boolean;
   suspendedByPurge: boolean;
   devices: BrowserSyncDevice[];
+  crossDeviceState: "off" | "waiting" | "verified";
+  otherInstallationCount: number;
+  lastOtherInstallationSyncAt?: number;
   omittedCategories: string[];
 }
 
@@ -250,6 +277,8 @@ export async function initializeBrowserSyncAccess(sync: StorageAreaLike | undefi
 export async function getBrowserSyncInstallationIdentity(
   apis: Pick<BrowserSyncApis, "local" | "distribution" | "platform">
 ): Promise<BrowserSyncInstallationIdentity> {
+  const stored = await readStoredBrowserSyncInstallationIdentity(apis.local);
+  if (stored) return stored;
   return withBrowserSyncOperationLock(() => getBrowserSyncInstallationIdentityUnlocked(apis));
 }
 
@@ -263,6 +292,16 @@ async function getBrowserSyncInstallationIdentityUnlocked(
   };
 }
 
+async function readStoredBrowserSyncInstallationIdentity(
+  local: StorageAreaLike
+): Promise<BrowserSyncInstallationIdentity | undefined> {
+  const value = (await local.get(BROWSER_SYNC_LOCAL_STATE_KEY))[BROWSER_SYNC_LOCAL_STATE_KEY];
+  if (!isRecord(value)) return undefined;
+  const installationId = sanitizeInstallationId(value.installationId);
+  const deviceName = sanitizeDeviceName(value.deviceName);
+  return installationId && deviceName ? { installationId, deviceName } : undefined;
+}
+
 export function formatBrowserSyncInstallationId(installationId: string): string {
   const compact = installationId.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
   return compact ? `QP-${compact.slice(0, 8)}` : "QP-UNKNOWN";
@@ -272,6 +311,14 @@ export function isBrowserSyncDeviceStorageKey(key: string): boolean {
   return key === BROWSER_SYNC_DEVICES_KEY || key.startsWith(BROWSER_SYNC_DEVICE_PREFIX);
 }
 
+export function isBrowserSyncPayloadStorageKey(key: string): boolean {
+  return key === BROWSER_SYNC_CONTROL_KEY
+    || key === BROWSER_SYNC_PURGE_KEY
+    || key === BROWSER_SYNC_EPOCH_KEY
+    || key === BROWSER_SYNC_MANIFEST_KEY
+    || key.startsWith(BROWSER_SYNC_CHUNK_PREFIX);
+}
+
 export async function getBrowserSyncStatus(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
   return withBrowserSyncOperationLock(() => getBrowserSyncStatusUnlocked(apis));
 }
@@ -279,9 +326,25 @@ export async function getBrowserSyncStatus(apis: BrowserSyncApis): Promise<Brows
 async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
-  const control = apis.sync ? await loadControl(apis.sync) : { version: 1 as const };
-  const registry = apis.sync ? await loadDeviceRegistry(apis.sync) : { version: 1 as const, devices: [] };
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
+  let control: BrowserSyncControl = { version: 1 };
+  let registry: BrowserSyncDeviceRegistry = { version: 1, devices: [] };
+  let statusReadError: string | undefined;
+  if (apis.sync) {
+    try {
+      [control, registry] = await Promise.all([
+        loadControl(apis.sync, now),
+        loadDeviceRegistry(apis.sync, now)
+      ]);
+    } catch (error) {
+      // A transient browser-sync outage must not make Settings unusable or
+      // conceal the last locally recorded state. The next alarm or manual sync
+      // can retry without touching local settings.
+      statusReadError = sanitizeSyncError(error);
+    }
+  }
+  const otherDevices = registry.devices.filter((device) => device.installationId !== state.installationId);
+  const activeOtherDevices = otherDevices.filter((device) => isRecentlyActiveSyncDevice(device, now));
   const suspendedByPurge = Boolean(control.purgedAt && control.purgedAt > (state.lastAppliedPurgeAt || 0) && (control.epochAt || 0) <= control.purgedAt);
   return {
     ...capability,
@@ -291,14 +354,24 @@ async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<Brow
     platform: normalizePlatform(apis.platform || detectPlatform()),
     lastSyncAt: state.lastSyncAt,
     lastSuccessAt: state.lastSuccessAt,
-    lastError: state.lastError,
+    lastError: state.lastError || statusReadError,
     reminderMode: state.reminderMode,
     reminderDue: !capability.supported
       && state.reminderMode !== "never"
       && (!state.lastReminderAt || now - state.lastReminderAt >= BROWSER_SYNC_REMINDER_INTERVAL_MS),
     suspendedByPurge,
     devices: registry.devices,
-    omittedCategories: state.omittedCategories || []
+    crossDeviceState: !capability.supported || !state.enabled
+      ? "off"
+      : activeOtherDevices.length
+        ? "verified"
+        : "waiting",
+    otherInstallationCount: activeOtherDevices.length,
+    lastOtherInstallationSyncAt: otherDevices[0]?.lastSyncAt,
+    omittedCategories: [...new Set([
+      ...(state.omittedCategories || []),
+      ...(state.incompleteCategories || [])
+    ])]
   };
 }
 
@@ -309,7 +382,7 @@ export async function synchronizeBrowserData(apis: BrowserSyncApis): Promise<Bro
 async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
-  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   if (!capability.supported || !apis.sync || !state.enabled) {
     return getBrowserSyncStatusUnlocked(apis);
   }
@@ -317,35 +390,52 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
   const sync = apis.sync;
   try {
     await initializeBrowserSyncAccess(sync);
-    state = await reconcileLocalDeviceName(apis.local, sync, state);
-    const control = await loadControl(sync);
-    if (control.purgedAt && control.purgedAt > (state.lastAppliedPurgeAt || 0) && (control.epochAt || 0) <= control.purgedAt) {
-      state = {
-        ...state,
-        enabled: false,
-        lastAppliedPurgeAt: control.purgedAt,
-        lastError: "Synced data was deleted from another installation. Sync is paused until you enable it again."
-      };
-      await saveLocalState(apis.local, state);
+    state = await reconcileLocalDeviceName(apis.local, sync, state, now);
+    const control = await loadControl(sync, now);
+    if (isActiveBrowserSyncPurge(control)) {
+      state = await pauseBrowserSyncAfterPurge(apis.local, sync, state, control.purgedAt || 0, now);
       return getBrowserSyncStatusUnlocked(apis);
     }
 
     const epochAt = control.epochAt || 0;
-    const remote = await readRemoteSnapshot(sync, epochAt);
+    const remote = await readRemoteSnapshot(sync, epochAt, now);
+    const acknowledgedPendingBaseline = Boolean(
+      remote?.manifest.generation
+      && state.lastRemoteGeneration === remote.manifest.generation
+      && state.pendingCategoryBaselines
+    );
+    const mergeBaselines = acknowledgedPendingBaseline
+      ? state.pendingCategoryBaselines || state.categoryBaselines
+      : state.categoryBaselines;
+    const incompleteCategories = reconcileIncompleteCategories(state, remote);
     let merged: BrowserSyncSnapshot = { version: 1, categories: {} };
     let mergedHashes: Partial<Record<SyncCategoryName, string>> = {};
+    let mergedValues: Partial<Record<SyncCategoryName, unknown>> = {};
     await mutateSettingsInStorage(apis.local, (latestSettings) => {
       const localSnapshot = buildLocalSnapshot(latestSettings, state, now, remote?.snapshot);
-      merged = mergeSnapshots(localSnapshot.snapshot, remote?.snapshot);
+      merged = mergeSnapshots(
+        localSnapshot.snapshot,
+        remote?.snapshot,
+        mergeBaselines,
+        remote?.manifest.omittedCategories,
+        localSnapshot.changedCategories
+      );
       const mergedSettings = applySnapshotToSettings(latestSettings, merged);
+      merged = normalizeSnapshotValues(merged, mergedSettings);
       mergedHashes = getCategoryHashes(mergedSettings);
+      mergedValues = getSyncCategoryValues(mergedSettings);
       return mergedSettings;
     });
-    const fitted = fitSnapshotForSync(merged);
+    const fitted = fitSnapshotForSync(merged, incompleteCategories);
     const remoteHash = remote?.manifest.hash;
     const fittedHash = hashString(canonicalStringify(fitted.snapshot));
+    const omissionMetadataChanged = !valuesEqual(
+      sanitizeCategoryNames(remote?.manifest.omittedCategories),
+      fitted.omittedCategories
+    );
     let generation = remote?.manifest.generation;
-    if (fittedHash !== remoteHash) {
+    let wroteRemoteSnapshot = false;
+    if (fittedHash !== remoteHash || omissionMetadataChanged) {
       generation = await writeRemoteSnapshot(
         sync,
         fitted.snapshot,
@@ -355,6 +445,21 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
         remote?.manifest.generation,
         epochAt
       );
+      wroteRemoteSnapshot = true;
+    }
+
+    // A purge or resume can race with the snapshot work above. Re-read the
+    // monotonic coordination markers before acknowledging success or writing
+    // this installation's heartbeat. A stale snapshot is harmless because its
+    // epoch is rejected, but a stale device record would otherwise reappear
+    // after an explicit cloud purge.
+    const finalControl = await loadControl(sync, now);
+    if (isActiveBrowserSyncPurge(finalControl)) {
+      state = await pauseBrowserSyncAfterPurge(apis.local, sync, state, finalControl.purgedAt || 0, now);
+      return getBrowserSyncStatusUnlocked(apis);
+    }
+    if ((finalControl.epochAt || 0) > epochAt) {
+      throw new Error("Browser sync coordination changed temporarily during this run. QuickPIM++ will retry automatically.");
     }
 
     const mergedCategoryUpdatedAt = Object.fromEntries(
@@ -370,7 +475,15 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       lastRemoteGeneration: generation,
       categoryHashes: mergedHashes,
       categoryUpdatedAt: mergedCategoryUpdatedAt,
-      omittedCategories: fitted.omittedCategories
+      // Do not acknowledge a generation in the three-way merge baseline until
+      // a later pass reads it back. Another installation can commit a
+      // different generation immediately after this write; keeping the old
+      // baseline lets that follow-up merge both edits instead of treating the
+      // temporarily hidden local edit as already synchronized.
+      categoryBaselines: wroteRemoteSnapshot ? mergeBaselines : mergedValues,
+      pendingCategoryBaselines: wroteRemoteSnapshot ? mergedValues : undefined,
+      omittedCategories: fitted.omittedCategories,
+      incompleteCategories
     };
     await saveLocalState(apis.local, state);
     await updateDeviceRegistry(sync, state, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, true);
@@ -390,8 +503,9 @@ export async function setBrowserSyncEnabled(apis: BrowserSyncApis, enabled: bool
 }
 
 async function setBrowserSyncEnabledUnlocked(apis: BrowserSyncApis, enabled: boolean): Promise<BrowserSyncStatus> {
+  const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
-  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   if (enabled && !capability.supported) {
     throw new Error(capability.reason || "Browser sync is unavailable for this installation.");
   }
@@ -399,23 +513,42 @@ async function setBrowserSyncEnabledUnlocked(apis: BrowserSyncApis, enabled: boo
   await saveLocalState(apis.local, state);
   if (!apis.sync) return getBrowserSyncStatusUnlocked(apis);
 
-  const now = apis.now ?? Date.now();
   if (enabled) {
-    const control = await loadControl(apis.sync);
-    if (control.purgedAt && (control.epochAt || 0) <= control.purgedAt) {
-      await apis.sync.set({
-        [BROWSER_SYNC_CONTROL_KEY]: {
-          ...control,
-          version: 1,
-          epochAt: Math.max(now, control.purgedAt + 1)
-        } satisfies BrowserSyncControl
-      });
-      state = { ...state, lastAppliedPurgeAt: control.purgedAt };
+    try {
+      const control = await loadControl(apis.sync, now);
+      if (control.purgedAt && (control.epochAt || 0) <= control.purgedAt) {
+        const epochAt = nextSyncRevision(now, control.purgedAt, control.epochAt || 0);
+        if (epochAt <= control.purgedAt) {
+          throw new Error("Browser clocks are too far apart to resume sync safely. Correct the system clock, then retry.");
+        }
+        // Resume and purge use independent keys so concurrent operations
+        // cannot replace one another at the storage-item level. The legacy
+        // control record remains readable for safe upgrades from older builds.
+        await apis.sync.set({
+          [BROWSER_SYNC_EPOCH_KEY]: { version: 1, epochAt } satisfies BrowserSyncEpochMarker
+        });
+        state = { ...state, lastAppliedPurgeAt: control.purgedAt };
+        await saveLocalState(apis.local, state);
+      }
+    } catch (error) {
+      state = {
+        ...state,
+        lastError: `Browser sync is enabled locally, but cloud state could not be checked: ${sanitizeSyncError(error)}`
+      };
       await saveLocalState(apis.local, state);
+      return getBrowserSyncStatusUnlocked(apis);
     }
     return synchronizeBrowserDataUnlocked(apis);
   }
-  await updateDeviceRegistry(apis.sync, state, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, false);
+  try {
+    await updateDeviceRegistry(apis.sync, state, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, false);
+  } catch (error) {
+    state = {
+      ...state,
+      lastError: `Browser sync is off locally, but the cloud installation status could not be updated: ${sanitizeSyncError(error)}`
+    };
+    await saveLocalState(apis.local, state);
+  }
   return getBrowserSyncStatusUnlocked(apis);
 }
 
@@ -424,20 +557,44 @@ export async function updateBrowserSyncDeviceName(apis: BrowserSyncApis, name: s
 }
 
 async function updateBrowserSyncDeviceNameUnlocked(apis: BrowserSyncApis, name: string): Promise<BrowserSyncStatus> {
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
-  const deviceName = sanitizeDeviceName(name) || buildDefaultDeviceName(apis.distribution, apis.platform);
   const now = apis.now ?? Date.now();
-  const nextState = { ...state, deviceName, deviceNameUpdatedAt: Math.max(now, state.deviceNameUpdatedAt + 1) };
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
+  const deviceName = sanitizeDeviceName(name) || buildDefaultDeviceName(apis.distribution, apis.platform);
+  const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
+  let remoteDevice: BrowserSyncDevice | undefined;
+  let deliveryError: string | undefined;
+  if (apis.sync && state.enabled && capability.supported) {
+    try {
+      remoteDevice = await loadDeviceRecord(apis.sync, state.installationId, now);
+    } catch (error) {
+      deliveryError = sanitizeSyncError(error);
+    }
+  }
+  const nextState = {
+    ...state,
+    deviceName,
+    deviceNameUpdatedAt: nextSyncRevision(now, state.deviceNameUpdatedAt, remoteDevice?.nameUpdatedAt || 0),
+    lastError: deliveryError
+      ? `The installation name is saved locally, but could not be sent yet: ${deliveryError}`
+      : undefined
+  };
   await saveLocalState(apis.local, nextState);
-  if (apis.sync && state.enabled && getBrowserSyncCapability(apis.distribution, true).supported) {
-    await updateDeviceRegistry(
-      apis.sync,
-      nextState,
-      browserFamilyLabel(apis.distribution.browser),
-      normalizePlatform(apis.platform || detectPlatform()),
-      now,
-      state.enabled
-    );
+  if (apis.sync && state.enabled && capability.supported && !deliveryError) {
+    try {
+      await updateDeviceRegistry(
+        apis.sync,
+        nextState,
+        browserFamilyLabel(apis.distribution.browser),
+        normalizePlatform(apis.platform || detectPlatform()),
+        now,
+        state.enabled
+      );
+    } catch (error) {
+      await saveLocalState(apis.local, {
+        ...nextState,
+        lastError: `The installation name is saved locally, but could not be sent yet: ${sanitizeSyncError(error)}`
+      });
+    }
   }
   return getBrowserSyncStatusUnlocked(apis);
 }
@@ -459,21 +616,20 @@ async function renameBrowserSyncDeviceUnlocked(
   if (!apis.sync || !capability.supported) {
     throw new Error(capability.reason || "Browser sync storage is unavailable.");
   }
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  const now = apis.now ?? Date.now();
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   if (!state.enabled) {
     throw new Error("Enable Browser Sync on this installation before renaming another installation.");
   }
-  const safeId = sanitizeText(installationId, 80);
+  const safeId = sanitizeInstallationId(installationId);
   const deviceName = sanitizeDeviceName(name);
   if (!safeId || !deviceName) throw new Error("Choose a valid installation and name.");
-  const registry = await loadDeviceRegistry(apis.sync);
-  const device = registry.devices.find((entry) => entry.installationId === safeId);
+  const device = await loadDeviceRecord(apis.sync, safeId, now);
   if (!device) throw new Error("This installation is no longer present in browser sync.");
-  const now = apis.now ?? Date.now();
   const renamed = {
     ...device,
     name: deviceName,
-    nameUpdatedAt: Math.max(now, device.nameUpdatedAt + 1)
+    nameUpdatedAt: nextSyncRevision(now, device.nameUpdatedAt)
   };
   await apis.sync.set({ [deviceKey(safeId)]: renamed });
 
@@ -498,11 +654,12 @@ async function dismissBrowserSyncReminderUnlocked(
   apis: BrowserSyncApis,
   mode: BrowserSyncReminderMode
 ): Promise<BrowserSyncStatus> {
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  const now = apis.now ?? Date.now();
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   await saveLocalState(apis.local, {
     ...state,
     reminderMode: mode,
-    lastReminderAt: apis.now ?? Date.now()
+    lastReminderAt: now
   });
   return getBrowserSyncStatusUnlocked(apis);
 }
@@ -512,11 +669,12 @@ export async function markBrowserSyncReminderShown(apis: BrowserSyncApis): Promi
 }
 
 async function markBrowserSyncReminderShownUnlocked(apis: BrowserSyncApis): Promise<void> {
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  const now = apis.now ?? Date.now();
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   if (state.reminderMode === "never") return;
   await saveLocalState(apis.local, {
     ...state,
-    lastReminderAt: apis.now ?? Date.now()
+    lastReminderAt: now
   });
 }
 
@@ -529,24 +687,40 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
     throw new Error("Browser sync storage is unavailable.");
   }
   const now = apis.now ?? Date.now();
+  const currentControl = await loadControl(apis.sync, now);
+  const purgedAt = nextSyncRevision(now, currentControl.purgedAt || 0, currentControl.epochAt || 0);
+  if (purgedAt <= Math.max(currentControl.purgedAt || 0, currentControl.epochAt || 0)) {
+    throw new Error("Browser clocks are too far apart to purge synced data safely. Correct the system clock, then retry.");
+  }
   await apis.sync.set({
-    [BROWSER_SYNC_CONTROL_KEY]: { version: 1, purgedAt: now, epochAt: 0 } satisfies BrowserSyncControl
+    [BROWSER_SYNC_CONTROL_KEY]: { version: 1, purgedAt, epochAt: 0 } satisfies BrowserSyncControl,
+    [BROWSER_SYNC_PURGE_KEY]: { version: 1, purgedAt } satisfies BrowserSyncPurgeMarker
   });
   const all = await apis.sync.get(null);
-  const keys = Object.keys(all).filter((key) => key.startsWith(BROWSER_SYNC_KEY_PREFIX) && key !== BROWSER_SYNC_CONTROL_KEY);
+  const coordinationKeys = new Set([
+    BROWSER_SYNC_CONTROL_KEY,
+    BROWSER_SYNC_PURGE_KEY,
+    BROWSER_SYNC_EPOCH_KEY
+  ]);
+  const keys = Object.keys(all).filter((key) =>
+    key.startsWith(BROWSER_SYNC_KEY_PREFIX) && !coordinationKeys.has(key)
+  );
   if (keys.length) await apis.sync.remove(keys);
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform);
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   await saveLocalState(apis.local, {
     ...state,
     enabled: false,
-    lastAppliedPurgeAt: now,
+    lastAppliedPurgeAt: purgedAt,
     lastSyncAt: now,
     lastSuccessAt: undefined,
     lastRemoteGeneration: undefined,
     lastError: undefined,
     categoryHashes: {},
     categoryUpdatedAt: {},
-    omittedCategories: []
+    categoryBaselines: getSyncCategoryValues(DEFAULT_SETTINGS),
+    pendingCategoryBaselines: undefined,
+    omittedCategories: [],
+    incompleteCategories: []
   });
   return getBrowserSyncStatusUnlocked(apis);
 }
@@ -556,6 +730,16 @@ export function sanitizeBrowserSyncStatus(value: unknown): BrowserSyncStatus | n
   const capability = value.capability === "available" || value.capability === "limited" || value.capability === "unavailable"
     ? value.capability
     : value.supported ? "available" : "limited";
+  const now = Date.now();
+  const devices = sanitizeDevices(value.devices, now);
+  const installationId = sanitizeInstallationId(value.installationId);
+  const otherDevices = devices.filter((device) => device.installationId !== installationId);
+  const activeOtherDevices = otherDevices.filter((device) => isRecentlyActiveSyncDevice(device, now));
+  const crossDeviceState = !value.supported || !value.enabled
+    ? "off"
+    : activeOtherDevices.length
+      ? "verified"
+      : "waiting";
   return {
     capability,
     supported: value.supported,
@@ -564,19 +748,23 @@ export function sanitizeBrowserSyncStatus(value: unknown): BrowserSyncStatus | n
     sourceLabel: sanitizeText(value.sourceLabel, 80) || "Unknown installation",
     ecosystemLabel: sanitizeText(value.ecosystemLabel, 80) || undefined,
     reason: sanitizeText(value.reason, 400) || undefined,
-    installationId: sanitizeText(value.installationId, 80),
+    installationId,
     deviceName: sanitizeDeviceName(value.deviceName) || "This installation",
     platform: sanitizeText(value.platform, 80) || "Unknown platform",
-    lastSyncAt: sanitizeTimestamp(value.lastSyncAt),
-    lastSuccessAt: sanitizeTimestamp(value.lastSuccessAt),
+    lastSyncAt: sanitizeTimestamp(value.lastSyncAt, now),
+    lastSuccessAt: sanitizeTimestamp(value.lastSuccessAt, now),
     lastError: sanitizeText(value.lastError, 300) || undefined,
     reminderMode: value.reminderMode === "never" ? "never" : "daily",
     reminderDue: value.reminderDue === true,
     suspendedByPurge: value.suspendedByPurge === true,
-    devices: sanitizeDevices(value.devices),
-    omittedCategories: Array.isArray(value.omittedCategories)
-      ? value.omittedCategories.filter((item): item is string => typeof item === "string").slice(0, SYNC_CATEGORY_NAMES.length)
-      : []
+    devices,
+    crossDeviceState,
+    otherInstallationCount: Math.min(
+      MAX_SYNC_DEVICES,
+      Math.max(0, activeOtherDevices.length)
+    ),
+    lastOtherInstallationSyncAt: sanitizeTimestamp(value.lastOtherInstallationSyncAt, now) || otherDevices[0]?.lastSyncAt,
+    omittedCategories: sanitizeCategoryNames(value.omittedCategories)
   };
 }
 
@@ -588,52 +776,256 @@ function buildLocalSnapshot(
 ) {
   const values = getSyncCategoryValues(settings);
   const categories: Partial<Record<SyncCategoryName, SyncCategory>> = {};
+  const changedCategories = new Set<SyncCategoryName>();
   const defaultHashes = getCategoryHashes(DEFAULT_SETTINGS);
   const hashes = getCategoryHashes(settings);
   for (const name of SYNC_CATEGORY_NAMES) {
-    const changed = state.categoryHashes[name] !== hashes[name];
+    const hasKnownLocalHash = state.categoryHashes[name] !== undefined;
+    const changed = hasKnownLocalHash
+      ? state.categoryHashes[name] !== hashes[name]
+      : hashes[name] !== defaultHashes[name];
+    if (changed) changedCategories.add(name);
     const initialTimestamp = hashes[name] === defaultHashes[name] ? 0 : now;
-    const changedTimestamp = Math.max(
-      now,
-      (state.categoryUpdatedAt[name] || 0) + 1,
-      (remote?.categories[name]?.updatedAt || 0) + 1
+    const inheritedRemote = !changed && !hasKnownLocalHash ? remote?.categories[name] : undefined;
+    const previousRevision = Math.max(
+      state.categoryUpdatedAt[name] || 0,
+      remote?.categories[name]?.updatedAt || 0
     );
+    const changedTimestamp = nextSyncRevision(
+      now,
+      previousRevision
+    );
+    if (changed && changedTimestamp <= previousRevision) {
+      throw new Error("Browser clocks are too far apart to order this settings change safely. QuickPIM++ kept the local change; correct the system clock, then retry sync.");
+    }
     categories[name] = {
       updatedAt: changed
         ? state.categoryHashes[name] === undefined && initialTimestamp === 0 ? 0 : changedTimestamp
-        : state.categoryUpdatedAt[name] || initialTimestamp,
-      updatedBy: state.installationId,
+        : inheritedRemote?.updatedAt ?? state.categoryUpdatedAt[name] ?? initialTimestamp,
+      updatedBy: inheritedRemote?.updatedBy || state.installationId,
       value: values[name]
     };
   }
-  return { snapshot: { version: 1 as const, categories }, hashes };
+  return { snapshot: { version: 1 as const, categories }, hashes, changedCategories };
 }
 
-function mergeSnapshots(local: BrowserSyncSnapshot, remote?: BrowserSyncSnapshot): BrowserSyncSnapshot {
+function mergeSnapshots(
+  local: BrowserSyncSnapshot,
+  remote?: BrowserSyncSnapshot,
+  baselines: Partial<Record<SyncCategoryName, unknown>> = {},
+  remoteOmittedCategories: SyncCategoryName[] = [],
+  localChangedCategories = new Set<SyncCategoryName>()
+): BrowserSyncSnapshot {
   if (!remote) return local;
   const categories: BrowserSyncSnapshot["categories"] = {};
+  const incompleteRemote = new Set(remoteOmittedCategories);
   for (const name of SYNC_CATEGORY_NAMES) {
     const localCategory = local.categories[name];
     const remoteCategory = remote.categories[name];
     if (!localCategory) categories[name] = remoteCategory;
     else if (!remoteCategory) categories[name] = localCategory;
-    else if (name === "activityHistory") {
-      categories[name] = mergeActivityHistoryCategories(localCategory, remoteCategory);
+    else if (incompleteRemote.has(name) && !localChangedCategories.has(name) && name === "activityHistory") {
+      categories[name] = mergeActivityHistoryCategoriesAdditively(localCategory, remoteCategory);
+    } else if (incompleteRemote.has(name) && !localChangedCategories.has(name) && name === "usageStatsByItemId") {
+      categories[name] = mergeUsageCategoriesAdditively(localCategory, remoteCategory);
+    } else if (incompleteRemote.has(name) && !localChangedCategories.has(name) && name === "recentJustifications") {
+      categories[name] = mergeIncompleteStringListCategories(localCategory, remoteCategory);
+    } else if (name === "activityHistory") {
+      categories[name] = mergeActivityHistoryCategories(localCategory, remoteCategory, baselines[name]);
     } else if (name === "usageStatsByItemId") {
-      categories[name] = mergeUsageCategories(localCategory, remoteCategory);
-    }
-    else if (localCategory.updatedAt !== remoteCategory.updatedAt) {
-      categories[name] = localCategory.updatedAt > remoteCategory.updatedAt ? localCategory : remoteCategory;
+      categories[name] = mergeUsageCategories(localCategory, remoteCategory, baselines[name]);
     } else {
-      categories[name] = localCategory.updatedBy.localeCompare(remoteCategory.updatedBy) >= 0 ? localCategory : remoteCategory;
+      categories[name] = mergeBaselineAwareCategory(name, localCategory, remoteCategory, baselines[name]);
     }
   }
   return { version: 1, categories };
 }
 
-function mergeActivityHistoryCategories(local: SyncCategory, remote: SyncCategory): SyncCategory {
+function normalizeSnapshotValues(snapshot: BrowserSyncSnapshot, settings: QuickPimSettings): BrowserSyncSnapshot {
+  const values = getSyncCategoryValues(settings);
+  return {
+    version: 1,
+    categories: Object.fromEntries(SYNC_CATEGORY_NAMES.flatMap((name) => {
+      const category = snapshot.categories[name];
+      return category ? [[name, { ...category, value: values[name] }] as const] : [];
+    }))
+  };
+}
+
+function mergeIncompleteStringListCategories(local: SyncCategory, remote: SyncCategory): SyncCategory {
+  const localValues = Array.isArray(local.value) ? local.value.filter((item): item is string => typeof item === "string") : [];
+  const remoteValues = Array.isArray(remote.value) ? remote.value.filter((item): item is string => typeof item === "string") : [];
+  const winner = chooseCategoryMetadata(local, remote);
+  const ordered = winner === local
+    ? [...localValues, ...remoteValues]
+    : [...remoteValues, ...localValues];
+  return {
+    ...winner,
+    value: ordered.filter((value, index) => ordered.indexOf(value) === index)
+  };
+}
+
+function mergeBaselineAwareCategory(
+  name: SyncCategoryName,
+  local: SyncCategory,
+  remote: SyncCategory,
+  baseline: unknown
+): SyncCategory {
+  if (valuesEqual(local.value, remote.value)) return { ...chooseCategoryMetadata(local, remote), value: local.value };
+  if (baseline === undefined) return chooseCategoryMetadata(local, remote);
+  if (valuesEqual(local.value, baseline)) return remote;
+  if (valuesEqual(remote.value, baseline)) return local;
+
+  const winner = chooseCategoryMetadata(local, remote);
+  const localWins = winner === local;
+  let value: unknown;
+  if (name === "preferences" || name === "aliasesByItemId") {
+    value = mergeRecordCategory(baseline, local.value, remote.value, localWins);
+  } else if (name === "favoriteItemIds" || name === "savedJustifications" || name === "recentJustifications") {
+    value = mergeStringListCategory(baseline, local.value, remote.value, localWins);
+  } else if (name === "bundles") {
+    value = mergeBundleCategory(baseline, local.value, remote.value, localWins);
+  } else {
+    value = winner.value;
+  }
+  return { ...winner, value: sanitizeSyncCategoryValue(name, value) ?? winner.value };
+}
+
+function mergeRecordCategory(baseline: unknown, local: unknown, remote: unknown, localWins: boolean): Record<string, unknown> {
+  const baseRecord = isRecord(baseline) ? baseline : {};
+  const localRecord = isRecord(local) ? local : {};
+  const remoteRecord = isRecord(remote) ? remote : {};
+  const merged: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(baseRecord), ...Object.keys(localRecord), ...Object.keys(remoteRecord)])) {
+    if (!isSafeRecordKey(key)) continue;
+    const baseValue = Object.hasOwn(baseRecord, key) ? baseRecord[key] : MISSING_VALUE;
+    const localValue = Object.hasOwn(localRecord, key) ? localRecord[key] : MISSING_VALUE;
+    const remoteValue = Object.hasOwn(remoteRecord, key) ? remoteRecord[key] : MISSING_VALUE;
+    const resolved = key === "enabledFeatures" && Array.isArray(localValue) && Array.isArray(remoteValue)
+      ? mergeStringListCategory(Array.isArray(baseValue) ? baseValue : [], localValue, remoteValue, localWins)
+      : resolveThreeWayValue(baseValue, localValue, remoteValue, localWins);
+    if (resolved !== MISSING_VALUE) merged[key] = structuredClone(resolved);
+  }
+  return sortObject(merged);
+}
+
+function mergeStringListCategory(baseline: unknown, local: unknown, remote: unknown, localWins: boolean): string[] {
+  const baseValues = Array.isArray(baseline) ? baseline.filter((item): item is string => typeof item === "string") : [];
+  const localValues = Array.isArray(local) ? local.filter((item): item is string => typeof item === "string") : [];
+  const remoteValues = Array.isArray(remote) ? remote.filter((item): item is string => typeof item === "string") : [];
+  const baseSet = new Set(baseValues);
+  const localSet = new Set(localValues);
+  const remoteSet = new Set(remoteValues);
+  const included = new Set<string>();
+  for (const value of new Set([...baseValues, ...localValues, ...remoteValues])) {
+    const resolved = resolveThreeWayValue(baseSet.has(value), localSet.has(value), remoteSet.has(value), localWins);
+    if (resolved === true) included.add(value);
+  }
+  return [...(localWins ? localValues : remoteValues), ...(localWins ? remoteValues : localValues), ...baseValues]
+    .filter((value, index, values) => included.has(value) && values.indexOf(value) === index);
+}
+
+function mergeBundleCategory(baseline: unknown, local: unknown, remote: unknown, localWins: boolean): unknown[] {
+  const toMap = (value: unknown) => new Map(
+    (Array.isArray(value) ? value : [])
+      .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.id === "string")
+      .map((item) => [item.id as string, item])
+  );
+  const baseMap = toMap(baseline);
+  const localMap = toMap(local);
+  const remoteMap = toMap(remote);
+  const merged = new Map<string, unknown>();
+  for (const id of new Set([...baseMap.keys(), ...localMap.keys(), ...remoteMap.keys()])) {
+    const resolved = mergeBundleValue(
+      baseMap.has(id) ? baseMap.get(id) : MISSING_VALUE,
+      localMap.has(id) ? localMap.get(id) : MISSING_VALUE,
+      remoteMap.has(id) ? remoteMap.get(id) : MISSING_VALUE,
+      localWins
+    );
+    if (resolved !== MISSING_VALUE) merged.set(id, structuredClone(resolved));
+  }
+  const winnerOrder = localWins ? [...localMap.keys()] : [...remoteMap.keys()];
+  const loserOrder = localWins ? [...remoteMap.keys()] : [...localMap.keys()];
+  return [...winnerOrder, ...loserOrder, ...baseMap.keys()]
+    .filter((id, index, ids) => merged.has(id) && ids.indexOf(id) === index)
+    .map((id) => merged.get(id));
+}
+
+function mergeBundleValue(
+  baseline: unknown,
+  local: unknown,
+  remote: unknown,
+  localWins: boolean
+): unknown {
+  if (valuesEqual(local, remote)) return local;
+  if (valuesEqual(local, baseline)) return remote;
+  if (valuesEqual(remote, baseline)) return local;
+  if (!isRecord(local) || !isRecord(remote)) return localWins ? local : remote;
+
+  const baseRecord = isRecord(baseline) ? baseline : {};
+  const merged: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(baseRecord), ...Object.keys(local), ...Object.keys(remote)])) {
+    if (!isSafeRecordKey(key)) continue;
+    const baseValue = Object.hasOwn(baseRecord, key) ? baseRecord[key] : MISSING_VALUE;
+    const localValue = Object.hasOwn(local, key) ? local[key] : MISSING_VALUE;
+    const remoteValue = Object.hasOwn(remote, key) ? remote[key] : MISSING_VALUE;
+    const fieldValue = key === "itemIds" && Array.isArray(localValue) && Array.isArray(remoteValue)
+      ? mergeStringListCategory(
+        Array.isArray(baseValue) ? baseValue : [],
+        localValue,
+        remoteValue,
+        localWins
+      )
+      : resolveThreeWayValue(baseValue, localValue, remoteValue, localWins);
+    if (fieldValue !== MISSING_VALUE) merged[key] = structuredClone(fieldValue);
+  }
+  return merged;
+}
+
+const MISSING_VALUE = Symbol("missing-sync-value");
+
+function resolveThreeWayValue(
+  baseline: unknown,
+  local: unknown,
+  remote: unknown,
+  localWins: boolean
+): unknown {
+  if (valuesEqual(local, remote)) return local;
+  if (valuesEqual(local, baseline)) return remote;
+  if (valuesEqual(remote, baseline)) return local;
+  return localWins ? local : remote;
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  if (left === MISSING_VALUE || right === MISSING_VALUE) return left === right;
+  return canonicalStringify(left) === canonicalStringify(right);
+}
+
+function mergeActivityHistoryCategories(local: SyncCategory, remote: SyncCategory, baseline: unknown): SyncCategory {
   const localEntries = sanitizeActivityHistoryValue(local.value);
   const remoteEntries = sanitizeActivityHistoryValue(remote.value);
+  if (baseline !== undefined) {
+    const baseMap = new Map(sanitizeActivityHistoryValue(baseline).map((entry) => [entry.id, entry]));
+    const localMap = new Map(localEntries.map((entry) => [entry.id, entry]));
+    const remoteMap = new Map(remoteEntries.map((entry) => [entry.id, entry]));
+    const winner = chooseCategoryMetadata(local, remote);
+    const entries: ActivityHistoryEntry[] = [];
+    for (const id of new Set([...baseMap.keys(), ...localMap.keys(), ...remoteMap.keys()])) {
+      const resolved = resolveThreeWayValue(
+        baseMap.has(id) ? baseMap.get(id) : MISSING_VALUE,
+        localMap.has(id) ? localMap.get(id) : MISSING_VALUE,
+        remoteMap.has(id) ? remoteMap.get(id) : MISSING_VALUE,
+        winner === local
+      );
+      if (resolved !== MISSING_VALUE) entries.push(structuredClone(resolved as ActivityHistoryEntry));
+    }
+    return {
+      ...winner,
+      value: entries
+        .sort((left, right) => activityTimestamp(right).localeCompare(activityTimestamp(left)) || right.id.localeCompare(left.id))
+        .slice(0, MAX_SYNC_ACTIVITY_ENTRIES)
+    };
+  }
   if (!localEntries.length && local.updatedAt > remote.updatedAt) return local;
   if (!remoteEntries.length && remote.updatedAt > local.updatedAt) return remote;
 
@@ -651,12 +1043,60 @@ function mergeActivityHistoryCategories(local: SyncCategory, remote: SyncCategor
   };
 }
 
-function mergeUsageCategories(local: SyncCategory, remote: SyncCategory): SyncCategory {
+function mergeActivityHistoryCategoriesAdditively(local: SyncCategory, remote: SyncCategory): SyncCategory {
+  const entries = new Map<string, ActivityHistoryEntry>();
+  for (const entry of [...sanitizeActivityHistoryValue(remote.value), ...sanitizeActivityHistoryValue(local.value)]) {
+    const existing = entries.get(entry.id);
+    if (!existing || compareActivityEntries(entry, existing) >= 0) entries.set(entry.id, entry);
+  }
+  return {
+    ...chooseCategoryMetadata(local, remote),
+    value: [...entries.values()]
+      .sort((left, right) => activityTimestamp(right).localeCompare(activityTimestamp(left)) || right.id.localeCompare(left.id))
+      .slice(0, MAX_SYNC_ACTIVITY_ENTRIES)
+  };
+}
+
+function mergeUsageCategories(local: SyncCategory, remote: SyncCategory, baseline: unknown): SyncCategory {
   const localStats = sanitizeUsageValue(local.value);
   const remoteStats = sanitizeUsageValue(remote.value);
+  if (baseline !== undefined) {
+    const baseStats = sanitizeUsageValue(baseline);
+    const winner = chooseCategoryMetadata(local, remote);
+    const merged: Record<string, UsageStats> = {};
+    for (const itemId of new Set([...Object.keys(baseStats), ...Object.keys(localStats), ...Object.keys(remoteStats)])) {
+      if (!isSafeRecordKey(itemId)) continue;
+      const base = baseStats[itemId];
+      const left = localStats[itemId];
+      const right = remoteStats[itemId];
+      const baseValue = base || MISSING_VALUE;
+      const leftValue = left || MISSING_VALUE;
+      const rightValue = right || MISSING_VALUE;
+      let resolved: unknown;
+      if (valuesEqual(leftValue, rightValue)) resolved = leftValue;
+      else if (valuesEqual(leftValue, baseValue)) resolved = rightValue;
+      else if (valuesEqual(rightValue, baseValue)) resolved = leftValue;
+      else resolved = mergeUsageStatsThreeWay(base, left, right, winner === local) || MISSING_VALUE;
+      if (resolved !== MISSING_VALUE) merged[itemId] = structuredClone(resolved as UsageStats);
+    }
+    return { ...winner, value: sortObject(merged) };
+  }
   if (!Object.keys(localStats).length && local.updatedAt > remote.updatedAt) return local;
   if (!Object.keys(remoteStats).length && remote.updatedAt > local.updatedAt) return remote;
 
+  const merged: Record<string, UsageStats> = {};
+  for (const itemId of new Set([...Object.keys(localStats), ...Object.keys(remoteStats)])) {
+    if (!isSafeRecordKey(itemId)) continue;
+    const left = localStats[itemId];
+    const right = remoteStats[itemId];
+    merged[itemId] = left && right ? mergeUsageStats(left, right) : structuredClone(left || right!);
+  }
+  return { ...chooseCategoryMetadata(local, remote), value: sortObject(merged) };
+}
+
+function mergeUsageCategoriesAdditively(local: SyncCategory, remote: SyncCategory): SyncCategory {
+  const localStats = sanitizeUsageValue(local.value);
+  const remoteStats = sanitizeUsageValue(remote.value);
   const merged: Record<string, UsageStats> = {};
   for (const itemId of new Set([...Object.keys(localStats), ...Object.keys(remoteStats)])) {
     if (!isSafeRecordKey(itemId)) continue;
@@ -700,6 +1140,88 @@ function mergeUsageStats(left: UsageStats, right: UsageStats): UsageStats {
     ...(legacyActivationCount ? { legacyActivationCount } : {}),
     ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
   };
+}
+
+function mergeUsageStatsThreeWay(
+  baseline: UsageStats | undefined,
+  local: UsageStats | undefined,
+  remote: UsageStats | undefined,
+  localWins: boolean
+): UsageStats | undefined {
+  const baselineByInstallation = baseline?.byInstallationId || {};
+  const localByInstallation = local?.byInstallationId || {};
+  const remoteByInstallation = remote?.byInstallationId || {};
+  const byInstallationId: NonNullable<UsageStats["byInstallationId"]> = {};
+
+  for (const installationId of new Set([
+    ...Object.keys(baselineByInstallation),
+    ...Object.keys(localByInstallation),
+    ...Object.keys(remoteByInstallation)
+  ])) {
+    if (!isSafeRecordKey(installationId)) continue;
+    const baseEntry = baselineByInstallation[installationId];
+    const localEntry = localByInstallation[installationId];
+    const remoteEntry = remoteByInstallation[installationId];
+    const count = resolveUsageCounter(
+      baseEntry?.activationCount,
+      localEntry?.activationCount,
+      remoteEntry?.activationCount,
+      localWins
+    );
+    if (!count) continue;
+    byInstallationId[installationId] = {
+      activationCount: count,
+      ...(latestTimestamp(localEntry?.lastUsedAt, remoteEntry?.lastUsedAt)
+        ? { lastUsedAt: latestTimestamp(localEntry?.lastUsedAt, remoteEntry?.lastUsedAt) }
+        : {})
+    };
+  }
+
+  const legacyActivationCount = resolveUsageCounter(
+    getLegacyUsageCount(baseline),
+    getLegacyUsageCount(local),
+    getLegacyUsageCount(remote),
+    localWins
+  ) || 0;
+  const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
+  const activationCount = Math.min(100000, legacyActivationCount + knownTotal);
+  if (!activationCount) return undefined;
+  return {
+    activationCount,
+    ...(latestTimestamp(local?.lastUsedAt, remote?.lastUsedAt)
+      ? { lastUsedAt: latestTimestamp(local?.lastUsedAt, remote?.lastUsedAt) }
+      : {}),
+    ...(legacyActivationCount ? { legacyActivationCount } : {}),
+    ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
+  };
+}
+
+function resolveUsageCounter(
+  baseline: number | undefined,
+  local: number | undefined,
+  remote: number | undefined,
+  localWins: boolean
+): number | undefined {
+  if (local === remote) return local;
+  if (local === baseline) return remote;
+  if (remote === baseline) return local;
+
+  // A reset removes the baseline count but must not erase activations that a
+  // different installation recorded concurrently.
+  if (local === undefined && remote !== undefined && baseline !== undefined && remote > baseline) {
+    return remote - baseline;
+  }
+  if (remote === undefined && local !== undefined && baseline !== undefined && local > baseline) {
+    return local - baseline;
+  }
+  if (local !== undefined && remote !== undefined) return Math.max(local, remote);
+  return localWins ? local : remote;
+}
+
+function getLegacyUsageCount(value: UsageStats | undefined): number | undefined {
+  if (!value) return undefined;
+  const known = Object.values(value.byInstallationId || {}).reduce((total, entry) => total + entry.activationCount, 0);
+  return value.legacyActivationCount ?? Math.max(0, value.activationCount - known);
 }
 
 function sanitizeActivityHistoryValue(value: unknown): ActivityHistoryEntry[] {
@@ -767,38 +1289,113 @@ function getCategoryHashes(settings: QuickPimSettings): Partial<Record<SyncCateg
   return Object.fromEntries(SYNC_CATEGORY_NAMES.map((name) => [name, hashString(canonicalStringify(values[name]))]));
 }
 
-function fitSnapshotForSync(snapshot: BrowserSyncSnapshot): { snapshot: BrowserSyncSnapshot; omittedCategories: SyncCategoryName[] } {
+function fitSnapshotForSync(
+  snapshot: BrowserSyncSnapshot,
+  incompleteCategories: SyncCategoryName[] = []
+): { snapshot: BrowserSyncSnapshot; omittedCategories: SyncCategoryName[] } {
   const fitted: BrowserSyncSnapshot = structuredClone(snapshot);
   const omittedCategories: SyncCategoryName[] = [];
-  for (const name of ["activityHistory", "usageStatsByItemId", "recentJustifications"] as SyncCategoryName[]) {
-    if (utf8Length(canonicalStringify(fitted)) <= BROWSER_SYNC_PAYLOAD_BYTES) break;
-    delete fitted.categories[name];
-    omittedCategories.push(name);
+  const markLimited = (name: SyncCategoryName) => {
+    if (!omittedCategories.includes(name)) omittedCategories.push(name);
+  };
+  for (const name of incompleteCategories) {
+    markLimited(name);
   }
-  if (utf8Length(canonicalStringify(fitted)) > BROWSER_SYNC_PAYLOAD_BYTES) {
+  const activityCategory = fitted.categories.activityHistory;
+  if (activityCategory && snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
+    const originalEntries = sanitizeActivityHistoryValue(activityCategory.value);
+    let entries = originalEntries;
+    while (entries.length > 10 && snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
+      entries = entries.slice(0, Math.max(10, Math.floor(entries.length * 0.8)));
+      activityCategory.value = entries;
+    }
+    if (entries.length < originalEntries.length) markLimited("activityHistory");
+  }
+  for (const name of ["usageStatsByItemId", "recentJustifications"] as SyncCategoryName[]) {
+    if (snapshotStoragePayloadBytes(fitted) <= BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) break;
+    delete fitted.categories[name];
+    markLimited(name);
+  }
+  if (activityCategory && snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
+    let entries = sanitizeActivityHistoryValue(activityCategory.value);
+    while (entries.length > 1 && snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
+      entries = entries.slice(0, Math.max(1, Math.floor(entries.length * 0.7)));
+      activityCategory.value = entries;
+    }
+    markLimited("activityHistory");
+  }
+  if (snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES && fitted.categories.activityHistory) {
+    delete fitted.categories.activityHistory;
+    markLimited("activityHistory");
+  }
+  if (snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
     throw new Error("Portable settings exceed the browser sync quota. Reduce aliases or bundle size, or use Backup & Restore.");
   }
   return { snapshot: fitted, omittedCategories };
 }
 
+function reconcileIncompleteCategories(
+  state: BrowserSyncLocalState,
+  remote: { manifest: BrowserSyncManifest; snapshot: BrowserSyncSnapshot } | undefined
+): SyncCategoryName[] {
+  const incomplete = new Set(state.incompleteCategories || []);
+  if (!remote) return [...incomplete];
+
+  for (const name of SYNC_CATEGORY_NAMES) {
+    if (remote.snapshot.categories[name] && !(remote.manifest.omittedCategories || []).includes(name)) {
+      incomplete.delete(name);
+    }
+  }
+  for (const name of remote.manifest.omittedCategories || []) {
+    const locallyOmittedCompleteCopy = (state.omittedCategories || []).includes(name) && !incomplete.has(name);
+    if (!locallyOmittedCompleteCopy) incomplete.add(name);
+  }
+  return SYNC_CATEGORY_NAMES.filter((name) => incomplete.has(name));
+}
+
 async function readRemoteSnapshot(
   sync: StorageAreaLike,
-  minimumEpochAt = 0
+  minimumEpochAt = 0,
+  now = Date.now()
 ): Promise<{ manifest: BrowserSyncManifest; snapshot: BrowserSyncSnapshot } | undefined> {
-  const manifestValue = (await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY];
-  const manifest = sanitizeManifest(manifestValue);
-  if (!manifest) return undefined;
-  if ((manifest.epochAt || 0) < minimumEpochAt) return undefined;
-  const keys = Array.from({ length: manifest.chunkCount }, (_, index) => chunkKey(manifest.generation, index));
-  const chunks = await sync.get(keys);
-  const serialized = keys.map((key) => typeof chunks[key] === "string" ? chunks[key] : "").join("");
-  if (utf8Length(serialized) !== manifest.byteLength || hashString(serialized) !== manifest.hash) {
-    throw new Error("Synced settings were incomplete. QuickPIM++ will retry after the browser finishes syncing.");
+  for (let attempt = 0; attempt <= BROWSER_SYNC_READ_RETRY_DELAYS_MS.length; attempt += 1) {
+    const manifestValue = (await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY];
+    if (manifestValue === undefined || manifestValue === null) return undefined;
+    const manifest = sanitizeManifest(manifestValue, now);
+    if (!manifest) {
+      throw new Error("Synced settings metadata is invalid. QuickPIM++ kept local data unchanged.");
+    }
+    if ((manifest.epochAt || 0) < minimumEpochAt) return undefined;
+    const keys = Array.from({ length: manifest.chunkCount }, (_, index) => chunkKey(manifest.generation, index));
+    const chunks = await sync.get(keys);
+    const serialized = keys.map((key) => typeof chunks[key] === "string" ? chunks[key] : "").join("");
+    if (utf8Length(serialized) === manifest.byteLength && hashString(serialized) === manifest.hash) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(serialized);
+      } catch {
+        throw new Error("Synced settings contain invalid JSON. QuickPIM++ kept local data unchanged.");
+      }
+      const snapshot = sanitizeBrowserSyncSnapshot(parsed, now);
+      if (!snapshot || hasInvalidKnownSyncCategory(parsed, snapshot)) {
+        throw new Error("Synced settings use an invalid or unsupported format. QuickPIM++ kept local data unchanged.");
+      }
+      return { manifest, snapshot };
+    }
+
+    if (attempt < BROWSER_SYNC_READ_RETRY_DELAYS_MS.length) {
+      await wait(BROWSER_SYNC_READ_RETRY_DELAYS_MS[attempt]!);
+    }
   }
-  const parsed: unknown = JSON.parse(serialized);
-  const snapshot = sanitizeBrowserSyncSnapshot(parsed);
-  if (!snapshot) throw new Error("Synced settings use an unsupported format.");
-  return { manifest, snapshot };
+  throw new Error("Synced settings are still arriving. QuickPIM++ will retry automatically when browser sync delivers the remaining data.");
+}
+
+function hasInvalidKnownSyncCategory(parsed: unknown, snapshot: BrowserSyncSnapshot): boolean {
+  if (!isRecord(parsed) || !isRecord(parsed.categories)) return true;
+  const categories = parsed.categories;
+  return SYNC_CATEGORY_NAMES.some((name) =>
+    Object.hasOwn(categories, name) && !snapshot.categories[name]
+  );
 }
 
 async function writeRemoteSnapshot(
@@ -811,10 +1408,9 @@ async function writeRemoteSnapshot(
   epochAt = 0
 ): Promise<string> {
   const serialized = canonicalStringify(snapshot);
-  const chunks = splitUtf8(serialized, BROWSER_SYNC_CHUNK_BYTES);
-  const generation = `${now.toString(36)}-${installationId.slice(-8)}-${randomId().slice(-6)}`;
+  const generation = `${now.toString(36)}-${BROWSER_SYNC_ATOMIC_GENERATION_MARKER}-${installationId.slice(-8)}-${randomId().slice(-6)}`;
+  const chunks = splitForStorageItems(serialized, generation);
   await removeStaleOrphanedChunks(sync, now, new Set(previousGeneration ? [previousGeneration] : []));
-  await sync.set(Object.fromEntries(chunks.map((chunk, index) => [chunkKey(generation, index), chunk])));
   const manifest: BrowserSyncManifest = {
     version: 1,
     generation,
@@ -826,7 +1422,10 @@ async function writeRemoteSnapshot(
     ...(epochAt ? { epochAt } : {}),
     ...(omittedCategories.length ? { omittedCategories } : {})
   };
-  await sync.set({ [BROWSER_SYNC_MANIFEST_KEY]: manifest });
+  await sync.set({
+    ...Object.fromEntries(chunks.map((chunk, index) => [chunkKey(generation, index), chunk])),
+    [BROWSER_SYNC_MANIFEST_KEY]: manifest
+  });
   // Delete only the committed generation this write replaced. Removing every
   // other generation can erase chunks another installation is uploading
   // concurrently before that installation publishes its manifest.
@@ -845,6 +1444,8 @@ async function removeStaleOrphanedChunks(
   protectedGenerations: Set<string>
 ): Promise<void> {
   const all = await sync.get(null);
+  const currentManifest = sanitizeManifest(all[BROWSER_SYNC_MANIFEST_KEY], now);
+  if (currentManifest) protectedGenerations.add(currentManifest.generation);
   const staleKeys = Object.keys(all).filter((key) => {
     if (!key.startsWith(BROWSER_SYNC_CHUNK_PREFIX)) return false;
     const suffix = key.slice(BROWSER_SYNC_CHUNK_PREFIX.length);
@@ -852,6 +1453,11 @@ async function removeStaleOrphanedChunks(
     if (chunkSeparator <= 0) return false;
     const generation = suffix.slice(0, chunkSeparator);
     if (protectedGenerations.has(generation)) return false;
+    // Atomic generations publish chunks and their manifest in one storage.set,
+    // so any non-current atomic generation is already superseded. Older
+    // two-phase generations keep the grace period to avoid deleting chunks
+    // that a previous QuickPIM++ version may still be uploading.
+    if (generation.split("-")[1] === BROWSER_SYNC_ATOMIC_GENERATION_MARKER) return true;
     const timestampPart = generation.split("-", 1)[0];
     if (!/^[0-9a-z]+$/i.test(timestampPart)) return false;
     const generatedAt = Number.parseInt(timestampPart, 36);
@@ -865,27 +1471,36 @@ async function removeStaleOrphanedChunks(
 async function loadBrowserSyncLocalState(
   local: StorageAreaLike,
   distribution: ExtensionDistributionInfo,
-  platform?: string
+  platform?: string,
+  now = Date.now()
 ): Promise<BrowserSyncLocalState> {
   const value = (await local.get(BROWSER_SYNC_LOCAL_STATE_KEY))[BROWSER_SYNC_LOCAL_STATE_KEY];
   const source = isRecord(value) ? value : {};
-  const installationId = sanitizeText(source.installationId, 80) || randomId();
+  const installationId = sanitizeInstallationId(source.installationId) || randomId();
+  const categoryBaselines = isRecord(value)
+    ? sanitizeCategoryBaselines(source.categoryBaselines)
+    : getSyncCategoryValues(DEFAULT_SETTINGS);
   const state: BrowserSyncLocalState = {
     version: 1,
     enabled: source.enabled !== false,
     installationId,
     deviceName: sanitizeDeviceName(source.deviceName) || buildDefaultDeviceName(distribution, platform),
-    deviceNameUpdatedAt: sanitizeTimestamp(source.deviceNameUpdatedAt) || 0,
+    deviceNameUpdatedAt: sanitizeTimestamp(source.deviceNameUpdatedAt, now) || 0,
     reminderMode: source.reminderMode === "never" ? "never" : "daily",
-    lastReminderAt: sanitizeTimestamp(source.lastReminderAt),
-    lastSyncAt: sanitizeTimestamp(source.lastSyncAt),
-    lastSuccessAt: sanitizeTimestamp(source.lastSuccessAt),
+    lastReminderAt: sanitizeTimestamp(source.lastReminderAt, now),
+    lastSyncAt: sanitizeTimestamp(source.lastSyncAt, now),
+    lastSuccessAt: sanitizeTimestamp(source.lastSuccessAt, now),
     lastError: sanitizeText(source.lastError, 300) || undefined,
     lastRemoteGeneration: sanitizeText(source.lastRemoteGeneration, 120) || undefined,
-    lastAppliedPurgeAt: sanitizeTimestamp(source.lastAppliedPurgeAt),
+    lastAppliedPurgeAt: sanitizeTimestamp(source.lastAppliedPurgeAt, now),
     categoryHashes: sanitizeCategoryNumberMap(source.categoryHashes, false),
-    categoryUpdatedAt: sanitizeCategoryNumberMap(source.categoryUpdatedAt, true),
-    omittedCategories: sanitizeCategoryNames(source.omittedCategories)
+    categoryUpdatedAt: sanitizeCategoryNumberMap(source.categoryUpdatedAt, true, now),
+    categoryBaselines,
+    pendingCategoryBaselines: isRecord(source.pendingCategoryBaselines)
+      ? sanitizeCategoryBaselines(source.pendingCategoryBaselines)
+      : undefined,
+    omittedCategories: sanitizeCategoryNames(source.omittedCategories),
+    incompleteCategories: sanitizeCategoryNames(source.incompleteCategories)
   };
   if (!isRecord(value) || canonicalStringify(value) !== canonicalStringify(state)) {
     await saveLocalState(local, state);
@@ -893,25 +1508,112 @@ async function loadBrowserSyncLocalState(
   return state;
 }
 
+function sanitizeCategoryBaselines(value: unknown): Partial<Record<SyncCategoryName, unknown>> {
+  if (!isRecord(value)) return {};
+  const result: Partial<Record<SyncCategoryName, unknown>> = {};
+  for (const name of SYNC_CATEGORY_NAMES) {
+    if (!Object.hasOwn(value, name)) continue;
+    const sanitized = sanitizeSyncCategoryValue(name, value[name]);
+    if (sanitized !== undefined) result[name] = sanitized;
+  }
+  return result;
+}
+
 async function saveLocalState(local: StorageAreaLike, state: BrowserSyncLocalState): Promise<void> {
   await local.set({ [BROWSER_SYNC_LOCAL_STATE_KEY]: state });
 }
 
-async function loadControl(sync: StorageAreaLike): Promise<BrowserSyncControl> {
-  const value = (await sync.get(BROWSER_SYNC_CONTROL_KEY))[BROWSER_SYNC_CONTROL_KEY];
-  if (!isRecord(value)) return { version: 1 };
+async function loadControl(sync: StorageAreaLike, now = Date.now()): Promise<BrowserSyncControl> {
+  const values = await sync.get([
+    BROWSER_SYNC_CONTROL_KEY,
+    BROWSER_SYNC_PURGE_KEY,
+    BROWSER_SYNC_EPOCH_KEY
+  ]);
+  const value = values[BROWSER_SYNC_CONTROL_KEY];
+  if (value !== undefined && value !== null && (!isRecord(value) || value.version !== 1)) {
+    throw new Error("Synced control metadata uses an invalid or unsupported version. QuickPIM++ kept local data unchanged.");
+  }
+  const legacy = isRecord(value) ? value : {};
+  const purgeMarker = values[BROWSER_SYNC_PURGE_KEY];
+  const epochMarker = values[BROWSER_SYNC_EPOCH_KEY];
+  const legacyPurgedAt = sanitizeTimestamp(legacy.purgedAt, now);
+  const legacyEpochAt = sanitizeTimestamp(legacy.epochAt, now);
+  const splitPurgedAt = sanitizeMonotonicMarker(purgeMarker, "purgedAt", now);
+  const splitEpochAt = sanitizeMonotonicMarker(epochMarker, "epochAt", now);
+  const hasInvalidPurge = Object.hasOwn(legacy, "purgedAt") && legacy.purgedAt !== undefined && !legacyPurgedAt;
+  const hasInvalidEpoch = Object.hasOwn(legacy, "epochAt")
+    && legacy.epochAt !== undefined
+    && Number(legacy.epochAt) !== 0
+    && !legacyEpochAt;
+  if (hasInvalidPurge || hasInvalidEpoch) {
+    throw new Error("Synced control metadata contains an invalid timestamp. QuickPIM++ kept local data unchanged.");
+  }
   return {
     version: 1,
-    purgedAt: sanitizeTimestamp(value.purgedAt),
-    epochAt: sanitizeTimestamp(value.epochAt)
+    purgedAt: Math.max(legacyPurgedAt || 0, splitPurgedAt || 0) || undefined,
+    epochAt: Math.max(legacyEpochAt || 0, splitEpochAt || 0) || undefined
   };
 }
 
-async function loadDeviceRegistry(sync: StorageAreaLike): Promise<BrowserSyncDeviceRegistry> {
-  return buildDeviceRegistry(await sync.get(null));
+function sanitizeMonotonicMarker(
+  value: unknown,
+  field: "purgedAt" | "epochAt",
+  now: number
+): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value) || value.version !== 1) {
+    throw new Error(`Synced ${field === "purgedAt" ? "purge" : "resume"} metadata uses an invalid or unsupported version. QuickPIM++ kept local data unchanged.`);
+  }
+  const timestamp = sanitizeTimestamp(value[field], now);
+  if (!timestamp) {
+    throw new Error(`Synced ${field === "purgedAt" ? "purge" : "resume"} metadata contains an invalid timestamp. QuickPIM++ kept local data unchanged.`);
+  }
+  return timestamp;
 }
 
-function buildDeviceRegistry(values: Record<string, unknown>): BrowserSyncDeviceRegistry {
+function isActiveBrowserSyncPurge(control: BrowserSyncControl): boolean {
+  return Boolean(control.purgedAt && (control.epochAt || 0) <= control.purgedAt);
+}
+
+async function pauseBrowserSyncAfterPurge(
+  local: StorageAreaLike,
+  sync: StorageAreaLike,
+  state: BrowserSyncLocalState,
+  purgedAt: number,
+  now: number
+): Promise<BrowserSyncLocalState> {
+  const next = {
+    ...state,
+    enabled: false,
+    lastAppliedPurgeAt: Math.max(state.lastAppliedPurgeAt || 0, purgedAt),
+    lastSyncAt: now,
+    lastError: "Synced data was deleted from another installation. Sync is paused until you enable it again."
+  };
+  await saveLocalState(local, next);
+  try {
+    await sync.remove(deviceKey(state.installationId));
+  } catch {
+    // The tombstone still protects synced settings. A later reconciliation can
+    // retry removal of this non-sensitive installation heartbeat.
+  }
+  return next;
+}
+
+async function loadDeviceRegistry(sync: StorageAreaLike, now = Date.now()): Promise<BrowserSyncDeviceRegistry> {
+  return buildDeviceRegistry(await sync.get(null), now);
+}
+
+async function loadDeviceRecord(
+  sync: StorageAreaLike,
+  installationId: string,
+  now = Date.now()
+): Promise<BrowserSyncDevice | undefined> {
+  const key = deviceKey(installationId);
+  const direct = sanitizeDevices([(await sync.get(key))[key]], now)[0];
+  return direct || (await loadDeviceRegistry(sync, now)).devices.find((device) => device.installationId === installationId);
+}
+
+function buildDeviceRegistry(values: Record<string, unknown>, now = Date.now()): BrowserSyncDeviceRegistry {
   const legacy = values[BROWSER_SYNC_DEVICES_KEY];
   const candidates = [
     ...(isRecord(legacy) && Array.isArray(legacy.devices) ? legacy.devices : []),
@@ -920,7 +1622,7 @@ function buildDeviceRegistry(values: Record<string, unknown>): BrowserSyncDevice
       .map(([, value]) => value)
   ];
   const devicesById = new Map<string, BrowserSyncDevice>();
-  for (const device of sanitizeDevices(candidates)) {
+  for (const device of sanitizeDevices(candidates, now)) {
     const current = devicesById.get(device.installationId);
     if (!current || device.lastSyncAt > current.lastSyncAt || device.nameUpdatedAt > current.nameUpdatedAt) {
       devicesById.set(device.installationId, mergeDeviceRecords(current, device));
@@ -940,36 +1642,61 @@ async function updateDeviceRegistry(
   now: number,
   syncEnabled: boolean
 ): Promise<void> {
-  const registry = await loadDeviceRegistry(sync);
-  const existing = registry.devices.find((item) => item.installationId === state.installationId);
+  const existing = await loadDeviceRecord(sync, state.installationId, now);
   const current: BrowserSyncDevice = {
     installationId: state.installationId,
     name: existing && existing.nameUpdatedAt > state.deviceNameUpdatedAt ? existing.name : state.deviceName,
     browser,
     platform,
     appVersion: APP_VERSION,
-    lastSyncAt: now,
+    lastSyncAt: Math.max(existing?.lastSyncAt || 0, now),
     syncEnabled,
     nameUpdatedAt: Math.max(existing?.nameUpdatedAt || 0, state.deviceNameUpdatedAt)
   };
-  await sync.set({ [deviceKey(state.installationId)]: current });
+  const recordChanged = !existing
+    || existing.name !== current.name
+    || existing.browser !== current.browser
+    || existing.platform !== current.platform
+    || existing.appVersion !== current.appVersion
+    || existing.syncEnabled !== current.syncEnabled
+    || existing.nameUpdatedAt !== current.nameUpdatedAt;
+  const heartbeatDue = !existing
+    || now - existing.lastSyncAt >= BROWSER_SYNC_DEVICE_HEARTBEAT_MS;
+  if (recordChanged || heartbeatDue) {
+    await sync.set({ [deviceKey(state.installationId)]: current });
+  }
   const all = await sync.get(null);
-  const latestRegistry = buildDeviceRegistry(all);
-  const retainedIds = new Set(latestRegistry.devices.map((device) => device.installationId));
+  const latestRegistry = buildDeviceRegistry(all, now);
+  const legacyMigrations = Object.fromEntries(latestRegistry.devices.flatMap((device) => {
+    const key = deviceKey(device.installationId);
+    return Object.hasOwn(all, key) ? [] : [[key, device] as const];
+  }));
+  if (Object.keys(legacyMigrations).length) await sync.set(legacyMigrations);
+  const retainedDevices = latestRegistry.devices.some((device) => device.installationId === state.installationId)
+    ? latestRegistry.devices
+    : [...latestRegistry.devices.slice(0, MAX_SYNC_DEVICES - 1), current];
+  const retainedIds = new Set(retainedDevices.map((device) => device.installationId));
   const staleDeviceKeys = Object.keys(all).filter((key) => {
     if (!key.startsWith(BROWSER_SYNC_DEVICE_PREFIX)) return false;
     return !retainedIds.has(key.slice(BROWSER_SYNC_DEVICE_PREFIX.length));
   });
-  if (staleDeviceKeys.length) await sync.remove(staleDeviceKeys);
+  if (Object.hasOwn(all, BROWSER_SYNC_DEVICES_KEY)) staleDeviceKeys.push(BROWSER_SYNC_DEVICES_KEY);
+  if (staleDeviceKeys.length) {
+    const latestCandidates = await sync.get(staleDeviceKeys);
+    const unchangedKeys = staleDeviceKeys.filter((key) =>
+      valuesEqual(latestCandidates[key], all[key])
+    );
+    if (unchangedKeys.length) await sync.remove(unchangedKeys);
+  }
 }
 
-function sanitizeDevices(value: unknown): BrowserSyncDevice[] {
+function sanitizeDevices(value: unknown, now = Date.now()): BrowserSyncDevice[] {
   if (!Array.isArray(value)) return [];
   const devicesById = new Map<string, BrowserSyncDevice>();
   for (const item of value) {
     if (!isRecord(item)) continue;
-    const installationId = sanitizeText(item.installationId, 80);
-    const lastSyncAt = sanitizeTimestamp(item.lastSyncAt);
+    const installationId = sanitizeInstallationId(item.installationId);
+    const lastSyncAt = sanitizeTimestamp(item.lastSyncAt, now);
     if (!installationId || !lastSyncAt) continue;
     const device: BrowserSyncDevice = {
       installationId,
@@ -979,7 +1706,7 @@ function sanitizeDevices(value: unknown): BrowserSyncDevice[] {
       appVersion: sanitizeText(item.appVersion, 30) || "Unknown version",
       lastSyncAt,
       syncEnabled: item.syncEnabled !== false,
-      nameUpdatedAt: sanitizeTimestamp(item.nameUpdatedAt) || 0
+      nameUpdatedAt: sanitizeTimestamp(item.nameUpdatedAt, now) || 0
     };
     devicesById.set(installationId, mergeDeviceRecords(devicesById.get(installationId), device));
   }
@@ -991,9 +1718,10 @@ function sanitizeDevices(value: unknown): BrowserSyncDevice[] {
 async function reconcileLocalDeviceName(
   local: StorageAreaLike,
   sync: StorageAreaLike,
-  state: BrowserSyncLocalState
+  state: BrowserSyncLocalState,
+  now = Date.now()
 ): Promise<BrowserSyncLocalState> {
-  const device = (await loadDeviceRegistry(sync)).devices.find((entry) => entry.installationId === state.installationId);
+  const device = await loadDeviceRecord(sync, state.installationId, now);
   if (!device || device.nameUpdatedAt <= state.deviceNameUpdatedAt || device.name === state.deviceName) return state;
   const next = {
     ...state,
@@ -1023,16 +1751,16 @@ function deviceKey(installationId: string): string {
   return `${BROWSER_SYNC_DEVICE_PREFIX}${installationId}`;
 }
 
-export function sanitizeBrowserSyncSnapshot(value: unknown): BrowserSyncSnapshot | undefined {
-  if (!isRecord(value) || !isRecord(value.categories)) return undefined;
+export function sanitizeBrowserSyncSnapshot(value: unknown, now = Date.now()): BrowserSyncSnapshot | undefined {
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.categories)) return undefined;
   const categories: BrowserSyncSnapshot["categories"] = {};
   for (const name of SYNC_CATEGORY_NAMES) {
     const category = value.categories[name];
     if (!isRecord(category)) continue;
     const updatedAt = Number(category.updatedAt);
-    const updatedBy = sanitizeText(category.updatedBy, 80);
+    const updatedBy = sanitizeInstallationId(category.updatedBy);
     const sanitizedValue = sanitizeSyncCategoryValue(name, category.value);
-    if (!Number.isFinite(updatedAt) || updatedAt < 0 || updatedAt > MAX_DATE_EPOCH_MS || !updatedBy || sanitizedValue === undefined) continue;
+    if (!Number.isFinite(updatedAt) || updatedAt < 0 || updatedAt > maximumSyncTimestamp(now) || !updatedBy || sanitizedValue === undefined) continue;
     categories[name] = { updatedAt, updatedBy, value: sanitizedValue };
   }
   return { version: 1, categories };
@@ -1052,16 +1780,20 @@ function sanitizeSyncCategoryValue(name: SyncCategoryName, value: unknown): unkn
   return getSyncCategoryValues(normalized)[name];
 }
 
-function sanitizeManifest(value: unknown): BrowserSyncManifest | undefined {
+function sanitizeManifest(value: unknown, now = Date.now()): BrowserSyncManifest | undefined {
   if (!isRecord(value) || value.version !== 1) return undefined;
-  const generation = sanitizeText(value.generation, 120);
+  const generation = sanitizeGeneration(value.generation);
   const chunkCount = Number(value.chunkCount);
   const byteLength = Number(value.byteLength);
   const hash = sanitizeText(value.hash, 32);
   const updatedAt = Number(value.updatedAt);
-  const updatedBy = sanitizeText(value.updatedBy, 80);
-  const epochAt = sanitizeTimestamp(value.epochAt);
-  if (!generation || !Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 20 || !Number.isInteger(byteLength) || byteLength < 1 || byteLength > BROWSER_SYNC_PAYLOAD_BYTES || !hash || !Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt > MAX_DATE_EPOCH_MS || !updatedBy) return undefined;
+  const updatedBy = sanitizeInstallationId(value.updatedBy);
+  const epochAt = sanitizeTimestamp(value.epochAt, now);
+  const hasInvalidEpoch = Object.hasOwn(value, "epochAt")
+    && value.epochAt !== undefined
+    && Number(value.epochAt) !== 0
+    && !epochAt;
+  if (!generation || !Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 20 || !Number.isInteger(byteLength) || byteLength < 1 || byteLength > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES || !/^[0-9a-f]{8}$/i.test(hash) || !Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt > maximumSyncTimestamp(now) || !updatedBy || hasInvalidEpoch) return undefined;
   return {
     version: 1,
     generation,
@@ -1075,16 +1807,16 @@ function sanitizeManifest(value: unknown): BrowserSyncManifest | undefined {
   };
 }
 
-function sanitizeCategoryNumberMap(value: unknown, numeric: true): Partial<Record<SyncCategoryName, number>>;
-function sanitizeCategoryNumberMap(value: unknown, numeric: false): Partial<Record<SyncCategoryName, string>>;
-function sanitizeCategoryNumberMap(value: unknown, numeric: boolean) {
+function sanitizeCategoryNumberMap(value: unknown, numeric: true, now?: number): Partial<Record<SyncCategoryName, number>>;
+function sanitizeCategoryNumberMap(value: unknown, numeric: false, now?: number): Partial<Record<SyncCategoryName, string>>;
+function sanitizeCategoryNumberMap(value: unknown, numeric: boolean, now = Date.now()) {
   if (!isRecord(value)) return {};
   const result: Partial<Record<SyncCategoryName, number | string>> = {};
   for (const name of SYNC_CATEGORY_NAMES) {
     const item = value[name];
     if (numeric) {
       const parsed = Number(item);
-      if (Number.isFinite(parsed) && parsed >= 0 && parsed <= MAX_DATE_EPOCH_MS) result[name] = parsed;
+      if (Number.isFinite(parsed) && parsed >= 0 && parsed <= maximumSyncTimestamp(now)) result[name] = parsed;
     } else if (typeof item === "string" && item.length <= 32) {
       result[name] = item;
     }
@@ -1094,7 +1826,8 @@ function sanitizeCategoryNumberMap(value: unknown, numeric: boolean) {
 
 function sanitizeCategoryNames(value: unknown): SyncCategoryName[] {
   if (!Array.isArray(value)) return [];
-  return [...new Set(value.filter((item): item is SyncCategoryName => SYNC_CATEGORY_NAMES.includes(item as SyncCategoryName)))];
+  const selected = new Set(value.filter((item): item is SyncCategoryName => SYNC_CATEGORY_NAMES.includes(item as SyncCategoryName)));
+  return SYNC_CATEGORY_NAMES.filter((name) => selected.has(name));
 }
 
 function buildDefaultDeviceName(distribution: ExtensionDistributionInfo, platform?: string): string {
@@ -1115,18 +1848,50 @@ function sanitizeDeviceName(value: unknown): string {
   return sanitizeText(value, MAX_DEVICE_NAME_LENGTH);
 }
 
+function sanitizeInstallationId(value: unknown): string {
+  const sanitized = sanitizeText(value, 80);
+  return /^[a-zA-Z0-9-]{8,80}$/.test(sanitized) ? sanitized : "";
+}
+
+function sanitizeGeneration(value: unknown): string {
+  const sanitized = sanitizeText(value, 120);
+  return /^[a-z0-9-]{3,120}$/i.test(sanitized) ? sanitized : "";
+}
+
 function sanitizeText(value: unknown, maxLength: number): string {
   return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, maxLength) : "";
 }
 
-function sanitizeTimestamp(value: unknown): number | undefined {
+function sanitizeTimestamp(value: unknown, now?: number): number | undefined {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 && parsed <= MAX_DATE_EPOCH_MS ? parsed : undefined;
+  const maximum = now === undefined ? MAX_DATE_EPOCH_MS : maximumSyncTimestamp(now);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= maximum ? parsed : undefined;
+}
+
+function maximumSyncTimestamp(now: number): number {
+  return Math.min(MAX_DATE_EPOCH_MS, Math.max(0, now) + MAX_SYNC_CLOCK_SKEW_MS);
+}
+
+function nextSyncRevision(now: number, ...previousValues: number[]): number {
+  return Math.min(
+    maximumSyncTimestamp(now),
+    Math.max(now, ...previousValues.map((value) => Number.isFinite(value) ? value + 1 : 0))
+  );
+}
+
+function isRecentlyActiveSyncDevice(device: BrowserSyncDevice, now: number): boolean {
+  return device.syncEnabled
+    && device.lastSyncAt <= now + SYNC_VERIFICATION_FUTURE_TOLERANCE_MS
+    && now - device.lastSyncAt <= BROWSER_SYNC_VERIFICATION_FRESHNESS_MS;
 }
 
 function sanitizeSyncError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error || "Browser sync failed.");
   return sanitizeText(message, 300) || "Browser sync failed.";
+}
+
+function wait(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function randomId(): string {
@@ -1139,22 +1904,34 @@ function chunkKey(generation: string, index: number): string {
   return `${BROWSER_SYNC_CHUNK_PREFIX}${generation}.${index}`;
 }
 
-function splitUtf8(value: string, maxBytes: number): string[] {
+function splitForStorageItems(value: string, generation: string): string[] {
   const chunks: string[] = [];
   let current = "";
-  let bytes = 0;
+  let bytes = storageItemBaseBytes(chunkKey(generation, 0));
   for (const character of value) {
-    const characterBytes = utf8Length(character);
-    if (current && bytes + characterBytes > maxBytes) {
+    const characterBytes = jsonStringContentBytes(character);
+    if (current && bytes + characterBytes > BROWSER_SYNC_CHUNK_QUOTA_BYTES) {
       chunks.push(current);
       current = "";
-      bytes = 0;
+      bytes = storageItemBaseBytes(chunkKey(generation, chunks.length));
     }
     current += character;
     bytes += characterBytes;
   }
   if (current) chunks.push(current);
   return chunks;
+}
+
+function storageItemBaseBytes(key: string): number {
+  return utf8Length(key) + utf8Length(JSON.stringify(""));
+}
+
+function jsonStringContentBytes(value: string): number {
+  return utf8Length(JSON.stringify(value)) - utf8Length(JSON.stringify(""));
+}
+
+function snapshotStoragePayloadBytes(snapshot: BrowserSyncSnapshot): number {
+  return utf8Length(JSON.stringify(canonicalStringify(snapshot)));
 }
 
 function utf8Length(value: string): number {

@@ -344,6 +344,7 @@ export interface ActivationResult {
   error?: string;
   accessRecoveryTarget?: AccessSetupTarget;
   outcomeUnknown?: boolean;
+  trackingUnavailable?: boolean;
 }
 
 export interface ActivationResponse {

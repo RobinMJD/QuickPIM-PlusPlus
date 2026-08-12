@@ -53,6 +53,8 @@ import {
   type ExtensionDistributionInfo
 } from "../lib/distribution";
 import {
+  BROWSER_SYNC_LOCAL_STATE_KEY,
+  BROWSER_SYNC_VERIFICATION_FRESHNESS_MS,
   formatBrowserSyncInstallationId,
   sanitizeBrowserSyncStatus,
   type BrowserSyncDevice,
@@ -844,7 +846,7 @@ function SettingsApp() {
                 trackedRequests={trackedRequests}
               />
             ) : null}
-            {tab === "sync" ? <BrowserSyncPanel /> : null}
+            {tab === "sync" ? <BrowserSyncPanel settings={settings} /> : null}
             {tab === "reset" ? <ResetDataPanel onNavigate={selectTab} onReset={resetExtensionData} /> : null}
           </div>
         </div>
@@ -1529,9 +1531,16 @@ function ActivityPanel({
     void sendMessage<BrowserSyncStatus>(
       { action: "getBrowserSyncStatus" },
       { timeoutMs: 4_000, timeoutMessage: "Browser sync device lookup timed out." }
-    ).then((value) => {
-      const next = sanitizeBrowserSyncStatus(value);
+    ).then(async (value) => {
+      let next = sanitizeBrowserSyncStatus(value);
       if (active && next) setBrowserSyncStatus(next);
+      if (next?.supported && next.enabled) {
+        next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
+          { action: "syncBrowserData" },
+          { timeoutMs: 15_000, timeoutMessage: "Browser sync will continue in the background." }
+        ));
+        if (active && next) setBrowserSyncStatus(next);
+      }
     }).catch(() => undefined);
     return () => {
       active = false;
@@ -1670,6 +1679,11 @@ function ActivityPanel({
           Usage
         </button>
       </div>
+      {view !== "requests" && browserSyncStatus?.supported && browserSyncStatus.enabled && browserSyncStatus.crossDeviceState === "waiting" ? (
+        <p className="message settings-inline-message">
+          Cross-device delivery is not verified yet, so activity from another computer may be missing. Open Browser Sync for the verification steps.
+        </p>
+      ) : null}
       {view === "requests" ? (
         <>
           <div className="toolbar settings-section-gap request-toolbar">
@@ -2038,7 +2052,7 @@ function matchesTrackedRequestFilter(
   return status === "completed" || status === "expired";
 }
 
-function BrowserSyncPanel() {
+function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
   const [status, setStatus] = useState<BrowserSyncStatus | null>(null);
   const [deviceName, setDeviceName] = useState("");
   const [isBusy, setIsBusy] = useState(false);
@@ -2046,25 +2060,61 @@ function BrowserSyncPanel() {
   const [error, setError] = useState("");
   const [confirmingPurge, setConfirmingPurge] = useState(false);
   const lastSavedDeviceName = useRef("");
+  const isMounted = useRef(true);
 
-  async function loadStatus() {
+  async function loadStatus(synchronize = false): Promise<BrowserSyncStatus | null> {
     try {
       const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
-        { action: "getBrowserSyncStatus" },
-        { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
+        { action: synchronize ? "syncBrowserData" : "getBrowserSyncStatus" },
+        {
+          timeoutMs: synchronize ? 15_000 : 4_000,
+          timeoutMessage: synchronize
+            ? "Browser sync will continue in the background."
+            : "Browser sync status check timed out."
+        }
       ));
-      if (next) {
+      if (next && isMounted.current) {
+        setError("");
         setStatus(next);
-        setDeviceName(next.deviceName);
+        const previousSavedName = lastSavedDeviceName.current;
+        setDeviceName((current) => !current || current === previousSavedName ? next.deviceName : current);
         lastSavedDeviceName.current = next.deviceName;
       }
+      return next;
     } catch (statusError) {
-      setError(statusError instanceof Error ? statusError.message : String(statusError));
+      if (isMounted.current) setError(statusError instanceof Error ? statusError.message : String(statusError));
+      return null;
     }
   }
 
   useEffect(() => {
-    void loadStatus();
+    let active = true;
+    void loadStatus().then((next) => {
+      if (active && next?.supported && next.enabled) void loadStatus(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => () => {
+    isMounted.current = false;
+  }, []);
+
+  useEffect(() => {
+    const storageChangeEvent = chrome.storage?.onChanged;
+    if (!storageChangeEvent) return;
+    let timer: number | undefined;
+    const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName !== "sync" && !(areaName === "local" && changes[BROWSER_SYNC_LOCAL_STATE_KEY])) return;
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void loadStatus(), 150);
+    };
+    storageChangeEvent.addListener(handleStorageChange);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      storageChangeEvent.removeListener(handleStorageChange);
+    };
   }, []);
 
   useEffect(() => {
@@ -2079,7 +2129,10 @@ function BrowserSyncPanel() {
     return () => window.clearTimeout(timer);
   }, [deviceName, status?.supported]);
 
-  async function runAction(request: Record<string, unknown>, successMessage: string): Promise<boolean> {
+  async function runAction(
+    request: Record<string, unknown>,
+    successMessage: string | ((next: BrowserSyncStatus | null) => string)
+  ): Promise<boolean> {
     setIsBusy(true);
     setMessage("");
     setError("");
@@ -2096,7 +2149,14 @@ function BrowserSyncPanel() {
           : next.deviceName);
         lastSavedDeviceName.current = next.deviceName;
       }
-      setMessage(successMessage);
+      const attemptedDataSync = request.action === "syncBrowserData"
+        || (request.action === "setBrowserSyncEnabled" && request.enabled === true);
+      if (attemptedDataSync && next?.lastError) {
+        setMessage("");
+        setError(next.lastError);
+        return false;
+      }
+      setMessage(typeof successMessage === "function" ? successMessage(next) : successMessage);
       return true;
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
@@ -2112,6 +2172,22 @@ function BrowserSyncPanel() {
   }
 
   const otherDevices = status?.devices.filter((device) => device.installationId !== status.installationId) || [];
+  const otherInstallationIds = new Set(otherDevices.map((device) => device.installationId));
+  const receivedActivityCount = status
+    ? settings.activityHistory.filter((entry) => entry.sourceInstallationId && otherInstallationIds.has(entry.sourceInstallationId)).length
+    : 0;
+  const verificationTitle = status?.crossDeviceState === "verified"
+    ? `Verified with ${status.otherInstallationCount} other installation${status.otherInstallationCount === 1 ? "" : "s"}`
+    : status?.crossDeviceState === "waiting"
+      ? "Waiting for another installation"
+      : "Cross-device sync is off";
+  const verificationDetail = status?.crossDeviceState === "verified"
+    ? `QuickPIM++ has received an installation record through ${status.ecosystemLabel || "browser sync"}.`
+    : status?.crossDeviceState === "waiting"
+      ? otherDevices.length
+        ? "Other installation records exist, but none has synchronized recently with sync enabled."
+        : "Data is stored in this browser's sync area, but no other QuickPIM++ installation has been observed yet."
+      : "Enable sync to store portable QuickPIM++ data in this browser's sync area.";
   const storeUrl = status?.browserLabel === "Microsoft Edge" ? EDGE_ADDONS_URL : CHROME_WEB_STORE_URL;
   const storeLabel = status?.browserLabel === "Microsoft Edge" ? "Microsoft Edge Add-ons" : "Chrome Web Store";
   const showBothStoreOptions = status?.browserLabel !== "Microsoft Edge" && status?.browserLabel !== "Google Chrome";
@@ -2123,8 +2199,8 @@ function BrowserSyncPanel() {
           <h2>Browser Sync</h2>
           <p className="muted">Keep useful QuickPIM++ settings and local activity available on your other signed-in browser installations.</p>
         </div>
-        {status ? <span className={`sync-capability-badge ${status.supported ? status.enabled ? "ready" : "off" : "limited"}`}>
-          {status.supported ? status.enabled ? "Sync on" : "Sync off" : "Limited"}
+        {status ? <span className={`sync-capability-badge ${status.supported ? status.crossDeviceState === "verified" ? "ready" : status.enabled ? "waiting" : "off" : "limited"}`}>
+          {status.supported ? status.crossDeviceState === "verified" ? "Cross-device verified" : status.enabled ? "Not yet verified" : "Sync off" : "Limited"}
         </span> : null}
       </div>
 
@@ -2151,37 +2227,80 @@ function BrowserSyncPanel() {
       {status?.supported ? (
         <>
           <div className="settings-subsection sync-overview-section">
-            <label className="preference-toggle sync-master-toggle">
-              <input
-                type="checkbox"
-                checked={status.enabled}
-                disabled={isBusy}
-                onChange={(event) => void runAction(
-                  { action: "setBrowserSyncEnabled", enabled: event.target.checked },
-                  event.target.checked ? "Browser sync enabled." : "Browser sync disabled on this installation."
+            <div className="sync-control-header">
+              <label className="preference-toggle sync-master-toggle">
+                <input
+                  type="checkbox"
+                  checked={status.enabled}
+                  disabled={isBusy}
+                  onChange={(event) => void runAction(
+                    { action: "setBrowserSyncEnabled", enabled: event.target.checked },
+                    event.target.checked ? "Browser sync enabled." : "Browser sync disabled on this installation."
+                  )}
+                />
+                <span className="preference-toggle-copy">
+                  <strong>Sync settings and activity</strong>
+                  <span className="muted">Enabled by default. Chrome and Edge use separate sync services.</span>
+                </span>
+              </label>
+              <button
+                className="btn primary"
+                disabled={isBusy || !status.enabled}
+                onClick={() => void runAction(
+                  { action: "syncBrowserData" },
+                  (next) => next?.crossDeviceState === "verified"
+                    ? `Send and receive completed. ${next.otherInstallationCount} other installation${next.otherInstallationCount === 1 ? "" : "s"} detected.`
+                    : "Saved in this browser's sync area. Open QuickPIM++ on the other computer to verify cross-device delivery."
                 )}
-              />
-              <span className="preference-toggle-copy">
-                <strong>Sync settings and activity</strong>
-                <span className="muted">Enabled by default. Uses {status.ecosystemLabel}; Chrome and Edge sync separately.</span>
-              </span>
-            </label>
-            <div className="sync-status-grid">
-              <div><strong>Last successful sync</strong><span>{formatSyncTimestamp(status.lastSuccessAt)}</span></div>
-              <div><strong>Sync service</strong><span>{status.ecosystemLabel || "Browser sync"}</span></div>
-              <div><strong>Installation</strong><span>{status.sourceLabel}</span></div>
+              >
+                {isBusy ? "Syncing..." : "Send & receive now"}
+              </button>
             </div>
+            <div className={`sync-verification-summary ${status.crossDeviceState}`}>
+              <div>
+                <strong>{verificationTitle}</strong>
+                <span>{verificationDetail}</span>
+              </div>
+              <span className={`sync-verification-chip ${status.crossDeviceState}`}>
+                {status.crossDeviceState === "verified" ? "Verified" : status.crossDeviceState === "waiting" ? "Unverified" : "Off"}
+              </span>
+            </div>
+            <dl className="sync-facts">
+              <div><dt>Last run here</dt><dd>{formatSyncTimestamp(status.lastSuccessAt)}</dd></div>
+              <div><dt>Service</dt><dd>{status.ecosystemLabel || "Browser sync"}</dd></div>
+              <div><dt>Activity received</dt><dd>{receivedActivityCount} event{receivedActivityCount === 1 ? "" : "s"} from other installations</dd></div>
+              <div><dt>Last other run</dt><dd>{formatSyncTimestamp(status.lastOtherInstallationSyncAt)}</dd></div>
+              <div><dt>Store edition</dt><dd>{status.sourceLabel}</dd></div>
+            </dl>
+            {status.crossDeviceState === "waiting" ? (
+              <details className="sync-help-details">
+                <summary>Why is my other computer not appearing?</summary>
+                <div>
+                  <p>A successful write here cannot confirm that the browser account transported it to another computer.</p>
+                  <ol>
+                    <li>Use the official {status.sourceLabel} edition on both computers.</li>
+                    <li>In the same {status.browserLabel} work profile, confirm browser sync is enabled and allowed by your organization.</li>
+                    <li>Open QuickPIM++ on the other computer and use Browser Sync &gt; Send &amp; receive now. Verification remains current for seven days after that installation&apos;s last run.</li>
+                  </ol>
+                  {status.browserLabel === "Microsoft Edge" ? (
+                    <a href="https://learn.microsoft.com/en-us/deployedge/microsoft-edge-enterprise-sync" target="_blank" rel="noreferrer">Microsoft Edge enterprise sync requirements</a>
+                  ) : null}
+                </div>
+              </details>
+            ) : null}
+            {status.crossDeviceState === "verified" && receivedActivityCount === 0 ? (
+              <p className="message settings-inline-message">Another installation is visible, but no activity from it is stored here yet. Use Send &amp; receive now on that computer after its QuickPIM++ activity is recorded.</p>
+            ) : null}
             {status.lastError ? <p className="message error settings-inline-message">{status.lastError}</p> : null}
             {status.omittedCategories.length ? (
-              <p className="message settings-inline-message">The browser quota excluded: {status.omittedCategories.join(", ")}. Core settings still sync; use Backup &amp; Restore for the complete dataset.</p>
+              <p className="message settings-inline-message">
+                Browser quota limits the synchronized copy of {formatLimitedSyncCategories(status.omittedCategories)}. Complete local data is preserved; use Backup &amp; Restore when the full dataset is required on another installation.
+              </p>
             ) : null}
-            <div className="button-row">
-              <button className="btn primary" disabled={isBusy || !status.enabled} onClick={() => void runAction({ action: "syncBrowserData" }, "Browser sync completed.") }>{isBusy ? "Working..." : "Sync now"}</button>
-            </div>
           </div>
 
           <div className="settings-subsection">
-            <h3>This installation</h3>
+            <h3>Installations</h3>
             <p className="muted">Use a recognizable name because browser extension APIs do not expose the computer hostname.</p>
             <div className="form-grid sync-device-name-row">
               <div className="field">
@@ -2198,24 +2317,23 @@ function BrowserSyncPanel() {
               </div>
             </div>
             <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
-          </div>
-
-          <div className="settings-subsection">
-            <h3>Other installations</h3>
-            <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>
-            <div className="sync-device-list">
-              {otherDevices.map((device) => (
-                <BrowserSyncDeviceEditor
-                  key={device.installationId}
-                  device={device}
-                  disabled={isBusy || !status.enabled}
-                  onRename={(name) => runAction(
-                    { action: "renameBrowserSyncDevice", installationId: device.installationId, name },
-                    `${formatBrowserSyncInstallationId(device.installationId)} renamed.`
-                  )}
-                />
-              ))}
-              {!otherDevices.length ? <p className="muted">No other installation has synced yet.</p> : null}
+            <div className="sync-other-installations">
+              <h4>Other installations</h4>
+              <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>
+              <div className="sync-device-list">
+                {otherDevices.map((device) => (
+                  <BrowserSyncDeviceEditor
+                    key={device.installationId}
+                    device={device}
+                    disabled={isBusy || !status.enabled}
+                    onRename={(name) => runAction(
+                      { action: "renameBrowserSyncDevice", installationId: device.installationId, name },
+                      `${formatBrowserSyncInstallationId(device.installationId)} renamed.`
+                    )}
+                  />
+                ))}
+                {!otherDevices.length ? <p className="muted">No other installation record has reached this browser yet.</p> : null}
+              </div>
             </div>
           </div>
 
@@ -2251,6 +2369,15 @@ function BrowserSyncPanel() {
   );
 }
 
+function formatLimitedSyncCategories(categories: string[]): string {
+  const labels: Record<string, string> = {
+    activityHistory: "activity history",
+    usageStatsByItemId: "usage counters",
+    recentJustifications: "recent justifications"
+  };
+  return categories.map((category) => labels[category] || category).join(", ");
+}
+
 function BrowserSyncDeviceEditor({
   device,
   disabled,
@@ -2264,6 +2391,10 @@ function BrowserSyncDeviceEditor({
   const trimmed = name.trim();
   const unchanged = trimmed === device.name;
   const lastSyncIso = toIsoTimestamp(device.lastSyncAt);
+  const syncAge = Date.now() - device.lastSyncAt;
+  const isRecentlyActive = device.syncEnabled
+    && syncAge >= -5 * 60_000
+    && syncAge <= BROWSER_SYNC_VERIFICATION_FRESHNESS_MS;
 
   useEffect(() => setName(device.name), [device.name]);
 
@@ -2295,7 +2426,7 @@ function BrowserSyncDeviceEditor({
           {formatBrowserSyncInstallationId(device.installationId)}
           <CopyTextButton text={device.installationId} label="installation ID" />
         </span>
-        <span>{device.syncEnabled ? "Sync enabled" : "Sync off"}</span>
+        <span>{!device.syncEnabled ? "Sync off" : isRecentlyActive ? "Sync current" : "Not seen recently"}</span>
         {lastSyncIso
           ? <time dateTime={lastSyncIso}>{formatSyncTimestamp(device.lastSyncAt)}</time>
           : <span>Not yet</span>}

@@ -3193,6 +3193,145 @@ describe("settings journey safeguards", () => {
   });
 });
 
+describe("settings Browser Sync page", () => {
+  test("distinguishes a local sync write from verified cross-device delivery", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const settings = createDefaultSettings();
+    settings.activityHistory = [{
+      id: "imported-activity",
+      action: "activate",
+      result: "success",
+      itemId: "directoryRole:one:/",
+      itemName: "Imported role",
+      itemType: "directoryRole",
+      requestedAt: new Date().toISOString(),
+      sourceInstallationId: "backup-only-installation"
+    }];
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = {
+      capability: "available",
+      supported: true,
+      enabled: true,
+      browserLabel: "Microsoft Edge",
+      sourceLabel: "Microsoft Edge Add-ons",
+      ecosystemLabel: "Microsoft Edge Sync",
+      installationId: "current-installation",
+      deviceName: "Admin Mac",
+      platform: "macOS",
+      lastSyncAt: Date.now(),
+      lastSuccessAt: Date.now(),
+      reminderMode: "daily",
+      reminderDue: false,
+      suspendedByPurge: false,
+      devices: [{
+        installationId: "current-installation",
+        name: "Admin Mac",
+        browser: "Microsoft Edge",
+        platform: "macOS",
+        appVersion: TEST_MANIFEST.version,
+        lastSyncAt: Date.now(),
+        syncEnabled: true,
+        nameUpdatedAt: Date.now()
+      }],
+      crossDeviceState: "waiting",
+      otherInstallationCount: 0,
+      omittedCategories: []
+    };
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus" || message.action === "syncBrowserData") {
+        return { success: true, data: status };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: { items: [], errors: [] } };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Waiting for another installation"));
+    expect(document.body.textContent).toContain("Not yet verified");
+    expect(document.body.textContent).toContain("Data is stored in this browser's sync area");
+    expect(document.body.textContent).toContain("0 events from other installations");
+    expect(document.body.textContent).toContain("No other installation record has reached this browser yet.");
+    expect(getExactButton("Send & receive now")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Last successful sync");
+    await waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({ action: "syncBrowserData" }));
+  });
+
+  test("shows a returned sync failure instead of a contradictory success message", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const baseStatus = {
+      capability: "available",
+      supported: true,
+      enabled: true,
+      browserLabel: "Microsoft Edge",
+      sourceLabel: "Microsoft Edge Add-ons",
+      ecosystemLabel: "Microsoft Edge Sync",
+      installationId: "current-installation",
+      deviceName: "Admin Mac",
+      platform: "macOS",
+      lastSyncAt: Date.now(),
+      lastSuccessAt: Date.now(),
+      reminderMode: "daily",
+      reminderDue: false,
+      suspendedByPurge: false,
+      devices: [{
+        installationId: "current-installation",
+        name: "Admin Mac",
+        browser: "Microsoft Edge",
+        platform: "macOS",
+        appVersion: TEST_MANIFEST.version,
+        lastSyncAt: Date.now(),
+        syncEnabled: true,
+        nameUpdatedAt: Date.now()
+      }],
+      crossDeviceState: "waiting",
+      otherInstallationCount: 0,
+      omittedCategories: []
+    };
+    let syncCalls = 0;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: baseStatus };
+      if (message.action === "syncBrowserData") {
+        syncCalls += 1;
+        return {
+          success: true,
+          data: syncCalls === 1
+            ? baseStatus
+            : { ...baseStatus, lastError: "Microsoft Edge Sync rejected the write." }
+        };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: { items: [], errors: [] } };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(syncCalls).toBe(1));
+    clickExactButton("Send & receive now");
+    await waitFor(() => expect(document.body.textContent).toContain("Microsoft Edge Sync rejected the write."));
+    expect(document.body.textContent).not.toContain("Saved in this browser's sync area. Open QuickPIM++ on the other computer");
+  });
+});
+
 describe("settings message contrast", () => {
   test("uses a dedicated high-contrast success style for saved settings messages", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");

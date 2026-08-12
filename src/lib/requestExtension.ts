@@ -1,6 +1,6 @@
 import { getEffectiveTrackedRequestStatus } from "./requestTracking";
 import { getGenericJustificationWarning } from "./justifications";
-import type { ActivationItem, TicketInfo, TrackedPimRequest } from "./types";
+import type { ActivationItem, ActivationResult, TicketInfo, TrackedPimRequest } from "./types";
 
 export const EXTENSION_DURATION_OPTIONS = [0.5, 1, 2, 4] as const;
 export const DEFAULT_EXTENSION_DURATION_HOURS = EXTENSION_DURATION_OPTIONS[0];
@@ -24,6 +24,16 @@ export function sanitizeExtensionDurationHours(value: unknown): number {
 export function formatExtensionDuration(durationHours: number): string {
   if (durationHours < 1) return `${Math.round(durationHours * 60)} minutes`;
   return `${durationHours} ${durationHours === 1 ? "hour" : "hours"}`;
+}
+
+export function requireTrackedRequestExtensionRequestId(result: ActivationResult): string {
+  const requestId = result.requestId?.trim();
+  if (!requestId) {
+    throw new Error(
+      "Microsoft accepted the extension request but did not return a tracking identifier. Check Microsoft PIM before trying again."
+    );
+  }
+  return requestId;
 }
 
 export function buildTrackedRequestExtensionPlan(
