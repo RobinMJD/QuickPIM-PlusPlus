@@ -3,13 +3,15 @@ import type {
   ActivationResult,
   ActivationResponse,
   RequestOperationAction,
-  RequestOperationRecord
+  RequestOperationRecord,
+  TrackedPimRequest
 } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
 import { normalizeActivationItemId } from "./activationIdentity";
 
 export const REQUEST_OPERATIONS_SESSION_KEY = "quickPimRequestOperations.v1";
 export const REQUEST_OPERATION_TTL_MS = 2 * 60 * 60_000;
+export const REQUEST_OPERATION_RECONCILIATION_GRACE_MS = 2 * 60_000;
 
 const MAX_OPERATIONS = 20;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
@@ -70,6 +72,36 @@ export function getRequestOperationFingerprint(operation: RequestOperationIdenti
     ticketInfo: ticketSystem || ticketNumber ? { ticketSystem, ticketNumber } : null,
     bundleName: operation.bundleName ?? null
   });
+}
+
+export function trackedRequestMatchesOperation(
+  request: TrackedPimRequest,
+  operation: RequestOperationRecord
+): boolean {
+  if (
+    request.action !== operation.action
+    || !operation.itemIds.map(normalizeActivationItemId).includes(normalizeActivationItemId(request.itemId))
+  ) {
+    return false;
+  }
+
+  if (request.operationId) {
+    return request.operationId === operation.id;
+  }
+
+  const requestedAt = Date.parse(request.requestedAt);
+  const earliestMatch = operation.startedAt - 30_000;
+  const latestMatch = operation.updatedAt + REQUEST_OPERATION_RECONCILIATION_GRACE_MS;
+  return Number.isFinite(requestedAt)
+    && requestedAt >= earliestMatch
+    && requestedAt <= latestMatch
+    && request.durationHours === operation.durationHours
+    && normalizeOptionalText(request.justification) === normalizeOptionalText(operation.justification)
+    && normalizeOptionalText(request.ticketSystem) === normalizeOptionalText(operation.ticketInfo?.ticketSystem)
+    && normalizeOptionalText(request.ticketNumber) === normalizeOptionalText(operation.ticketInfo?.ticketNumber)
+    && normalizeOptionalText(request.bundleName) === normalizeOptionalText(operation.bundleName)
+    && (!operation.sourceInstallationId || !request.sourceInstallationId
+      || request.sourceInstallationId === operation.sourceInstallationId);
 }
 
 export async function completeRequestOperation(
@@ -264,4 +296,8 @@ function isOperationId(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeOptionalText(value: string | undefined): string {
+  return value?.trim() || "";
 }

@@ -4,6 +4,7 @@ import { describe, expect, test } from "vitest";
 describe("Microsoft PIM API contracts", () => {
   const background = readFileSync("src/background.ts", "utf8");
   const popup = readFileSync("src/popup/main.tsx", "utf8");
+  const settings = readFileSync("src/settings/main.tsx", "utf8");
 
   test("loads Entra eligibility and active state from current-user schedule instances", () => {
     expect(background).toContain("roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')");
@@ -55,9 +56,11 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("isBrowserSyncPayloadStorageKey(key)");
     expect(background).toContain("isBrowserSyncDeviceStorageKey(key)");
     expect(background).toContain("runBrowserSync(true)");
-    expect(background).toContain("browserSyncFollowUpRequested = true");
+    expect(background).toContain("const followUp = predecessor.catch(() => undefined).then(() => {");
+    expect(background).toContain("return startBrowserSync();");
     expect(background).toContain("BROWSER_SYNC_TRANSIENT_RETRY_MINUTES");
     expect(background).toContain("isTransientBrowserSyncError(status.lastError)");
+    expect(background).toMatch(/case "syncBrowserData":[\s\S]{0,400}return runBrowserSync\(true\);/);
     expect(background).not.toContain("await initializeBrowserSync();\n      return status;");
   });
 
@@ -70,6 +73,22 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("REQUEST_TRACKING_GRAPH_CONCURRENCY");
     expect(background).not.toContain("void initializeBackgroundRefresh();\nvoid initializeRequestTracking();");
     expect(background).not.toContain("chrome.cookies");
+  });
+
+  test("coalesces forced request-status checks and preserves reset boundaries", () => {
+    expect(background).toContain("requestTrackingMaintenanceFollowUp");
+    expect(background).toContain("pendingForcedTrackedRequestIds");
+    expect(background).toContain("forceAllTrackedRequestMaintenance");
+    expect(background).toContain("queueForcedTrackedRequestMaintenance(requestIds)");
+    expect(background).toContain("return startTrackedRequestMaintenance(queuedRequestIds, true);");
+    expect(background).not.toContain("const current = await requestTrackingMaintenanceInFlight;");
+    expect(background).toMatch(/hasInFlightTasks:[\s\S]{0,500}requestTrackingMaintenanceFollowUp[\s\S]{0,300}browserSyncFollowUp/);
+    expect(background).toContain("if (extensionResetInProgress || Date.now() < suppressBackgroundStorageEventsUntil) return;");
+    expect(background).toContain("bestEffortTasks.size");
+    expect(background).toContain("await initializeEnabledBackgroundServices().catch(() => undefined);");
+    expect(background.indexOf("await initializeEnabledBackgroundServices().catch(() => undefined);")).toBeGreaterThan(
+      background.indexOf("await resetExtensionData({")
+    );
   });
 
   test("keeps activation execution in the service worker and only retries pre-write access failures", () => {
@@ -87,6 +106,23 @@ describe("Microsoft PIM API contracts", () => {
     expect(popup).toContain("let requestContinuesInBackground = false");
     expect(popup).toContain("requestContinuesInBackground = true");
     expect(popup).toContain("if (!requestContinuesInBackground) {");
+  });
+
+  test("keeps portal-recovery polling serialized and preserves the last known state on transient failures", () => {
+    expect(popup).toContain("readPortalRecoveryStatus(recoveryStatus)");
+    expect(popup).toContain("readPortalRecoveryStatus(progressiveRecoveryStatus)");
+    expect(popup).toContain("readPortalRecoveryStatus(portalRecoveryStatusRef.current)");
+    expect(popup).not.toContain("setInterval(() => void pollRecovery()");
+    expect(settings).toContain("readPortalRecoveryStatus(portalRecoveryStatusRef.current)");
+    expect(settings).toContain("readPortalRecoveryStatus(latestRecoveryStatus)");
+    expect(settings).not.toContain("setInterval(() => void updateStatus()");
+  });
+
+  test("retries token-state reads within the existing timeout budget before using verified in-memory state", () => {
+    expect(popup).toContain("readTokenStatusWithRetry(tokenStatusRef.current)");
+    expect(settings).toContain("readTokenStatusWithRetry(tokenStatusRef.current)");
+    expect(popup).toContain("const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2");
+    expect(settings).toContain("const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2");
   });
 
   test("queues notification extensions in the service worker without replaying ambiguous writes", () => {

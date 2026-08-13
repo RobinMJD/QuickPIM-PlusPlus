@@ -41,6 +41,7 @@ interface CreateTrackedRequestInput {
   item: ActivationItem;
   action: ActivityAction;
   requestId: string;
+  operationId?: string;
   payload?: unknown;
   requestedAt: string;
   durationHours?: number;
@@ -109,6 +110,7 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
   const base: TrackedPimRequest = {
     id: `${input.item.type}:${requestId}`,
     requestId,
+    operationId: sanitizeOperationId(input.operationId),
     action: input.action,
     itemId: input.item.id,
     itemName: input.item.displayName || input.item.sourceName,
@@ -485,6 +487,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
     return undefined;
   }
   const requestId = sanitizeString(value.requestId, MAX_ID_LENGTH);
+  const operationId = sanitizeOperationId(value.operationId);
   const itemId = sanitizeString(value.itemId, MAX_ID_LENGTH);
   const itemName = sanitizeString(value.itemName, MAX_NAME_LENGTH);
   const principalId = sanitizeString(value.principalId, MAX_ID_LENGTH);
@@ -524,6 +527,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
   return {
     id,
     requestId,
+    operationId,
     action,
     itemId,
     itemName,
@@ -682,6 +686,12 @@ function sanitizeString(value: unknown, maxLength: number): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function sanitizeOperationId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{8,80}$/.test(value)
+    ? value
+    : undefined;
 }
 
 function stringValue(value: unknown): string | undefined {

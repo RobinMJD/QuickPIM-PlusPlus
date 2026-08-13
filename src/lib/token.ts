@@ -1,4 +1,4 @@
-import type { TokenKind, TokenStatusEntry } from "./types";
+import type { TokenKind, TokenStatus, TokenStatusEntry } from "./types";
 
 const TOKEN_MAX_AGE_MINUTES = 45;
 
@@ -30,6 +30,38 @@ export function makeTokenStatus(
     isExpired: expiresAtMs === undefined ? tokenAge > TOKEN_MAX_AGE_MINUTES : expiresAtMs <= now,
     grantedScopes: getGrantedScopes(decoded),
     source
+  };
+}
+
+export function refreshTokenStatusFreshness(status: TokenStatus, now = Date.now()): TokenStatus {
+  return {
+    graph: refreshTokenStatusEntry(status.graph, now),
+    ...(status.graphTargets ? {
+      graphTargets: Object.fromEntries(
+        Object.entries(status.graphTargets).map(([target, entry]) => [
+          target,
+          entry ? refreshTokenStatusEntry(entry, now) : entry
+        ])
+      ) as TokenStatus["graphTargets"]
+    } : {}),
+    azureManagement: refreshTokenStatusEntry(status.azureManagement, now)
+  };
+}
+
+function refreshTokenStatusEntry(entry: TokenStatusEntry, now: number): TokenStatusEntry {
+  if (!entry.hasToken) {
+    return entry;
+  }
+  const expiresAt = entry.expiresAt ? Date.parse(entry.expiresAt) : Number.NaN;
+  const capturedAt = Number(entry.capturedAt);
+  const hasKnownExpiry = Number.isFinite(expiresAt);
+  return {
+    ...entry,
+    ...(Number.isFinite(capturedAt) ? { tokenAge: Math.max(0, Math.round((now - capturedAt) / 60_000)) } : {}),
+    expiresInMinutes: hasKnownExpiry ? Math.max(0, Math.floor((expiresAt - now) / 60_000)) : undefined,
+    // Every captured token is validated with an exp claim before storage. An
+    // in-memory fallback without one must therefore fail closed.
+    isExpired: !hasKnownExpiry || expiresAt <= now
   };
 }
 

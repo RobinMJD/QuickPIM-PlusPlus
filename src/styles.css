@@ -1733,8 +1733,104 @@ a.btn {
   align-items: center;
 }
 
-.sync-master-toggle {
-  margin: 0;
+.sync-master-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+  min-height: 54px;
+  padding: 9px 12px;
+  border: 1px solid var(--settings-border);
+  border-radius: 6px;
+  background: var(--settings-field);
+  color: var(--settings-text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sync-master-switch:hover:not(:disabled),
+.sync-master-switch:focus-visible {
+  border-color: #60a5fa;
+  background: #f8fbff;
+}
+
+.sync-master-switch:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.sync-master-switch:disabled {
+  cursor: wait;
+  opacity: 0.68;
+}
+
+.sync-master-switch-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sync-master-switch-copy strong {
+  font-size: 12px;
+}
+
+.sync-master-switch-copy .muted {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.sync-master-switch-state {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 64px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.sync-master-switch-state > strong {
+  min-width: 18px;
+}
+
+.sync-master-switch-track {
+  position: relative;
+  display: inline-flex;
+  width: 34px;
+  height: 20px;
+  padding: 2px;
+  border: 1px solid #94a3b8;
+  border-radius: 999px;
+  background: #cbd5e1;
+}
+
+.sync-master-switch-track > span {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.25);
+  transform: translateX(0);
+  transition: transform 160ms ease;
+}
+
+.sync-master-switch.enabled {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+
+.sync-master-switch.enabled .sync-master-switch-state {
+  color: #166534;
+}
+
+.sync-master-switch.enabled .sync-master-switch-track {
+  border-color: #16a34a;
+  background: #22c55e;
+}
+
+.sync-master-switch.enabled .sync-master-switch-track > span {
+  transform: translateX(14px);
 }
 
 .sync-verification-summary {
@@ -1901,11 +1997,32 @@ a.btn {
 
 .sync-device-name-row {
   grid-template-columns: minmax(240px, 1fr) minmax(220px, 0.7fr);
-  align-items: end;
+  align-items: stretch;
+}
+
+.sync-installations-section {
+  display: grid;
+  gap: 0;
+}
+
+.sync-section-heading {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.sync-section-heading h3,
+.sync-section-heading p {
+  margin: 0;
+}
+
+.sync-current-installation {
+  display: grid;
+  gap: 7px;
 }
 
 .sync-current-device-summary {
-  min-height: 38px;
+  min-height: 60px;
   align-content: center;
 }
 
@@ -1925,11 +2042,11 @@ a.btn {
 }
 
 .sync-id-help {
-  margin: 8px 0 0;
+  margin: 0;
 }
 
 .sync-other-installations {
-  margin-top: 14px;
+  margin-top: 16px;
   padding: 12px;
   border-radius: 6px;
   background: var(--settings-field);
@@ -2832,7 +2949,8 @@ a.btn {
   }
 
   .active-filter-switch .switch-track,
-  .active-filter-switch .switch-track > span {
+  .active-filter-switch .switch-track > span,
+  .sync-master-switch-track > span {
     transition: none;
   }
 
@@ -4196,6 +4314,31 @@ body.dark-mode .sync-capability-badge.limited {
   border-color: #a16207;
   background: #422006;
   color: #fef3c7;
+}
+
+body.dark-mode .sync-master-switch {
+  border-color: #475569;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+body.dark-mode .sync-master-switch:hover:not(:disabled),
+body.dark-mode .sync-master-switch:focus-visible {
+  border-color: #3b82f6;
+  background: #172554;
+}
+
+body.dark-mode .sync-master-switch.enabled {
+  border-color: #15803d;
+  background: #052e16;
+}
+
+body.dark-mode .sync-master-switch.enabled .sync-master-switch-state {
+  color: #bbf7d0;
+}
+
+body.dark-mode .sync-master-switch.disabled .sync-master-switch-state {
+  color: #94a3b8;
 }
 
 body.dark-mode .sync-verification-summary.verified {

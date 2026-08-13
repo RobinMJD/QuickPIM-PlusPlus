@@ -38,6 +38,7 @@ import { MAX_USER_JUSTIFICATION_LENGTH, getGenericJustificationWarning } from ".
 import { APP_BUILD_TIMESTAMP, APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import { isOperationTimeoutError } from "../lib/async";
+import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { savePopupDraft } from "../lib/popupDraft";
 import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
@@ -94,6 +95,7 @@ const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 const PORTAL_TOKEN_WAIT_TIMEOUT_MS = 12_000;
 const PORTAL_TOKEN_POLL_INTERVAL_MS = 1500;
 const TOKEN_STATUS_TIMEOUT_MS = 8_000;
+const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2;
 const PORTAL_TOKEN_REFRESH_TIMEOUT_MS = 17_000;
 const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
 const SETTINGS_REFRESH_STEPS: readonly ProgressStepDefinition[] = [
@@ -150,6 +152,7 @@ function SettingsApp() {
   const [exportExternalChange, setExportExternalChange] = useState(false);
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
+  const [isSettingsRefreshInFlight, setIsSettingsRefreshInFlight] = useState(true);
   const [eligibleRefreshProgress, setEligibleRefreshProgress] = useState<OperationProgress | null>(null);
   const [accessRefreshProgress, setAccessRefreshProgress] = useState<OperationProgress | null>(null);
   const [isSettingsReady, setIsSettingsReady] = useState(false);
@@ -162,10 +165,20 @@ function SettingsApp() {
   const explicitPortalScanDepth = useRef(0);
   const settingsProgressRunId = useRef(0);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const settingsRefreshInFlight = useRef(false);
+  const settingsRefreshCompletion = useRef<Promise<void>>(Promise.resolve());
   const pendingTabFlushRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const pendingPreferenceFlush = useRef<Promise<void>>(Promise.resolve());
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+
+  tokenStatusRef.current = tokenStatus;
+
+  function publishTokenStatus(nextStatus: TokenStatus): void {
+    tokenStatusRef.current = nextStatus;
+    setTokenStatus(nextStatus);
+  }
 
   function replaceExportText(value: string, dirty = false) {
     exportTextDirty.current = dirty;
@@ -266,6 +279,15 @@ function SettingsApp() {
   }, []);
 
   async function refresh(options: { showProgress?: boolean } = {}) {
+    if (settingsRefreshInFlight.current) {
+      return settingsRefreshCompletion.current;
+    }
+    let resolveRefreshCompletion: () => void = () => undefined;
+    settingsRefreshCompletion.current = new Promise<void>((resolve) => {
+      resolveRefreshCompletion = resolve;
+    });
+    settingsRefreshInFlight.current = true;
+    setIsSettingsRefreshInFlight(true);
     const refreshStartedAt = Date.now();
     let progress: OperationProgress | null = null;
     let progressCompleted = false;
@@ -300,10 +322,7 @@ function SettingsApp() {
       }
       setIsSettingsReady(true);
       const [loadedTokens, loadedCache, loadedReferenceData, loadedTrackedRequests] = await Promise.all([
-        sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Saved settings and cached data remain available." }
-        ),
+        readTokenStatusWithRetry(tokenStatusRef.current),
         loadDataCache(),
         loadReferenceData(),
         loadTrackedRequests()
@@ -361,7 +380,7 @@ function SettingsApp() {
       showProgressStep(3);
       await saveReferenceData(nextReferenceData);
       setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
-      setTokenStatus(effectiveTokenStatus);
+      publishTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       if (options.showProgress) {
@@ -388,6 +407,9 @@ function SettingsApp() {
         setEligibleRefreshProgress(progress);
       }
     } finally {
+      settingsRefreshInFlight.current = false;
+      setIsSettingsRefreshInFlight(false);
+      resolveRefreshCompletion();
       if (options.showProgress) {
         setIsRefreshingEligible(false);
         if (progressCompleted && progress) {
@@ -424,13 +446,17 @@ function SettingsApp() {
     setIsRefreshingAccess(true);
     setEligibleRefreshProgress(null);
     setAccessRefreshProgress(progress);
-    const refreshRun = accessRefreshQueue.current.then(() => {
+    const refreshRun = accessRefreshQueue.current.then(async () => {
+      // Initial Settings hydration and a user-requested eligible refresh both
+      // publish token/cache state. Wait for that writer before Access Setup
+      // starts so an older bootstrap result cannot overwrite recovered access.
+      await settingsRefreshCompletion.current;
       // Clear feedback when this queued run actually starts. Clearing it while
       // enqueuing allows an older run to publish a stale error after the clear.
       setError("");
       setMessage("");
       showProgressStep(1, "Reading local access state");
-      return performAccessDataRefresh(tokens, targets, options, showProgressStep);
+      await performAccessDataRefresh(tokens, targets, options, showProgressStep);
     });
     accessRefreshQueue.current = refreshRun.then(() => undefined, () => undefined);
 
@@ -473,10 +499,7 @@ function SettingsApp() {
       loadReferenceData(),
       tokens
         ? Promise.resolve(tokens)
-        : sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Cached access data remains available." }
-        )
+        : readTokenStatusWithRetry(tokenStatusRef.current)
     ]);
     const latestTokens = loadedTokens;
     const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
@@ -492,7 +515,7 @@ function SettingsApp() {
     );
 
     setSettings(loadedSettings);
-    setTokenStatus(latestTokens);
+    publishTokenStatus(latestTokens);
     setDataCache(currentCache);
     if (!refreshTargets.length) {
       onProgress(3, "Finalizing current access data");
@@ -542,7 +565,7 @@ function SettingsApp() {
     const active = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), fetchedAt, legacyCacheKey);
     const nextReferenceData = learnReferenceDataFromItems(currentReferenceData, [...eligible.items, ...active.items]);
     await saveReferenceData(nextReferenceData);
-    setTokenStatus(snapshotTokenStatus);
+    publishTokenStatus(snapshotTokenStatus);
     setDataCache(nextCache);
     setReferenceData(nextReferenceData);
     setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
@@ -585,7 +608,7 @@ function SettingsApp() {
       return result.tokenStatus;
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : String(scanError));
-      return tokenStatus || {
+      return tokenStatusRef.current || {
         graph: { hasToken: false },
         azureManagement: { hasToken: false }
       };
@@ -635,7 +658,7 @@ function SettingsApp() {
     try {
       suppressSessionTokenRefreshUntil.current = Date.now() + 1000;
       await sendMessage<boolean>({ action: "clearToken" });
-      setTokenStatus({
+      publishTokenStatus({
         graph: { hasToken: false },
         azureManagement: { hasToken: false }
       });
@@ -662,16 +685,20 @@ function SettingsApp() {
 
   async function resetExtensionData(): Promise<boolean> {
     try {
+      if (settingsRefreshInFlight.current || isRefreshingEligible || isRefreshingAccess || pendingAccessRefreshes.current > 0) {
+        throw new Error("Wait for the current access refresh to finish before resetting QuickPIM++.");
+      }
       await pendingPreferenceFlush.current;
       await pendingTabFlushRef.current?.();
       await pendingPreferenceFlush.current;
+      await settingsMutationQueue.current;
       await sendMessage<boolean>(
         { action: "resetExtensionData" },
-        { timeoutMs: 15_000, timeoutMessage: "QuickPIM++ data reset timed out. No success was confirmed." }
+        { timeoutMs: 30_000, timeoutMessage: "QuickPIM++ data reset timed out. No success was confirmed." }
       );
       setSettings(DEFAULT_SETTINGS);
       setItems([]);
-      setTokenStatus({ graph: { hasToken: false }, azureManagement: { hasToken: false } });
+      publishTokenStatus({ graph: { hasToken: false }, azureManagement: { hasToken: false } });
       setDataCache({});
       setReferenceData(undefined);
       setTrackedRequests({ version: 1, requests: [] });
@@ -715,7 +742,7 @@ function SettingsApp() {
             <p>Set up role access, personalize the popup, configure activation, and manage local data.</p>
           </div>
         </div>
-        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible || isRefreshingAccess}>
+        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isSettingsRefreshInFlight || isRefreshingEligible || isRefreshingAccess}>
           {isRefreshingEligible ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
@@ -777,7 +804,7 @@ function SettingsApp() {
                   tokenStatus={tokenStatus}
                   dataCache={dataCache}
                   isRefreshingAccess={isRefreshingAccess}
-                  isRefreshingEligible={isRefreshingEligible}
+                  isRefreshingEligible={isRefreshingEligible || isSettingsRefreshInFlight}
                   onSave={persist}
                   onFlushPreferences={async () => {
                     await pendingPreferenceFlush.current;
@@ -1072,25 +1099,42 @@ function AccessSetupPanel({
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
   const identity = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
   const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
+  const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
+
+  portalRecoveryStatusRef.current = portalRecoveryStatus;
+
+  function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
+    portalRecoveryStatusRef.current = nextStatus;
+    setPortalRecoveryStatus(nextStatus);
+  }
 
   useEffect(() => {
     let active = true;
-    const updateStatus = async () => {
-      const next = await readPortalRecoveryStatus();
+    let timer: number | undefined;
+    const updateStatus = async (): Promise<void> => {
+      const next = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
       if (active) {
-        setPortalRecoveryStatus(next);
+        publishPortalRecoveryStatus(next);
+        if (next.state !== "idle") {
+          timer = window.setTimeout(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+        }
       }
     };
-    void updateStatus();
-    if (portalRecoveryStatus.state === "idle") {
+    if (isRunningSetup || isRecheckingPortalTabs) {
       return () => { active = false; };
     }
-    const timer = window.setInterval(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+    if (portalRecoveryStatus.state === "idle") {
+      // Restore an existing managed sign-in session immediately on first load.
+      // Subsequent non-idle checks are scheduled only after the prior one ends.
+      void updateStatus();
+    } else {
+      timer = window.setTimeout(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+    }
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [portalRecoveryStatus.state]);
+  }, [isRecheckingPortalTabs, isRunningSetup, portalRecoveryStatus.state]);
 
   async function setIgnored(ignored: boolean) {
     await onSave(
@@ -1113,6 +1157,7 @@ function AccessSetupPanel({
     }
     setIsRunningSetup(true);
     setPortalRecoveryError("");
+    let latestRecoveryStatus = portalRecoveryStatus;
     try {
       const latestSettings = await onFlushPreferences();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
@@ -1123,7 +1168,8 @@ function AccessSetupPanel({
       ).filter((target) => initialTargets.includes(target));
       if (remainingTargets.length) {
         await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
-        setPortalRecoveryStatus(await readPortalRecoveryStatus());
+        latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
+        publishPortalRecoveryStatus(latestRecoveryStatus);
       }
 
       if (!remainingTargets.length) {
@@ -1132,7 +1178,8 @@ function AccessSetupPanel({
       }
 
       const tokenRefresh = await waitForPortalTokens(remainingTargets, scannedTokens, onScanPortalTabsForTokens);
-      setPortalRecoveryStatus(tokenRefresh.recoveryStatus);
+      latestRecoveryStatus = tokenRefresh.recoveryStatus;
+      publishPortalRecoveryStatus(tokenRefresh.recoveryStatus);
       if (tokenRefresh.changedTargets.length) {
         await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, { skipTargetsWithCurrentTokenCache: true });
       }
@@ -1143,9 +1190,12 @@ function AccessSetupPanel({
       if (unchangedTargets.length) {
         await onRefreshAccessData(tokenRefresh.tokens, unchangedTargets);
       }
+    } catch (setupError) {
+      setPortalRecoveryError(setupError instanceof Error ? setupError.message : String(setupError));
     } finally {
       setIsRunningSetup(false);
-      setPortalRecoveryStatus(await readPortalRecoveryStatus());
+      latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
+      publishPortalRecoveryStatus(latestRecoveryStatus);
     }
   }
 
@@ -1153,7 +1203,7 @@ function AccessSetupPanel({
     setPortalRecoveryError("");
     try {
       const result = await sendMessage<PortalRecoveryFocusResult>({ action: "focusPortalRecoveryTabs" });
-      setPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
+      publishPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
       if (!result?.focused) {
         setPortalRecoveryError("The Microsoft sign-in tab is no longer available. Open the missing portal pages again.");
       }
@@ -1164,17 +1214,20 @@ function AccessSetupPanel({
 
   async function recheckPortalAccess() {
     setIsRecheckingPortalTabs(true);
+    setPortalRecoveryError("");
     try {
       const latestSettings = await onFlushPreferences();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const scannedTokens = await onScanPortalTabsForTokens();
-      const recoveryStatus = await readPortalRecoveryStatus();
-      setPortalRecoveryStatus(recoveryStatus);
+      const recoveryStatus = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
+      publishPortalRecoveryStatus(recoveryStatus);
       if (recoveryStatus.state === "interactionRequired") {
         return;
       }
       const currentTargets = getAccessSetupTargets(buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures));
       await onRefreshAccessData(scannedTokens, currentTargets.length ? currentTargets : currentFeatures);
+    } catch (recheckError) {
+      setPortalRecoveryError(recheckError instanceof Error ? recheckError.message : String(recheckError));
     } finally {
       setIsRecheckingPortalTabs(false);
     }
@@ -1342,7 +1395,33 @@ function emptyPortalRecoveryStatus(): PortalRecoveryStatus {
   return sanitizePortalRecoveryStatus(undefined);
 }
 
-async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
+async function readTokenStatusWithRetry(fallback?: TokenStatus | null): Promise<TokenStatus> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await sendMessage<TokenStatus>(
+        { action: "getTokenStatus" },
+        {
+          timeoutMs: TOKEN_STATUS_ATTEMPT_TIMEOUT_MS,
+          timeoutMessage: "Token status check timed out. Saved settings and cached data remain available."
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await delay(100);
+      }
+    }
+  }
+  if (fallback) {
+    return refreshTokenStatusFreshness(fallback);
+  }
+  throw lastError;
+}
+
+async function readPortalRecoveryStatus(
+  fallback: PortalRecoveryStatus = emptyPortalRecoveryStatus()
+): Promise<PortalRecoveryStatus> {
   try {
     return sanitizePortalRecoveryStatus(
       await sendMessage<PortalRecoveryStatus>(
@@ -1351,7 +1430,7 @@ async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
       )
     );
   } catch {
-    return emptyPortalRecoveryStatus();
+    return fallback;
   }
 }
 
@@ -1367,7 +1446,7 @@ async function waitForPortalTokens(
   while (Date.now() < deadline) {
     [latestTokens, recoveryStatus] = await Promise.all([
       scanPortalTabsForTokens(),
-      readPortalRecoveryStatus()
+      readPortalRecoveryStatus(recoveryStatus)
     ]);
     changedTargets = targets.filter((target) => hasTargetPortalTokenChanged(target, baselineTokens, latestTokens));
     if (changedTargets.length === targets.length) {
@@ -1379,7 +1458,7 @@ async function waitForPortalTokens(
     await delay(Math.min(PORTAL_TOKEN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
   }
   if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
-    recoveryStatus = await readPortalRecoveryStatus();
+    recoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
   }
   return { tokens: latestTokens, changedTargets, recoveryStatus };
 }
@@ -2060,9 +2139,42 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
   const [error, setError] = useState("");
   const [confirmingPurge, setConfirmingPurge] = useState(false);
   const lastSavedDeviceName = useRef("");
+  const lastRequestedDeviceName = useRef("");
+  const lastFailedDeviceName = useRef("");
+  const currentDeviceName = useRef("");
+  const currentStatus = useRef<BrowserSyncStatus | null>(null);
+  const actionInFlight = useRef(false);
+  const pendingStatusRefresh = useRef(false);
+  const nextStatusRequestId = useRef(0);
+  const lastAppliedStatusRequestId = useRef(0);
   const isMounted = useRef(true);
 
+  currentDeviceName.current = deviceName;
+  currentStatus.current = status;
+
+  function applyStatus(
+    next: BrowserSyncStatus,
+    requestId: number,
+    request?: Record<string, unknown>
+  ): boolean {
+    if (!isMounted.current || requestId < lastAppliedStatusRequestId.current) return false;
+    lastAppliedStatusRequestId.current = requestId;
+    setStatus(next);
+    currentStatus.current = next;
+    const previousSavedName = lastSavedDeviceName.current;
+    setDeviceName((current) => request?.action === "updateBrowserSyncDeviceName"
+      && current.trim() !== request.name
+      ? current
+      : !current || current === previousSavedName || request?.action === "updateBrowserSyncDeviceName"
+        ? next.deviceName
+        : current);
+    lastSavedDeviceName.current = next.deviceName;
+    if (lastRequestedDeviceName.current === next.deviceName) lastRequestedDeviceName.current = "";
+    return true;
+  }
+
   async function loadStatus(synchronize = false): Promise<BrowserSyncStatus | null> {
+    const requestId = ++nextStatusRequestId.current;
     try {
       const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
         { action: synchronize ? "syncBrowserData" : "getBrowserSyncStatus" },
@@ -2073,16 +2185,16 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
             : "Browser sync status check timed out."
         }
       ));
-      if (next && isMounted.current) {
+      if (!next) throw new Error("Browser sync returned an invalid status. Retry the check.");
+      const applied = applyStatus(next, requestId);
+      if (applied) {
         setError("");
-        setStatus(next);
-        const previousSavedName = lastSavedDeviceName.current;
-        setDeviceName((current) => !current || current === previousSavedName ? next.deviceName : current);
-        lastSavedDeviceName.current = next.deviceName;
       }
       return next;
     } catch (statusError) {
-      if (isMounted.current) setError(statusError instanceof Error ? statusError.message : String(statusError));
+      if (isMounted.current && requestId >= lastAppliedStatusRequestId.current) {
+        setError(statusError instanceof Error ? statusError.message : String(statusError));
+      }
       return null;
     }
   }
@@ -2097,8 +2209,31 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
     };
   }, []);
 
-  useEffect(() => () => {
-    isMounted.current = false;
+  useEffect(() => {
+    isMounted.current = true;
+    const flushPendingDeviceName = () => {
+      const next = currentDeviceName.current.trim();
+      if (!currentStatus.current?.supported
+        || !next
+        || next === lastSavedDeviceName.current
+        || next === lastRequestedDeviceName.current
+        || next === lastFailedDeviceName.current) return;
+      lastRequestedDeviceName.current = next;
+      try {
+        void Promise.resolve(chrome.runtime.sendMessage({ action: "updateBrowserSyncDeviceName", name: next }))
+          .catch(() => {
+            if (lastRequestedDeviceName.current === next) lastRequestedDeviceName.current = "";
+          });
+      } catch {
+        if (lastRequestedDeviceName.current === next) lastRequestedDeviceName.current = "";
+      }
+    };
+    window.addEventListener("pagehide", flushPendingDeviceName);
+    return () => {
+      window.removeEventListener("pagehide", flushPendingDeviceName);
+      flushPendingDeviceName();
+      isMounted.current = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -2107,6 +2242,10 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
     let timer: number | undefined;
     const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
       if (areaName !== "sync" && !(areaName === "local" && changes[BROWSER_SYNC_LOCAL_STATE_KEY])) return;
+      if (actionInFlight.current) {
+        pendingStatusRefresh.current = true;
+        return;
+      }
       if (timer) window.clearTimeout(timer);
       timer = window.setTimeout(() => void loadStatus(), 150);
     };
@@ -2119,7 +2258,12 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
 
   useEffect(() => {
     const trimmed = deviceName.trim();
-    if (!status?.supported || !trimmed || trimmed === lastSavedDeviceName.current) return;
+    if (isBusy
+      || !status?.supported
+      || !trimmed
+      || trimmed === lastSavedDeviceName.current
+      || trimmed === lastRequestedDeviceName.current
+      || trimmed === lastFailedDeviceName.current) return;
     const timer = window.setTimeout(() => {
       void runAction(
         { action: "updateBrowserSyncDeviceName", name: trimmed },
@@ -2127,48 +2271,74 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
       );
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [deviceName, status?.supported]);
+  }, [deviceName, isBusy, status?.supported]);
 
   async function runAction(
     request: Record<string, unknown>,
     successMessage: string | ((next: BrowserSyncStatus | null) => string)
   ): Promise<boolean> {
-    setIsBusy(true);
-    setMessage("");
-    setError("");
+    if (actionInFlight.current) return false;
+    actionInFlight.current = true;
+    const requestId = ++nextStatusRequestId.current;
+    const requestedDeviceName = request.action === "updateBrowserSyncDeviceName" && typeof request.name === "string"
+      ? request.name
+      : "";
+    if (requestedDeviceName) lastRequestedDeviceName.current = requestedDeviceName;
+    if (isMounted.current) {
+      setIsBusy(true);
+      setMessage("");
+      setError("");
+    }
     try {
       const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
         request,
         { timeoutMs: 15_000, timeoutMessage: "Browser sync did not finish in time. It will retry in the background." }
       ));
-      if (next) {
-        setStatus(next);
-        setDeviceName((current) => request.action === "updateBrowserSyncDeviceName"
-          && current.trim() !== request.name
-          ? current
-          : next.deviceName);
-        lastSavedDeviceName.current = next.deviceName;
-      }
+      if (!next) throw new Error("Browser sync returned an invalid status. Retry the action.");
+      const applied = applyStatus(next, requestId, request);
       const attemptedDataSync = request.action === "syncBrowserData"
         || (request.action === "setBrowserSyncEnabled" && request.enabled === true);
-      if (attemptedDataSync && next?.lastError) {
-        setMessage("");
-        setError(next.lastError);
+      const actionReportedFailure = attemptedDataSync
+        || (request.action === "setBrowserSyncEnabled" && request.enabled === false)
+        || (request.action === "updateBrowserSyncDeviceName"
+          && next.lastError?.startsWith("The installation name is saved locally"));
+      if (actionReportedFailure && next.lastError) {
+        if (requestedDeviceName) {
+          lastRequestedDeviceName.current = "";
+          lastFailedDeviceName.current = requestedDeviceName;
+        }
+        if (isMounted.current) {
+          setMessage("");
+          setError(next.lastError);
+        }
         return false;
       }
-      setMessage(typeof successMessage === "function" ? successMessage(next) : successMessage);
+      if (isMounted.current && applied) {
+        setMessage(typeof successMessage === "function" ? successMessage(next) : successMessage);
+      }
       return true;
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      if (requestedDeviceName && lastRequestedDeviceName.current === requestedDeviceName) {
+        lastRequestedDeviceName.current = "";
+      }
+      if (requestedDeviceName) lastFailedDeviceName.current = requestedDeviceName;
+      if (isMounted.current) setError(actionError instanceof Error ? actionError.message : String(actionError));
       return false;
     } finally {
-      setIsBusy(false);
+      actionInFlight.current = false;
+      if (isMounted.current) {
+        setIsBusy(false);
+        if (pendingStatusRefresh.current) {
+          pendingStatusRefresh.current = false;
+          void loadStatus();
+        }
+      }
     }
   }
 
   async function purgeSyncedData() {
     await runAction({ action: "purgeBrowserSyncData" }, "Synced settings and history were deleted. Sync is now off on this installation.");
-    setConfirmingPurge(false);
+    if (isMounted.current) setConfirmingPurge(false);
   }
 
   const otherDevices = status?.devices.filter((device) => device.installationId !== status.installationId) || [];
@@ -2204,7 +2374,12 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
         </span> : null}
       </div>
 
-      {!status ? <div className="settings-subsection"><p className="muted">Checking browser sync...</p></div> : null}
+      {!status ? (
+        <div className="settings-subsection sync-status-placeholder">
+          <p className="muted">{error ? "Browser sync status is unavailable." : "Checking browser sync..."}</p>
+          {error ? <button className="btn compact" onClick={() => void loadStatus()}>Retry status check</button> : null}
+        </div>
+      ) : null}
       {status && !status.supported ? (
         <div className="settings-subsection sync-limitation-card">
           <h3>Native sync is unavailable for this installation</h3>
@@ -2228,21 +2403,27 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
         <>
           <div className="settings-subsection sync-overview-section">
             <div className="sync-control-header">
-              <label className="preference-toggle sync-master-toggle">
-                <input
-                  type="checkbox"
-                  checked={status.enabled}
-                  disabled={isBusy}
-                  onChange={(event) => void runAction(
-                    { action: "setBrowserSyncEnabled", enabled: event.target.checked },
-                    event.target.checked ? "Browser sync enabled." : "Browser sync disabled on this installation."
-                  )}
-                />
-                <span className="preference-toggle-copy">
+              <button
+                type="button"
+                className={`sync-master-switch ${status.enabled ? "enabled" : "disabled"}`}
+                role="switch"
+                aria-checked={status.enabled}
+                aria-label="Browser sync"
+                disabled={isBusy}
+                onClick={() => void runAction(
+                  { action: "setBrowserSyncEnabled", enabled: !status.enabled },
+                  status.enabled ? "Browser sync disabled on this installation." : "Browser sync enabled."
+                )}
+              >
+                <span className="sync-master-switch-copy">
                   <strong>Sync settings and activity</strong>
                   <span className="muted">Enabled by default. Chrome and Edge use separate sync services.</span>
                 </span>
-              </label>
+                <span className="sync-master-switch-state" aria-hidden="true">
+                  <span className="sync-master-switch-track"><span /></span>
+                  <strong>{status.enabled ? "On" : "Off"}</strong>
+                </span>
+              </button>
               <button
                 className="btn primary"
                 disabled={isBusy || !status.enabled}
@@ -2299,24 +2480,47 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
             ) : null}
           </div>
 
-          <div className="settings-subsection">
-            <h3>Installations</h3>
-            <p className="muted">Use a recognizable name because browser extension APIs do not expose the computer hostname.</p>
-            <div className="form-grid sync-device-name-row">
-              <div className="field">
-                <label htmlFor="sync-device-name">Installation name</label>
-                <input id="sync-device-name" className="input" value={deviceName} maxLength={60} disabled={isBusy} onChange={(event) => setDeviceName(event.target.value)} />
-              </div>
-              <div className="sync-current-device-summary">
-                <strong>{status.browserLabel} / {status.platform}</strong>
-                <span>QuickPIM++ {APP_VERSION}</span>
-                <span className="sync-installation-id" title={status.installationId}>
-                  ID {formatBrowserSyncInstallationId(status.installationId)}
-                  <CopyTextButton text={status.installationId} label="installation ID" />
-                </span>
-              </div>
+          <div className="settings-subsection sync-installations-section">
+            <div className="sync-section-heading">
+              <h3>Installations</h3>
+              <p className="muted">Give each installation a recognizable name. Browser extension APIs do not expose the computer hostname.</p>
             </div>
-            <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
+            <div className="sync-current-installation">
+              <div className="form-grid sync-device-name-row">
+                <div className="field">
+                  <label htmlFor="sync-device-name">Installation name</label>
+                  <input
+                    id="sync-device-name"
+                    className="input"
+                    value={deviceName}
+                    maxLength={60}
+                    disabled={isBusy}
+                    onChange={(event) => {
+                      lastFailedDeviceName.current = "";
+                      setDeviceName(event.target.value);
+                    }}
+                    onBlur={() => {
+                      const trimmed = currentDeviceName.current.trim();
+                      if (!trimmed) {
+                        setDeviceName(lastSavedDeviceName.current);
+                        setError("Installation name cannot be empty.");
+                      } else if (trimmed !== currentDeviceName.current) {
+                        setDeviceName(trimmed);
+                      }
+                    }}
+                  />
+                </div>
+                <div className="sync-current-device-summary">
+                  <strong>{status.browserLabel} / {status.platform}</strong>
+                  <span>QuickPIM++ {APP_VERSION}</span>
+                  <span className="sync-installation-id" title={status.installationId}>
+                    ID {formatBrowserSyncInstallationId(status.installationId)}
+                    <CopyTextButton text={status.installationId} label="installation ID" />
+                  </span>
+                </div>
+              </div>
+              <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
+            </div>
             <div className="sync-other-installations">
               <h4>Other installations</h4>
               <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>

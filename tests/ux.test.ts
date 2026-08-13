@@ -36,7 +36,7 @@ import {
 } from "../src/lib/popupModel";
 import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole, normalizePimGroup } from "../src/lib/pim";
 import { isPrivilegedAzureRoleDefinition } from "../src/lib/privilegedRoles";
-import { makeTokenStatus } from "../src/lib/token";
+import { makeTokenStatus, refreshTokenStatusFreshness } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
 
 const directoryRole: ActivationItem = {
@@ -593,6 +593,22 @@ describe("popup model helpers", () => {
     expect(tokenStatusText("Graph", makeTokenStatus(expiredToken, capturedAt, "portal", now))).toBe(
       "Graph refresh needed"
     );
+  });
+
+  test("revalidates in-memory token status before using it as a timeout fallback", () => {
+    const capturedAt = Date.parse("2026-05-18T14:00:00.000Z");
+    const expiresAt = "2026-05-18T14:10:00.000Z";
+    const refreshed = refreshTokenStatusFreshness({
+      graph: { hasToken: true, capturedAt, expiresAt, isExpired: false, expiresInMinutes: 10 },
+      graphTargets: {
+        directoryRole: { hasToken: true, capturedAt, expiresAt, isExpired: false, expiresInMinutes: 10 }
+      },
+      azureManagement: { hasToken: false }
+    }, Date.parse("2026-05-18T14:11:00.000Z"));
+
+    expect(refreshed.graph).toMatchObject({ isExpired: true, expiresInMinutes: 0, tokenAge: 11 });
+    expect(refreshed.graphTargets?.directoryRole).toMatchObject({ isExpired: true, expiresInMinutes: 0 });
+    expect(refreshed.azureManagement).toEqual({ hasToken: false });
   });
 
   test("maps role tabs to matching Entra portal pages", () => {

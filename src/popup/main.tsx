@@ -74,6 +74,7 @@ import {
   sanitizePortalRecoveryStatus
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
+import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { getActivationItemIdentity, normalizeActivationItemId } from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
@@ -178,6 +179,7 @@ const REFRESH_SAVE_STEP: ProgressStepDefinition = {
   expectedDurationMs: 1_500
 };
 const TOKEN_STATUS_TIMEOUT_MS = 8_000;
+const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2;
 const PORTAL_TOKEN_REFRESH_TIMEOUT_MS = 17_000;
 const PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 15_000;
 const PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
@@ -203,7 +205,9 @@ function emptyPortalRecoveryStatus(): PortalRecoveryStatus {
   return sanitizePortalRecoveryStatus(undefined);
 }
 
-async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
+async function readPortalRecoveryStatus(
+  fallback: PortalRecoveryStatus = emptyPortalRecoveryStatus()
+): Promise<PortalRecoveryStatus> {
   try {
     return sanitizePortalRecoveryStatus(
       await sendMessage<PortalRecoveryStatus>(
@@ -212,8 +216,32 @@ async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
       )
     );
   } catch {
-    return emptyPortalRecoveryStatus();
+    return fallback;
   }
+}
+
+async function readTokenStatusWithRetry(fallback?: TokenStatus | null): Promise<TokenStatus> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await sendMessage<TokenStatus>(
+        { action: "getTokenStatus" },
+        {
+          timeoutMs: TOKEN_STATUS_ATTEMPT_TIMEOUT_MS,
+          timeoutMessage: "Token status check timed out. Cached role data remains available."
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+  if (fallback) {
+    return refreshTokenStatusFreshness(fallback);
+  }
+  throw lastError;
 }
 
 async function waitForManagedPortalRecovery(
@@ -237,7 +265,7 @@ async function waitForManagedPortalRecovery(
           { action: "getTokenStatus" },
           { timeoutMs: 2_500, timeoutMessage: "Waiting for Microsoft portal access timed out." }
         ),
-        readPortalRecoveryStatus()
+        readPortalRecoveryStatus(recoveryStatus)
       ]);
       latestTokens = nextTokens;
       recoveryStatus = nextRecoveryStatus;
@@ -256,7 +284,7 @@ async function waitForManagedPortalRecovery(
   }
 
   if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
-    recoveryStatus = await readPortalRecoveryStatus();
+    recoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
   }
   return { tokens: latestTokens, changedTargets, recoveryStatus };
 }
@@ -356,6 +384,21 @@ function PopupApp() {
   const reconciledRequestOperationIds = useRef(new Set<string>());
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+  const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
+
+  tokenStatusRef.current = tokenStatus;
+  portalRecoveryStatusRef.current = portalRecoveryStatus;
+
+  function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
+    portalRecoveryStatusRef.current = nextStatus;
+    setPortalRecoveryStatus(nextStatus);
+  }
+
+  function publishTokenStatus(nextStatus: TokenStatus): void {
+    tokenStatusRef.current = nextStatus;
+    setTokenStatus(nextStatus);
+  }
 
   useEffect(() => {
     void initializePopupForDistribution();
@@ -477,12 +520,13 @@ function PopupApp() {
     }
 
     let active = true;
+    let timer: number | undefined;
     const pollRecovery = async () => {
-      const nextStatus = await readPortalRecoveryStatus();
+      const nextStatus = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
       if (!active) {
         return;
       }
-      setPortalRecoveryStatus(nextStatus);
+      publishPortalRecoveryStatus(nextStatus);
       if (nextStatus.state === "idle" && activeRefreshRunId.current === undefined) {
         void refresh({
           force: false,
@@ -490,12 +534,16 @@ function PopupApp() {
           targets: enabledRoleFeatures,
           recoverMissingPortalAccess: false
         });
+      } else {
+        timer = window.setTimeout(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
       }
     };
-    const timer = window.setInterval(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
+    timer = window.setTimeout(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
     };
   }, [enabledRoleFeatures.join("|"), isLoading, isRefreshing, portalRecoveryStatus.state]);
 
@@ -946,11 +994,8 @@ function PopupApp() {
         loadSettings(),
         loadDataCache(),
         loadReferenceData(),
-        sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Cached role data remains available." }
-        ),
-        readPortalRecoveryStatus()
+        readTokenStatusWithRetry(tokenStatusRef.current),
+        readPortalRecoveryStatus(portalRecoveryStatusRef.current)
       ]);
       if (!isCurrentRun()) {
         return;
@@ -960,14 +1005,15 @@ function PopupApp() {
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
       const refreshTargets = normalizeRefreshTargets(options.targets || enabledRoleFeatures, enabledRoleFeatures);
       setSettings(loadedSettings);
-      setTokenStatus(loadedTokens);
-      setPortalRecoveryStatus(loadedRecoveryStatus);
+      publishTokenStatus(loadedTokens);
+      publishPortalRecoveryStatus(loadedRecoveryStatus);
       setReferenceData(loadedReferenceData);
       setAccessCapabilities(buildAccessCapabilityItems(loadedTokens, currentCache, enabledRoleFeatures));
       const initialCacheView = getActivationCacheView(currentCache, loadedTokens, enabledRoleFeatures, now);
       let currentCacheView = initialCacheView;
       let progressiveCache = currentCache;
       let progressiveTokens = loadedTokens;
+      let progressiveRecoveryStatus = loadedRecoveryStatus;
       let progressiveReferenceData = learnReferenceDataFromItems(
         loadedReferenceData,
         [...initialCacheView.eligible.items, ...initialCacheView.active.items]
@@ -1040,16 +1086,18 @@ function PopupApp() {
           );
           return;
         }
-        setPortalRecoveryStatus(await readPortalRecoveryStatus());
+        progressiveRecoveryStatus = await readPortalRecoveryStatus(progressiveRecoveryStatus);
+        publishPortalRecoveryStatus(progressiveRecoveryStatus);
         showProgressStep(portalProgressStep!, "Waiting for Microsoft portal access");
         const recovered = await waitForManagedPortalRecovery(portalTokenRecoveryTargets, loadedTokens, isCurrentRun);
         if (!isCurrentRun()) {
           return;
         }
-        setPortalRecoveryStatus(recovered.recoveryStatus);
+        publishPortalRecoveryStatus(recovered.recoveryStatus);
+        progressiveRecoveryStatus = recovered.recoveryStatus;
         if (recovered.recoveryStatus.state === "interactionRequired") {
           progressiveTokens = recovered.tokens;
-          setTokenStatus(progressiveTokens);
+          publishTokenStatus(progressiveTokens);
           setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
           setHasActivationDataLoaded(true);
           setError("");
@@ -1065,7 +1113,7 @@ function PopupApp() {
           return;
         }
         progressiveTokens = recovered.tokens;
-        setTokenStatus(progressiveTokens);
+        publishTokenStatus(progressiveTokens);
         setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
         currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
         staleTargets = refreshTargets.filter(
@@ -1088,7 +1136,7 @@ function PopupApp() {
             return;
           }
           progressiveTokens = tokenRefresh.tokenStatus;
-          setTokenStatus(progressiveTokens);
+          publishTokenStatus(progressiveTokens);
           setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
           currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
           staleTargets = refreshTargets.filter(
@@ -1334,7 +1382,8 @@ function PopupApp() {
           // Role data is ready even if the browser rejects optional temporary-tab cleanup.
         }
       }
-      setPortalRecoveryStatus(await readPortalRecoveryStatus());
+      progressiveRecoveryStatus = await readPortalRecoveryStatus(progressiveRecoveryStatus);
+      publishPortalRecoveryStatus(progressiveRecoveryStatus);
       const loadErrors = filterLoadErrorsForAccessState([
         ...Object.values(eligibleResultsByTarget).flatMap((result) => result.errors || []),
         ...Object.values(activeResultsByTarget).flatMap((result) => result.errors || []),
@@ -1404,7 +1453,7 @@ function PopupApp() {
     active: { items: ActivationItem[]; errors: string[] }
   ) {
     setSettings(nextSettings);
-    setTokenStatus(nextTokens);
+    publishTokenStatus(nextTokens);
     setReferenceData(nextReferenceData);
     setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(nextSettings)));
     setEligibleItems(applyDisplayData(eligible.items, nextSettings, nextReferenceData));
@@ -2055,7 +2104,7 @@ function PopupApp() {
     await flushPopupDraft();
     try {
       const result = await sendMessage<PortalRecoveryFocusResult>({ action: "focusPortalRecoveryTabs" });
-      setPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
+      publishPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
       if (!result?.focused) {
         setError("The Microsoft sign-in tab is no longer available. Use Refresh to open it again.");
       }

@@ -139,6 +139,7 @@ export interface ActivityHistoryEntry {
 export interface TrackedPimRequest {
   id: string;
   requestId: string;
+  operationId?: string;
   action: ActivityAction;
   itemId: string;
   itemName: string;

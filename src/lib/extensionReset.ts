@@ -16,7 +16,7 @@ export interface ExtensionResetApis {
 export async function resetExtensionData(apis: ExtensionResetApis): Promise<void> {
   const operations = await apis.loadRequestOperations();
   if (apis.hasInFlightTasks() || operations.some((operation) => operation.state === "running")) {
-    throw new Error("Wait for the current activation or deactivation to finish before resetting QuickPIM++.");
+    throw new Error("Wait for the current activation, refresh, sync, or status check to finish before resetting QuickPIM++.");
   }
 
   // A full reset must leave the browser-sync purge marker intact so another

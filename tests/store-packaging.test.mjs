@@ -11,9 +11,9 @@ import {
 
 describe("shared Chromium Store packaging", () => {
   test("uses one neutral package for Chrome and Edge", () => {
-    const path = getStorePackagePath("2.17.0", "release");
-    const paths = getStorePackagePaths("2.17.0", "release");
-    expect(path).toMatch(/quickpim-plusplus-v2\.17\.0-chromium-stores\.zip$/);
+    const path = getStorePackagePath("2.17.2", "release");
+    const paths = getStorePackagePaths("2.17.2", "release");
+    expect(path).toMatch(/quickpim-plusplus-v2\.17\.2-chromium-stores\.zip$/);
     expect(paths).toEqual({ shared: path, chrome: path, edge: path });
     expect(STORE_PACKAGE_SUFFIX).toBe("chromium-stores");
   });
@@ -24,16 +24,16 @@ describe("shared Chromium Store packaging", () => {
     const releaseDir = join(root, "release");
     mkdirSync(distDir);
     mkdirSync(releaseDir);
-    writeFileSync(join(distDir, "manifest.json"), JSON.stringify({ manifest_version: 3, version: "2.17.0" }));
+    writeFileSync(join(distDir, "manifest.json"), JSON.stringify({ manifest_version: 3, version: "2.17.2" }));
     writeFileSync(join(distDir, "popup.html"), "<!doctype html>");
-    const legacyChrome = join(releaseDir, "quickpim-plusplus-v2.17.0-chrome-webstore.zip");
-    const legacyEdge = join(releaseDir, "quickpim-plusplus-v2.17.0-edge-addons.zip");
+    const legacyChrome = join(releaseDir, "quickpim-plusplus-v2.17.2-chrome-webstore.zip");
+    const legacyEdge = join(releaseDir, "quickpim-plusplus-v2.17.2-edge-addons.zip");
     writeFileSync(legacyChrome, "stale");
     writeFileSync(legacyEdge, "stale");
 
     try {
-      const paths = packageStores({ distDir, releaseDir, version: "2.17.0" });
-      expect(readdirSync(releaseDir)).toEqual(["quickpim-plusplus-v2.17.0-chromium-stores.zip"]);
+      const paths = packageStores({ distDir, releaseDir, version: "2.17.2" });
+      expect(readdirSync(releaseDir)).toEqual(["quickpim-plusplus-v2.17.2-chromium-stores.zip"]);
       expect(existsSync(paths.shared)).toBe(true);
       expect(paths.chrome).toBe(paths.shared);
       expect(paths.edge).toBe(paths.shared);
