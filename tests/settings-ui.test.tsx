@@ -948,6 +948,7 @@ describe("settings Access Setup page", () => {
       [SETTINGS_KEY]: createDefaultSettings()
     };
     let tokenRequests = 0;
+    let resolveInitialTokenStatus: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
         getManifest: () => TEST_MANIFEST,
@@ -991,6 +992,11 @@ describe("settings Access Setup page", () => {
                   graph: { hasToken: true, capturedAt: 2 },
                   azureManagement: { hasToken: true, capturedAt: 1 }
                 };
+            if (message.action === "getTokenStatus" && tokenRequests === 1) {
+              return await new Promise((resolve) => {
+                resolveInitialTokenStatus = resolve;
+              });
+            }
             return message.action === "refreshPortalTokens"
               ? { success: true, data: { tokenStatus: currentTokens, tabsFound: 1, tabsScanned: 1, captured: ["graph"] } }
               : { success: true, data: currentTokens };
@@ -1018,7 +1024,15 @@ describe("settings Access Setup page", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
-    clickButton("Recheck now");
+    const recheckButton = clickButton("Recheck now");
+    expect(recheckButton.disabled).toBe(false);
+    resolveInitialTokenStatus?.({
+      success: true,
+      data: {
+        graph: { hasToken: false },
+        azureManagement: { hasToken: true, capturedAt: 1 }
+      }
+    });
 
     await waitFor(() => expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "refreshPortalTokens" }));
     await waitFor(() => expect(tokenRequests).toBeGreaterThanOrEqual(2));
@@ -1392,6 +1406,15 @@ describe("settings Access Setup page", () => {
     let eligibleCalls = 0;
     let holdEligibleRefresh = false;
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
+    let tokenStatusCalls = 0;
+    let resolveInitialTokenStatus: ((value: unknown) => void) | undefined;
+    const readyTokens = {
+      success: true,
+      data: {
+        graph: { hasToken: true, capturedAt: 1 },
+        azureManagement: { hasToken: true, capturedAt: 1 }
+      }
+    };
     const chromeMock = {
       runtime: {
         getManifest: () => TEST_MANIFEST,
@@ -1409,13 +1432,13 @@ describe("settings Access Setup page", () => {
             return { success: true, data: { items: [], errors: [] } };
           }
           if (message.action === "getTokenStatus") {
-            return {
-              success: true,
-              data: {
-                graph: { hasToken: true, capturedAt: 1 },
-                azureManagement: { hasToken: true, capturedAt: 1 }
-              }
-            };
+            tokenStatusCalls += 1;
+            if (tokenStatusCalls === 1) {
+              return await new Promise((resolve) => {
+                resolveInitialTokenStatus = resolve;
+              });
+            }
+            return readyTokens;
           }
           return { success: true, data: true };
         }),
@@ -1439,7 +1462,11 @@ describe("settings Access Setup page", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     holdEligibleRefresh = true;
-    clickButton("Refresh eligible items");
+    const refreshButton = clickButton("Refresh eligible items");
+    expect(refreshButton.disabled).toBe(false);
+    await waitFor(() => expect(document.body.textContent).toContain("Waiting to refresh"));
+    expect(eligibleCalls).toBe(0);
+    resolveInitialTokenStatus?.(readyTokens);
     await waitFor(() => expect(eligibleCalls).toBe(1));
 
     expect(document.body.textContent).toContain("Refreshing eligible items");

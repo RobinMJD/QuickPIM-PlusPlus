@@ -151,8 +151,8 @@ function SettingsApp() {
   const [exportBaselineText, setExportBaselineText] = useState("");
   const [exportExternalChange, setExportExternalChange] = useState(false);
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
+  const [isEligibleRefreshQueued, setIsEligibleRefreshQueued] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
-  const [isSettingsRefreshInFlight, setIsSettingsRefreshInFlight] = useState(true);
   const [eligibleRefreshProgress, setEligibleRefreshProgress] = useState<OperationProgress | null>(null);
   const [accessRefreshProgress, setAccessRefreshProgress] = useState<OperationProgress | null>(null);
   const [isSettingsReady, setIsSettingsReady] = useState(false);
@@ -167,11 +167,20 @@ function SettingsApp() {
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
   const settingsRefreshInFlight = useRef(false);
   const settingsRefreshCompletion = useRef<Promise<void>>(Promise.resolve());
+  const initialSettingsHydration = useRef<Promise<void> | undefined>(undefined);
+  const resolveInitialSettingsHydration = useRef<(() => void) | undefined>(undefined);
+  const eligibleRefreshQueued = useRef(false);
   const pendingTabFlushRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const pendingPreferenceFlush = useRef<Promise<void>>(Promise.resolve());
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+
+  if (!initialSettingsHydration.current) {
+    initialSettingsHydration.current = new Promise<void>((resolve) => {
+      resolveInitialSettingsHydration.current = resolve;
+    });
+  }
 
   tokenStatusRef.current = tokenStatus;
 
@@ -190,7 +199,10 @@ function SettingsApp() {
   }
 
   useEffect(() => {
-    void refresh();
+    void refresh().finally(() => {
+      resolveInitialSettingsHydration.current?.();
+      resolveInitialSettingsHydration.current = undefined;
+    });
   }, []);
 
   useEffect(() => () => {
@@ -287,7 +299,6 @@ function SettingsApp() {
       resolveRefreshCompletion = resolve;
     });
     settingsRefreshInFlight.current = true;
-    setIsSettingsRefreshInFlight(true);
     const refreshStartedAt = Date.now();
     let progress: OperationProgress | null = null;
     let progressCompleted = false;
@@ -408,7 +419,6 @@ function SettingsApp() {
       }
     } finally {
       settingsRefreshInFlight.current = false;
-      setIsSettingsRefreshInFlight(false);
       resolveRefreshCompletion();
       if (options.showProgress) {
         setIsRefreshingEligible(false);
@@ -420,6 +430,28 @@ function SettingsApp() {
           }, 350);
         }
       }
+    }
+  }
+
+  async function requestEligibleRefresh(): Promise<void> {
+    if (eligibleRefreshQueued.current || isRefreshingEligible || isRefreshingAccess) {
+      return;
+    }
+    eligibleRefreshQueued.current = true;
+    setIsEligibleRefreshQueued(true);
+    try {
+      // Settings becomes interactive before its initial local hydration is
+      // necessarily complete. Preserve an early click and run it afterward.
+      await initialSettingsHydration.current;
+      // Access recovery writes the same token/cache state. Let any operation
+      // that won the click race finish before starting the eligible refresh.
+      while (pendingAccessRefreshes.current > 0) {
+        await accessRefreshQueue.current;
+      }
+      await refresh({ showProgress: true });
+    } finally {
+      eligibleRefreshQueued.current = false;
+      setIsEligibleRefreshQueued(false);
     }
   }
 
@@ -450,6 +482,7 @@ function SettingsApp() {
       // Initial Settings hydration and a user-requested eligible refresh both
       // publish token/cache state. Wait for that writer before Access Setup
       // starts so an older bootstrap result cannot overwrite recovered access.
+      await initialSettingsHydration.current;
       await settingsRefreshCompletion.current;
       // Clear feedback when this queued run actually starts. Clearing it while
       // enqueuing allows an older run to publish a stale error after the clear.
@@ -742,11 +775,16 @@ function SettingsApp() {
             <p>Set up role access, personalize the popup, configure activation, and manage local data.</p>
           </div>
         </div>
-        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isSettingsRefreshInFlight || isRefreshingEligible || isRefreshingAccess}>
+        <button className="btn" onClick={() => void requestEligibleRefresh()} disabled={isEligibleRefreshQueued || isRefreshingEligible || isRefreshingAccess}>
           {isRefreshingEligible ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
               <span>Refreshing eligible items...</span>
+            </span>
+          ) : isEligibleRefreshQueued ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Waiting to refresh...</span>
             </span>
           ) : (
             "Refresh eligible items"
@@ -804,9 +842,11 @@ function SettingsApp() {
                   tokenStatus={tokenStatus}
                   dataCache={dataCache}
                   isRefreshingAccess={isRefreshingAccess}
-                  isRefreshingEligible={isRefreshingEligible || isSettingsRefreshInFlight}
+                  isRefreshingEligible={isRefreshingEligible || isEligibleRefreshQueued}
                   onSave={persist}
                   onFlushPreferences={async () => {
+                    await initialSettingsHydration.current;
+                    await settingsRefreshCompletion.current;
                     await pendingPreferenceFlush.current;
                     await pendingTabFlushRef.current?.();
                     await pendingPreferenceFlush.current;
@@ -1094,6 +1134,8 @@ function AccessSetupPanel({
   const [isRecheckingPortalTabs, setIsRecheckingPortalTabs] = useState(false);
   const [portalRecoveryStatus, setPortalRecoveryStatus] = useState<PortalRecoveryStatus>(() => emptyPortalRecoveryStatus());
   const [portalRecoveryError, setPortalRecoveryError] = useState("");
+  const portalSetupInFlight = useRef(false);
+  const portalRecheckInFlight = useRef(false);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
   const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
@@ -1151,14 +1193,18 @@ function AccessSetupPanel({
   }
 
   async function runPortalSetup() {
-    if (portalRecoveryStatus.state === "interactionRequired") {
-      await continueMicrosoftSignIn();
+    if (portalSetupInFlight.current || portalRecheckInFlight.current || isRefreshingAccess || isRefreshingEligible) {
       return;
     }
+    portalSetupInFlight.current = true;
     setIsRunningSetup(true);
     setPortalRecoveryError("");
     let latestRecoveryStatus = portalRecoveryStatus;
     try {
+      if (portalRecoveryStatus.state === "interactionRequired") {
+        await continueMicrosoftSignIn();
+        return;
+      }
       const latestSettings = await onFlushPreferences();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const initialTargets = getAccessSetupTargets(buildAccessCapabilityItems(tokenStatus, dataCache, currentFeatures));
@@ -1193,9 +1239,13 @@ function AccessSetupPanel({
     } catch (setupError) {
       setPortalRecoveryError(setupError instanceof Error ? setupError.message : String(setupError));
     } finally {
-      setIsRunningSetup(false);
-      latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
-      publishPortalRecoveryStatus(latestRecoveryStatus);
+      try {
+        latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
+        publishPortalRecoveryStatus(latestRecoveryStatus);
+      } finally {
+        portalSetupInFlight.current = false;
+        setIsRunningSetup(false);
+      }
     }
   }
 
@@ -1213,6 +1263,10 @@ function AccessSetupPanel({
   }
 
   async function recheckPortalAccess() {
+    if (portalSetupInFlight.current || portalRecheckInFlight.current || isRefreshingAccess || isRefreshingEligible) {
+      return;
+    }
+    portalRecheckInFlight.current = true;
     setIsRecheckingPortalTabs(true);
     setPortalRecoveryError("");
     try {
@@ -1229,6 +1283,7 @@ function AccessSetupPanel({
     } catch (recheckError) {
       setPortalRecoveryError(recheckError instanceof Error ? recheckError.message : String(recheckError));
     } finally {
+      portalRecheckInFlight.current = false;
       setIsRecheckingPortalTabs(false);
     }
   }
