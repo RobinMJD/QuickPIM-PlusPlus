@@ -3367,6 +3367,7 @@ describe("settings Browser Sync page", () => {
     await import("../src/settings/main");
 
     await waitFor(() => expect(syncCalls).toBe(1));
+    await waitFor(() => expect(getExactButton("Send & receive now")).toBeTruthy());
     clickExactButton("Send & receive now");
     await waitFor(() => expect(document.body.textContent).toContain("Microsoft Edge Sync rejected the write."));
     expect(document.body.textContent).not.toContain("Saved in this browser's sync area. Open QuickPIM++ on the other computer");

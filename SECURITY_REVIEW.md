@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.17.3.
+Reviewed for v2.17.4.
 
 ## v2.17.0 Audit Outcome
 
