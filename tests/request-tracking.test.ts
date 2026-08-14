@@ -1,5 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
+  EXPIRY_REMINDER_CATCH_UP_GRACE_MS,
+  EXPIRY_REMINDER_RETRY_DELAY_MS,
   REQUEST_TRACKING_KEY,
   REQUEST_TRACKING_MAX_DUE_PER_RUN,
   REQUEST_TRACKING_TTL_MS,
@@ -7,8 +9,10 @@ import {
   getActivationRequestItemStatus,
   getDueTrackedRequests,
   getEffectiveTrackedRequestStatus,
+  getNextTrackedExpiryReminderTime,
   getPendingTrackedRequestCount,
   getRequestTrackingMaintenanceTime,
+  getTrackedExpiryReminderDecision,
   markTrackedRequestCheckFailure,
   mutateTrackedRequests,
   normalizeTrackedRequestStatus,
@@ -176,6 +180,54 @@ describe("tracked PIM requests", () => {
       { version: 1, requests: [{ ...active, status: "completed", activeUntil: undefined }] },
       { notificationsEnabled: false, expiryReminderMinutes: 15, now: NOW }
     )).toBeUndefined();
+  });
+
+  test("catches up a recently missed expiry reminder after browser downtime", () => {
+    const activeUntil = NOW - 10 * 60_000;
+    const expired = createRequest({
+      id: "expired",
+      requestId: "expired",
+      status: "expired",
+      nextCheckAt: undefined,
+      activeUntil: new Date(activeUntil).toISOString()
+    });
+    const store = { version: 1, requests: [expired] } as TrackedPimRequestStore;
+
+    expect(getTrackedExpiryReminderDecision(expired, 5, NOW)).toBe("missed");
+    expect(getNextTrackedExpiryReminderTime(store, 5, NOW)).toBe(NOW + 1_000);
+    expect(getRequestTrackingMaintenanceTime(
+      store,
+      { notificationsEnabled: true, expiryReminderMinutes: 5, now: NOW }
+    )).toBe(NOW + 1_000);
+    expect(getTrackedExpiryReminderDecision(
+      { ...expired, activeUntil: new Date(NOW - EXPIRY_REMINDER_CATCH_UP_GRACE_MS - 1).toISOString() },
+      5,
+      NOW
+    )).toBeUndefined();
+    const denied = { ...expired, id: "denied", requestId: "denied", status: "denied" as const };
+    expect(getTrackedExpiryReminderDecision(denied, 5, NOW)).toBeUndefined();
+    expect(getNextTrackedExpiryReminderTime({ version: 1, requests: [denied] }, 5, NOW)).toBeUndefined();
+  });
+
+  test("backs off a failed reminder instead of retrying every second", () => {
+    const attemptedAt = NOW - 60_000;
+    const active = createRequest({
+      id: "active-retry",
+      requestId: "active-retry",
+      status: "active",
+      nextCheckAt: undefined,
+      activeUntil: new Date(NOW + 10 * 60_000).toISOString(),
+      expiryReminderAttemptedAt: new Date(attemptedAt).toISOString()
+    });
+    const store = { version: 1, requests: [active] } as TrackedPimRequestStore;
+
+    expect(getTrackedExpiryReminderDecision(active, 15, NOW)).toBeUndefined();
+    expect(getNextTrackedExpiryReminderTime(store, 15, NOW)).toBe(attemptedAt + EXPIRY_REMINDER_RETRY_DELAY_MS);
+    expect(getTrackedExpiryReminderDecision(
+      active,
+      15,
+      attemptedAt + EXPIRY_REMINDER_RETRY_DELAY_MS
+    )).toBe("upcoming");
   });
 
   test("fails closed when the current token identity cannot be matched to the tracked request", () => {

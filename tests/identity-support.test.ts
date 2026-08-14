@@ -96,6 +96,7 @@ describe("sanitized support reports", () => {
         installType: "normal",
         blockedInEdge: false
       },
+      notificationPermissionGranted: false,
       userAgent: "Browser/1.0 (private platform)"
     });
     expect(report).toContain('"directoryRole:eligible": 1');
@@ -105,6 +106,8 @@ describe("sanitized support reports", () => {
     expect(report).not.toContain("admin@example.test");
     expect(report).not.toContain("request-secret");
     expect(report).toContain('"source": "Microsoft Edge Add-ons"');
+    expect(report).toContain('"notificationPermissionGranted": false');
+    expect(report).toContain('"notificationDeliveryReady": false');
     expect(report).not.toContain(EDGE_ADDONS_EXTENSION_ID);
   });
 

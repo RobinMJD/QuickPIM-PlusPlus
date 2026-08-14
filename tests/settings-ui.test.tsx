@@ -80,7 +80,11 @@ function createBasicSettingsChrome(storageData: Record<string, unknown>, options
   removePermission?: ReturnType<typeof vi.fn>;
 } = {}) {
   return {
+    notifications: {
+      create: vi.fn(async () => "quickpim-test")
+    },
     permissions: {
+      contains: vi.fn(async () => false),
       request: vi.fn(async () => true),
       remove: options.removePermission || vi.fn(async () => true)
     },
@@ -948,6 +952,7 @@ describe("settings Access Setup page", () => {
       [SETTINGS_KEY]: createDefaultSettings()
     };
     let tokenRequests = 0;
+    let resolveInitialTokenStatus: ((value: unknown) => void) | undefined;
     const chromeMock = {
       runtime: {
         getManifest: () => TEST_MANIFEST,
@@ -991,6 +996,11 @@ describe("settings Access Setup page", () => {
                   graph: { hasToken: true, capturedAt: 2 },
                   azureManagement: { hasToken: true, capturedAt: 1 }
                 };
+            if (message.action === "getTokenStatus" && tokenRequests === 1) {
+              return await new Promise((resolve) => {
+                resolveInitialTokenStatus = resolve;
+              });
+            }
             return message.action === "refreshPortalTokens"
               ? { success: true, data: { tokenStatus: currentTokens, tabsFound: 1, tabsScanned: 1, captured: ["graph"] } }
               : { success: true, data: currentTokens };
@@ -1018,7 +1028,15 @@ describe("settings Access Setup page", () => {
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
-    clickButton("Recheck now");
+    const recheckButton = clickButton("Recheck now");
+    expect(recheckButton.disabled).toBe(false);
+    resolveInitialTokenStatus?.({
+      success: true,
+      data: {
+        graph: { hasToken: false },
+        azureManagement: { hasToken: true, capturedAt: 1 }
+      }
+    });
 
     await waitFor(() => expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "refreshPortalTokens" }));
     await waitFor(() => expect(tokenRequests).toBeGreaterThanOrEqual(2));
@@ -1392,6 +1410,15 @@ describe("settings Access Setup page", () => {
     let eligibleCalls = 0;
     let holdEligibleRefresh = false;
     let resolveEligibleRefresh: ((value: unknown) => void) | undefined;
+    let tokenStatusCalls = 0;
+    let resolveInitialTokenStatus: ((value: unknown) => void) | undefined;
+    const readyTokens = {
+      success: true,
+      data: {
+        graph: { hasToken: true, capturedAt: 1 },
+        azureManagement: { hasToken: true, capturedAt: 1 }
+      }
+    };
     const chromeMock = {
       runtime: {
         getManifest: () => TEST_MANIFEST,
@@ -1409,13 +1436,13 @@ describe("settings Access Setup page", () => {
             return { success: true, data: { items: [], errors: [] } };
           }
           if (message.action === "getTokenStatus") {
-            return {
-              success: true,
-              data: {
-                graph: { hasToken: true, capturedAt: 1 },
-                azureManagement: { hasToken: true, capturedAt: 1 }
-              }
-            };
+            tokenStatusCalls += 1;
+            if (tokenStatusCalls === 1) {
+              return await new Promise((resolve) => {
+                resolveInitialTokenStatus = resolve;
+              });
+            }
+            return readyTokens;
           }
           return { success: true, data: true };
         }),
@@ -1439,7 +1466,11 @@ describe("settings Access Setup page", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
 
     holdEligibleRefresh = true;
-    clickButton("Refresh eligible items");
+    const refreshButton = clickButton("Refresh eligible items");
+    expect(refreshButton.disabled).toBe(false);
+    await waitFor(() => expect(document.body.textContent).toContain("Waiting to refresh"));
+    expect(eligibleCalls).toBe(0);
+    resolveInitialTokenStatus?.(readyTokens);
     await waitFor(() => expect(eligibleCalls).toBe(1));
 
     expect(document.body.textContent).toContain("Refreshing eligible items");
@@ -2539,12 +2570,17 @@ describe("settings dark mode", () => {
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
     const requestPermission = vi.fn(async () => true);
     const chromeMock = {
+      notifications: {
+        create: vi.fn(async () => "quickpim-test")
+      },
       permissions: {
+        contains: vi.fn(async () => false),
         request: requestPermission,
         remove: vi.fn(async () => true)
       },
       runtime: {
         getManifest: () => TEST_MANIFEST,
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
         sendMessage: vi.fn(async (message: { action: string }) => message.action === "getTokenStatus"
           ? { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } }
           : { success: true, data: { items: [], errors: [] } })
@@ -2572,6 +2608,58 @@ describe("settings dark mode", () => {
     await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({
       preferences: expect.objectContaining({ requestNotificationsEnabled: true, expiryReminderMinutes: 15 })
     }));
+  });
+
+  test("shows and repairs a saved notification preference whose browser permission is missing", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#automation");
+    const settings = createDefaultSettings();
+    settings.preferences.requestNotificationsEnabled = true;
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    let permissionGranted = false;
+    const requestPermission = vi.fn(async () => {
+      permissionGranted = true;
+      return true;
+    });
+    const createNotification = vi.fn(async () => "quickpim-notification-test");
+    const chromeMock = {
+      notifications: { create: createNotification },
+      permissions: {
+        contains: vi.fn(async () => permissionGranted),
+        request: requestPermission,
+        remove: vi.fn(async () => true)
+      },
+      runtime: {
+        getManifest: () => TEST_MANIFEST,
+        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
+        sendMessage: vi.fn(async () => ({ success: true, data: true }))
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Setup required"));
+    expect(document.body.textContent).toContain("has not granted the optional notification permission");
+    expect(document.body.textContent).toContain("Portal-only activations are not tracked");
+    clickExactButton("Enable on this browser");
+    await waitFor(() => expect(requestPermission).toHaveBeenCalledWith({ permissions: ["notifications"] }));
+    await waitFor(() => expect(document.body.textContent).toContain("Desktop notification deliveryReady"));
+
+    clickExactButton("Send test notification");
+    await waitFor(() => expect(createNotification).toHaveBeenCalledWith(
+      "quickpim-notification-test",
+      expect.objectContaining({ title: "QuickPIM++ notifications are ready" })
+    ));
+    await waitFor(() => expect(document.body.textContent).toContain("Test sent"));
   });
 
   test("saves display preferences and applies dark mode to settings", async () => {
@@ -3193,6 +3281,328 @@ describe("settings journey safeguards", () => {
   });
 });
 
+describe("settings Browser Sync page", () => {
+  test("distinguishes a local sync write from verified cross-device delivery", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const settings = createDefaultSettings();
+    settings.activityHistory = [{
+      id: "imported-activity",
+      action: "activate",
+      result: "success",
+      itemId: "directoryRole:one:/",
+      itemName: "Imported role",
+      itemType: "directoryRole",
+      requestedAt: new Date().toISOString(),
+      sourceInstallationId: "backup-only-installation"
+    }];
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: settings };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = {
+      capability: "available",
+      supported: true,
+      enabled: true,
+      browserLabel: "Microsoft Edge",
+      sourceLabel: "Microsoft Edge Add-ons",
+      ecosystemLabel: "Microsoft Edge Sync",
+      installationId: "current-installation",
+      deviceName: "Admin Mac",
+      platform: "macOS",
+      lastSyncAt: Date.now(),
+      lastSuccessAt: Date.now(),
+      reminderMode: "daily",
+      reminderDue: false,
+      suspendedByPurge: false,
+      devices: [{
+        installationId: "current-installation",
+        name: "Admin Mac",
+        browser: "Microsoft Edge",
+        platform: "macOS",
+        appVersion: TEST_MANIFEST.version,
+        lastSyncAt: Date.now(),
+        syncEnabled: true,
+        nameUpdatedAt: Date.now()
+      }],
+      crossDeviceState: "waiting",
+      otherInstallationCount: 0,
+      omittedCategories: []
+    };
+    let currentStatus = status;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus" || message.action === "syncBrowserData") {
+        return { success: true, data: currentStatus };
+      }
+      if (message.action === "setBrowserSyncEnabled") {
+        currentStatus = { ...currentStatus, enabled: Boolean((message as { enabled?: boolean }).enabled) };
+        return { success: true, data: currentStatus };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: { items: [], errors: [] } };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Waiting for another installation"));
+    expect(document.body.textContent).toContain("Not yet verified");
+    expect(document.body.textContent).toContain("Data is stored in this browser's sync area");
+    expect(document.body.textContent).toContain("0 events from other installations");
+    expect(document.body.textContent).toContain("No other installation record has reached this browser yet.");
+    expect(getExactButton("Send & receive now")).toBeTruthy();
+    const syncSwitch = document.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Browser sync"]');
+    expect(syncSwitch?.getAttribute("aria-checked")).toBe("true");
+    expect(syncSwitch?.textContent).toContain("On");
+    expect(document.querySelector(".sync-section-heading")?.textContent).toContain("computer hostname");
+    expect(document.querySelector(".sync-current-installation .sync-device-name-row")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Last successful sync");
+    await waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({ action: "syncBrowserData" }));
+    syncSwitch?.click();
+    await waitFor(() => expect(syncSwitch?.getAttribute("aria-checked")).toBe("false"));
+    expect(syncSwitch?.textContent).toContain("Off");
+    expect(runtime.sendMessage).toHaveBeenCalledWith({ action: "setBrowserSyncEnabled", enabled: false });
+  });
+
+  test("shows a returned sync failure instead of a contradictory success message", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const baseStatus = {
+      capability: "available",
+      supported: true,
+      enabled: true,
+      browserLabel: "Microsoft Edge",
+      sourceLabel: "Microsoft Edge Add-ons",
+      ecosystemLabel: "Microsoft Edge Sync",
+      installationId: "current-installation",
+      deviceName: "Admin Mac",
+      platform: "macOS",
+      lastSyncAt: Date.now(),
+      lastSuccessAt: Date.now(),
+      reminderMode: "daily",
+      reminderDue: false,
+      suspendedByPurge: false,
+      devices: [{
+        installationId: "current-installation",
+        name: "Admin Mac",
+        browser: "Microsoft Edge",
+        platform: "macOS",
+        appVersion: TEST_MANIFEST.version,
+        lastSyncAt: Date.now(),
+        syncEnabled: true,
+        nameUpdatedAt: Date.now()
+      }],
+      crossDeviceState: "waiting",
+      otherInstallationCount: 0,
+      omittedCategories: []
+    };
+    let syncCalls = 0;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: baseStatus };
+      if (message.action === "syncBrowserData") {
+        syncCalls += 1;
+        return {
+          success: true,
+          data: syncCalls === 1
+            ? baseStatus
+            : { ...baseStatus, lastError: "Microsoft Edge Sync rejected the write." }
+        };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: { items: [], errors: [] } };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(syncCalls).toBe(1));
+    await waitFor(() => expect(getExactButton("Send & receive now")).toBeTruthy());
+    clickExactButton("Send & receive now");
+    await waitFor(() => expect(document.body.textContent).toContain("Microsoft Edge Sync rejected the write."));
+    expect(document.body.textContent).not.toContain("Saved in this browser's sync area. Open QuickPIM++ on the other computer");
+  });
+
+  test("flushes a pending installation name when leaving Browser Sync", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = createBrowserSyncUiStatus({ enabled: false });
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string; name?: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: status };
+      if (message.action === "updateBrowserSyncDeviceName") {
+        return { success: true, data: { ...status, deviceName: message.name || status.deviceName } };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector<HTMLInputElement>("#sync-device-name")?.value).toBe("Admin Mac"));
+    setFieldValue(document.querySelector<HTMLInputElement>("#sync-device-name")!, "Operations laptop");
+    clickExactButton("Home");
+
+    await waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({
+      action: "updateBrowserSyncDeviceName",
+      name: "Operations laptop"
+    }));
+  });
+
+  test("prevents duplicate Browser Sync actions before React disables the control", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = createBrowserSyncUiStatus({ enabled: false });
+    let toggleCalls = 0;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string; enabled?: boolean }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: status };
+      if (message.action === "setBrowserSyncEnabled") {
+        toggleCalls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { success: true, data: { ...status, enabled: Boolean(message.enabled) } };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Browser sync"]')).toBeTruthy());
+    const syncSwitch = document.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Browser sync"]')!;
+    syncSwitch.click();
+    syncSwitch.click();
+    await waitFor(() => expect(toggleCalls).toBe(1));
+  });
+
+  test("shows a recoverable error when Browser Sync returns malformed status data", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: { enabled: true } };
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Browser sync returned an invalid status"));
+    expect(getExactButton("Retry status check")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Checking browser sync...");
+  });
+
+  test("does not show installation-name success when cloud delivery failed", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = createBrowserSyncUiStatus({ enabled: false });
+    let renameCalls = 0;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string; name?: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: status };
+      if (message.action === "updateBrowserSyncDeviceName") {
+        renameCalls += 1;
+        return {
+          success: true,
+          data: {
+            ...status,
+            deviceName: message.name || status.deviceName,
+            lastError: "The installation name is saved locally, but could not be sent yet: sync unavailable"
+          }
+        };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector<HTMLInputElement>("#sync-device-name")?.value).toBe("Admin Mac"));
+    setFieldValue(document.querySelector<HTMLInputElement>("#sync-device-name")!, "Renamed laptop");
+    await waitFor(() => expect(document.body.textContent).toContain("could not be sent yet"), 1_500);
+    expect(document.body.textContent).not.toContain("Installation name saved.");
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    expect(renameCalls).toBe(1);
+  });
+});
+
+function createBrowserSyncUiStatus(overrides: Record<string, unknown> = {}) {
+  const now = Date.now();
+  return {
+    capability: "available",
+    supported: true,
+    enabled: true,
+    browserLabel: "Microsoft Edge",
+    sourceLabel: "Microsoft Edge Add-ons",
+    ecosystemLabel: "Microsoft Edge Sync",
+    installationId: "current-installation",
+    deviceName: "Admin Mac",
+    platform: "macOS",
+    lastSyncAt: now,
+    lastSuccessAt: now,
+    reminderMode: "daily",
+    reminderDue: false,
+    suspendedByPurge: false,
+    devices: [{
+      installationId: "current-installation",
+      name: "Admin Mac",
+      browser: "Microsoft Edge",
+      platform: "macOS",
+      appVersion: TEST_MANIFEST.version,
+      lastSyncAt: now,
+      syncEnabled: true,
+      nameUpdatedAt: now
+    }],
+    crossDeviceState: "waiting",
+    otherInstallationCount: 0,
+    omittedCategories: [],
+    ...overrides
+  };
+}
+
 describe("settings message contrast", () => {
   test("uses a dedicated high-contrast success style for saved settings messages", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
@@ -3212,6 +3622,18 @@ describe("settings message contrast", () => {
     expect(css).toMatch(/\.checkbox-grid\.enabled-features-grid\s*\{\s*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.checkbox-grid\.enabled-features-grid\s*\{\s*grid-template-columns: 1fr;/);
     expect(css).toMatch(/@media \(max-width: 760px\)[\s\S]*\.settings-nav\s*\{[\s\S]*display: flex;[\s\S]*overflow-x: auto;/);
+  });
+
+  test("uses an explicit Browser Sync switch and separates installation guidance from its controls", () => {
+    const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
+    const switchRule = css.match(/\.sync-master-switch\s*\{[^}]+\}/)?.[0] || "";
+    const headingRule = css.match(/\.sync-section-heading\s*\{[^}]+\}/)?.[0] || "";
+    const installationRule = css.match(/\.sync-current-installation\s*\{[^}]+\}/)?.[0] || "";
+
+    expect(switchRule).toContain("justify-content: space-between;");
+    expect(switchRule).toContain("min-height: 54px;");
+    expect(headingRule).toContain("margin-bottom: 14px;");
+    expect(installationRule).toContain("gap: 7px;");
   });
 
   test("allows long Microsoft context values to wrap without clipping", () => {

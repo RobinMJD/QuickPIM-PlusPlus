@@ -16,6 +16,8 @@ export const REQUEST_TRACKING_MAX_DUE_PER_RUN = 20;
 export const REQUEST_TRACKING_AZURE_CONCURRENCY = 3;
 export const REQUEST_TRACKING_GRAPH_CONCURRENCY = 3;
 export const DEFAULT_EXPIRY_REMINDER_MINUTES = 15;
+export const EXPIRY_REMINDER_CATCH_UP_GRACE_MS = 60 * 60 * 1000;
+export const EXPIRY_REMINDER_RETRY_DELAY_MS = 5 * 60 * 1000;
 
 const MAX_TRACKED_REQUESTS = 100;
 const MAX_ID_LENGTH = 512;
@@ -41,6 +43,7 @@ interface CreateTrackedRequestInput {
   item: ActivationItem;
   action: ActivityAction;
   requestId: string;
+  operationId?: string;
   payload?: unknown;
   requestedAt: string;
   durationHours?: number;
@@ -109,6 +112,7 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
   const base: TrackedPimRequest = {
     id: `${input.item.type}:${requestId}`,
     requestId,
+    operationId: sanitizeOperationId(input.operationId),
     action: input.action,
     itemId: input.item.id,
     itemName: input.item.displayName || input.item.sourceName,
@@ -255,17 +259,6 @@ export function getRequestTrackingMaintenanceTime(
         candidates.push(nextCheck);
       }
     }
-    if (
-      options.notificationsEnabled
-      && getEffectiveTrackedRequestStatus(request, now) === "active"
-      && request.activeUntil
-      && !request.expiryReminderSentAt
-    ) {
-      const activeUntil = Date.parse(request.activeUntil);
-      if (Number.isFinite(activeUntil) && activeUntil > now) {
-        candidates.push(activeUntil - normalizeReminderMinutes(options.expiryReminderMinutes) * 60_000);
-      }
-    }
     if (request.status === "scheduled" && request.activeFrom) {
       const activeFrom = Date.parse(request.activeFrom);
       if (Number.isFinite(activeFrom) && activeFrom > now) {
@@ -273,10 +266,84 @@ export function getRequestTrackingMaintenanceTime(
       }
     }
   }
+  if (options.notificationsEnabled) {
+    const nextReminder = getNextTrackedExpiryReminderTime(store, options.expiryReminderMinutes, now);
+    if (nextReminder !== undefined) {
+      candidates.push(nextReminder);
+    }
+  }
   if (!candidates.length) {
     return undefined;
   }
   return Math.max(now + 1_000, Math.min(...candidates));
+}
+
+export type TrackedExpiryReminderDecision = "upcoming" | "missed";
+
+export function getTrackedExpiryReminderDecision(
+  request: TrackedPimRequest,
+  reminderMinutes: number,
+  now = Date.now()
+): TrackedExpiryReminderDecision | undefined {
+  if (request.action !== "activate" || !request.activeUntil || request.expiryReminderSentAt) {
+    return undefined;
+  }
+  const activeUntil = Date.parse(request.activeUntil);
+  if (!Number.isFinite(activeUntil)) {
+    return undefined;
+  }
+  const attemptedAt = request.expiryReminderAttemptedAt
+    ? Date.parse(request.expiryReminderAttemptedAt)
+    : Number.NaN;
+  if (Number.isFinite(attemptedAt) && now < attemptedAt + EXPIRY_REMINDER_RETRY_DELAY_MS) {
+    return undefined;
+  }
+  if (activeUntil <= now) {
+    return getEffectiveTrackedRequestStatus(request, now) === "expired"
+      && now - activeUntil <= EXPIRY_REMINDER_CATCH_UP_GRACE_MS
+        ? "missed"
+        : undefined;
+  }
+  if (getEffectiveTrackedRequestStatus(request, now) !== "active") {
+    return undefined;
+  }
+  const reminderAt = activeUntil - normalizeReminderMinutes(reminderMinutes) * 60_000;
+  return now >= reminderAt ? "upcoming" : undefined;
+}
+
+export function getNextTrackedExpiryReminderTime(
+  store: TrackedPimRequestStore,
+  reminderMinutes: number,
+  now = Date.now()
+): number | undefined {
+  const candidates: number[] = [];
+  for (const request of store.requests) {
+    if (request.action !== "activate" || !request.activeUntil || request.expiryReminderSentAt) {
+      continue;
+    }
+    const activeUntil = Date.parse(request.activeUntil);
+    if (!Number.isFinite(activeUntil) || now - activeUntil > EXPIRY_REMINDER_CATCH_UP_GRACE_MS) {
+      continue;
+    }
+    const attemptedAt = request.expiryReminderAttemptedAt
+      ? Date.parse(request.expiryReminderAttemptedAt)
+      : Number.NaN;
+    const retryAt = Number.isFinite(attemptedAt)
+      ? attemptedAt + EXPIRY_REMINDER_RETRY_DELAY_MS
+      : Number.NaN;
+    if (activeUntil <= now) {
+      if (getEffectiveTrackedRequestStatus(request, now) === "expired") {
+        candidates.push(Number.isFinite(retryAt) && retryAt > now ? retryAt : now);
+      }
+      continue;
+    }
+    if (getEffectiveTrackedRequestStatus(request, now) !== "active") {
+      continue;
+    }
+    const reminderAt = activeUntil - normalizeReminderMinutes(reminderMinutes) * 60_000;
+    candidates.push(Number.isFinite(retryAt) && retryAt > now && reminderAt <= now ? retryAt : reminderAt);
+  }
+  return candidates.length ? Math.max(now + 1_000, Math.min(...candidates)) : undefined;
 }
 
 export function getPendingTrackedRequestCount(store: TrackedPimRequestStore): number {
@@ -485,6 +552,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
     return undefined;
   }
   const requestId = sanitizeString(value.requestId, MAX_ID_LENGTH);
+  const operationId = sanitizeOperationId(value.operationId);
   const itemId = sanitizeString(value.itemId, MAX_ID_LENGTH);
   const itemName = sanitizeString(value.itemName, MAX_NAME_LENGTH);
   const principalId = sanitizeString(value.principalId, MAX_ID_LENGTH);
@@ -511,6 +579,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
   const completedAt = sanitizeRequestMetadataTimestamp(value.completedAt, requestedAtMs, now);
   const extensionRequestedAt = sanitizeRequestMetadataTimestamp(value.extensionRequestedAt, requestedAtMs, now);
   const lastCheckedAt = sanitizeRequestMetadataTimestamp(value.lastCheckedAt, requestedAtMs, now);
+  const expiryReminderAttemptedAt = sanitizeRequestMetadataTimestamp(value.expiryReminderAttemptedAt, requestedAtMs, now);
   const expiryReminderSentAt = sanitizeRequestMetadataTimestamp(value.expiryReminderSentAt, requestedAtMs, now);
   const parsedNextCheckAt = sanitizeTimestamp(value.nextCheckAt);
   const nextCheckAtMs = parsedNextCheckAt ? Date.parse(parsedNextCheckAt) : Number.NaN;
@@ -524,6 +593,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
   return {
     id,
     requestId,
+    operationId,
     action,
     itemId,
     itemName,
@@ -568,6 +638,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
       ? sanitizeErrorMessage(value.lastError, MAX_ERROR_LENGTH) || undefined
       : undefined,
     notifiedStatus: isTrackedStatus(value.notifiedStatus) ? value.notifiedStatus : undefined,
+    expiryReminderAttemptedAt,
     expiryReminderSentAt,
     sourceInstallationId: sanitizeString(value.sourceInstallationId, 80),
     sourceDeviceName: sanitizeString(value.sourceDeviceName, 60)
@@ -682,6 +753,12 @@ function sanitizeString(value: unknown, maxLength: number): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function sanitizeOperationId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{8,80}$/.test(value)
+    ? value
+    : undefined;
 }
 
 function stringValue(value: unknown): string | undefined {

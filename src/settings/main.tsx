@@ -38,6 +38,7 @@ import { MAX_USER_JUSTIFICATION_LENGTH, getGenericJustificationWarning } from ".
 import { APP_BUILD_TIMESTAMP, APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import { isOperationTimeoutError } from "../lib/async";
+import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { savePopupDraft } from "../lib/popupDraft";
 import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
@@ -53,6 +54,8 @@ import {
   type ExtensionDistributionInfo
 } from "../lib/distribution";
 import {
+  BROWSER_SYNC_LOCAL_STATE_KEY,
+  BROWSER_SYNC_VERIFICATION_FRESHNESS_MS,
   formatBrowserSyncInstallationId,
   sanitizeBrowserSyncStatus,
   type BrowserSyncDevice,
@@ -72,6 +75,7 @@ import {
   REQUEST_TRACKING_KEY,
   clearTrackedRequests,
   getEffectiveTrackedRequestStatus,
+  getNextTrackedExpiryReminderTime,
   getPendingTrackedRequestCount,
   loadTrackedRequests,
   sanitizeTrackedRequestStore,
@@ -92,6 +96,7 @@ const CHANGELOG_FETCH_TIMEOUT_MS = 5000;
 const PORTAL_TOKEN_WAIT_TIMEOUT_MS = 12_000;
 const PORTAL_TOKEN_POLL_INTERVAL_MS = 1500;
 const TOKEN_STATUS_TIMEOUT_MS = 8_000;
+const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2;
 const PORTAL_TOKEN_REFRESH_TIMEOUT_MS = 17_000;
 const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
 const SETTINGS_REFRESH_STEPS: readonly ProgressStepDefinition[] = [
@@ -147,6 +152,7 @@ function SettingsApp() {
   const [exportBaselineText, setExportBaselineText] = useState("");
   const [exportExternalChange, setExportExternalChange] = useState(false);
   const [isRefreshingEligible, setIsRefreshingEligible] = useState(false);
+  const [isEligibleRefreshQueued, setIsEligibleRefreshQueued] = useState(false);
   const [isRefreshingAccess, setIsRefreshingAccess] = useState(false);
   const [eligibleRefreshProgress, setEligibleRefreshProgress] = useState<OperationProgress | null>(null);
   const [accessRefreshProgress, setAccessRefreshProgress] = useState<OperationProgress | null>(null);
@@ -160,10 +166,29 @@ function SettingsApp() {
   const explicitPortalScanDepth = useRef(0);
   const settingsProgressRunId = useRef(0);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const settingsRefreshInFlight = useRef(false);
+  const settingsRefreshCompletion = useRef<Promise<void>>(Promise.resolve());
+  const initialSettingsHydration = useRef<Promise<void> | undefined>(undefined);
+  const resolveInitialSettingsHydration = useRef<(() => void) | undefined>(undefined);
+  const eligibleRefreshQueued = useRef(false);
   const pendingTabFlushRef = useRef<(() => Promise<void>) | undefined>(undefined);
   const pendingPreferenceFlush = useRef<Promise<void>>(Promise.resolve());
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+
+  if (!initialSettingsHydration.current) {
+    initialSettingsHydration.current = new Promise<void>((resolve) => {
+      resolveInitialSettingsHydration.current = resolve;
+    });
+  }
+
+  tokenStatusRef.current = tokenStatus;
+
+  function publishTokenStatus(nextStatus: TokenStatus): void {
+    tokenStatusRef.current = nextStatus;
+    setTokenStatus(nextStatus);
+  }
 
   function replaceExportText(value: string, dirty = false) {
     exportTextDirty.current = dirty;
@@ -175,7 +200,10 @@ function SettingsApp() {
   }
 
   useEffect(() => {
-    void refresh();
+    void refresh().finally(() => {
+      resolveInitialSettingsHydration.current?.();
+      resolveInitialSettingsHydration.current = undefined;
+    });
   }, []);
 
   useEffect(() => () => {
@@ -264,6 +292,14 @@ function SettingsApp() {
   }, []);
 
   async function refresh(options: { showProgress?: boolean } = {}) {
+    if (settingsRefreshInFlight.current) {
+      return settingsRefreshCompletion.current;
+    }
+    let resolveRefreshCompletion: () => void = () => undefined;
+    settingsRefreshCompletion.current = new Promise<void>((resolve) => {
+      resolveRefreshCompletion = resolve;
+    });
+    settingsRefreshInFlight.current = true;
     const refreshStartedAt = Date.now();
     let progress: OperationProgress | null = null;
     let progressCompleted = false;
@@ -298,10 +334,7 @@ function SettingsApp() {
       }
       setIsSettingsReady(true);
       const [loadedTokens, loadedCache, loadedReferenceData, loadedTrackedRequests] = await Promise.all([
-        sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Saved settings and cached data remain available." }
-        ),
+        readTokenStatusWithRetry(tokenStatusRef.current),
         loadDataCache(),
         loadReferenceData(),
         loadTrackedRequests()
@@ -359,7 +392,7 @@ function SettingsApp() {
       showProgressStep(3);
       await saveReferenceData(nextReferenceData);
       setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
-      setTokenStatus(effectiveTokenStatus);
+      publishTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
       if (options.showProgress) {
@@ -386,6 +419,8 @@ function SettingsApp() {
         setEligibleRefreshProgress(progress);
       }
     } finally {
+      settingsRefreshInFlight.current = false;
+      resolveRefreshCompletion();
       if (options.showProgress) {
         setIsRefreshingEligible(false);
         if (progressCompleted && progress) {
@@ -396,6 +431,28 @@ function SettingsApp() {
           }, 350);
         }
       }
+    }
+  }
+
+  async function requestEligibleRefresh(): Promise<void> {
+    if (eligibleRefreshQueued.current || isRefreshingEligible || isRefreshingAccess) {
+      return;
+    }
+    eligibleRefreshQueued.current = true;
+    setIsEligibleRefreshQueued(true);
+    try {
+      // Settings becomes interactive before its initial local hydration is
+      // necessarily complete. Preserve an early click and run it afterward.
+      await initialSettingsHydration.current;
+      // Access recovery writes the same token/cache state. Let any operation
+      // that won the click race finish before starting the eligible refresh.
+      while (pendingAccessRefreshes.current > 0) {
+        await accessRefreshQueue.current;
+      }
+      await refresh({ showProgress: true });
+    } finally {
+      eligibleRefreshQueued.current = false;
+      setIsEligibleRefreshQueued(false);
     }
   }
 
@@ -422,13 +479,18 @@ function SettingsApp() {
     setIsRefreshingAccess(true);
     setEligibleRefreshProgress(null);
     setAccessRefreshProgress(progress);
-    const refreshRun = accessRefreshQueue.current.then(() => {
+    const refreshRun = accessRefreshQueue.current.then(async () => {
+      // Initial Settings hydration and a user-requested eligible refresh both
+      // publish token/cache state. Wait for that writer before Access Setup
+      // starts so an older bootstrap result cannot overwrite recovered access.
+      await initialSettingsHydration.current;
+      await settingsRefreshCompletion.current;
       // Clear feedback when this queued run actually starts. Clearing it while
       // enqueuing allows an older run to publish a stale error after the clear.
       setError("");
       setMessage("");
       showProgressStep(1, "Reading local access state");
-      return performAccessDataRefresh(tokens, targets, options, showProgressStep);
+      await performAccessDataRefresh(tokens, targets, options, showProgressStep);
     });
     accessRefreshQueue.current = refreshRun.then(() => undefined, () => undefined);
 
@@ -471,10 +533,7 @@ function SettingsApp() {
       loadReferenceData(),
       tokens
         ? Promise.resolve(tokens)
-        : sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Cached access data remains available." }
-        )
+        : readTokenStatusWithRetry(tokenStatusRef.current)
     ]);
     const latestTokens = loadedTokens;
     const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
@@ -490,7 +549,7 @@ function SettingsApp() {
     );
 
     setSettings(loadedSettings);
-    setTokenStatus(latestTokens);
+    publishTokenStatus(latestTokens);
     setDataCache(currentCache);
     if (!refreshTargets.length) {
       onProgress(3, "Finalizing current access data");
@@ -540,7 +599,7 @@ function SettingsApp() {
     const active = mergeTargetEntries(enabledRoleFeatures.map((target) => activeCache[target]?.entry), fetchedAt, legacyCacheKey);
     const nextReferenceData = learnReferenceDataFromItems(currentReferenceData, [...eligible.items, ...active.items]);
     await saveReferenceData(nextReferenceData);
-    setTokenStatus(snapshotTokenStatus);
+    publishTokenStatus(snapshotTokenStatus);
     setDataCache(nextCache);
     setReferenceData(nextReferenceData);
     setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
@@ -583,7 +642,7 @@ function SettingsApp() {
       return result.tokenStatus;
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : String(scanError));
-      return tokenStatus || {
+      return tokenStatusRef.current || {
         graph: { hasToken: false },
         azureManagement: { hasToken: false }
       };
@@ -633,7 +692,7 @@ function SettingsApp() {
     try {
       suppressSessionTokenRefreshUntil.current = Date.now() + 1000;
       await sendMessage<boolean>({ action: "clearToken" });
-      setTokenStatus({
+      publishTokenStatus({
         graph: { hasToken: false },
         azureManagement: { hasToken: false }
       });
@@ -660,16 +719,20 @@ function SettingsApp() {
 
   async function resetExtensionData(): Promise<boolean> {
     try {
+      if (settingsRefreshInFlight.current || isRefreshingEligible || isRefreshingAccess || pendingAccessRefreshes.current > 0) {
+        throw new Error("Wait for the current access refresh to finish before resetting QuickPIM++.");
+      }
       await pendingPreferenceFlush.current;
       await pendingTabFlushRef.current?.();
       await pendingPreferenceFlush.current;
+      await settingsMutationQueue.current;
       await sendMessage<boolean>(
         { action: "resetExtensionData" },
-        { timeoutMs: 15_000, timeoutMessage: "QuickPIM++ data reset timed out. No success was confirmed." }
+        { timeoutMs: 30_000, timeoutMessage: "QuickPIM++ data reset timed out. No success was confirmed." }
       );
       setSettings(DEFAULT_SETTINGS);
       setItems([]);
-      setTokenStatus({ graph: { hasToken: false }, azureManagement: { hasToken: false } });
+      publishTokenStatus({ graph: { hasToken: false }, azureManagement: { hasToken: false } });
       setDataCache({});
       setReferenceData(undefined);
       setTrackedRequests({ version: 1, requests: [] });
@@ -713,11 +776,16 @@ function SettingsApp() {
             <p>Set up role access, personalize the popup, configure activation, and manage local data.</p>
           </div>
         </div>
-        <button className="btn" onClick={() => void refresh({ showProgress: true })} disabled={isRefreshingEligible || isRefreshingAccess}>
+        <button className="btn" onClick={() => void requestEligibleRefresh()} disabled={isEligibleRefreshQueued || isRefreshingEligible || isRefreshingAccess}>
           {isRefreshingEligible ? (
             <span className="loading-inline">
               <span className="spinner" aria-hidden="true" />
               <span>Refreshing eligible items...</span>
+            </span>
+          ) : isEligibleRefreshQueued ? (
+            <span className="loading-inline">
+              <span className="spinner" aria-hidden="true" />
+              <span>Waiting to refresh...</span>
             </span>
           ) : (
             "Refresh eligible items"
@@ -775,9 +843,11 @@ function SettingsApp() {
                   tokenStatus={tokenStatus}
                   dataCache={dataCache}
                   isRefreshingAccess={isRefreshingAccess}
-                  isRefreshingEligible={isRefreshingEligible}
+                  isRefreshingEligible={isRefreshingEligible || isEligibleRefreshQueued}
                   onSave={persist}
                   onFlushPreferences={async () => {
+                    await initialSettingsHydration.current;
+                    await settingsRefreshCompletion.current;
                     await pendingPreferenceFlush.current;
                     await pendingTabFlushRef.current?.();
                     await pendingPreferenceFlush.current;
@@ -844,7 +914,7 @@ function SettingsApp() {
                 trackedRequests={trackedRequests}
               />
             ) : null}
-            {tab === "sync" ? <BrowserSyncPanel /> : null}
+            {tab === "sync" ? <BrowserSyncPanel settings={settings} /> : null}
             {tab === "reset" ? <ResetDataPanel onNavigate={selectTab} onReset={resetExtensionData} /> : null}
           </div>
         </div>
@@ -1065,30 +1135,49 @@ function AccessSetupPanel({
   const [isRecheckingPortalTabs, setIsRecheckingPortalTabs] = useState(false);
   const [portalRecoveryStatus, setPortalRecoveryStatus] = useState<PortalRecoveryStatus>(() => emptyPortalRecoveryStatus());
   const [portalRecoveryError, setPortalRecoveryError] = useState("");
+  const portalSetupInFlight = useRef(false);
+  const portalRecheckInFlight = useRef(false);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings]);
   const accessStatus = useMemo(() => buildAccessCapabilityItems(tokenStatus, dataCache, enabledRoleFeatures), [dataCache, enabledRoleFeatures, tokenStatus]);
   const setupTargets = useMemo(() => getAccessSetupTargets(accessStatus), [accessStatus]);
   const identity = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
   const warningIgnored = Boolean(settings.preferences.permissionWarningIgnored);
+  const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
+
+  portalRecoveryStatusRef.current = portalRecoveryStatus;
+
+  function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
+    portalRecoveryStatusRef.current = nextStatus;
+    setPortalRecoveryStatus(nextStatus);
+  }
 
   useEffect(() => {
     let active = true;
-    const updateStatus = async () => {
-      const next = await readPortalRecoveryStatus();
+    let timer: number | undefined;
+    const updateStatus = async (): Promise<void> => {
+      const next = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
       if (active) {
-        setPortalRecoveryStatus(next);
+        publishPortalRecoveryStatus(next);
+        if (next.state !== "idle") {
+          timer = window.setTimeout(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+        }
       }
     };
-    void updateStatus();
-    if (portalRecoveryStatus.state === "idle") {
+    if (isRunningSetup || isRecheckingPortalTabs) {
       return () => { active = false; };
     }
-    const timer = window.setInterval(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+    if (portalRecoveryStatus.state === "idle") {
+      // Restore an existing managed sign-in session immediately on first load.
+      // Subsequent non-idle checks are scheduled only after the prior one ends.
+      void updateStatus();
+    } else {
+      timer = window.setTimeout(() => void updateStatus(), PORTAL_TOKEN_POLL_INTERVAL_MS);
+    }
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [portalRecoveryStatus.state]);
+  }, [isRecheckingPortalTabs, isRunningSetup, portalRecoveryStatus.state]);
 
   async function setIgnored(ignored: boolean) {
     await onSave(
@@ -1105,13 +1194,18 @@ function AccessSetupPanel({
   }
 
   async function runPortalSetup() {
-    if (portalRecoveryStatus.state === "interactionRequired") {
-      await continueMicrosoftSignIn();
+    if (portalSetupInFlight.current || portalRecheckInFlight.current || isRefreshingAccess || isRefreshingEligible) {
       return;
     }
+    portalSetupInFlight.current = true;
     setIsRunningSetup(true);
     setPortalRecoveryError("");
+    let latestRecoveryStatus = portalRecoveryStatus;
     try {
+      if (portalRecoveryStatus.state === "interactionRequired") {
+        await continueMicrosoftSignIn();
+        return;
+      }
       const latestSettings = await onFlushPreferences();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const initialTargets = getAccessSetupTargets(buildAccessCapabilityItems(tokenStatus, dataCache, currentFeatures));
@@ -1121,7 +1215,8 @@ function AccessSetupPanel({
       ).filter((target) => initialTargets.includes(target));
       if (remainingTargets.length) {
         await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
-        setPortalRecoveryStatus(await readPortalRecoveryStatus());
+        latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
+        publishPortalRecoveryStatus(latestRecoveryStatus);
       }
 
       if (!remainingTargets.length) {
@@ -1130,7 +1225,8 @@ function AccessSetupPanel({
       }
 
       const tokenRefresh = await waitForPortalTokens(remainingTargets, scannedTokens, onScanPortalTabsForTokens);
-      setPortalRecoveryStatus(tokenRefresh.recoveryStatus);
+      latestRecoveryStatus = tokenRefresh.recoveryStatus;
+      publishPortalRecoveryStatus(tokenRefresh.recoveryStatus);
       if (tokenRefresh.changedTargets.length) {
         await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, { skipTargetsWithCurrentTokenCache: true });
       }
@@ -1141,9 +1237,16 @@ function AccessSetupPanel({
       if (unchangedTargets.length) {
         await onRefreshAccessData(tokenRefresh.tokens, unchangedTargets);
       }
+    } catch (setupError) {
+      setPortalRecoveryError(setupError instanceof Error ? setupError.message : String(setupError));
     } finally {
-      setIsRunningSetup(false);
-      setPortalRecoveryStatus(await readPortalRecoveryStatus());
+      try {
+        latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
+        publishPortalRecoveryStatus(latestRecoveryStatus);
+      } finally {
+        portalSetupInFlight.current = false;
+        setIsRunningSetup(false);
+      }
     }
   }
 
@@ -1151,7 +1254,7 @@ function AccessSetupPanel({
     setPortalRecoveryError("");
     try {
       const result = await sendMessage<PortalRecoveryFocusResult>({ action: "focusPortalRecoveryTabs" });
-      setPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
+      publishPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
       if (!result?.focused) {
         setPortalRecoveryError("The Microsoft sign-in tab is no longer available. Open the missing portal pages again.");
       }
@@ -1161,19 +1264,27 @@ function AccessSetupPanel({
   }
 
   async function recheckPortalAccess() {
+    if (portalSetupInFlight.current || portalRecheckInFlight.current || isRefreshingAccess || isRefreshingEligible) {
+      return;
+    }
+    portalRecheckInFlight.current = true;
     setIsRecheckingPortalTabs(true);
+    setPortalRecoveryError("");
     try {
       const latestSettings = await onFlushPreferences();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const scannedTokens = await onScanPortalTabsForTokens();
-      const recoveryStatus = await readPortalRecoveryStatus();
-      setPortalRecoveryStatus(recoveryStatus);
+      const recoveryStatus = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
+      publishPortalRecoveryStatus(recoveryStatus);
       if (recoveryStatus.state === "interactionRequired") {
         return;
       }
       const currentTargets = getAccessSetupTargets(buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures));
       await onRefreshAccessData(scannedTokens, currentTargets.length ? currentTargets : currentFeatures);
+    } catch (recheckError) {
+      setPortalRecoveryError(recheckError instanceof Error ? recheckError.message : String(recheckError));
     } finally {
+      portalRecheckInFlight.current = false;
       setIsRecheckingPortalTabs(false);
     }
   }
@@ -1340,7 +1451,33 @@ function emptyPortalRecoveryStatus(): PortalRecoveryStatus {
   return sanitizePortalRecoveryStatus(undefined);
 }
 
-async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
+async function readTokenStatusWithRetry(fallback?: TokenStatus | null): Promise<TokenStatus> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await sendMessage<TokenStatus>(
+        { action: "getTokenStatus" },
+        {
+          timeoutMs: TOKEN_STATUS_ATTEMPT_TIMEOUT_MS,
+          timeoutMessage: "Token status check timed out. Saved settings and cached data remain available."
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await delay(100);
+      }
+    }
+  }
+  if (fallback) {
+    return refreshTokenStatusFreshness(fallback);
+  }
+  throw lastError;
+}
+
+async function readPortalRecoveryStatus(
+  fallback: PortalRecoveryStatus = emptyPortalRecoveryStatus()
+): Promise<PortalRecoveryStatus> {
   try {
     return sanitizePortalRecoveryStatus(
       await sendMessage<PortalRecoveryStatus>(
@@ -1349,7 +1486,7 @@ async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
       )
     );
   } catch {
-    return emptyPortalRecoveryStatus();
+    return fallback;
   }
 }
 
@@ -1365,7 +1502,7 @@ async function waitForPortalTokens(
   while (Date.now() < deadline) {
     [latestTokens, recoveryStatus] = await Promise.all([
       scanPortalTabsForTokens(),
-      readPortalRecoveryStatus()
+      readPortalRecoveryStatus(recoveryStatus)
     ]);
     changedTargets = targets.filter((target) => hasTargetPortalTokenChanged(target, baselineTokens, latestTokens));
     if (changedTargets.length === targets.length) {
@@ -1377,7 +1514,7 @@ async function waitForPortalTokens(
     await delay(Math.min(PORTAL_TOKEN_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
   }
   if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
-    recoveryStatus = await readPortalRecoveryStatus();
+    recoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
   }
   return { tokens: latestTokens, changedTargets, recoveryStatus };
 }
@@ -1529,9 +1666,16 @@ function ActivityPanel({
     void sendMessage<BrowserSyncStatus>(
       { action: "getBrowserSyncStatus" },
       { timeoutMs: 4_000, timeoutMessage: "Browser sync device lookup timed out." }
-    ).then((value) => {
-      const next = sanitizeBrowserSyncStatus(value);
+    ).then(async (value) => {
+      let next = sanitizeBrowserSyncStatus(value);
       if (active && next) setBrowserSyncStatus(next);
+      if (next?.supported && next.enabled) {
+        next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
+          { action: "syncBrowserData" },
+          { timeoutMs: 15_000, timeoutMessage: "Browser sync will continue in the background." }
+        ));
+        if (active && next) setBrowserSyncStatus(next);
+      }
     }).catch(() => undefined);
     return () => {
       active = false;
@@ -1670,6 +1814,11 @@ function ActivityPanel({
           Usage
         </button>
       </div>
+      {view !== "requests" && browserSyncStatus?.supported && browserSyncStatus.enabled && browserSyncStatus.crossDeviceState === "waiting" ? (
+        <p className="message settings-inline-message">
+          Cross-device delivery is not verified yet, so activity from another computer may be missing. Open Browser Sync for the verification steps.
+        </p>
+      ) : null}
       {view === "requests" ? (
         <>
           <div className="toolbar settings-section-gap request-toolbar">
@@ -2038,7 +2187,7 @@ function matchesTrackedRequestFilter(
   return status === "completed" || status === "expired";
 }
 
-function BrowserSyncPanel() {
+function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
   const [status, setStatus] = useState<BrowserSyncStatus | null>(null);
   const [deviceName, setDeviceName] = useState("");
   const [isBusy, setIsBusy] = useState(false);
@@ -2046,30 +2195,131 @@ function BrowserSyncPanel() {
   const [error, setError] = useState("");
   const [confirmingPurge, setConfirmingPurge] = useState(false);
   const lastSavedDeviceName = useRef("");
+  const lastRequestedDeviceName = useRef("");
+  const lastFailedDeviceName = useRef("");
+  const currentDeviceName = useRef("");
+  const currentStatus = useRef<BrowserSyncStatus | null>(null);
+  const actionInFlight = useRef(false);
+  const pendingStatusRefresh = useRef(false);
+  const nextStatusRequestId = useRef(0);
+  const lastAppliedStatusRequestId = useRef(0);
+  const isMounted = useRef(true);
 
-  async function loadStatus() {
+  currentDeviceName.current = deviceName;
+  currentStatus.current = status;
+
+  function applyStatus(
+    next: BrowserSyncStatus,
+    requestId: number,
+    request?: Record<string, unknown>
+  ): boolean {
+    if (!isMounted.current || requestId < lastAppliedStatusRequestId.current) return false;
+    lastAppliedStatusRequestId.current = requestId;
+    setStatus(next);
+    currentStatus.current = next;
+    const previousSavedName = lastSavedDeviceName.current;
+    setDeviceName((current) => request?.action === "updateBrowserSyncDeviceName"
+      && current.trim() !== request.name
+      ? current
+      : !current || current === previousSavedName || request?.action === "updateBrowserSyncDeviceName"
+        ? next.deviceName
+        : current);
+    lastSavedDeviceName.current = next.deviceName;
+    if (lastRequestedDeviceName.current === next.deviceName) lastRequestedDeviceName.current = "";
+    return true;
+  }
+
+  async function loadStatus(synchronize = false): Promise<BrowserSyncStatus | null> {
+    const requestId = ++nextStatusRequestId.current;
     try {
       const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
-        { action: "getBrowserSyncStatus" },
-        { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
+        { action: synchronize ? "syncBrowserData" : "getBrowserSyncStatus" },
+        {
+          timeoutMs: synchronize ? 15_000 : 4_000,
+          timeoutMessage: synchronize
+            ? "Browser sync will continue in the background."
+            : "Browser sync status check timed out."
+        }
       ));
-      if (next) {
-        setStatus(next);
-        setDeviceName(next.deviceName);
-        lastSavedDeviceName.current = next.deviceName;
+      if (!next) throw new Error("Browser sync returned an invalid status. Retry the check.");
+      const applied = applyStatus(next, requestId);
+      if (applied) {
+        setError("");
       }
+      return next;
     } catch (statusError) {
-      setError(statusError instanceof Error ? statusError.message : String(statusError));
+      if (isMounted.current && requestId >= lastAppliedStatusRequestId.current) {
+        setError(statusError instanceof Error ? statusError.message : String(statusError));
+      }
+      return null;
     }
   }
 
   useEffect(() => {
-    void loadStatus();
+    let active = true;
+    void loadStatus().then((next) => {
+      if (active && next?.supported && next.enabled) void loadStatus(true);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    isMounted.current = true;
+    const flushPendingDeviceName = () => {
+      const next = currentDeviceName.current.trim();
+      if (!currentStatus.current?.supported
+        || !next
+        || next === lastSavedDeviceName.current
+        || next === lastRequestedDeviceName.current
+        || next === lastFailedDeviceName.current) return;
+      lastRequestedDeviceName.current = next;
+      try {
+        void Promise.resolve(chrome.runtime.sendMessage({ action: "updateBrowserSyncDeviceName", name: next }))
+          .catch(() => {
+            if (lastRequestedDeviceName.current === next) lastRequestedDeviceName.current = "";
+          });
+      } catch {
+        if (lastRequestedDeviceName.current === next) lastRequestedDeviceName.current = "";
+      }
+    };
+    window.addEventListener("pagehide", flushPendingDeviceName);
+    return () => {
+      window.removeEventListener("pagehide", flushPendingDeviceName);
+      flushPendingDeviceName();
+      isMounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const storageChangeEvent = chrome.storage?.onChanged;
+    if (!storageChangeEvent) return;
+    let timer: number | undefined;
+    const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName !== "sync" && !(areaName === "local" && changes[BROWSER_SYNC_LOCAL_STATE_KEY])) return;
+      if (actionInFlight.current) {
+        pendingStatusRefresh.current = true;
+        return;
+      }
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(() => void loadStatus(), 150);
+    };
+    storageChangeEvent.addListener(handleStorageChange);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+      storageChangeEvent.removeListener(handleStorageChange);
+    };
   }, []);
 
   useEffect(() => {
     const trimmed = deviceName.trim();
-    if (!status?.supported || !trimmed || trimmed === lastSavedDeviceName.current) return;
+    if (isBusy
+      || !status?.supported
+      || !trimmed
+      || trimmed === lastSavedDeviceName.current
+      || trimmed === lastRequestedDeviceName.current
+      || trimmed === lastFailedDeviceName.current) return;
     const timer = window.setTimeout(() => {
       void runAction(
         { action: "updateBrowserSyncDeviceName", name: trimmed },
@@ -2077,41 +2327,93 @@ function BrowserSyncPanel() {
       );
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [deviceName, status?.supported]);
+  }, [deviceName, isBusy, status?.supported]);
 
-  async function runAction(request: Record<string, unknown>, successMessage: string): Promise<boolean> {
-    setIsBusy(true);
-    setMessage("");
-    setError("");
+  async function runAction(
+    request: Record<string, unknown>,
+    successMessage: string | ((next: BrowserSyncStatus | null) => string)
+  ): Promise<boolean> {
+    if (actionInFlight.current) return false;
+    actionInFlight.current = true;
+    const requestId = ++nextStatusRequestId.current;
+    const requestedDeviceName = request.action === "updateBrowserSyncDeviceName" && typeof request.name === "string"
+      ? request.name
+      : "";
+    if (requestedDeviceName) lastRequestedDeviceName.current = requestedDeviceName;
+    if (isMounted.current) {
+      setIsBusy(true);
+      setMessage("");
+      setError("");
+    }
     try {
       const next = sanitizeBrowserSyncStatus(await sendMessage<BrowserSyncStatus>(
         request,
         { timeoutMs: 15_000, timeoutMessage: "Browser sync did not finish in time. It will retry in the background." }
       ));
-      if (next) {
-        setStatus(next);
-        setDeviceName((current) => request.action === "updateBrowserSyncDeviceName"
-          && current.trim() !== request.name
-          ? current
-          : next.deviceName);
-        lastSavedDeviceName.current = next.deviceName;
+      if (!next) throw new Error("Browser sync returned an invalid status. Retry the action.");
+      const applied = applyStatus(next, requestId, request);
+      const attemptedDataSync = request.action === "syncBrowserData"
+        || (request.action === "setBrowserSyncEnabled" && request.enabled === true);
+      const actionReportedFailure = attemptedDataSync
+        || (request.action === "setBrowserSyncEnabled" && request.enabled === false)
+        || (request.action === "updateBrowserSyncDeviceName"
+          && next.lastError?.startsWith("The installation name is saved locally"));
+      if (actionReportedFailure && next.lastError) {
+        if (requestedDeviceName) {
+          lastRequestedDeviceName.current = "";
+          lastFailedDeviceName.current = requestedDeviceName;
+        }
+        if (isMounted.current) {
+          setMessage("");
+          setError(next.lastError);
+        }
+        return false;
       }
-      setMessage(successMessage);
+      if (isMounted.current && applied) {
+        setMessage(typeof successMessage === "function" ? successMessage(next) : successMessage);
+      }
       return true;
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      if (requestedDeviceName && lastRequestedDeviceName.current === requestedDeviceName) {
+        lastRequestedDeviceName.current = "";
+      }
+      if (requestedDeviceName) lastFailedDeviceName.current = requestedDeviceName;
+      if (isMounted.current) setError(actionError instanceof Error ? actionError.message : String(actionError));
       return false;
     } finally {
-      setIsBusy(false);
+      actionInFlight.current = false;
+      if (isMounted.current) {
+        setIsBusy(false);
+        if (pendingStatusRefresh.current) {
+          pendingStatusRefresh.current = false;
+          void loadStatus();
+        }
+      }
     }
   }
 
   async function purgeSyncedData() {
     await runAction({ action: "purgeBrowserSyncData" }, "Synced settings and history were deleted. Sync is now off on this installation.");
-    setConfirmingPurge(false);
+    if (isMounted.current) setConfirmingPurge(false);
   }
 
   const otherDevices = status?.devices.filter((device) => device.installationId !== status.installationId) || [];
+  const otherInstallationIds = new Set(otherDevices.map((device) => device.installationId));
+  const receivedActivityCount = status
+    ? settings.activityHistory.filter((entry) => entry.sourceInstallationId && otherInstallationIds.has(entry.sourceInstallationId)).length
+    : 0;
+  const verificationTitle = status?.crossDeviceState === "verified"
+    ? `Verified with ${status.otherInstallationCount} other installation${status.otherInstallationCount === 1 ? "" : "s"}`
+    : status?.crossDeviceState === "waiting"
+      ? "Waiting for another installation"
+      : "Cross-device sync is off";
+  const verificationDetail = status?.crossDeviceState === "verified"
+    ? `QuickPIM++ has received an installation record through ${status.ecosystemLabel || "browser sync"}.`
+    : status?.crossDeviceState === "waiting"
+      ? otherDevices.length
+        ? "Other installation records exist, but none has synchronized recently with sync enabled."
+        : "Data is stored in this browser's sync area, but no other QuickPIM++ installation has been observed yet."
+      : "Enable sync to store portable QuickPIM++ data in this browser's sync area.";
   const storeUrl = status?.browserLabel === "Microsoft Edge" ? EDGE_ADDONS_URL : CHROME_WEB_STORE_URL;
   const storeLabel = status?.browserLabel === "Microsoft Edge" ? "Microsoft Edge Add-ons" : "Chrome Web Store";
   const showBothStoreOptions = status?.browserLabel !== "Microsoft Edge" && status?.browserLabel !== "Google Chrome";
@@ -2123,12 +2425,17 @@ function BrowserSyncPanel() {
           <h2>Browser Sync</h2>
           <p className="muted">Keep useful QuickPIM++ settings and local activity available on your other signed-in browser installations.</p>
         </div>
-        {status ? <span className={`sync-capability-badge ${status.supported ? status.enabled ? "ready" : "off" : "limited"}`}>
-          {status.supported ? status.enabled ? "Sync on" : "Sync off" : "Limited"}
+        {status ? <span className={`sync-capability-badge ${status.supported ? status.crossDeviceState === "verified" ? "ready" : status.enabled ? "waiting" : "off" : "limited"}`}>
+          {status.supported ? status.crossDeviceState === "verified" ? "Cross-device verified" : status.enabled ? "Not yet verified" : "Sync off" : "Limited"}
         </span> : null}
       </div>
 
-      {!status ? <div className="settings-subsection"><p className="muted">Checking browser sync...</p></div> : null}
+      {!status ? (
+        <div className="settings-subsection sync-status-placeholder">
+          <p className="muted">{error ? "Browser sync status is unavailable." : "Checking browser sync..."}</p>
+          {error ? <button className="btn compact" onClick={() => void loadStatus()}>Retry status check</button> : null}
+        </div>
+      ) : null}
       {status && !status.supported ? (
         <div className="settings-subsection sync-limitation-card">
           <h3>Native sync is unavailable for this installation</h3>
@@ -2151,71 +2458,142 @@ function BrowserSyncPanel() {
       {status?.supported ? (
         <>
           <div className="settings-subsection sync-overview-section">
-            <label className="preference-toggle sync-master-toggle">
-              <input
-                type="checkbox"
-                checked={status.enabled}
+            <div className="sync-control-header">
+              <button
+                type="button"
+                className={`sync-master-switch ${status.enabled ? "enabled" : "disabled"}`}
+                role="switch"
+                aria-checked={status.enabled}
+                aria-label="Browser sync"
                 disabled={isBusy}
-                onChange={(event) => void runAction(
-                  { action: "setBrowserSyncEnabled", enabled: event.target.checked },
-                  event.target.checked ? "Browser sync enabled." : "Browser sync disabled on this installation."
+                onClick={() => void runAction(
+                  { action: "setBrowserSyncEnabled", enabled: !status.enabled },
+                  status.enabled ? "Browser sync disabled on this installation." : "Browser sync enabled."
                 )}
-              />
-              <span className="preference-toggle-copy">
-                <strong>Sync settings and activity</strong>
-                <span className="muted">Enabled by default. Uses {status.ecosystemLabel}; Chrome and Edge sync separately.</span>
-              </span>
-            </label>
-            <div className="sync-status-grid">
-              <div><strong>Last successful sync</strong><span>{formatSyncTimestamp(status.lastSuccessAt)}</span></div>
-              <div><strong>Sync service</strong><span>{status.ecosystemLabel || "Browser sync"}</span></div>
-              <div><strong>Installation</strong><span>{status.sourceLabel}</span></div>
+              >
+                <span className="sync-master-switch-copy">
+                  <strong>Sync settings and activity</strong>
+                  <span className="muted">Enabled by default. Chrome and Edge use separate sync services.</span>
+                </span>
+                <span className="sync-master-switch-state" aria-hidden="true">
+                  <span className="sync-master-switch-track"><span /></span>
+                  <strong>{status.enabled ? "On" : "Off"}</strong>
+                </span>
+              </button>
+              <button
+                className="btn primary"
+                disabled={isBusy || !status.enabled}
+                onClick={() => void runAction(
+                  { action: "syncBrowserData" },
+                  (next) => next?.crossDeviceState === "verified"
+                    ? `Send and receive completed. ${next.otherInstallationCount} other installation${next.otherInstallationCount === 1 ? "" : "s"} detected.`
+                    : "Saved in this browser's sync area. Open QuickPIM++ on the other computer to verify cross-device delivery."
+                )}
+              >
+                {isBusy ? "Syncing..." : "Send & receive now"}
+              </button>
             </div>
+            <div className={`sync-verification-summary ${status.crossDeviceState}`}>
+              <div>
+                <strong>{verificationTitle}</strong>
+                <span>{verificationDetail}</span>
+              </div>
+              <span className={`sync-verification-chip ${status.crossDeviceState}`}>
+                {status.crossDeviceState === "verified" ? "Verified" : status.crossDeviceState === "waiting" ? "Unverified" : "Off"}
+              </span>
+            </div>
+            <dl className="sync-facts">
+              <div><dt>Last run here</dt><dd>{formatSyncTimestamp(status.lastSuccessAt)}</dd></div>
+              <div><dt>Service</dt><dd>{status.ecosystemLabel || "Browser sync"}</dd></div>
+              <div><dt>Activity received</dt><dd>{receivedActivityCount} event{receivedActivityCount === 1 ? "" : "s"} from other installations</dd></div>
+              <div><dt>Last other run</dt><dd>{formatSyncTimestamp(status.lastOtherInstallationSyncAt)}</dd></div>
+              <div><dt>Store edition</dt><dd>{status.sourceLabel}</dd></div>
+            </dl>
+            {status.crossDeviceState === "waiting" ? (
+              <details className="sync-help-details">
+                <summary>Why is my other computer not appearing?</summary>
+                <div>
+                  <p>A successful write here cannot confirm that the browser account transported it to another computer.</p>
+                  <ol>
+                    <li>Use the official {status.sourceLabel} edition on both computers.</li>
+                    <li>In the same {status.browserLabel} work profile, confirm browser sync is enabled and allowed by your organization.</li>
+                    <li>Open QuickPIM++ on the other computer and use Browser Sync &gt; Send &amp; receive now. Verification remains current for seven days after that installation&apos;s last run.</li>
+                  </ol>
+                  {status.browserLabel === "Microsoft Edge" ? (
+                    <a href="https://learn.microsoft.com/en-us/deployedge/microsoft-edge-enterprise-sync" target="_blank" rel="noreferrer">Microsoft Edge enterprise sync requirements</a>
+                  ) : null}
+                </div>
+              </details>
+            ) : null}
+            {status.crossDeviceState === "verified" && receivedActivityCount === 0 ? (
+              <p className="message settings-inline-message">Another installation is visible, but no activity from it is stored here yet. Use Send &amp; receive now on that computer after its QuickPIM++ activity is recorded.</p>
+            ) : null}
             {status.lastError ? <p className="message error settings-inline-message">{status.lastError}</p> : null}
             {status.omittedCategories.length ? (
-              <p className="message settings-inline-message">The browser quota excluded: {status.omittedCategories.join(", ")}. Core settings still sync; use Backup &amp; Restore for the complete dataset.</p>
+              <p className="message settings-inline-message">
+                Browser quota limits the synchronized copy of {formatLimitedSyncCategories(status.omittedCategories)}. Complete local data is preserved; use Backup &amp; Restore when the full dataset is required on another installation.
+              </p>
             ) : null}
-            <div className="button-row">
-              <button className="btn primary" disabled={isBusy || !status.enabled} onClick={() => void runAction({ action: "syncBrowserData" }, "Browser sync completed.") }>{isBusy ? "Working..." : "Sync now"}</button>
-            </div>
           </div>
 
-          <div className="settings-subsection">
-            <h3>This installation</h3>
-            <p className="muted">Use a recognizable name because browser extension APIs do not expose the computer hostname.</p>
-            <div className="form-grid sync-device-name-row">
-              <div className="field">
-                <label htmlFor="sync-device-name">Installation name</label>
-                <input id="sync-device-name" className="input" value={deviceName} maxLength={60} disabled={isBusy} onChange={(event) => setDeviceName(event.target.value)} />
-              </div>
-              <div className="sync-current-device-summary">
-                <strong>{status.browserLabel} / {status.platform}</strong>
-                <span>QuickPIM++ {APP_VERSION}</span>
-                <span className="sync-installation-id" title={status.installationId}>
-                  ID {formatBrowserSyncInstallationId(status.installationId)}
-                  <CopyTextButton text={status.installationId} label="installation ID" />
-                </span>
-              </div>
+          <div className="settings-subsection sync-installations-section">
+            <div className="sync-section-heading">
+              <h3>Installations</h3>
+              <p className="muted">Give each installation a recognizable name. Browser extension APIs do not expose the computer hostname.</p>
             </div>
-            <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
-          </div>
-
-          <div className="settings-subsection">
-            <h3>Other installations</h3>
-            <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>
-            <div className="sync-device-list">
-              {otherDevices.map((device) => (
-                <BrowserSyncDeviceEditor
-                  key={device.installationId}
-                  device={device}
-                  disabled={isBusy || !status.enabled}
-                  onRename={(name) => runAction(
-                    { action: "renameBrowserSyncDevice", installationId: device.installationId, name },
-                    `${formatBrowserSyncInstallationId(device.installationId)} renamed.`
-                  )}
-                />
-              ))}
-              {!otherDevices.length ? <p className="muted">No other installation has synced yet.</p> : null}
+            <div className="sync-current-installation">
+              <div className="form-grid sync-device-name-row">
+                <div className="field">
+                  <label htmlFor="sync-device-name">Installation name</label>
+                  <input
+                    id="sync-device-name"
+                    className="input"
+                    value={deviceName}
+                    maxLength={60}
+                    disabled={isBusy}
+                    onChange={(event) => {
+                      lastFailedDeviceName.current = "";
+                      setDeviceName(event.target.value);
+                    }}
+                    onBlur={() => {
+                      const trimmed = currentDeviceName.current.trim();
+                      if (!trimmed) {
+                        setDeviceName(lastSavedDeviceName.current);
+                        setError("Installation name cannot be empty.");
+                      } else if (trimmed !== currentDeviceName.current) {
+                        setDeviceName(trimmed);
+                      }
+                    }}
+                  />
+                </div>
+                <div className="sync-current-device-summary">
+                  <strong>{status.browserLabel} / {status.platform}</strong>
+                  <span>QuickPIM++ {APP_VERSION}</span>
+                  <span className="sync-installation-id" title={status.installationId}>
+                    ID {formatBrowserSyncInstallationId(status.installationId)}
+                    <CopyTextButton text={status.installationId} label="installation ID" />
+                  </span>
+                </div>
+              </div>
+              <p className="muted sync-id-help">The generated ID stays with this extension installation until its data is reset or the extension is reinstalled.</p>
+            </div>
+            <div className="sync-other-installations">
+              <h4>Other installations</h4>
+              <p className="muted">These installations have written to the same browser sync account. Times use this computer&apos;s local time.</p>
+              <div className="sync-device-list">
+                {otherDevices.map((device) => (
+                  <BrowserSyncDeviceEditor
+                    key={device.installationId}
+                    device={device}
+                    disabled={isBusy || !status.enabled}
+                    onRename={(name) => runAction(
+                      { action: "renameBrowserSyncDevice", installationId: device.installationId, name },
+                      `${formatBrowserSyncInstallationId(device.installationId)} renamed.`
+                    )}
+                  />
+                ))}
+                {!otherDevices.length ? <p className="muted">No other installation record has reached this browser yet.</p> : null}
+              </div>
             </div>
           </div>
 
@@ -2251,6 +2629,15 @@ function BrowserSyncPanel() {
   );
 }
 
+function formatLimitedSyncCategories(categories: string[]): string {
+  const labels: Record<string, string> = {
+    activityHistory: "activity history",
+    usageStatsByItemId: "usage counters",
+    recentJustifications: "recent justifications"
+  };
+  return categories.map((category) => labels[category] || category).join(", ");
+}
+
 function BrowserSyncDeviceEditor({
   device,
   disabled,
@@ -2264,6 +2651,10 @@ function BrowserSyncDeviceEditor({
   const trimmed = name.trim();
   const unchanged = trimmed === device.name;
   const lastSyncIso = toIsoTimestamp(device.lastSyncAt);
+  const syncAge = Date.now() - device.lastSyncAt;
+  const isRecentlyActive = device.syncEnabled
+    && syncAge >= -5 * 60_000
+    && syncAge <= BROWSER_SYNC_VERIFICATION_FRESHNESS_MS;
 
   useEffect(() => setName(device.name), [device.name]);
 
@@ -2295,7 +2686,7 @@ function BrowserSyncDeviceEditor({
           {formatBrowserSyncInstallationId(device.installationId)}
           <CopyTextButton text={device.installationId} label="installation ID" />
         </span>
-        <span>{device.syncEnabled ? "Sync enabled" : "Sync off"}</span>
+        <span>{!device.syncEnabled ? "Sync off" : isRecentlyActive ? "Sync current" : "Not seen recently"}</span>
         {lastSyncIso
           ? <time dateTime={lastSyncIso}>{formatSyncTimestamp(device.lastSyncAt)}</time>
           : <span>Not yet</span>}
@@ -2329,6 +2720,7 @@ function DiagnosticsPanel({
   const [reportStatus, setReportStatus] = useState("");
   const [distributionInfo, setDistributionInfo] = useState<ExtensionDistributionInfo | null>(null);
   const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
+  const [notificationPermissionGranted, setNotificationPermissionGranted] = useState<boolean | null>(null);
   const identity = getIdentityContext(tokenStatus);
   useEffect(() => {
     void getExtensionDistributionInfo().then(setDistributionInfo).catch(() => setDistributionInfo(null));
@@ -2336,6 +2728,25 @@ function DiagnosticsPanel({
       { action: "getBrowserSyncStatus" },
       { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
     ).then((value) => setBrowserSyncStatus(sanitizeBrowserSyncStatus(value))).catch(() => setBrowserSyncStatus(null));
+    const refreshNotificationPermission = () => {
+      if (!chrome.notifications || !chrome.permissions?.contains) {
+        setNotificationPermissionGranted(false);
+        return;
+      }
+      void chrome.permissions.contains({ permissions: ["notifications"] })
+        .then(setNotificationPermissionGranted)
+        .catch(() => setNotificationPermissionGranted(false));
+    };
+    const handlePermissionChange = (permissions: chrome.permissions.Permissions) => {
+      if (permissions.permissions?.includes("notifications")) refreshNotificationPermission();
+    };
+    refreshNotificationPermission();
+    chrome.permissions?.onAdded?.addListener(handlePermissionChange);
+    chrome.permissions?.onRemoved?.addListener(handlePermissionChange);
+    return () => {
+      chrome.permissions?.onAdded?.removeListener(handlePermissionChange);
+      chrome.permissions?.onRemoved?.removeListener(handlePermissionChange);
+    };
   }, []);
   const diagnostics = useMemo(() => {
     const allDiagnostics = [
@@ -2371,6 +2782,7 @@ function DiagnosticsPanel({
       trackedRequests,
       distribution: distributionInfo,
       browserSync: browserSyncStatus,
+      notificationPermissionGranted: notificationPermissionGranted ?? undefined,
       userAgent: navigator.userAgent
     });
   }
@@ -2459,6 +2871,19 @@ function DiagnosticsPanel({
             </p>
           ) : null}
           {browserSyncStatus?.lastError ? <p className="diagnostic-warning">Last sync did not complete successfully.</p> : null}
+        </div>
+        <div>
+          <strong>Desktop notifications</strong>
+          <p>{!settings.preferences.requestNotificationsEnabled
+            ? "Disabled in QuickPIM++"
+            : notificationPermissionGranted === null
+              ? "Checking browser permission..."
+              : notificationPermissionGranted
+                ? "Ready on this installation"
+                : "Setup required on this installation"}</p>
+          {settings.preferences.requestNotificationsEnabled && notificationPermissionGranted === false ? (
+            <p className="diagnostic-warning">The saved setting is enabled, but the optional browser permission is missing.</p>
+          ) : null}
         </div>
       </div>
       <div className="activity-list">
@@ -3022,6 +3447,13 @@ const PREFERENCE_AUTOSAVE_MAX_RETRIES = 2;
 const PREFERENCE_FEATURES: QuickPimFeature[] = ["directoryRole", "pimGroup", "azureRole", "bundles"];
 
 type PreferenceSaveState = "idle" | "pending" | "saving" | "saved" | "invalid" | "error";
+type NotificationPermissionState = "checking" | "granted" | "missing" | "unsupported";
+
+interface NotificationHealthState {
+  permission: NotificationPermissionState;
+  reminderCount: number;
+  nextReminderAt?: string;
+}
 
 interface PreferenceDraft {
   defaultDurationHours: number;
@@ -3149,6 +3581,11 @@ function PreferencesPanel({
   const [saveState, setSaveState] = useState<PreferenceSaveState>("idle");
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [notificationPermissionError, setNotificationPermissionError] = useState("");
+  const [notificationTestMessage, setNotificationTestMessage] = useState("");
+  const [notificationHealth, setNotificationHealth] = useState<NotificationHealthState>({
+    permission: "checking",
+    reminderCount: 0
+  });
   const [isRequestingNotificationPermission, setIsRequestingNotificationPermission] = useState(false);
   const settingsRef = useRef(settings);
   const onSaveRef = useRef(onSave);
@@ -3220,6 +3657,22 @@ function PreferencesPanel({
     };
   }, [navigationFlushRef]);
 
+  useEffect(() => {
+    if (page !== "activation") return;
+    void refreshNotificationHealth();
+    const handlePermissionChange = (permissions: chrome.permissions.Permissions) => {
+      if (permissions.permissions?.includes("notifications")) {
+        void refreshNotificationHealth();
+      }
+    };
+    chrome.permissions?.onAdded?.addListener(handlePermissionChange);
+    chrome.permissions?.onRemoved?.addListener(handlePermissionChange);
+    return () => {
+      chrome.permissions?.onAdded?.removeListener(handlePermissionChange);
+      chrome.permissions?.onRemoved?.removeListener(handlePermissionChange);
+    };
+  }, [page, draft.requestNotificationsEnabled, draft.expiryReminderMinutes]);
+
   function updateDraft(patch: Partial<PreferenceDraft>) {
     if (autosaveRetryTimerRef.current !== undefined) {
       window.clearTimeout(autosaveRetryTimerRef.current);
@@ -3263,6 +3716,7 @@ function PreferencesPanel({
 
       if (
         !snapshot.requestNotificationsEnabled
+        && !draftRef.current.requestNotificationsEnabled
         && (lastSavedNotificationsRef.current || notificationPermissionGrantedRef.current)
       ) {
         try {
@@ -3271,6 +3725,9 @@ function PreferencesPanel({
           // The preference remains disabled even if this browser retains the optional permission.
         }
         notificationPermissionGrantedRef.current = false;
+        if (isMountedRef.current) {
+          setNotificationHealth((current) => ({ ...current, permission: "missing", nextReminderAt: undefined }));
+        }
       }
       lastSavedNotificationsRef.current = snapshot.requestNotificationsEnabled;
       savedRevisionRef.current = Math.max(savedRevisionRef.current, revision);
@@ -3305,23 +3762,105 @@ function PreferencesPanel({
 
   async function toggleRequestNotifications(enabled: boolean) {
     setNotificationPermissionError("");
+    setNotificationTestMessage("");
     if (!enabled) {
       updateDraft({ requestNotificationsEnabled: false });
       return;
+    }
+    const granted = await requestNotificationPermission();
+    if (granted) {
+      updateDraft({ requestNotificationsEnabled: true });
+    }
+  }
+
+  async function requestNotificationPermission(): Promise<boolean> {
+    if (!chrome.notifications || !chrome.permissions?.request) {
+      setNotificationPermissionError("This browser does not expose extension notifications. Request tracking still works in Settings > Activity & Usage.");
+      setNotificationHealth((current) => ({ ...current, permission: "unsupported", nextReminderAt: undefined }));
+      return false;
     }
     setIsRequestingNotificationPermission(true);
     try {
       const granted = await chrome.permissions.request({ permissions: ["notifications"] });
       if (!granted) {
         setNotificationPermissionError("Notification permission was not granted. Request tracking still works in Settings > Activity & Usage.");
-        return;
+        setNotificationHealth((current) => ({ ...current, permission: "missing", nextReminderAt: undefined }));
+        return false;
       }
       notificationPermissionGrantedRef.current = true;
-      updateDraft({ requestNotificationsEnabled: true });
+      setNotificationHealth((current) => ({ ...current, permission: "granted" }));
+      return true;
     } catch {
       setNotificationPermissionError("This browser could not enable request notifications. Request tracking still works in Settings > Activity & Usage.");
+      setNotificationHealth((current) => ({ ...current, permission: "missing", nextReminderAt: undefined }));
+      return false;
     } finally {
       setIsRequestingNotificationPermission(false);
+    }
+  }
+
+  async function enableNotificationsOnBrowser() {
+    setNotificationPermissionError("");
+    setNotificationTestMessage("");
+    if (!(await requestNotificationPermission())) return;
+    if (!draftRef.current.requestNotificationsEnabled) {
+      updateDraft({ requestNotificationsEnabled: true });
+    }
+    await refreshNotificationHealth();
+  }
+
+  async function sendTestNotification() {
+    setNotificationPermissionError("");
+    setNotificationTestMessage("");
+    if (notificationHealth.permission !== "granted" && !(await requestNotificationPermission())) {
+      return;
+    }
+    try {
+      await chrome.notifications.create("quickpim-notification-test", {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
+        title: "QuickPIM++ notifications are ready",
+        message: "This browser can deliver PIM request and expiry notifications."
+      });
+      setNotificationTestMessage("Test sent. If it is not visible, allow notifications for this browser in the operating system.");
+    } catch {
+      setNotificationPermissionError("The browser accepted the permission but could not create a test notification. Check browser and operating-system notification settings.");
+    }
+  }
+
+  async function refreshNotificationHealth() {
+    const supported = Boolean(chrome.notifications && chrome.permissions?.contains);
+    let permission: NotificationPermissionState = supported ? "missing" : "unsupported";
+    if (supported) {
+      try {
+        permission = await chrome.permissions.contains({ permissions: ["notifications"] }) ? "granted" : "missing";
+      } catch {
+        permission = "missing";
+      }
+    }
+    notificationPermissionGrantedRef.current = permission === "granted";
+    let reminderCount = 0;
+    let nextReminderAt: string | undefined;
+    try {
+      const store = await loadTrackedRequests();
+      const now = Date.now();
+      reminderCount = store.requests.filter((request) => {
+        const activeUntil = request.activeUntil ? Date.parse(request.activeUntil) : Number.NaN;
+        return request.action === "activate"
+          && !request.expiryReminderSentAt
+          && getEffectiveTrackedRequestStatus(request, now) === "active"
+          && Number.isFinite(activeUntil)
+          && activeUntil > now;
+      }).length;
+      const nextReminder = getNextTrackedExpiryReminderTime(store, draftRef.current.expiryReminderMinutes, now);
+      if (nextReminder !== undefined && permission === "granted" && draftRef.current.requestNotificationsEnabled) {
+        nextReminderAt = new Date(nextReminder).toISOString();
+      }
+    } catch {
+      // Permission status remains useful even when local request history is unavailable.
+    }
+    if (isMountedRef.current) {
+      setNotificationHealth({ permission, reminderCount, nextReminderAt });
     }
   }
 
@@ -3380,6 +3919,29 @@ function PreferencesPanel({
   const restoreDescription = page === "appearance"
     ? "Restore dark mode, Bundles visibility, assigned roles, remaining time, counters, enablement details, and last-enablement date?"
     : "Restore activation duration, extension duration, request notifications, and expiry reminder?";
+  const notificationDeliveryState = !draft.requestNotificationsEnabled
+    ? "off"
+    : notificationHealth.permission === "granted"
+      ? "ready"
+      : notificationHealth.permission === "checking"
+        ? "checking"
+        : "attention";
+  const notificationDeliveryLabel = notificationDeliveryState === "ready"
+    ? "Ready"
+    : notificationDeliveryState === "attention"
+      ? "Setup required"
+      : notificationDeliveryState === "checking"
+        ? "Checking"
+        : "Off";
+  const notificationDeliveryDescription = notificationDeliveryState === "ready"
+    ? "This installation has the optional browser permission required for desktop notifications."
+    : notificationDeliveryState === "attention"
+      ? notificationHealth.permission === "unsupported"
+        ? "This browser does not expose the extension notification capability. Request tracking remains available in Activity & Usage."
+        : "The saved setting is on, but this installation has not granted the optional notification permission. No desktop reminder can be delivered yet."
+      : notificationDeliveryState === "checking"
+        ? "Checking this installation's browser permission."
+        : "Enable request status notifications to receive reminders on this installation.";
 
   return (
     <section className="panel preferences-panel" data-preference-page={page}>
@@ -3456,6 +4018,32 @@ function PreferencesPanel({
                 <span><strong>Request status notifications</strong><span className="muted">Notify when a request is approved, denied, completed, or close to expiry. Disabled by default.</span></span>
               </label>
             </div>
+            <div className={`notification-health ${notificationDeliveryState}`}>
+              <div className="notification-health-copy">
+                <div className="notification-health-title">
+                  <strong>Desktop notification delivery</strong>
+                  <span className={`notification-health-badge ${notificationDeliveryState}`}>{notificationDeliveryLabel}</span>
+                </div>
+                <p className="muted">{notificationDeliveryDescription}</p>
+                {draft.requestNotificationsEnabled && notificationHealth.permission === "granted" ? (
+                  <p className="muted">
+                    {notificationHealth.reminderCount
+                      ? `${notificationHealth.reminderCount} tracked active request${notificationHealth.reminderCount === 1 ? "" : "s"} can produce an expiry reminder${notificationHealth.nextReminderAt ? `; next check ${formatLocalDateTime(notificationHealth.nextReminderAt)}` : ""}.`
+                      : "No active QuickPIM++ request currently has a future Microsoft end time to remind about."}
+                  </p>
+                ) : null}
+              </div>
+              <div className="button-row notification-health-actions">
+                {draft.requestNotificationsEnabled && notificationHealth.permission === "missing" ? (
+                  <button className="btn primary" disabled={isRequestingNotificationPermission} onClick={() => void enableNotificationsOnBrowser()}>
+                    {isRequestingNotificationPermission ? "Enabling..." : "Enable on this browser"}
+                  </button>
+                ) : null}
+                {draft.requestNotificationsEnabled && notificationHealth.permission === "granted" ? (
+                  <button className="btn secondary" onClick={() => void sendTestNotification()}>Send test notification</button>
+                ) : null}
+              </div>
+            </div>
             <div className="form-grid settings-section-gap compact-preference-fields">
               <div className="field">
                 <label>Expiry reminder</label>
@@ -3474,7 +4062,11 @@ function PreferencesPanel({
                 <p className="muted">Used only when Microsoft returns an activation end time.</p>
               </div>
             </div>
+            <p className="muted notification-scope-note">
+              Expiry reminders cover activation requests submitted by QuickPIM++ when Microsoft returns an end time. Portal-only activations are not tracked.
+            </p>
             {notificationPermissionError ? <p className="message error settings-inline-message" role="alert">{notificationPermissionError}</p> : null}
+            {notificationTestMessage ? <p className="message success settings-inline-message" role="status">{notificationTestMessage}</p> : null}
           </div>
         </>
       ) : null}

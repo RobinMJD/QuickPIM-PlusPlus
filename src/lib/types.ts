@@ -139,6 +139,7 @@ export interface ActivityHistoryEntry {
 export interface TrackedPimRequest {
   id: string;
   requestId: string;
+  operationId?: string;
   action: ActivityAction;
   itemId: string;
   itemName: string;
@@ -177,6 +178,7 @@ export interface TrackedPimRequest {
   checkCount: number;
   lastError?: string;
   notifiedStatus?: TrackedPimRequestStatus;
+  expiryReminderAttemptedAt?: string;
   expiryReminderSentAt?: string;
   sourceInstallationId?: string;
   sourceDeviceName?: string;
@@ -344,6 +346,7 @@ export interface ActivationResult {
   error?: string;
   accessRecoveryTarget?: AccessSetupTarget;
   outcomeUnknown?: boolean;
+  trackingUnavailable?: boolean;
 }
 
 export interface ActivationResponse {

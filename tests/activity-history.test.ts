@@ -144,8 +144,9 @@ describe("activity history", () => {
 
     expect(replayed.activityHistory).toHaveLength(1);
     expect(replayed.activityHistory[0].id.length).toBeLessThanOrEqual(256);
-    expect(replayed.activityHistory[0].itemId).toBe(azureItem.id);
-    expect(replayed.usageStatsByItemId[azureItem.id].activationCount).toBe(1);
+    const canonicalItemId = azureItem.id.toLowerCase().replace(/^azurerole:/, "azureRole:");
+    expect(replayed.activityHistory[0].itemId).toBe(canonicalItemId);
+    expect(replayed.usageStatsByItemId[canonicalItemId].activationCount).toBe(1);
   });
 
   test("records a thrown-operation failure with its source without incrementing usage", () => {

@@ -23,7 +23,7 @@ describe("full extension reset", () => {
       loadRequestOperations: vi.fn(async () => [{ state: "running" } as never])
     });
 
-    await expect(resetExtensionData(apis)).rejects.toThrow("current activation or deactivation");
+    await expect(resetExtensionData(apis)).rejects.toThrow("current activation, refresh, sync, or status check");
     expect(apis.clearLocalStorage).not.toHaveBeenCalled();
     expect(apis.clearSessionStorage).not.toHaveBeenCalled();
   });

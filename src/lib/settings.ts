@@ -23,6 +23,7 @@ import {
 } from "./justifications";
 import { isSafeRecordKey, sanitizeErrorMessage } from "./security";
 import { DEFAULT_EXTENSION_DURATION_HOURS, sanitizeExtensionDurationHours } from "./requestExtension";
+import { getActivationItemIdentity, normalizeActivationItemId } from "./activationIdentity";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
 const MAX_HISTORY_ENTRIES = 50;
@@ -36,6 +37,7 @@ const MAX_SAVED_JUSTIFICATIONS = 100;
 const MAX_BUNDLES = 50;
 const MAX_BUNDLE_ITEMS = 100;
 const MAX_BUNDLE_NAME_LENGTH = 80;
+const MAX_TIMESTAMP_FUTURE_SKEW_MS = 5 * 60_000;
 export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "pimGroup", "azureRole"];
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 const withSettingsMutationLock = createStorageMutationLock("quickPimSettingsMutation");
@@ -135,7 +137,7 @@ export function getDisplayName(
   settings: QuickPimSettings,
   referenceData?: ReferenceDataCache
 ): string {
-  const alias = settings.aliasesByItemId[item.id]?.trim();
+  const alias = settings.aliasesByItemId[getActivationItemIdentity(item)]?.trim();
   return alias || getReferenceDisplayName(item, referenceData) || item.displayName || item.sourceName || "Unknown";
 }
 
@@ -144,7 +146,7 @@ export function getScopeLabel(item: ActivationItem, referenceData?: ReferenceDat
 }
 
 export function getUsage(item: ActivationItem, settings: QuickPimSettings) {
-  return settings.usageStatsByItemId[item.id] || { activationCount: 0 };
+  return settings.usageStatsByItemId[getActivationItemIdentity(item)] || { activationCount: 0 };
 }
 
 export function sortItems(
@@ -155,9 +157,9 @@ export function sortItems(
   sortDirection: SortDirection = getDefaultSortDirection(sortMode)
 ): ActivationItem[] {
   const sortable = [...items];
-  const favoriteItemIds = new Set(settings.favoriteItemIds || []);
+  const favoriteItemIds = new Set((settings.favoriteItemIds || []).map(normalizeActivationItemId));
   return sortable.sort((a, b) => {
-    const favoriteDiff = Number(favoriteItemIds.has(b.id)) - Number(favoriteItemIds.has(a.id));
+    const favoriteDiff = Number(favoriteItemIds.has(getActivationItemIdentity(b))) - Number(favoriteItemIds.has(getActivationItemIdentity(a)));
     if (favoriteDiff) {
       return favoriteDiff;
     }
@@ -224,8 +226,9 @@ export function recordActivations(
   const usageStatsByItemId = { ...settings.usageStatsByItemId };
 
   for (const item of items) {
-    if (!isSafeRecordKey(item.id)) continue;
-    const current = usageStatsByItemId[item.id] || { activationCount: 0 };
+    const itemId = getActivationItemIdentity(item);
+    if (!isSafeRecordKey(itemId)) continue;
+    const current = usageStatsByItemId[itemId] || { activationCount: 0 };
     if (source?.installationId && isSafeRecordKey(source.installationId)) {
       const byInstallationId = { ...current.byInstallationId };
       const currentSource = byInstallationId[source.installationId] || { activationCount: 0 };
@@ -236,14 +239,14 @@ export function recordActivations(
       const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
       const previousKnownTotal = Object.values(current.byInstallationId || {}).reduce((total, entry) => total + entry.activationCount, 0);
       const legacyActivationCount = current.legacyActivationCount ?? Math.max(0, current.activationCount - previousKnownTotal);
-      usageStatsByItemId[item.id] = {
+      usageStatsByItemId[itemId] = {
         activationCount: legacyActivationCount + knownTotal,
         lastUsedAt: latestIsoTimestamp(current.lastUsedAt, activatedAt),
         ...(legacyActivationCount ? { legacyActivationCount } : {}),
         byInstallationId
       };
     } else {
-      usageStatsByItemId[item.id] = {
+      usageStatsByItemId[itemId] = {
         ...current,
         activationCount: current.activationCount + 1,
         lastUsedAt: activatedAt
@@ -278,9 +281,9 @@ export function recordActivityResults(
     source?: ActivitySource;
   }
 ): QuickPimSettings {
-  const itemsById = new Map(input.items.map((item) => [item.id, item]));
+  const itemsById = new Map(input.items.map((item) => [normalizeActivationItemId(item.id), item]));
   const entries = input.response.results.map((result): ActivityHistoryEntry => {
-    const item = itemsById.get(result.itemId);
+    const item = itemsById.get(normalizeActivationItemId(result.itemId));
     const historyResult: ActivityResult = result.success ? "success" : "failed";
     return {
       id: buildActivityHistoryEntryId(input.eventIdPrefix || input.completedAt, input.action, result.itemId, historyResult),
@@ -330,11 +333,11 @@ export function recordOperationActivity(
   let updated = settings;
   if (input.action === "activate") {
     const existingIds = new Set(settings.activityHistory.map((entry) => entry.id));
-    const itemsById = new Map(input.items.map((item) => [item.id, item]));
+    const itemsById = new Map(input.items.map((item) => [normalizeActivationItemId(item.id), item]));
     const newlyCompletedItems = input.response.results.flatMap((result) => {
       if (!result.success) return [];
       const eventId = buildActivityHistoryEntryId(input.operationId, input.action, result.itemId, "success");
-      const item = itemsById.get(result.itemId);
+      const item = itemsById.get(normalizeActivationItemId(result.itemId));
       return item && !existingIds.has(eventId) ? [item] : [];
     });
     updated = recordActivations(
@@ -401,8 +404,9 @@ function stableTextHash(value: string): string {
 }
 
 export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): BundleExpansion {
+  const itemsById = new Map(items.map((item) => [getActivationItemIdentity(item), item]));
   const bundleItems = bundle.itemIds
-    .map((itemId) => items.find((item) => item.id === itemId))
+    .map((itemId) => itemsById.get(normalizeActivationItemId(itemId)))
     .filter((item): item is ActivationItem => Boolean(item && item.status === "eligible"));
 
   return {
@@ -423,13 +427,14 @@ function sanitizeAliases(value: unknown): Record<string, string> {
     return {};
   }
 
-  const entries = Object.entries(value)
-    .slice(0, MAX_ALIASES)
-    .flatMap(([key, alias]) => {
-      const safeKey = sanitizeString(key, MAX_ITEM_ID_LENGTH);
-      const safeAlias = sanitizeString(alias, MAX_ALIAS_LENGTH);
-      return safeKey && isSafeRecordKey(safeKey) && safeAlias ? [[safeKey, safeAlias] as const] : [];
-    });
+  const entries: Array<readonly [string, string]> = [];
+  for (const [key, alias] of Object.entries(value)) {
+    const safeKey = sanitizeItemId(key);
+    const safeAlias = sanitizeString(alias, MAX_ALIAS_LENGTH);
+    if (!safeKey || !isSafeRecordKey(safeKey) || !safeAlias) continue;
+    entries.push([safeKey, safeAlias] as const);
+    if (entries.length >= MAX_ALIASES) break;
+  }
   return Object.fromEntries(entries);
 }
 
@@ -438,57 +443,53 @@ function sanitizeUsageStats(value: unknown): QuickPimSettings["usageStatsByItemI
     return {};
   }
 
-  const entries = Object.entries(value)
-    .slice(0, MAX_ALIASES)
-    .flatMap(([key, stats]) => {
-      if (!isRecord(stats)) {
-        return [];
+  const entries: Array<readonly [string, UsageStats]> = [];
+  for (const [key, stats] of Object.entries(value)) {
+    if (!isRecord(stats)) {
+      continue;
+    }
+    const safeKey = sanitizeItemId(key);
+    if (!safeKey || !isSafeRecordKey(safeKey)) {
+      continue;
+    }
+    const activationCount = clampInteger(stats.activationCount, 0, 100000, 0);
+    const lastUsedAt = sanitizeIsoTimestamp(stats.lastUsedAt);
+    const byInstallationId = sanitizeInstallationUsageStats(stats.byInstallationId);
+    const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
+    const legacyActivationCount = clampInteger(
+      stats.legacyActivationCount,
+      0,
+      100000,
+      Math.max(0, activationCount - knownTotal)
+    );
+    const normalizedTotal = Math.min(100000, legacyActivationCount + knownTotal);
+    entries.push([
+      safeKey,
+      {
+        activationCount: normalizedTotal,
+        ...(lastUsedAt ? { lastUsedAt } : {}),
+        ...(legacyActivationCount ? { legacyActivationCount } : {}),
+        ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
       }
-      const safeKey = sanitizeString(key, MAX_ITEM_ID_LENGTH);
-      if (!safeKey || !isSafeRecordKey(safeKey)) {
-        return [];
-      }
-      const activationCount = clampInteger(stats.activationCount, 0, 100000, 0);
-      const lastUsedAt = sanitizeString(stats.lastUsedAt, 64);
-      const byInstallationId = sanitizeInstallationUsageStats(stats.byInstallationId);
-      const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
-      const legacyActivationCount = clampInteger(
-        stats.legacyActivationCount,
-        0,
-        100000,
-        Math.max(0, activationCount - knownTotal)
-      );
-      const normalizedTotal = Math.min(100000, legacyActivationCount + knownTotal);
-      return [
-        [
-          safeKey,
-          {
-            activationCount: normalizedTotal,
-            ...(lastUsedAt ? { lastUsedAt } : {}),
-            ...(legacyActivationCount ? { legacyActivationCount } : {}),
-            ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
-          }
-        ] as const
-      ];
-    });
+    ] as const);
+    if (entries.length >= MAX_ALIASES) break;
+  }
   return Object.fromEntries(entries);
 }
 
 function sanitizeInstallationUsageStats(value: unknown): NonNullable<UsageStats["byInstallationId"]> {
   if (!isRecord(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value)
-      .slice(0, 20)
-      .flatMap(([installationId, entry]) => {
-        if (!isRecord(entry)) return [];
-        const safeId = sanitizeString(installationId, 80);
-        const activationCount = clampInteger(entry.activationCount, 0, 100000, 0);
-        const lastUsedAt = sanitizeString(entry.lastUsedAt, 64);
-        return safeId && isSafeRecordKey(safeId) && activationCount
-          ? [[safeId, { activationCount, ...(lastUsedAt ? { lastUsedAt } : {}) }] as const]
-          : [];
-      })
-  );
+  const entries: Array<readonly [string, NonNullable<UsageStats["byInstallationId"]>[string]]> = [];
+  for (const [installationId, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) continue;
+    const safeId = sanitizeString(installationId, 80);
+    const activationCount = clampInteger(entry.activationCount, 0, 100000, 0);
+    const lastUsedAt = sanitizeIsoTimestamp(entry.lastUsedAt);
+    if (!safeId || !isSafeRecordKey(safeId) || !activationCount) continue;
+    entries.push([safeId, { activationCount, ...(lastUsedAt ? { lastUsedAt } : {}) }] as const);
+    if (entries.length >= 20) break;
+  }
+  return Object.fromEntries(entries);
 }
 
 function sanitizeFavoriteItemIds(value: unknown): string[] {
@@ -505,7 +506,7 @@ function sanitizeFavoriteItemIds(value: unknown): string[] {
     const key = trimmed.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    result.push(trimmed);
+    result.push(normalizeActivationItemId(trimmed));
     if (result.length >= MAX_FAVORITES) break;
   }
   return result;
@@ -592,30 +593,30 @@ function sanitizeBundles(value: unknown): QuickPimBundle[] {
     return [];
   }
 
-  const bundles = value.slice(0, MAX_BUNDLES).flatMap((bundle) => {
+  const bundles: QuickPimBundle[] = [];
+  for (const bundle of value) {
     if (!isRecord(bundle)) {
-      return [];
+      continue;
     }
     const name = sanitizeString(bundle.name, MAX_BUNDLE_NAME_LENGTH);
     if (!name) {
-      return [];
+      continue;
     }
     const id = sanitizeString(bundle.id, MAX_ITEM_ID_LENGTH) || createBundleId(name);
     const itemIds = sanitizeStringList(bundle.itemIds, MAX_BUNDLE_ITEMS, MAX_ITEM_ID_LENGTH);
     if (!itemIds.length) {
-      return [];
+      continue;
     }
     const defaultJustification = sanitizeUserJustification(bundle.defaultJustification);
-    return [
-      {
-        id,
-        name,
-        itemIds,
-        defaultDurationHours: clampNumber(bundle.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
-        defaultJustification: defaultJustification && !isGenericJustification(defaultJustification) ? defaultJustification : undefined
-      }
-    ];
-  });
+    bundles.push({
+      id,
+      name,
+      itemIds,
+      defaultDurationHours: clampNumber(bundle.defaultDurationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS, DEFAULT_SETTINGS.preferences.defaultDurationHours),
+      defaultJustification: defaultJustification && !isGenericJustification(defaultJustification) ? defaultJustification : undefined
+    });
+    if (bundles.length >= MAX_BUNDLES) break;
+  }
 
   const seenIds = new Set<string>();
   return bundles.map((bundle) => {
@@ -653,29 +654,30 @@ function sanitizeActivationHistory(value: unknown): ActivationHistoryEntry[] {
     return [];
   }
 
-  return value.slice(0, MAX_HISTORY_ENTRIES).flatMap((entry) => {
+  const result: ActivationHistoryEntry[] = [];
+  for (const entry of value) {
     if (!isRecord(entry)) {
-      return [];
+      continue;
     }
     const id = sanitizeString(entry.id, MAX_ITEM_ID_LENGTH);
-    const itemId = sanitizeString(entry.itemId, MAX_ITEM_ID_LENGTH);
+    const itemId = sanitizeItemId(entry.itemId);
     const itemName = sanitizeString(entry.itemName, MAX_ALIAS_LENGTH);
     const itemType = isActivationItemType(entry.itemType) ? entry.itemType : undefined;
-    const activatedAt = sanitizeString(entry.activatedAt, 64);
+    const activatedAt = sanitizeIsoTimestamp(entry.activatedAt);
     if (!id || !itemId || !itemName || !itemType || !activatedAt) {
-      return [];
+      continue;
     }
-    return [
-      {
-        id,
-        itemId,
-        itemName,
-        itemType,
-        activatedAt,
-        bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH)
-      }
-    ];
-  });
+    result.push({
+      id,
+      itemId,
+      itemName,
+      itemType,
+      activatedAt,
+      bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH)
+    });
+    if (result.length >= MAX_HISTORY_ENTRIES) break;
+  }
+  return result;
 }
 
 function sanitizeActivityHistory(
@@ -691,47 +693,50 @@ function sanitizeActivityHistory(
   );
   const source = Array.isArray(value) ? value : migrateActivationHistoryToActivity(legacyActivationHistory);
 
-  return source.slice(0, limit).flatMap((entry) => {
+  const resultEntries: ActivityHistoryEntry[] = [];
+  for (const entry of source) {
     if (!isRecord(entry)) {
-      return [];
+      continue;
     }
     const id = sanitizeString(entry.id, MAX_ITEM_ID_LENGTH);
     const action = entry.action === "deactivate" ? "deactivate" : entry.action === "activate" ? "activate" : undefined;
     const result = entry.result === "failed" || entry.result === "skipped" || entry.result === "success" ? entry.result : undefined;
-    const itemId = sanitizeString(entry.itemId, MAX_ITEM_ID_LENGTH);
+    const itemId = sanitizeItemId(entry.itemId);
     const itemName = sanitizeString(entry.itemName, MAX_ALIAS_LENGTH);
     const itemType = isActivationItemType(entry.itemType) ? entry.itemType : undefined;
-    const requestedAt = sanitizeString(entry.requestedAt, 64);
+    const requestedAt = sanitizeIsoTimestamp(entry.requestedAt);
     if (!id || !action || !result || !itemId || !itemName || !itemType || !requestedAt) {
-      return [];
+      continue;
     }
     const durationHours = clampOptionalNumber(entry.durationHours, MIN_ACTIVATION_DURATION_HOURS, MAX_ACTIVATION_DURATION_HOURS);
-    return [
-      {
-        id,
-        action,
-        result,
-        itemId,
-        itemName,
-        itemType,
-        requestedAt,
-        ...(sanitizeString(entry.completedAt, 64) ? { completedAt: sanitizeString(entry.completedAt, 64) } : {}),
-        ...(sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) ? { scopeLabel: sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) } : {}),
-        ...(durationHours ? { durationHours } : {}),
-        ...(sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) ? { bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) } : {}),
-        ...(sanitizeUserJustification(entry.justification) ? { justification: sanitizeUserJustification(entry.justification) } : {}),
-        ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {}),
-        ...(sanitizeString(entry.sourceInstallationId, 80) ? { sourceInstallationId: sanitizeString(entry.sourceInstallationId, 80) } : {}),
-        ...(sanitizeString(entry.sourceDeviceName, 60) ? { sourceDeviceName: sanitizeString(entry.sourceDeviceName, 60) } : {})
-      }
-    ];
-  });
+    resultEntries.push({
+      id,
+      action,
+      result,
+      itemId,
+      itemName,
+      itemType,
+      requestedAt,
+      ...(sanitizeIsoTimestamp(entry.completedAt) ? { completedAt: sanitizeIsoTimestamp(entry.completedAt) } : {}),
+      ...(sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) ? { scopeLabel: sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) } : {}),
+      ...(durationHours ? { durationHours } : {}),
+      ...(sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) ? { bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH) } : {}),
+      ...(sanitizeUserJustification(entry.justification) ? { justification: sanitizeUserJustification(entry.justification) } : {}),
+      ...(sanitizeString(entry.error, 260) ? { error: sanitizeErrorMessage(sanitizeString(entry.error, 260)) } : {}),
+      ...(sanitizeString(entry.sourceInstallationId, 80) ? { sourceInstallationId: sanitizeString(entry.sourceInstallationId, 80) } : {}),
+      ...(sanitizeString(entry.sourceDeviceName, 60) ? { sourceDeviceName: sanitizeString(entry.sourceDeviceName, 60) } : {})
+    });
+    if (resultEntries.length >= limit) break;
+  }
+  return resultEntries;
 }
 
 function latestIsoTimestamp(left: string | undefined, right: string | undefined): string | undefined {
-  if (!left) return right;
-  if (!right) return left;
-  return left.localeCompare(right) >= 0 ? left : right;
+  const safeLeft = sanitizeIsoTimestamp(left);
+  const safeRight = sanitizeIsoTimestamp(right);
+  if (!safeLeft) return safeRight;
+  if (!safeRight) return safeLeft;
+  return Date.parse(safeLeft) >= Date.parse(safeRight) ? safeLeft : safeRight;
 }
 
 function migrateActivationHistoryToActivity(value: unknown): ActivityHistoryEntry[] {
@@ -756,7 +761,7 @@ function sanitizeStringList(value: unknown, maxItems: number, maxLength: number)
   const seen = new Set<string>();
   const result: string[] = [];
   for (const item of value) {
-    const safeItem = sanitizeString(item, maxLength);
+    const safeItem = sanitizeItemId(item, maxLength);
     if (!safeItem) continue;
     const key = safeItem.toLowerCase();
     if (seen.has(key)) continue;
@@ -765,6 +770,20 @@ function sanitizeStringList(value: unknown, maxItems: number, maxLength: number)
     if (result.length >= maxItems) break;
   }
   return result;
+}
+
+function sanitizeItemId(value: unknown, maxLength = MAX_ITEM_ID_LENGTH): string {
+  const safeItem = sanitizeString(value, maxLength);
+  return safeItem ? normalizeActivationItemId(safeItem) : "";
+}
+
+function sanitizeIsoTimestamp(value: unknown, now = Date.now()): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0 || timestamp > now + MAX_TIMESTAMP_FUTURE_SKEW_MS) {
+    return undefined;
+  }
+  return new Date(timestamp).toISOString();
 }
 
 function sanitizeString(value: unknown, maxLength: number): string | undefined {

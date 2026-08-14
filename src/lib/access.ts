@@ -152,6 +152,22 @@ export function buildTargetCacheKeys(
   return Object.fromEntries(targets.map((target) => [target, buildTargetCacheKey(tokenStatus, target)]));
 }
 
+export function isTargetCacheKeyForCurrentIdentity(
+  cacheKey: string | undefined,
+  tokenStatus: TokenStatus | null | undefined,
+  target: AccessSetupTarget
+): boolean {
+  if (!cacheKey) {
+    return false;
+  }
+  const token = getTokenStatusForTarget(target, tokenStatus);
+  if (!token?.hasToken || token.isExpired || !token.tenantId || !token.principalId) {
+    return false;
+  }
+  const label = target === "azureRole" ? "azure" : target === "directoryRole" ? "graphDirectory" : "graphPimGroup";
+  return cacheKey.startsWith(`${label}:${token.tenantId}:${token.principalId}:`);
+}
+
 export function hasRequiredPortalToken(target: AccessSetupTarget, tokenStatus: TokenStatus): boolean {
   const token = getTokenStatusForTarget(target, tokenStatus);
   if (!token?.hasToken || token.isExpired) {

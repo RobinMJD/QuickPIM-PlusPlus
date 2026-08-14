@@ -15,6 +15,7 @@ export const PORTAL_RECOVERY_SESSION_TTL_MS = 10 * 60_000;
 export const PORTAL_RECOVERY_INTERACTION_TIMEOUT_MS = 15_000;
 export const PORTAL_RECOVERY_AUTH_PROBE_GRACE_MS = 8_000;
 export const PORTAL_RECOVERY_CLEANUP_ALARM_NAME = "quickPimPortalRecoveryCleanup";
+const PORTAL_RECOVERY_MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
 
 interface PortalRecoverySession {
   version: 1;
@@ -65,7 +66,7 @@ export async function openPortalRecoveryTabs(
 ): Promise<PortalRecoveryOpenResult> {
   return enqueuePortalRecoveryMutation(async () => {
     const targets = uniqueTargets(requestedTargets);
-    let session = await loadPortalRecoverySession(apis.storage);
+    let session = await loadPortalRecoverySession(apis.storage, now);
     if (session && now - session.createdAt > PORTAL_RECOVERY_SESSION_TTL_MS) {
       await closeTrackedTabs(session, apis.tabs);
       await apis.storage.remove(PORTAL_RECOVERY_SESSION_KEY);
@@ -142,7 +143,7 @@ export async function getPortalRecoveryStatus(
   tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryStatus> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage);
+    let session = await loadPortalRecoverySession(apis.storage, now);
     if (!session) {
       return idlePortalRecoveryStatus();
     }
@@ -161,7 +162,7 @@ export async function focusPortalRecoveryTabs(
   tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryFocusResult> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage);
+    let session = await loadPortalRecoverySession(apis.storage, now);
     if (!session) {
       return { focused: false, status: idlePortalRecoveryStatus() };
     }
@@ -274,7 +275,7 @@ export async function closeExpiredPortalRecoveryTabs(
   now = Date.now()
 ): Promise<AccessSetupTarget[]> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage);
+    let session = await loadPortalRecoverySession(apis.storage, now);
     if (!session || now - session.createdAt < PORTAL_RECOVERY_SESSION_TTL_MS) {
       return [];
     }
@@ -297,16 +298,16 @@ function newPortalRecoverySession(now: number): PortalRecoverySession {
 }
 
 function shouldStageAuthentication(targets: AccessSetupTarget[], tokenStatus: TokenStatus): boolean {
-  return targets.length > 1 && !hasUsablePortalSessionHint(tokenStatus);
+  return targets.length > 1 && !hasUsablePortalSessionHint(tokenStatus, targets);
 }
 
-function hasUsablePortalSessionHint(tokenStatus: TokenStatus): boolean {
-  const candidates: Array<TokenStatusEntry | undefined> = [
-    tokenStatus.graph,
-    tokenStatus.graphTargets?.directoryRole,
-    tokenStatus.graphTargets?.pimGroup,
-    tokenStatus.azureManagement
-  ];
+function hasUsablePortalSessionHint(
+  tokenStatus: TokenStatus,
+  targets: AccessSetupTarget[]
+): boolean {
+  const candidates: Array<TokenStatusEntry | undefined> = targets.map((target) =>
+    getTargetTokenStatus(tokenStatus, target)
+  );
   return candidates.some((token) => Boolean(token?.hasToken && !token.isExpired));
 }
 
@@ -342,7 +343,7 @@ async function advanceAuthenticationStage(
     const pendingTargets = [...session.deferredTargets];
     session.deferredTargets = [];
     const openedTargets: AccessSetupTarget[] = [];
-    if (hasUsablePortalSessionHint(tokenStatus)) {
+    if (hasUsablePortalSessionHint(tokenStatus, pendingTargets)) {
       for (const target of pendingTargets) {
         if (await openRecoveryTarget(session, target, apis.tabs)) openedTargets.push(target);
         else session.deferredTargets.push(target);
@@ -707,14 +708,23 @@ async function saveOrRemoveSession(session: PortalRecoverySession, storage: Port
   }
 }
 
-async function loadPortalRecoverySession(storage: PortalRecoveryStorageLike): Promise<PortalRecoverySession | undefined> {
+async function loadPortalRecoverySession(
+  storage: PortalRecoveryStorageLike,
+  now = Date.now()
+): Promise<PortalRecoverySession | undefined> {
   const result = await storage.get(PORTAL_RECOVERY_SESSION_KEY);
   const value = result[PORTAL_RECOVERY_SESSION_KEY];
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
   }
   const record = value as Record<string, unknown>;
-  if (record.version !== 1 || typeof record.createdAt !== "number" || !Number.isFinite(record.createdAt)) {
+  if (
+    record.version !== 1
+    || typeof record.createdAt !== "number"
+    || !Number.isFinite(record.createdAt)
+    || record.createdAt <= 0
+    || record.createdAt > now + PORTAL_RECOVERY_MAX_FUTURE_CLOCK_SKEW_MS
+  ) {
     return undefined;
   }
   const tabsByTarget = sanitizeTargetNumbers(record.tabsByTarget);

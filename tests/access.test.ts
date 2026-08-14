@@ -4,7 +4,8 @@ import {
   buildTargetCacheKey,
   buildTokenCacheKey,
   getAccessSetupTargets,
-  getPortalUrlsForTargets
+  getPortalUrlsForTargets,
+  isTargetCacheKeyForCurrentIdentity
 } from "../src/lib/access";
 import { ENTRA_PORTAL_URLS } from "../src/lib/popupModel";
 import type { QuickPimDataCache, TokenStatus } from "../src/lib/types";
@@ -419,5 +420,34 @@ describe("portal-driven access setup", () => {
       azureManagement: { hasToken: false }
     };
     expect(buildTargetCacheKey(first, "directoryRole")).not.toBe(buildTargetCacheKey(second, "directoryRole"));
+  });
+
+  test("allows scope-changed display cache only for the same tenant and principal", () => {
+    const previous: TokenStatus = {
+      graph: {
+        hasToken: true,
+        tenantId: "tenant-a",
+        principalId: "user-a",
+        grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+      },
+      azureManagement: { hasToken: false }
+    };
+    const current: TokenStatus = {
+      graph: {
+        hasToken: true,
+        tenantId: "tenant-a",
+        principalId: "user-a",
+        grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
+      },
+      azureManagement: { hasToken: false }
+    };
+    const anotherAccount: TokenStatus = {
+      ...current,
+      graph: { ...current.graph, principalId: "user-b" }
+    };
+    const previousKey = buildTargetCacheKey(previous, "pimGroup");
+
+    expect(isTargetCacheKeyForCurrentIdentity(previousKey, current, "pimGroup")).toBe(true);
+    expect(isTargetCacheKeyForCurrentIdentity(previousKey, anotherAccount, "pimGroup")).toBe(false);
   });
 });

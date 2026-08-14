@@ -12,6 +12,7 @@ import {
   shouldShowRemainingActivationTime
 } from "../lib/popupModel";
 import { getDisplayName, getScopeLabel, getUsage } from "../lib/settings";
+import { normalizeActivationItemId } from "../lib/activationIdentity";
 import type { ActivationItem, PopupRequestMode, QuickPimSettings, ReferenceDataCache } from "../lib/types";
 
 export function RoleList({
@@ -66,7 +67,7 @@ export function RoleList({
         const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
         const selected = isSelectable && selectedIds.has(item.id);
         const displayName = getDisplayName(item, settings, referenceData);
-        const isFavorite = favoriteIds.has(item.id);
+        const isFavorite = favoriteIds.has(normalizeActivationItemId(item.id));
         const statusTitle = getActivationStatusTitle(item);
         const activeAssignmentType = getEffectiveActiveAssignmentType(item);
         const statusBadgeClass = activeAssignmentType === "assigned"

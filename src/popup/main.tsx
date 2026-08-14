@@ -18,6 +18,7 @@ import {
   buildTokenCacheKey,
   buildTargetCacheKeys,
   getAccessSetupTargets,
+  isTargetCacheKeyForCurrentIdentity,
   type AccessCapabilityItem
 } from "../lib/access";
 import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
@@ -74,8 +75,9 @@ import {
   sanitizePortalRecoveryStatus
 } from "../lib/portalRecoveryTabs";
 import { isOperationTimeoutError } from "../lib/async";
+import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
-import { getActivationItemIdentity } from "../lib/activationIdentity";
+import { getActivationItemIdentity, normalizeActivationItemId } from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
 import {
   EDGE_ADDONS_URL,
@@ -178,6 +180,7 @@ const REFRESH_SAVE_STEP: ProgressStepDefinition = {
   expectedDurationMs: 1_500
 };
 const TOKEN_STATUS_TIMEOUT_MS = 8_000;
+const TOKEN_STATUS_ATTEMPT_TIMEOUT_MS = TOKEN_STATUS_TIMEOUT_MS / 2;
 const PORTAL_TOKEN_REFRESH_TIMEOUT_MS = 17_000;
 const PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 15_000;
 const PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
@@ -203,7 +206,9 @@ function emptyPortalRecoveryStatus(): PortalRecoveryStatus {
   return sanitizePortalRecoveryStatus(undefined);
 }
 
-async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
+async function readPortalRecoveryStatus(
+  fallback: PortalRecoveryStatus = emptyPortalRecoveryStatus()
+): Promise<PortalRecoveryStatus> {
   try {
     return sanitizePortalRecoveryStatus(
       await sendMessage<PortalRecoveryStatus>(
@@ -212,8 +217,32 @@ async function readPortalRecoveryStatus(): Promise<PortalRecoveryStatus> {
       )
     );
   } catch {
-    return emptyPortalRecoveryStatus();
+    return fallback;
   }
+}
+
+async function readTokenStatusWithRetry(fallback?: TokenStatus | null): Promise<TokenStatus> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await sendMessage<TokenStatus>(
+        { action: "getTokenStatus" },
+        {
+          timeoutMs: TOKEN_STATUS_ATTEMPT_TIMEOUT_MS,
+          timeoutMessage: "Token status check timed out. Cached role data remains available."
+        }
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+  if (fallback) {
+    return refreshTokenStatusFreshness(fallback);
+  }
+  throw lastError;
 }
 
 async function waitForManagedPortalRecovery(
@@ -237,7 +266,7 @@ async function waitForManagedPortalRecovery(
           { action: "getTokenStatus" },
           { timeoutMs: 2_500, timeoutMessage: "Waiting for Microsoft portal access timed out." }
         ),
-        readPortalRecoveryStatus()
+        readPortalRecoveryStatus(recoveryStatus)
       ]);
       latestTokens = nextTokens;
       recoveryStatus = nextRecoveryStatus;
@@ -256,7 +285,7 @@ async function waitForManagedPortalRecovery(
   }
 
   if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
-    recoveryStatus = await readPortalRecoveryStatus();
+    recoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
   }
   return { tokens: latestTokens, changedTargets, recoveryStatus };
 }
@@ -330,6 +359,7 @@ function PopupApp() {
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
   const [refreshProgress, setRefreshProgress] = useState<OperationProgress | null>(null);
   const [refreshSuccessKey, setRefreshSuccessKey] = useState(0);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
@@ -350,12 +380,28 @@ function PopupApp() {
   const requestProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshRunId = useRef(0);
   const activeRefreshRunId = useRef<number | undefined>(undefined);
+  const manualRefreshInFlight = useRef(false);
   const requestProgressRunId = useRef(0);
   const activationRequestInFlight = useRef(false);
   const ownedRequestOperationIds = useRef(new Set<string>());
   const reconciledRequestOperationIds = useRef(new Set<string>());
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+  const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
+
+  tokenStatusRef.current = tokenStatus;
+  portalRecoveryStatusRef.current = portalRecoveryStatus;
+
+  function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
+    portalRecoveryStatusRef.current = nextStatus;
+    setPortalRecoveryStatus(nextStatus);
+  }
+
+  function publishTokenStatus(nextStatus: TokenStatus): void {
+    tokenStatusRef.current = nextStatus;
+    setTokenStatus(nextStatus);
+  }
 
   useEffect(() => {
     void initializePopupForDistribution();
@@ -401,7 +447,10 @@ function PopupApp() {
   );
   const activatableItemCount = useMemo(() => getActivatableItems(displayItems).length, [displayItems]);
   const itemsById = useMemo(() => new Map(
-    displayItems.flatMap((item) => [[item.id, item] as const, [item.id.toLowerCase(), item] as const])
+    displayItems.flatMap((item) => [
+      [item.id, item] as const,
+      [normalizeActivationItemId(item.id), item] as const
+    ])
   ), [displayItems]);
   const enabledFeatures = useMemo(() => new Set<QuickPimFeature>(settings.preferences.enabledFeatures || []), [settings.preferences.enabledFeatures]);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings.preferences.enabledFeatures]);
@@ -420,7 +469,10 @@ function PopupApp() {
     }
     return tabs;
   }, [enabledFeatures, roleTabs]);
-  const favoriteIds = useMemo(() => new Set(settings.favoriteItemIds || []), [settings.favoriteItemIds]);
+  const favoriteIds = useMemo(
+    () => new Set((settings.favoriteItemIds || []).map(normalizeActivationItemId)),
+    [settings.favoriteItemIds]
+  );
   const selectedItems = useMemo(
     () => {
       const items = [...selectedIds].map((id) => getItemByPersistedId(itemsById, id)).filter((item): item is ActivationItem => Boolean(item));
@@ -471,12 +523,13 @@ function PopupApp() {
     }
 
     let active = true;
+    let timer: number | undefined;
     const pollRecovery = async () => {
-      const nextStatus = await readPortalRecoveryStatus();
+      const nextStatus = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
       if (!active) {
         return;
       }
-      setPortalRecoveryStatus(nextStatus);
+      publishPortalRecoveryStatus(nextStatus);
       if (nextStatus.state === "idle" && activeRefreshRunId.current === undefined) {
         void refresh({
           force: false,
@@ -484,12 +537,16 @@ function PopupApp() {
           targets: enabledRoleFeatures,
           recoverMissingPortalAccess: false
         });
+      } else {
+        timer = window.setTimeout(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
       }
     };
-    const timer = window.setInterval(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
+    timer = window.setTimeout(() => void pollRecovery(), PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS);
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
     };
   }, [enabledRoleFeatures.join("|"), isLoading, isRefreshing, portalRecoveryStatus.state]);
 
@@ -753,7 +810,11 @@ function PopupApp() {
       }
     } finally {
       setIsPopupDraftReady(true);
-      void refresh({ force: false, quietWhenCached: true });
+      void refresh({
+        force: false,
+        quietWhenCached: true,
+        startPortalRecoveryInBackground: true
+      });
     }
   }
 
@@ -849,11 +910,17 @@ function PopupApp() {
     suppressMessage?: boolean;
     targets?: AccessSetupTarget[];
     recoverMissingPortalAccess?: boolean;
+    startPortalRecoveryInBackground?: boolean;
     quietWhenCached?: boolean;
+    userInitiated?: boolean;
   }) {
     const refreshStartedAt = Date.now();
     const runId = ++refreshRunId.current;
     activeRefreshRunId.current = runId;
+    if (options.userInitiated) {
+      manualRefreshInFlight.current = true;
+      setIsManualRefreshing(true);
+    }
     const isCurrentRun = () => refreshRunId.current === runId;
     const showBlockingLoading = options.showLoading !== false;
     const shouldShowProgress = !options.suppressMessage;
@@ -940,11 +1007,8 @@ function PopupApp() {
         loadSettings(),
         loadDataCache(),
         loadReferenceData(),
-        sendMessage<TokenStatus>(
-          { action: "getTokenStatus" },
-          { timeoutMs: TOKEN_STATUS_TIMEOUT_MS, timeoutMessage: "Token status check timed out. Cached role data remains available." }
-        ),
-        readPortalRecoveryStatus()
+        readTokenStatusWithRetry(tokenStatusRef.current),
+        readPortalRecoveryStatus(portalRecoveryStatusRef.current)
       ]);
       if (!isCurrentRun()) {
         return;
@@ -954,14 +1018,15 @@ function PopupApp() {
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
       const refreshTargets = normalizeRefreshTargets(options.targets || enabledRoleFeatures, enabledRoleFeatures);
       setSettings(loadedSettings);
-      setTokenStatus(loadedTokens);
-      setPortalRecoveryStatus(loadedRecoveryStatus);
+      publishTokenStatus(loadedTokens);
+      publishPortalRecoveryStatus(loadedRecoveryStatus);
       setReferenceData(loadedReferenceData);
       setAccessCapabilities(buildAccessCapabilityItems(loadedTokens, currentCache, enabledRoleFeatures));
       const initialCacheView = getActivationCacheView(currentCache, loadedTokens, enabledRoleFeatures, now);
       let currentCacheView = initialCacheView;
       let progressiveCache = currentCache;
       let progressiveTokens = loadedTokens;
+      let progressiveRecoveryStatus = loadedRecoveryStatus;
       let progressiveReferenceData = learnReferenceDataFromItems(
         loadedReferenceData,
         [...initialCacheView.eligible.items, ...initialCacheView.active.items]
@@ -997,7 +1062,7 @@ function PopupApp() {
           || !initialCacheView.eligibleCache[target]?.isFresh
           || !initialCacheView.activeCache[target]?.isFresh
       );
-      const portalTokenRecoveryTargets = getPortalTokenRecoveryTargets({
+      let portalTokenRecoveryTargets = getPortalTokenRecoveryTargets({
         cache: currentCache,
         enabledTargets: refreshTargets,
         staleTargets,
@@ -1017,6 +1082,11 @@ function PopupApp() {
       const sourceProgressStep = portalTokenRecoveryTargets.length ? 4 : 3;
       const saveProgressStep = refreshSteps.length;
       let managedPortalRecoveryCompleted = false;
+      const pendingPortalRecoveryTargets = new Set<AccessSetupTarget>(
+        loadedRecoveryStatus.state === "idle"
+          ? []
+          : loadedRecoveryStatus.managedTargets.filter((target) => refreshTargets.includes(target))
+      );
       if (options.recoverMissingPortalAccess && portalTokenRecoveryTargets.length) {
         showProgressStep(
           portalProgressStep!,
@@ -1034,16 +1104,18 @@ function PopupApp() {
           );
           return;
         }
-        setPortalRecoveryStatus(await readPortalRecoveryStatus());
+        progressiveRecoveryStatus = await readPortalRecoveryStatus(progressiveRecoveryStatus);
+        publishPortalRecoveryStatus(progressiveRecoveryStatus);
         showProgressStep(portalProgressStep!, "Waiting for Microsoft portal access");
         const recovered = await waitForManagedPortalRecovery(portalTokenRecoveryTargets, loadedTokens, isCurrentRun);
         if (!isCurrentRun()) {
           return;
         }
-        setPortalRecoveryStatus(recovered.recoveryStatus);
+        publishPortalRecoveryStatus(recovered.recoveryStatus);
+        progressiveRecoveryStatus = recovered.recoveryStatus;
         if (recovered.recoveryStatus.state === "interactionRequired") {
           progressiveTokens = recovered.tokens;
-          setTokenStatus(progressiveTokens);
+          publishTokenStatus(progressiveTokens);
           setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
           setHasActivationDataLoaded(true);
           setError("");
@@ -1059,7 +1131,7 @@ function PopupApp() {
           return;
         }
         progressiveTokens = recovered.tokens;
-        setTokenStatus(progressiveTokens);
+        publishTokenStatus(progressiveTokens);
         setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
         currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
         staleTargets = refreshTargets.filter(
@@ -1070,7 +1142,94 @@ function PopupApp() {
         managedPortalRecoveryCompleted = true;
       }
 
-      if (portalTokenRecoveryTargets.length && !managedPortalRecoveryCompleted) {
+      if (
+        options.startPortalRecoveryInBackground
+        && portalTokenRecoveryTargets.length
+        && hasSuccessfulActivationCache(currentCache, refreshTargets)
+      ) {
+        const targetsToStart = portalTokenRecoveryTargets.filter(
+          (target) => !pendingPortalRecoveryTargets.has(target)
+        );
+        if (targetsToStart.length) {
+          setIsRefreshing(true);
+          targetsToStart.forEach((target) => pendingPortalRecoveryTargets.add(target));
+          showProgressStep(
+            portalProgressStep!,
+            `Preparing Microsoft portal access for ${targetsToStart.map(tabLabel).join(", ")}`
+          );
+          try {
+            const recovery = await startPortalRecoveryInBackground(targetsToStart);
+            if (!isCurrentRun()) {
+              return;
+            }
+            if (!recovery.managedCount) {
+              targetsToStart.forEach((target) => pendingPortalRecoveryTargets.delete(target));
+            }
+            progressiveRecoveryStatus = await readPortalRecoveryStatus(progressiveRecoveryStatus);
+            publishPortalRecoveryStatus(progressiveRecoveryStatus);
+            if (progressiveRecoveryStatus.state !== "idle") {
+              targetsToStart.forEach((target) => pendingPortalRecoveryTargets.delete(target));
+            }
+            progressiveRecoveryStatus.managedTargets
+              .filter((target) => refreshTargets.includes(target))
+              .forEach((target) => pendingPortalRecoveryTargets.add(target));
+
+            progressiveTokens = await readTokenStatusWithRetry(progressiveTokens);
+            publishTokenStatus(progressiveTokens);
+            setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
+            currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
+            staleTargets = refreshTargets.filter(
+              (target) => options.force
+                || !currentCacheView.eligibleCache[target]?.isFresh
+                || !currentCacheView.activeCache[target]?.isFresh
+            );
+            portalTokenRecoveryTargets = getPortalTokenRecoveryTargets({
+              cache: currentCache,
+              enabledTargets: refreshTargets,
+              staleTargets,
+              tokenStatus: progressiveTokens,
+              force: options.force,
+              now: Date.now()
+            });
+            const unresolvedRecoveryTargets = new Set(portalTokenRecoveryTargets);
+            targetsToStart
+              .filter((target) => !unresolvedRecoveryTargets.has(target))
+              .forEach((target) => pendingPortalRecoveryTargets.delete(target));
+            if (
+              recovery.managedCount
+              && progressiveRecoveryStatus.state === "idle"
+              && targetsToStart.some((target) => unresolvedRecoveryTargets.has(target))
+            ) {
+              progressiveRecoveryStatus = sanitizePortalRecoveryStatus({
+                state: "waiting",
+                managedTargets: targetsToStart.filter((target) => unresolvedRecoveryTargets.has(target)),
+                interactionTargets: [],
+                grouped: recovery.grouped
+              });
+              publishPortalRecoveryStatus(progressiveRecoveryStatus);
+            }
+          } catch (recoveryError) {
+            if (!isOperationTimeoutError(recoveryError)) {
+              targetsToStart.forEach((target) => pendingPortalRecoveryTargets.delete(target));
+            }
+            // A timed-out runtime response does not cancel the background tab
+            // operation. The next popup open will reconcile its durable session.
+          }
+        }
+      }
+
+      if (pendingPortalRecoveryTargets.size) {
+        staleTargets = staleTargets.filter((target) => !pendingPortalRecoveryTargets.has(target));
+        if (!canShowCachedData) {
+          setHasActivationDataLoaded(true);
+          setIsLoading(false);
+        }
+      }
+
+      const passiveRecoveryTargets = portalTokenRecoveryTargets.filter(
+        (target) => !pendingPortalRecoveryTargets.has(target)
+      );
+      if (passiveRecoveryTargets.length && !managedPortalRecoveryCompleted) {
         setIsRefreshing(true);
         showProgressStep(portalProgressStep!, "Checking existing Microsoft portal tabs");
         try {
@@ -1082,14 +1241,14 @@ function PopupApp() {
             return;
           }
           progressiveTokens = tokenRefresh.tokenStatus;
-          setTokenStatus(progressiveTokens);
+          publishTokenStatus(progressiveTokens);
           setAccessCapabilities(buildAccessCapabilityItems(progressiveTokens, currentCache, enabledRoleFeatures));
           currentCacheView = getActivationCacheView(currentCache, progressiveTokens, enabledRoleFeatures, Date.now());
           staleTargets = refreshTargets.filter(
             (target) => options.force
               || !currentCacheView.eligibleCache[target]?.isFresh
               || !currentCacheView.activeCache[target]?.isFresh
-          );
+          ).filter((target) => !pendingPortalRecoveryTargets.has(target));
         } catch {
           // Existing tokens and cached data remain usable when no portal tab can answer the optional scan.
         }
@@ -1328,7 +1487,8 @@ function PopupApp() {
           // Role data is ready even if the browser rejects optional temporary-tab cleanup.
         }
       }
-      setPortalRecoveryStatus(await readPortalRecoveryStatus());
+      progressiveRecoveryStatus = await readPortalRecoveryStatus(progressiveRecoveryStatus);
+      publishPortalRecoveryStatus(progressiveRecoveryStatus);
       const loadErrors = filterLoadErrorsForAccessState([
         ...Object.values(eligibleResultsByTarget).flatMap((result) => result.errors || []),
         ...Object.values(activeResultsByTarget).flatMap((result) => result.errors || []),
@@ -1375,6 +1535,10 @@ function PopupApp() {
       if (isCurrentRun()) {
         setIsLoading(false);
         setIsRefreshing(false);
+        if (options.userInitiated) {
+          manualRefreshInFlight.current = false;
+          setIsManualRefreshing(false);
+        }
         if (progressVisible && refreshCompleted) {
           refreshProgressClearTimer.current = setTimeout(() => {
             if (refreshRunId.current === runId) {
@@ -1398,7 +1562,7 @@ function PopupApp() {
     active: { items: ActivationItem[]; errors: string[] }
   ) {
     setSettings(nextSettings);
-    setTokenStatus(nextTokens);
+    publishTokenStatus(nextTokens);
     setReferenceData(nextReferenceData);
     setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(nextSettings)));
     setEligibleItems(applyDisplayData(eligible.items, nextSettings, nextReferenceData));
@@ -1434,12 +1598,13 @@ function PopupApp() {
   }
 
   async function toggleFavorite(itemId: string) {
+    const canonicalId = normalizeActivationItemId(itemId);
     try {
       await mutatePopupSettings((latest) => ({
         ...latest,
-        favoriteItemIds: latest.favoriteItemIds.includes(itemId)
-          ? latest.favoriteItemIds.filter((id) => id !== itemId)
-          : [itemId, ...latest.favoriteItemIds]
+        favoriteItemIds: latest.favoriteItemIds.some((id) => normalizeActivationItemId(id) === canonicalId)
+          ? latest.favoriteItemIds.filter((id) => normalizeActivationItemId(id) !== canonicalId)
+          : [canonicalId, ...latest.favoriteItemIds]
       }));
     } catch (saveError) {
       setActivationFailureNotice(null);
@@ -1529,11 +1694,13 @@ function PopupApp() {
       const operationItems = operation.itemIds
         .map((id) => getItemByPersistedId(itemsById, id))
         .filter((item): item is ActivationItem => Boolean(item));
-      const successfulIds = new Set(response.results.filter((result) => result.success).map((result) => result.itemId));
-      const failedIds = new Set(response.errors.map((result) => result.itemId));
+      const successfulIds = new Set(response.results
+        .filter((result) => result.success)
+        .map((result) => normalizeActivationItemId(result.itemId)));
+      const failedIds = new Set(response.errors.map((result) => normalizeActivationItemId(result.itemId)));
       const failedSelectionIds = operation.itemIds.flatMap((id) => {
         const item = getItemByPersistedId(itemsById, id);
-        return item && failedIds.has(id) ? [item.id] : [];
+        return item && failedIds.has(normalizeActivationItemId(id)) ? [item.id] : [];
       });
       const successCount = successfulIds.size;
       const failureNotice = response.errors.length
@@ -1544,12 +1711,17 @@ function PopupApp() {
       setActivationFailureNotice(failureNotice);
       setSelectedIds((current) => {
         const next = new Set(
-          [...current].filter((id) => !successfulIds.has(id))
+          [...current].filter((id) => !successfulIds.has(normalizeActivationItemId(id)))
         );
         failedSelectionIds.forEach((id) => next.add(id));
         return next;
       });
-      setMessage(formatRequestConfirmation(operationLabel, successCount, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        operationLabel,
+        successCount,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
 
       await recordCompletedOperationActivity(operation, operationItems, response);
 
@@ -1749,7 +1921,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => activatableItems.find((item) => item.id === result.itemId))
+        .map((result) => activatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
         .filter((item): item is ActivationItem => Boolean(item));
 
       await mutatePopupSettings((latest) => {
@@ -1797,7 +1969,12 @@ function PopupApp() {
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
-      setMessage(formatRequestConfirmation("activation", successItems.length, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        "activation",
+        successItems.length,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
       if (failureNotice) {
         setActivationProgress(null);
       } else {
@@ -1900,7 +2077,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => deactivatableItems.find((item) => item.id === result.itemId))
+        .map((result) => deactivatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
@@ -1957,7 +2134,12 @@ function PopupApp() {
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
-      setMessage(formatRequestConfirmation("deactivation", successItems.length, response.errors.length));
+      setMessage(formatRequestConfirmation(
+        "deactivation",
+        successItems.length,
+        response.errors.length,
+        response.results.filter((result) => result.success && result.trackingUnavailable).length
+      ));
       if (failureNotice) {
         setActivationProgress(null);
       } else {
@@ -2022,16 +2204,25 @@ function PopupApp() {
     await openPortalUrls([url]);
   }
 
-  async function openPortalPagesForTargets(targets: AccessSetupTarget[]): Promise<PortalRecoveryOpenResult> {
+  async function openPortalPagesForTargets(
+    targets: AccessSetupTarget[]
+  ): Promise<PortalRecoveryOpenResult> {
     await flushPopupDraft();
     return sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets });
+  }
+
+  function startPortalRecoveryInBackground(targets: AccessSetupTarget[]): Promise<PortalRecoveryOpenResult> {
+    return sendMessage<PortalRecoveryOpenResult>(
+      { action: "openPortalRecoveryTabs", targets },
+      { timeoutMs: 8_000, timeoutMessage: "Background Microsoft portal recovery is still starting." }
+    );
   }
 
   async function continueMicrosoftSignIn() {
     await flushPopupDraft();
     try {
       const result = await sendMessage<PortalRecoveryFocusResult>({ action: "focusPortalRecoveryTabs" });
-      setPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
+      publishPortalRecoveryStatus(sanitizePortalRecoveryStatus(result?.status));
       if (!result?.focused) {
         setError("The Microsoft sign-in tab is no longer available. Use Refresh to open it again.");
       }
@@ -2184,6 +2375,9 @@ function PopupApp() {
           <button
             className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
             onClick={() => {
+              if (manualRefreshInFlight.current) {
+                return;
+              }
               if (isPortalInteractionRequired) {
                 void continueMicrosoftSignIn();
                 return;
@@ -2196,11 +2390,12 @@ function PopupApp() {
                 force: true,
                 showLoading: false,
                 targets: manualRefreshTargets,
-                recoverMissingPortalAccess: true
+                recoverMissingPortalAccess: true,
+                userInitiated: true
               });
             }}
-            disabled={isLoading || isRefreshing || manualRefreshTargets.length === 0}
-            title={manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
+            disabled={isManualRefreshing || manualRefreshTargets.length === 0}
+            title={isManualRefreshing ? "Refresh in progress" : manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
             aria-label={manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
           >
             <RefreshIcon />
@@ -2234,6 +2429,7 @@ function PopupApp() {
         <PermissionWarningBanner
           missingCount={accessSetupTargets.length}
           signInRequired={isPortalInteractionRequired}
+          recoveryInProgress={portalRecoveryStatus.state === "waiting"}
           onContinueSignIn={() => void continueMicrosoftSignIn()}
           onDetails={() => openSettingsSection("role-access")}
           onDismiss={() => void ignorePermissionWarning()}
@@ -2546,12 +2742,14 @@ function BrowserSyncLimitationBanner({
 function PermissionWarningBanner({
   missingCount,
   signInRequired,
+  recoveryInProgress,
   onContinueSignIn,
   onDetails,
   onDismiss
 }: {
   missingCount: number;
   signInRequired: boolean;
+  recoveryInProgress: boolean;
   onContinueSignIn: () => void;
   onDetails: () => void;
   onDismiss: () => void;
@@ -2562,9 +2760,17 @@ function PermissionWarningBanner({
         <strong>
           {signInRequired
             ? "Microsoft sign-in is needed to finish refreshing access."
+            : recoveryInProgress
+              ? missingCount === 1 ? "Refreshing one role source in the background." : `Refreshing ${missingCount} role sources in the background.`
             : missingCount === 1 ? "One role source needs a refresh." : `${missingCount} role sources need a refresh.`}
         </strong>
-        <p>{signInRequired ? "Continue the account prompt; available roles remain usable." : "Use Refresh in the top-right. Available roles remain usable."}</p>
+        <p>
+          {signInRequired
+            ? "Continue the account prompt; available roles remain usable."
+            : recoveryInProgress
+              ? "QuickPIM++ will update the affected source when Microsoft access is ready. Available roles remain usable."
+              : "Use Refresh in the top-right. Available roles remain usable."}
+        </p>
       </div>
       <div className="button-row permission-actions">
         {signInRequired ? (
@@ -3303,16 +3509,27 @@ function formatBundleDuration(durationHours: number | undefined): string {
   return `${durationHours} hour${durationHours === 1 ? "" : "s"}`;
 }
 
-function formatRequestConfirmation(requestType: "activation" | "deactivation", successCount: number, errorCount: number): string {
+function formatRequestConfirmation(
+  requestType: "activation" | "deactivation",
+  successCount: number,
+  errorCount: number,
+  trackingUnavailableCount = 0
+): string {
   const itemLabel = (count: number) => `item${count === 1 ? "" : "s"}`;
   const noun = requestType === "deactivation" ? "Deactivation" : "Activation";
   if (successCount && !errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.${formatTrackingUnavailable(trackingUnavailableCount)}`;
   }
   if (successCount && errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.`;
+    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.${formatTrackingUnavailable(trackingUnavailableCount)}`;
   }
   return `${noun} failed for ${errorCount} ${itemLabel(errorCount)}.`;
+}
+
+function formatTrackingUnavailable(count: number): string {
+  return count > 0
+    ? ` Microsoft accepted ${count === 1 ? "it" : "them"}, but did not return ${count === 1 ? "a tracking ID" : "tracking IDs"}; verify status in Microsoft PIM.`
+    : "";
 }
 
 function scrollPopupToTop(): void {
@@ -3330,6 +3547,23 @@ function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatur
   return targets.filter((target, index) => enabled.has(target) && targets.indexOf(target) === index);
 }
 
+function hasSuccessfulActivationCache(cache: QuickPimDataCache, targets: AccessSetupTarget[]): boolean {
+  const entries = [
+    cache.eligible,
+    cache.active,
+    ...targets.flatMap((target) => [cache.eligibleByTarget?.[target], cache.activeByTarget?.[target]])
+  ];
+  return entries.some((entry) => Boolean(
+    entry
+    && Number.isFinite(entry.fetchedAt)
+    && entry.fetchedAt > 0
+    && (
+      !entry.errors.length
+      || entry.diagnostics?.some((diagnostic) => diagnostic.success)
+    )
+  ));
+}
+
 function isMissingAccessSummary(message: string): boolean {
   const lines = message.split(/\n+/).map((line) => line.trim()).filter(Boolean);
   return lines.length > 0 && lines.every((line) =>
@@ -3343,7 +3577,7 @@ function getItemByPersistedId(
   itemsById: ReadonlyMap<string, ActivationItem>,
   itemId: string
 ): ActivationItem | undefined {
-  return itemsById.get(itemId) || itemsById.get(itemId.toLowerCase());
+  return itemsById.get(itemId) || itemsById.get(normalizeActivationItemId(itemId));
 }
 
 function setsEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {
@@ -3360,12 +3594,14 @@ function getActivationCacheView(
   const targetCacheKeys = buildTargetCacheKeys(tokenStatus, enabledRoleFeatures);
   const legacyCacheKey = buildFeatureCacheKey(tokenCacheKey, enabledRoleFeatures);
   const eligibleCache = getTargetEntriesFromCache(cache, "eligible", enabledRoleFeatures, targetCacheKeys, {
+    compatibleCacheKey: (target, cacheKey) => isTargetCacheKeyForCurrentIdentity(cacheKey, tokenStatus, target),
     legacyCacheKey,
     now,
     freshTtlMs: DEFAULT_ELIGIBLE_CACHE_TTL_MS,
     usableTtlMs: STALE_ELIGIBLE_CACHE_TTL_MS
   });
   const activeCache = getTargetEntriesFromCache(cache, "active", enabledRoleFeatures, targetCacheKeys, {
+    compatibleCacheKey: (target, cacheKey) => isTargetCacheKeyForCurrentIdentity(cacheKey, tokenStatus, target),
     legacyCacheKey,
     now,
     freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS

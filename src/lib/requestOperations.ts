@@ -3,12 +3,15 @@ import type {
   ActivationResult,
   ActivationResponse,
   RequestOperationAction,
-  RequestOperationRecord
+  RequestOperationRecord,
+  TrackedPimRequest
 } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
+import { normalizeActivationItemId } from "./activationIdentity";
 
 export const REQUEST_OPERATIONS_SESSION_KEY = "quickPimRequestOperations.v1";
-export const REQUEST_OPERATION_TTL_MS = 30 * 60_000;
+export const REQUEST_OPERATION_TTL_MS = 2 * 60 * 60_000;
+export const REQUEST_OPERATION_RECONCILIATION_GRACE_MS = 2 * 60_000;
 
 const MAX_OPERATIONS = 20;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
@@ -62,13 +65,43 @@ export function getRequestOperationFingerprint(operation: RequestOperationIdenti
   const ticketNumber = operation.ticketInfo?.ticketNumber?.trim() || null;
   return JSON.stringify({
     action: operation.action,
-    itemIds: [...new Set(operation.itemIds)].sort(),
+    itemIds: [...new Set(operation.itemIds.map(normalizeActivationItemId))].sort(),
     targets: [...new Set(operation.targets)].sort(),
     durationHours: operation.durationHours ?? null,
     justification: operation.justification ?? null,
     ticketInfo: ticketSystem || ticketNumber ? { ticketSystem, ticketNumber } : null,
     bundleName: operation.bundleName ?? null
   });
+}
+
+export function trackedRequestMatchesOperation(
+  request: TrackedPimRequest,
+  operation: RequestOperationRecord
+): boolean {
+  if (
+    request.action !== operation.action
+    || !operation.itemIds.map(normalizeActivationItemId).includes(normalizeActivationItemId(request.itemId))
+  ) {
+    return false;
+  }
+
+  if (request.operationId) {
+    return request.operationId === operation.id;
+  }
+
+  const requestedAt = Date.parse(request.requestedAt);
+  const earliestMatch = operation.startedAt - 30_000;
+  const latestMatch = operation.updatedAt + REQUEST_OPERATION_RECONCILIATION_GRACE_MS;
+  return Number.isFinite(requestedAt)
+    && requestedAt >= earliestMatch
+    && requestedAt <= latestMatch
+    && request.durationHours === operation.durationHours
+    && normalizeOptionalText(request.justification) === normalizeOptionalText(operation.justification)
+    && normalizeOptionalText(request.ticketSystem) === normalizeOptionalText(operation.ticketInfo?.ticketSystem)
+    && normalizeOptionalText(request.ticketNumber) === normalizeOptionalText(operation.ticketInfo?.ticketNumber)
+    && normalizeOptionalText(request.bundleName) === normalizeOptionalText(operation.bundleName)
+    && (!operation.sourceInstallationId || !request.sourceInstallationId
+      || request.sourceInstallationId === operation.sourceInstallationId);
 }
 
 export async function completeRequestOperation(
@@ -85,6 +118,17 @@ export async function failRequestOperation(
   options: { storage?: StorageAreaLike; now?: number } = {}
 ): Promise<void> {
   await updateRequestOperation(id, { state: "error", error: error.slice(0, 1_000) }, options);
+}
+
+export async function touchRequestOperation(
+  id: string,
+  options: { storage?: StorageAreaLike; now?: number } = {}
+): Promise<void> {
+  const storage = options.storage || chrome.storage.session;
+  const now = options.now ?? Date.now();
+  await mutateOperations(storage, now, (current) => current.map((item) => item.id === id && item.state === "running"
+    ? { ...item, updatedAt: now }
+    : item));
 }
 
 export async function dismissRequestOperations(
@@ -153,7 +197,7 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     || startedAt > now + MAX_FUTURE_CLOCK_SKEW_MS
     || updatedAt < startedAt
   ) return undefined;
-  const itemIds = sanitizeStrings(value.itemIds, 100, 512);
+  const itemIds = [...new Set(sanitizeStrings(value.itemIds, 100, 512).map(normalizeActivationItemId))];
   const targets = sanitizeTargets(value.targets);
   if (!itemIds.length || !targets.length) return undefined;
   const response = sanitizeActivationResponse(value.response);
@@ -241,7 +285,8 @@ function sanitizeActivationResult(value: unknown): ActivationResult | undefined 
     ...(typeof value.requestId === "string" ? { requestId: value.requestId.slice(0, 512) } : {}),
     ...(typeof value.error === "string" ? { error: value.error.slice(0, 1_000) } : {}),
     ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
-    ...(value.outcomeUnknown === true ? { outcomeUnknown: true } : {})
+    ...(value.outcomeUnknown === true ? { outcomeUnknown: true } : {}),
+    ...(value.trackingUnavailable === true ? { trackingUnavailable: true } : {})
   };
 }
 
@@ -251,4 +296,8 @@ function isOperationId(value: unknown): value is string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeOptionalText(value: string | undefined): string {
+  return value?.trim() || "";
 }

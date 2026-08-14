@@ -56,6 +56,7 @@ import {
   getEffectiveTrackedRequestStatus,
   getPendingTrackedRequestCount,
   getRequestTrackingMaintenanceTime,
+  getTrackedExpiryReminderDecision,
   isTrackedRequestPending,
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
@@ -112,8 +113,11 @@ import {
   dismissRequestOperations,
   failRequestOperation,
   getRequestOperationFingerprint,
-  loadRequestOperations
+  loadRequestOperations,
+  trackedRequestMatchesOperation,
+  touchRequestOperation
 } from "./lib/requestOperations";
+import { normalizeActivationItemId } from "./lib/activationIdentity";
 import {
   getAccessRecoveryTargets,
   getFreshAccessRecoveryTargets,
@@ -123,7 +127,8 @@ import {
 } from "./lib/requestRecovery";
 import {
   buildTrackedRequestExtensionPlan,
-  formatExtensionDuration
+  formatExtensionDuration,
+  requireTrackedRequestExtensionRequestId
 } from "./lib/requestExtension";
 import {
   formatUnknownWriteOutcome,
@@ -146,14 +151,12 @@ import {
 } from "./lib/distribution";
 import {
   BROWSER_SYNC_ALARM_NAME,
-  BROWSER_SYNC_CONTROL_KEY,
-  BROWSER_SYNC_DEVICES_KEY,
-  BROWSER_SYNC_MANIFEST_KEY,
   dismissBrowserSyncReminder,
   getBrowserSyncInstallationIdentity,
   getBrowserSyncStatus,
   initializeBrowserSyncAccess,
   isBrowserSyncDeviceStorageKey,
+  isBrowserSyncPayloadStorageKey,
   markBrowserSyncReminderShown,
   purgeBrowserSyncData,
   renameBrowserSyncDevice,
@@ -167,6 +170,7 @@ import type {
   ActivationItem,
   ActivationDataResult,
   ActivationRequest,
+  ActivationResult,
   ActivationSnapshot,
   ActivationResponse,
   ActivationStatus,
@@ -193,6 +197,42 @@ type ActivationRequirements = NonNullable<ActivationItem["activationRequirements
 interface ActivationSubmissionOptions {
   startDateTime?: string;
   continuationOfRequestId?: string;
+  operationId?: string;
+}
+interface ActivationWriteResponse {
+  payload: unknown;
+  location?: string;
+}
+interface ActivationSnapshotFetchResult {
+  eligibleItems: ActivationItem[];
+  activeItems: ActivationItem[];
+  eligibleError?: string;
+  activeError?: string;
+}
+interface AzureRoleScope {
+  scope: string;
+  displayName: string;
+  subscriptionId?: string;
+}
+interface AzureRoleScopeResult {
+  scopes: AzureRoleScope[];
+  warnings: string[];
+}
+interface AzureRoleLoadResult {
+  items: ActivationItem[];
+  warnings: string[];
+}
+interface AzureManagementGroupApi {
+  id?: string;
+  name?: string;
+  properties?: { displayName?: string };
+}
+
+class PartialActivationDataError extends Error {
+  constructor(message: string, readonly items: ActivationItem[]) {
+    super(message);
+    this.name = "PartialActivationDataError";
+  }
 }
 interface AzureRoleDefinitionResponse {
   properties?: {
@@ -228,14 +268,22 @@ const GRAPH_BATCH_REQUEST_LIMIT = 20;
 const TRANSIENT_READ_RETRY_DELAY_MS = 250;
 let portalTokenRefreshInFlight: Promise<PortalTokenRefreshResult> | undefined;
 let requestTrackingMaintenanceInFlight: Promise<TrackedPimRequestStore> | undefined;
+let requestTrackingMaintenanceFollowUp: Promise<TrackedPimRequestStore> | undefined;
+const pendingForcedTrackedRequestIds = new Set<string>();
+let forceAllTrackedRequestMaintenance = false;
 let backgroundPreRefreshInFlight: Promise<void> | undefined;
 let browserSyncInFlight: Promise<BrowserSyncStatus> | undefined;
-let browserSyncFollowUpRequested = false;
+let browserSyncFollowUp: Promise<BrowserSyncStatus> | undefined;
 let distributionInfoPromise: Promise<ExtensionDistributionInfo> | undefined;
+let extensionResetInProgress = false;
+let suppressBackgroundStorageEventsUntil = 0;
+const bestEffortTasks = new Set<Promise<unknown>>();
 const requestOperationTasks = new Map<string, { fingerprint: string; task: Promise<ActivationResponse> }>();
 const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionResult>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
 const REQUEST_TRACKING_STORAGE_TIMEOUT_MS = 750;
+const BROWSER_SYNC_PERIOD_MINUTES = 30;
+const BROWSER_SYNC_TRANSIENT_RETRY_MINUTES = 5;
 
 const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
   directoryRole: {
@@ -271,6 +319,7 @@ chrome.runtime.onStartup?.addListener(() => {
 });
 
 chrome.storage.onChanged?.addListener((changes, areaName) => {
+  if (extensionResetInProgress || Date.now() < suppressBackgroundStorageEventsUntil) return;
   if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
     runBestEffort(runIfExtensionEnabled(async () => {
       await Promise.all([initializeBackgroundRefresh(), initializeRequestTracking(), runBrowserSync(true)]);
@@ -279,17 +328,40 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
   if (areaName === "local" && changes[REQUEST_TRACKING_KEY]) {
     runBestEffort(runIfExtensionEnabled(initializeRequestTracking));
   }
-  if (areaName === "sync" && (
-    changes[BROWSER_SYNC_MANIFEST_KEY]
-    || changes[BROWSER_SYNC_CONTROL_KEY]
-    || changes[BROWSER_SYNC_DEVICES_KEY]
-    || Object.keys(changes).some(isBrowserSyncDeviceStorageKey)
+  if (areaName === "sync" && Object.keys(changes).some((key) =>
+    isBrowserSyncPayloadStorageKey(key) || isBrowserSyncDeviceStorageKey(key)
   )) {
-    runBestEffort(runIfExtensionEnabled(runBrowserSync));
+    // Browser sync can deliver a manifest before its chunks. Queue one
+    // follow-up pass even when a sync is already running so the completed
+    // generation is consumed as soon as the remaining change events arrive.
+    runBestEffort(runIfExtensionEnabled(() => runBrowserSync(true)));
   }
 });
 
+function notificationPermissionRemoved(permissions: chrome.permissions.Permissions): void {
+  if (permissions.permissions?.includes("notifications")) {
+    runBestEffort(runIfExtensionEnabled(initializeRequestTracking));
+  }
+}
+
+function notificationPermissionAdded(permissions: chrome.permissions.Permissions): void {
+  if (!permissions.permissions?.includes("notifications")) return;
+  runBestEffort(runIfExtensionEnabled(async () => {
+    await mutateTrackedRequests((current) => ({
+      version: 1,
+      requests: current.requests.map((request) => request.expiryReminderSentAt
+        ? request
+        : { ...request, expiryReminderAttemptedAt: undefined })
+    }));
+    await initializeRequestTracking();
+  }));
+}
+
+chrome.permissions?.onAdded?.addListener(notificationPermissionAdded);
+chrome.permissions?.onRemoved?.addListener(notificationPermissionRemoved);
+
 chrome.alarms?.onAlarm?.addListener((alarm) => {
+  if (extensionResetInProgress) return;
   if (alarm.name === PRE_REFRESH_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runBackgroundPreRefresh));
   } else if (alarm.name === REQUEST_TRACKING_ALARM_NAME) {
@@ -305,7 +377,7 @@ chrome.notifications?.onClicked?.addListener((notificationId) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  runBestEffort(openTrackedRequestDetails());
+  runBestEffort(runIfExtensionEnabled(openTrackedRequestDetails));
   chrome.notifications.clear(notificationId);
 });
 
@@ -315,10 +387,12 @@ chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex)
   }
   chrome.notifications.clear(notificationId);
   if (notificationId.endsWith(":expiry-extend") && buttonIndex === 0) {
-    runBestEffort(runWithServiceWorkerKeepAlive(() => handleExtensionNotificationClick(notificationId)));
+    runBestEffort(runIfExtensionEnabled(() => runWithServiceWorkerKeepAlive(
+      () => handleExtensionNotificationClick(notificationId)
+    )));
     return;
   }
-  runBestEffort(openTrackedRequestDetails());
+  runBestEffort(runIfExtensionEnabled(openTrackedRequestDetails));
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -354,6 +428,12 @@ async function runIfExtensionEnabled<T>(operation: () => T | Promise<T>, rejectW
   if (distribution.blockedInEdge) {
     if (rejectWhenBlocked) {
       throw new Error("This Chrome Web Store copy of QuickPIM++ is disabled in Microsoft Edge. Install the Microsoft Edge Add-ons edition.");
+    }
+    return undefined;
+  }
+  if (extensionResetInProgress) {
+    if (rejectWhenBlocked) {
+      throw new Error("QuickPIM++ is resetting its data. Wait for the reset to finish, then retry.");
     }
     return undefined;
   }
@@ -398,35 +478,64 @@ async function initializeBrowserSync(): Promise<void> {
   const distribution = await getDistributionInfo();
   await initializeBrowserSyncAccess(chrome.storage.sync);
   const status = await getBrowserSyncStatus(getBrowserSyncApis(distribution));
-  if (chrome.alarms) {
-    if (status.supported && status.enabled) {
-      const existing = await chrome.alarms.get(BROWSER_SYNC_ALARM_NAME);
-      if (!existing) chrome.alarms.create(BROWSER_SYNC_ALARM_NAME, { delayInMinutes: 1, periodInMinutes: 30 });
-    } else {
-      await chrome.alarms.clear(BROWSER_SYNC_ALARM_NAME);
-    }
+  if (status.supported && status.enabled) {
+    await runBrowserSync();
+  } else {
+    await updateBrowserSyncAlarm(status);
   }
-  if (status.supported && status.enabled) await runBrowserSync();
+}
+
+async function updateBrowserSyncAlarm(status: BrowserSyncStatus): Promise<void> {
+  if (!chrome.alarms) return;
+  if (status.supported && status.enabled) {
+    const existing = await chrome.alarms.get(BROWSER_SYNC_ALARM_NAME);
+    const retrySoon = isTransientBrowserSyncError(status.lastError);
+    const retryDeadline = Date.now() + BROWSER_SYNC_TRANSIENT_RETRY_MINUTES * 60_000;
+    if (!existing || (retrySoon && (!existing.scheduledTime || existing.scheduledTime > retryDeadline + 5_000))) {
+      chrome.alarms.create(BROWSER_SYNC_ALARM_NAME, {
+        delayInMinutes: retrySoon ? BROWSER_SYNC_TRANSIENT_RETRY_MINUTES : 1,
+        periodInMinutes: BROWSER_SYNC_PERIOD_MINUTES
+      });
+    }
+  } else {
+    await chrome.alarms.clear(BROWSER_SYNC_ALARM_NAME);
+  }
+}
+
+function isTransientBrowserSyncError(error: string | undefined): boolean {
+  return Boolean(error && /still arriving|temporar|unavailable|network|timed? out|rate limit|write operations/i.test(error));
 }
 
 async function runBrowserSync(queueFollowUpIfBusy = false): Promise<BrowserSyncStatus> {
   if (browserSyncInFlight) {
-    if (queueFollowUpIfBusy) browserSyncFollowUpRequested = true;
-    return browserSyncInFlight;
+    if (!queueFollowUpIfBusy) return browserSyncInFlight;
+    if (!browserSyncFollowUp) {
+      const predecessor = browserSyncInFlight;
+      const followUp = predecessor.catch(() => undefined).then(() => {
+        if (browserSyncFollowUp === followUp) browserSyncFollowUp = undefined;
+        return startBrowserSync();
+      });
+      browserSyncFollowUp = followUp;
+    }
+    return browserSyncFollowUp;
   }
+
+  return startBrowserSync();
+}
+
+function startBrowserSync(): Promise<BrowserSyncStatus> {
   const task = (async () => {
     const distribution = await getDistributionInfo();
-    let status: BrowserSyncStatus;
-    do {
-      browserSyncFollowUpRequested = false;
-      status = await synchronizeBrowserData(getBrowserSyncApis(distribution));
-    } while (browserSyncFollowUpRequested);
+    const status = await synchronizeBrowserData(getBrowserSyncApis(distribution));
+    await updateBrowserSyncAlarm(status);
     return status;
   })();
-  browserSyncInFlight = task.finally(() => {
-    browserSyncInFlight = undefined;
-  });
-  return browserSyncInFlight;
+  browserSyncInFlight = task;
+  const clearInFlight = () => {
+    if (browserSyncInFlight === task) browserSyncInFlight = undefined;
+  };
+  void task.then(clearInFlight, clearInFlight);
+  return task;
 }
 
 async function initializeBackgroundRefresh(): Promise<void> {
@@ -442,7 +551,11 @@ async function initializeBackgroundRefresh(): Promise<void> {
 }
 
 function runBestEffort(operation: Promise<unknown>): void {
-  void operation.catch(() => undefined);
+  bestEffortTasks.add(operation);
+  void operation.then(
+    () => bestEffortTasks.delete(operation),
+    () => bestEffortTasks.delete(operation)
+  );
 }
 
 async function initializeRequestTracking(): Promise<void> {
@@ -457,22 +570,58 @@ async function initializeRequestTracking(): Promise<void> {
   }
 }
 
-async function runTrackedRequestMaintenance(
+function runTrackedRequestMaintenance(
   requestIds?: string[],
   force = false
 ): Promise<TrackedPimRequestStore> {
   if (requestTrackingMaintenanceInFlight) {
-    const current = await requestTrackingMaintenanceInFlight;
-    if (!force) {
-      return current;
+    if (!force) return requestTrackingMaintenanceInFlight;
+
+    queueForcedTrackedRequestMaintenance(requestIds);
+    if (!requestTrackingMaintenanceFollowUp) {
+      const predecessor = requestTrackingMaintenanceInFlight;
+      const followUp = predecessor.catch(() => undefined).then(() => {
+        if (requestTrackingMaintenanceFollowUp === followUp) {
+          requestTrackingMaintenanceFollowUp = undefined;
+        }
+        const queuedRequestIds = forceAllTrackedRequestMaintenance
+          ? undefined
+          : [...pendingForcedTrackedRequestIds];
+        forceAllTrackedRequestMaintenance = false;
+        pendingForcedTrackedRequestIds.clear();
+        return startTrackedRequestMaintenance(queuedRequestIds, true);
+      });
+      requestTrackingMaintenanceFollowUp = followUp;
     }
+    return requestTrackingMaintenanceFollowUp;
   }
 
-  const maintenance = performTrackedRequestMaintenance(requestIds, force);
-  requestTrackingMaintenanceInFlight = maintenance.finally(() => {
-    requestTrackingMaintenanceInFlight = undefined;
-  });
-  return requestTrackingMaintenanceInFlight;
+  return startTrackedRequestMaintenance(requestIds, force);
+}
+
+function queueForcedTrackedRequestMaintenance(requestIds?: string[]): void {
+  if (!requestIds?.length) {
+    forceAllTrackedRequestMaintenance = true;
+    pendingForcedTrackedRequestIds.clear();
+    return;
+  }
+  if (forceAllTrackedRequestMaintenance) return;
+  requestIds.forEach((requestId) => pendingForcedTrackedRequestIds.add(requestId));
+}
+
+function startTrackedRequestMaintenance(
+  requestIds: string[] | undefined,
+  force: boolean
+): Promise<TrackedPimRequestStore> {
+  const task = performTrackedRequestMaintenance(requestIds, force);
+  requestTrackingMaintenanceInFlight = task;
+  const clearInFlight = () => {
+    if (requestTrackingMaintenanceInFlight === task) {
+      requestTrackingMaintenanceInFlight = undefined;
+    }
+  };
+  void task.then(clearInFlight, clearInFlight);
+  return task;
 }
 
 async function performTrackedRequestMaintenance(
@@ -678,22 +827,20 @@ async function notifyTrackedRequestChanges(
       }
     }
 
-    if (status === "active" && request.activeUntil && !request.expiryReminderSentAt) {
-      const expiresAt = Date.parse(request.activeUntil);
-      const reminderAt = expiresAt - reminderMinutes * 60_000;
-      if (Number.isFinite(expiresAt) && now >= reminderAt && now < expiresAt) {
-        const shown = await showExpiryReminderNotification(
-          request,
-          reminderMinutes,
-          settings.preferences.defaultExtensionDurationHours
-        );
-        if (shown) {
-          patches.set(request.id, {
-            ...patches.get(request.id),
-            expiryReminderSentAt: new Date(now).toISOString()
-          });
-        }
-      }
+    const reminderDecision = getTrackedExpiryReminderDecision(request, reminderMinutes, now);
+    if (reminderDecision) {
+      const shown = reminderDecision === "upcoming"
+        ? await showExpiryReminderNotification(
+            request,
+            reminderMinutes,
+            settings.preferences.defaultExtensionDurationHours
+          )
+        : await showMissedExpiryReminderNotification(request);
+      patches.set(request.id, {
+        ...patches.get(request.id),
+        expiryReminderAttemptedAt: new Date(now).toISOString(),
+        ...(shown ? { expiryReminderSentAt: new Date(now).toISOString() } : {})
+      });
     }
   }
 
@@ -704,6 +851,17 @@ async function notifyTrackedRequestChanges(
     version: 1,
     requests: current.requests.map((request) => ({ ...request, ...patches.get(request.id) }))
   }));
+}
+
+async function showMissedExpiryReminderNotification(request: TrackedPimRequest): Promise<boolean> {
+  return createRequestNotification(
+    request,
+    "PIM access expired",
+    `${request.itemName} expired while this browser was unavailable.`,
+    "expired",
+    "expiry-missed",
+    [{ title: "View details" }]
+  );
 }
 
 async function showTrackedRequestNotification(
@@ -983,13 +1141,16 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return status;
     }
     case "syncBrowserData":
-      return runBrowserSync();
+      // A user-triggered sync must not be satisfied only by an alarm run that
+      // was already in progress when they clicked. Queue one fresh pass so
+      // edits made during that run are included before the response resolves.
+      return runBrowserSync(true);
     case "setBrowserSyncEnabled": {
       const status = await setBrowserSyncEnabled(
         getBrowserSyncApis(await getDistributionInfo()),
         message.enabled
       );
-      await initializeBrowserSync();
+      await updateBrowserSyncAlarm(status);
       return status;
     }
     case "updateBrowserSyncDeviceName":
@@ -1010,7 +1171,7 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       );
     case "purgeBrowserSyncData": {
       const status = await purgeBrowserSyncData(getBrowserSyncApis(await getDistributionInfo()));
-      await initializeBrowserSync();
+      await updateBrowserSyncAlarm(status);
       return status;
     }
     case "refreshPortalTokens":
@@ -1066,7 +1227,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           message.durationHours,
           message.justification,
           message.ticketInfo || {},
-          message.bundleName
+          message.bundleName,
+          { operationId: message.operationId }
         ),
         message.items
       );
@@ -1084,7 +1246,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
         () => deactivateItemsWithPortalRecovery(
           message.items,
           message.justification || "",
-          message.ticketInfo || {}
+          message.ticketInfo || {},
+          { operationId: message.operationId }
         ),
         message.items
       );
@@ -1094,35 +1257,58 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
 }
 
 async function resetAllExtensionData(): Promise<void> {
-  await resetExtensionData({
-    loadRequestOperations,
-    hasInFlightTasks: () => Boolean(
-      requestOperationTasks.size
-      || requestExtensionTasks.size
-      || portalTokenRefreshInFlight
-      || requestTrackingMaintenanceInFlight
-      || backgroundPreRefreshInFlight
-    ),
-    closePortalRecoveryTabs: () => closePortalRecoveryTabsForTargets(
-      ["directoryRole", "pimGroup", "azureRole"],
-      getPortalRecoveryApis()
-    ),
-    clearNotifications: async () => {
-      if (!chrome.notifications?.getAll) return;
-      const notifications = await new Promise<object>((resolve) => chrome.notifications.getAll(resolve));
-      await Promise.all(Object.keys(notifications).map((notificationId) => new Promise<void>((resolve) => {
-        chrome.notifications.clear(notificationId, () => resolve());
-      })));
-    },
-    removeNotificationPermission: () => chrome.permissions?.remove
-      ? chrome.permissions.remove({ permissions: ["notifications"] })
-      : Promise.resolve(false),
-    purgeSyncedData: async () => purgeBrowserSyncData(getBrowserSyncApis(await getDistributionInfo())),
-    clearLocalStorage: () => chrome.storage.local.clear(),
-    clearSessionStorage: () => chrome.storage.session.clear(),
-    clearAlarms: () => chrome.alarms?.clearAll ? chrome.alarms.clearAll() : Promise.resolve(false),
-    clearActionBadge: () => chrome.action?.setBadgeText ? chrome.action.setBadgeText({ text: "" }) : Promise.resolve()
-  });
+  if (extensionResetInProgress) {
+    throw new Error("QuickPIM++ data reset is already in progress.");
+  }
+  extensionResetInProgress = true;
+  let resetCompleted = false;
+  try {
+    await resetExtensionData({
+      loadRequestOperations,
+      hasInFlightTasks: () => Boolean(
+        bestEffortTasks.size
+        || requestOperationTasks.size
+        || requestExtensionTasks.size
+        || portalTokenRefreshInFlight
+        || requestTrackingMaintenanceInFlight
+        || requestTrackingMaintenanceFollowUp
+        || backgroundPreRefreshInFlight
+        || browserSyncInFlight
+        || browserSyncFollowUp
+      ),
+      closePortalRecoveryTabs: () => closePortalRecoveryTabsForTargets(
+        ["directoryRole", "pimGroup", "azureRole"],
+        getPortalRecoveryApis()
+      ),
+      clearNotifications: async () => {
+        if (!chrome.notifications?.getAll) return;
+        const notifications = await new Promise<object>((resolve) => chrome.notifications.getAll(resolve));
+        await Promise.all(Object.keys(notifications).map((notificationId) => new Promise<void>((resolve) => {
+          chrome.notifications.clear(notificationId, () => resolve());
+        })));
+      },
+      removeNotificationPermission: () => chrome.permissions?.remove
+        ? chrome.permissions.remove({ permissions: ["notifications"] })
+        : Promise.resolve(false),
+      purgeSyncedData: async () => purgeBrowserSyncData(getBrowserSyncApis(await getDistributionInfo())),
+      clearLocalStorage: () => chrome.storage.local.clear(),
+      clearSessionStorage: () => chrome.storage.session.clear(),
+      clearAlarms: () => chrome.alarms?.clearAll ? chrome.alarms.clearAll() : Promise.resolve(false),
+      clearActionBadge: () => chrome.action?.setBadgeText ? chrome.action.setBadgeText({ text: "" }) : Promise.resolve()
+    });
+    // Recreate only default runtime services after the destructive clear. The
+    // browser-sync purge marker keeps sync paused, while background refresh and
+    // request-tracking alarms return to their default state without requiring a
+    // browser restart.
+    await initializeEnabledBackgroundServices().catch(() => undefined);
+    resetCompleted = true;
+  } finally {
+    // Storage events generated by the reset may be delivered after clear()
+    // resolves. Ignore that short tail so default services cannot recreate
+    // alarms or synced state immediately after an explicit purge.
+    if (resetCompleted) suppressBackgroundStorageEventsUntil = Date.now() + 2_000;
+    extensionResetInProgress = false;
+  }
 }
 
 async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]> {
@@ -1134,9 +1320,54 @@ async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]
     return operations;
   }
 
-  const error = "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request.";
-  await Promise.all(orphaned.map((operation) => failRequestOperation(operation.id, error)));
+  await Promise.all(orphaned.map((operation) => reconcileOrphanedRequestOperation(operation)));
   return loadRequestOperations();
+}
+
+async function reconcileOrphanedRequestOperation(operation: RequestOperationRecord): Promise<void> {
+  const store = await loadTrackedRequests().catch(() => undefined);
+  const matching = (store?.requests || []).filter((request) => trackedRequestMatchesOperation(request, operation));
+  const byItemId = new Map<string, TrackedPimRequest>();
+  for (const request of matching) {
+    const itemId = normalizeActivationItemId(request.itemId);
+    const current = byItemId.get(itemId);
+    if (!current || request.requestedAt > current.requestedAt) {
+      byItemId.set(itemId, request);
+    }
+  }
+  const results: ActivationResult[] = operation.itemIds.map((itemId) => {
+    const tracked = byItemId.get(normalizeActivationItemId(itemId));
+    return tracked
+      ? {
+          itemId,
+          itemName: tracked.itemName,
+          success: true,
+          requestId: tracked.requestId
+        }
+      : {
+          itemId,
+          itemName: itemId,
+          success: false,
+          error: "QuickPIM++ restarted before this item's Microsoft result could be recorded. Check Microsoft PIM before retrying.",
+          outcomeUnknown: true
+        };
+  });
+  if (matching.length) {
+    const errors = results.filter((result) => !result.success);
+    await completeRequestOperation(operation.id, {
+      success: errors.length === 0,
+      results,
+      errors,
+      ...(operation.sourceInstallationId ? { sourceInstallationId: operation.sourceInstallationId } : {}),
+      ...(operation.sourceDeviceName ? { sourceDeviceName: operation.sourceDeviceName } : {})
+    });
+    return;
+  }
+
+  await failRequestOperation(
+    operation.id,
+    "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request."
+  );
 }
 
 function runDurableRequestOperation(
@@ -1154,7 +1385,7 @@ function runDurableRequestOperation(
     return existingOperation.task;
   }
 
-  const task = (async () => {
+  const task = runWithServiceWorkerKeepAlive(async () => {
     const stored = (await loadRequestOperations()).find((item) => item.id === operation.id);
     if (stored && getRequestOperationFingerprint(stored) !== fingerprint) {
       throw new Error("This request operation ID was already used for different role work.");
@@ -1166,9 +1397,10 @@ function runDurableRequestOperation(
       throw new Error(stored.error || "The previous QuickPIM++ request failed.");
     }
     if (stored?.state === "running") {
-      const error = "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request.";
-      await failRequestOperation(operation.id, error);
-      throw new Error(error);
+      await reconcileOrphanedRequestOperation(stored);
+      const reconciled = (await loadRequestOperations()).find((item) => item.id === operation.id);
+      if (reconciled?.state === "complete" && reconciled.response) return reconciled.response;
+      throw new Error(reconciled?.error || "The previous QuickPIM++ request outcome is unknown. Check Microsoft PIM before retrying.");
     }
 
     const source = await getBrowserSyncInstallationIdentity(
@@ -1182,6 +1414,9 @@ function runDurableRequestOperation(
         }
       : operation;
     await beginRequestOperation(sourcedOperation);
+    const heartbeat = setInterval(() => {
+      void touchRequestOperation(operation.id).catch(() => undefined);
+    }, 60_000);
     let result: ActivationResponse;
     try {
       result = await execute();
@@ -1214,6 +1449,8 @@ function runDurableRequestOperation(
         source
       })).catch(() => undefined);
       throw error;
+    } finally {
+      clearInterval(heartbeat);
     }
 
     if (source) await annotateTrackedRequestSources(result, source).catch(() => undefined);
@@ -1236,7 +1473,7 @@ function runDurableRequestOperation(
       source
     })).catch(() => undefined);
     return response;
-  })();
+  });
 
   requestOperationTasks.set(operation.id, { fingerprint, task });
   void task.then(
@@ -1284,12 +1521,13 @@ async function activateItemsWithPortalRecovery(
 async function deactivateItemsWithPortalRecovery(
   items: ActivationItem[],
   justification: string,
-  ticketInfo: TicketInfo
+  ticketInfo: TicketInfo,
+  options: ActivationSubmissionOptions = {}
 ): Promise<ActivationResponse> {
   return executeWithPortalAccessRecovery(
     items,
     "deactivation",
-    (retryItems) => deactivateItems(retryItems, justification, ticketInfo)
+    (retryItems) => deactivateItems(retryItems, justification, ticketInfo, options)
   );
 }
 
@@ -1377,16 +1615,18 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
       );
     }
 
+    const extensionRequestId = requireTrackedRequestExtensionRequestId(result);
+
     await patchTrackedExtensionSource(source.id, {
       extensionAttemptState: "queued",
-      extensionRequestId: result.requestId,
+      extensionRequestId,
       extensionLastError: undefined
     });
     return {
       success: true,
       message: `${source.itemName} is queued for ${formatExtensionDuration(plan.durationHours)} more access after its current activation ends.`,
       sourceRequestId: source.requestId,
-      requestId: result.requestId,
+      requestId: extensionRequestId,
       scheduledStartAt: plan.startDateTime,
       scheduledEndAt: plan.endDateTime,
       durationHours: plan.durationHours
@@ -2255,7 +2495,7 @@ async function fetchSnapshotGroup(
   target: AccessSetupTarget,
   tokenKind: TokenKind,
   token: string | undefined,
-  fetcher: (token: string) => Promise<[ActivationItem[], ActivationItem[]]>,
+  fetcher: (token: string) => Promise<[ActivationItem[], ActivationItem[]] | ActivationSnapshotFetchResult>,
   eligibleFallback: (token: string) => Promise<ActivationItem[]>,
   activeFallback: (token: string) => Promise<ActivationItem[]>
 ): Promise<TargetSnapshotResult> {
@@ -2269,11 +2509,14 @@ async function fetchSnapshotGroup(
   }
 
   try {
-    const [eligibleItems, activeItems] = await fetcher(token);
+    const fetched = await fetcher(token);
+    const [eligibleItems, activeItems, eligibleError, activeError] = Array.isArray(fetched)
+      ? [fetched[0], fetched[1], undefined, undefined]
+      : [fetched.eligibleItems, fetched.activeItems, fetched.eligibleError, fetched.activeError];
     return {
       target,
-      eligible: makeSnapshotData(target, eligibleItems, undefined, "eligible"),
-      active: makeSnapshotData(target, activeItems, undefined, "active")
+      eligible: makeSnapshotData(target, eligibleItems, eligibleError, "eligible"),
+      active: makeSnapshotData(target, activeItems, activeError, "active")
     };
   } catch {
     const [eligible, active] = await Promise.all([
@@ -2362,8 +2605,9 @@ async function fetchItemGroup(
     };
   } catch (error) {
     const sanitized = sanitizeErrorMessage(error);
+    const partialItems = error instanceof PartialActivationDataError ? error.items : [];
     return {
-      items: [],
+      items: partialItems,
       error: sanitized,
       diagnostic: {
         target,
@@ -2905,60 +3149,69 @@ async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Re
 
 async function getAzureRoles(azureManagementToken: string): Promise<ActivationItem[]> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const subscriptions = await getSubscriptions(azureManagementToken);
-  return getAzureRolesForSubscriptions(azureManagementToken, subscriptions);
+  const scopeResult = await getAzureRoleScopes(azureManagementToken);
+  const result = await getAzureRolesForScopes(azureManagementToken, scopeResult.scopes);
+  return returnOrThrowPartialAzureData(result, scopeResult.warnings, "eligible Azure roles");
 }
 
-async function getAzureRoleSnapshot(azureManagementToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+async function getAzureRoleSnapshot(azureManagementToken: string): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const subscriptions = await getSubscriptions(azureManagementToken);
-  return Promise.all([
-    getAzureRolesForSubscriptions(azureManagementToken, subscriptions),
-    getActiveAzureRolesForSubscriptions(azureManagementToken, subscriptions)
-  ]);
-}
-
-async function getAzureRoleCoreSnapshot(azureManagementToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
-  assertFreshToken(azureManagementToken, "azureManagement");
-  const subscriptions = await getSubscriptions(azureManagementToken);
+  const scopeResult = await getAzureRoleScopes(azureManagementToken);
   const [eligible, active] = await Promise.all([
-    getAzureRolesForSubscriptions(azureManagementToken, subscriptions, false),
-    getActiveAzureRolesForSubscriptions(azureManagementToken, subscriptions)
+    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes),
+    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes)
   ]);
-  return [eligible.map(markActivationPolicyPending), active.map(markActivationPolicyPending)];
+  return {
+    eligibleItems: eligible.items,
+    activeItems: active.items,
+    eligibleError: formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
+    activeError: formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
+  };
 }
 
-async function getAzureRolesForSubscriptions(
+async function getAzureRoleCoreSnapshot(azureManagementToken: string): Promise<ActivationSnapshotFetchResult> {
+  assertFreshToken(azureManagementToken, "azureManagement");
+  const scopeResult = await getAzureRoleScopes(azureManagementToken);
+  const [eligible, active] = await Promise.all([
+    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes, false),
+    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes)
+  ]);
+  return {
+    eligibleItems: eligible.items.map(markActivationPolicyPending),
+    activeItems: active.items.map(markActivationPolicyPending),
+    eligibleError: formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
+    activeError: formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
+  };
+}
+
+async function getAzureRolesForScopes(
   azureManagementToken: string,
-  subscriptions: Array<{ subscriptionId: string; displayName: string }>,
+  scopes: AzureRoleScope[],
   includePolicies = true
-): Promise<ActivationItem[]> {
+): Promise<AzureRoleLoadResult> {
   const roleGroups = await mapWithConcurrencySettled(
-    subscriptions,
+    scopes,
     4,
-    async (subscription) => {
+    async (scope) => {
       const roles = await retryTransientMicrosoftRead(() =>
         fetchAllPages<AzureRoleApi>(
           azureManagementUrl(
-            `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
+            `${scope.scope}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
           ),
           azureManagementToken
         )
       );
-      return roles.map((role) =>
-        normalizeAzureRole({
-          ...role,
-          subscriptionId: subscription.subscriptionId,
-          subscriptionName: subscription.displayName
-        })
-      );
+      return roles.map((role) => normalizeAzureRole(withAzureScopeContext(role, scope)));
     }
   );
 
-  assertAtLeastOneSubscriptionSucceeded(roleGroups, "eligible Azure roles");
-  const items = roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []));
+  assertAtLeastOneAzureScopeSucceeded(roleGroups, "eligible Azure roles");
+  const items = dedupeItems(roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])));
   const itemsWithPolicies = includePolicies ? await applyAzureRolePolicyRequirements(items, azureManagementToken) : items;
-  return applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken);
+  return {
+    items: await applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken),
+    warnings: getAzureScopeWarnings(roleGroups, scopes)
+  };
 }
 
 async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
@@ -3001,6 +3254,42 @@ async function getSubscriptions(token: string): Promise<Array<{ subscriptionId: 
   );
 }
 
+async function getAzureRoleScopes(token: string): Promise<AzureRoleScopeResult> {
+  const [subscriptions, managementGroups] = await Promise.allSettled([
+    retryTransientMicrosoftRead(() => getSubscriptions(token)),
+    retryTransientMicrosoftRead(() => fetchAllPages<AzureManagementGroupApi>(
+      azureManagementUrl("/providers/Microsoft.Management/managementGroups?api-version=2020-05-01"),
+      token
+    ))
+  ]);
+  if (subscriptions.status === "rejected" && managementGroups.status === "rejected") {
+    throw new Error(`Unable to enumerate Azure scopes. ${sanitizeErrorMessage(subscriptions.reason)}`.trim());
+  }
+  const scopes: AzureRoleScope[] = [
+    ...(subscriptions.status === "fulfilled" ? subscriptions.value.map((subscription) => ({
+      scope: `/subscriptions/${subscription.subscriptionId}`,
+      displayName: subscription.displayName || subscription.subscriptionId,
+      subscriptionId: subscription.subscriptionId
+    })) : []),
+    ...(managementGroups.status === "fulfilled" ? managementGroups.value.flatMap((group) => {
+      const name = group.name || group.id?.split("/").filter(Boolean).at(-1);
+      return name ? [{
+        scope: `/providers/Microsoft.Management/managementGroups/${name}`,
+        displayName: group.properties?.displayName || name
+      }] : [];
+    }) : [])
+  ];
+  const warnings = [
+    ...(subscriptions.status === "rejected"
+      ? [`Azure subscriptions could not be enumerated: ${sanitizeErrorMessage(subscriptions.reason)}`]
+      : []),
+    ...(managementGroups.status === "rejected"
+      ? [`Azure management groups could not be enumerated: ${sanitizeErrorMessage(managementGroups.reason)}`]
+      : [])
+  ];
+  return { scopes: dedupeAzureScopes(scopes), warnings };
+}
+
 async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
   const [instances, requests] = await Promise.all([
@@ -3025,23 +3314,24 @@ async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationIt
 
 async function getActiveAzureRoles(azureManagementToken: string): Promise<ActivationItem[]> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const subscriptions = await getSubscriptions(azureManagementToken);
-  return getActiveAzureRolesForSubscriptions(azureManagementToken, subscriptions);
+  const scopeResult = await getAzureRoleScopes(azureManagementToken);
+  const result = await getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes);
+  return returnOrThrowPartialAzureData(result, scopeResult.warnings, "active Azure roles");
 }
 
-async function getActiveAzureRolesForSubscriptions(
+async function getActiveAzureRolesForScopes(
   azureManagementToken: string,
-  subscriptions: Array<{ subscriptionId: string; displayName: string }>
-): Promise<ActivationItem[]> {
+  scopes: AzureRoleScope[]
+): Promise<AzureRoleLoadResult> {
   const now = Date.now();
   const roleGroups = await mapWithConcurrencySettled(
-    subscriptions,
+    scopes,
     4,
-    async (subscription) => {
+    async (scope) => {
       const roles = await retryTransientMicrosoftRead(() =>
         fetchAllPages<AzureRoleApi>(
           azureManagementUrl(
-            `/subscriptions/${encodePathSegment(subscription.subscriptionId)}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
+            `${scope.scope}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
           ),
           azureManagementToken
         )
@@ -3053,11 +3343,7 @@ async function getActiveAzureRolesForSubscriptions(
         }))
         .filter(({ activeUntil }) => !activeUntil || Date.parse(activeUntil) > now)
         .map(({ role, activeUntil }) => {
-          const item = normalizeAzureRole({
-            ...role,
-            subscriptionId: subscription.subscriptionId,
-            subscriptionName: subscription.displayName
-          });
+          const item = normalizeAzureRole(withAzureScopeContext(role, scope));
           const activeAssignmentType = normalizeActiveAssignmentType(role.properties?.assignmentType);
           const isSelfActivated = activeAssignmentType === "activated";
           return {
@@ -3072,14 +3358,17 @@ async function getActiveAzureRolesForSubscriptions(
     }
   );
 
-  assertAtLeastOneSubscriptionSucceeded(roleGroups, "active Azure roles");
-  return applyAzureRoleDefinitionMetadata(
-    roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])),
-    azureManagementToken
-  );
+  assertAtLeastOneAzureScopeSucceeded(roleGroups, "active Azure roles");
+  return {
+    items: await applyAzureRoleDefinitionMetadata(
+      dedupeItems(roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []))),
+      azureManagementToken
+    ),
+    warnings: getAzureScopeWarnings(roleGroups, scopes)
+  };
 }
 
-function assertAtLeastOneSubscriptionSucceeded<T>(
+function assertAtLeastOneAzureScopeSucceeded<T>(
   results: Array<PromiseSettledResult<T>>,
   operation: string
 ): void {
@@ -3087,6 +3376,53 @@ function assertAtLeastOneSubscriptionSucceeded<T>(
     const firstError = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason;
     throw new Error(`Unable to load ${operation} data from any subscription. ${sanitizeErrorMessage(firstError)}`.trim());
   }
+}
+
+function withAzureScopeContext(role: AzureRoleApi, scope: AzureRoleScope): AzureRoleApi {
+  const expandedProperties = role.properties?.expandedProperties || {};
+  return {
+    ...role,
+    ...(scope.subscriptionId ? { subscriptionId: scope.subscriptionId, subscriptionName: scope.displayName } : {}),
+    properties: {
+      ...role.properties,
+      scope: role.properties?.scope || scope.scope,
+      expandedProperties: {
+        ...expandedProperties,
+        scope: expandedProperties.scope || {
+          id: scope.scope,
+          displayName: scope.displayName,
+          type: scope.subscriptionId ? "subscription" : "managementGroup"
+        }
+      }
+    }
+  };
+}
+
+function dedupeAzureScopes(scopes: AzureRoleScope[]): AzureRoleScope[] {
+  return [...new Map(scopes.map((scope) => [scope.scope.toLowerCase(), scope])).values()];
+}
+
+function getAzureScopeWarnings<T>(results: Array<PromiseSettledResult<T>>, scopes: AzureRoleScope[]): string[] {
+  return results.flatMap((result, index) => result.status === "rejected"
+    ? [`${scopes[index]?.displayName || scopes[index]?.scope || "Azure scope"}: ${sanitizeErrorMessage(result.reason)}`]
+    : []);
+}
+
+function formatAzurePartialWarning(warnings: string[], operation: string): string | undefined {
+  const unique = [...new Set(warnings.filter(Boolean))];
+  return unique.length
+    ? `Some ${operation} data could not be loaded (${unique.length} scope issue${unique.length === 1 ? "" : "s"}). ${unique.slice(0, 3).join(" ")}`
+    : undefined;
+}
+
+function returnOrThrowPartialAzureData(
+  result: AzureRoleLoadResult,
+  discoveryWarnings: string[],
+  operation: string
+): ActivationItem[] {
+  const warning = formatAzurePartialWarning([...discoveryWarnings, ...result.warnings], operation);
+  if (warning) throw new PartialActivationDataError(warning, result.items);
+  return result.items;
 }
 
 function retryTransientMicrosoftRead<T>(operation: () => Promise<T>): Promise<T> {
@@ -3222,30 +3558,36 @@ async function activateItems(
           }
 
           const data = await sendActivationRequest(request, token);
-          const requestId = getResponseIdentifier(data, request);
+          const requestId = getResponseIdentifier(data.payload, request, data.location);
+          const trackedRequest = requestId
+            ? createTrackedPimRequest({
+              item,
+              action: "activate",
+              requestId,
+              operationId: options.operationId,
+              payload: data.payload,
+              requestedAt: submittedAt,
+              scheduledStartAt: startDateTime,
+              durationHours,
+              justification: justification.trim(),
+              ticketInfo,
+              bundleName,
+              continuationOfRequestId: options.continuationOfRequestId,
+              tenantId: getTokenTenantId(token)
+            })
+            : undefined;
+          const trackingStored = trackedRequest
+            ? await persistTrackedSubmissionsBestEffort([trackedRequest])
+            : false;
           return {
             result: {
               itemId: item.id,
               itemName: item.displayName,
               success: true,
-              requestId
+              requestId,
+              ...(!requestId || !trackingStored ? { trackingUnavailable: true } : {})
             },
-            trackedRequest: requestId
-              ? createTrackedPimRequest({
-                item,
-                action: "activate",
-                requestId,
-                payload: data,
-                requestedAt: submittedAt,
-                scheduledStartAt: startDateTime,
-                durationHours,
-                justification: justification.trim(),
-                ticketInfo,
-                bundleName,
-                continuationOfRequestId: options.continuationOfRequestId,
-                tenantId: getTokenTenantId(token)
-              })
-              : undefined
+            trackedRequest
           };
         });
       } catch (error) {
@@ -3267,10 +3609,6 @@ async function activateItems(
     }
   );
   const results = executions.map((execution) => execution.result);
-  await persistTrackedSubmissionsBestEffort(
-    executions.flatMap((execution) => execution.trackedRequest ? [execution.trackedRequest] : [])
-  );
-
   const errors = results.filter((result) => !result.success);
   return {
     success: errors.length === 0,
@@ -3279,7 +3617,7 @@ async function activateItems(
   };
 }
 
-async function sendActivationRequest(request: ActivationRequest, token: string): Promise<unknown> {
+async function sendActivationRequest(request: ActivationRequest, token: string): Promise<ActivationWriteResponse> {
   const response = await fetchMicrosoftApi(request.endpoint, {
     method: request.method,
     headers: {
@@ -3294,13 +3632,17 @@ async function sendActivationRequest(request: ActivationRequest, token: string):
     throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
   }
 
-  return safeJson(response);
+  return {
+    payload: await safeJson(response),
+    location: getAllowedResponseLocation(response)
+  };
 }
 
 async function deactivateItems(
   items: ActivationItem[],
   justification: string,
-  ticketInfo: TicketInfo
+  ticketInfo: TicketInfo,
+  options: ActivationSubmissionOptions = {}
 ): Promise<ActivationResponse> {
   if (!items.length) {
     throw new Error("Select at least one active item to deactivate.");
@@ -3323,26 +3665,32 @@ async function deactivateItems(
           assertRequestTokenReady(item, token, request.tokenKind, "deactivation");
           assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
           const data = await sendActivationRequest(request, token);
-          const requestId = getResponseIdentifier(data, request);
+          const requestId = getResponseIdentifier(data.payload, request, data.location);
+          const trackedRequest = requestId
+            ? createTrackedPimRequest({
+              item,
+              action: "deactivate",
+              requestId,
+              operationId: options.operationId,
+              payload: data.payload,
+              requestedAt: startDateTime,
+              justification: justification.trim(),
+              ticketInfo,
+              tenantId: getTokenTenantId(token)
+            })
+            : undefined;
+          const trackingStored = trackedRequest
+            ? await persistTrackedSubmissionsBestEffort([trackedRequest])
+            : false;
           return {
             result: {
               itemId: item.id,
               itemName: item.displayName,
               success: true,
-              requestId
+              requestId,
+              ...(!requestId || !trackingStored ? { trackingUnavailable: true } : {})
             },
-            trackedRequest: requestId
-              ? createTrackedPimRequest({
-                item,
-                action: "deactivate",
-                requestId,
-                payload: data,
-                requestedAt: startDateTime,
-                justification: justification.trim(),
-                ticketInfo,
-                tenantId: getTokenTenantId(token)
-              })
-              : undefined
+            trackedRequest
           };
         });
       } catch (error) {
@@ -3364,10 +3712,6 @@ async function deactivateItems(
     }
   );
   const results = executions.map((execution) => execution.result);
-  await persistTrackedSubmissionsBestEffort(
-    executions.flatMap((execution) => execution.trackedRequest ? [execution.trackedRequest] : [])
-  );
-
   const errors = results.filter((result) => !result.success);
   return {
     success: errors.length === 0,
@@ -3579,9 +3923,9 @@ function getApiErrorMessage(payload: unknown, response?: Response): string | und
   return isClaimsChallengeMessage(message) ? CLAIMS_CHALLENGE_MESSAGE : message;
 }
 
-async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]): Promise<void> {
+async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]): Promise<boolean> {
   if (!requests.length) {
-    return;
+    return true;
   }
   try {
     await withTimeout((async () => {
@@ -3592,8 +3936,20 @@ async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]
         scheduleTrackedRequestMaintenance(store, settings)
       ]);
     })(), REQUEST_TRACKING_STORAGE_TIMEOUT_MS, "Request tracking storage timed out.");
+    return true;
   } catch {
     // Microsoft already accepted the request. Tracking must not alter that result.
+    try {
+      const requestIds = new Set(requests.map((request) => request.requestId));
+      const stored = await withTimeout(
+        loadTrackedRequests(),
+        REQUEST_TRACKING_STORAGE_TIMEOUT_MS,
+        "Request tracking verification timed out."
+      );
+      return requests.length > 0 && stored.requests.filter((request) => requestIds.has(request.requestId)).length === requestIds.size;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -3602,19 +3958,48 @@ function getTokenTenantId(token: string): string | undefined {
   return typeof decoded?.tid === "string" ? decoded.tid : undefined;
 }
 
-function getResponseIdentifier(payload: unknown, request?: ActivationRequest): string | undefined {
+function getResponseIdentifier(payload: unknown, request?: ActivationRequest, location?: string): string | undefined {
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
     const record = payload as Record<string, unknown>;
     const identifier = typeof record.id === "string" ? record.id : typeof record.name === "string" ? record.name : undefined;
     if (identifier) {
-      return identifier;
+      return sanitizeResponseIdentifier(identifier);
+    }
+  }
+  if (location) {
+    try {
+      return sanitizeResponseIdentifier(decodeURIComponent(new URL(location).pathname.split("/").filter(Boolean).at(-1) || ""));
+    } catch {
+      // Ignore malformed response metadata and use the request fallback below.
     }
   }
   if (request?.method === "PUT") {
     try {
-      return decodeURIComponent(new URL(request.endpoint).pathname.split("/").filter(Boolean).at(-1) || "") || undefined;
+      return sanitizeResponseIdentifier(decodeURIComponent(new URL(request.endpoint).pathname.split("/").filter(Boolean).at(-1) || ""));
     } catch {
       return undefined;
+    }
+  }
+  return undefined;
+}
+
+function sanitizeResponseIdentifier(value: string): string | undefined {
+  const sanitized = value.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 512);
+  return sanitized || undefined;
+}
+
+function getAllowedResponseLocation(response: Response): string | undefined {
+  for (const header of ["operation-location", "location"]) {
+    const value = response.headers.get(header);
+    if (!value) continue;
+    try {
+      const location = new URL(value, response.url);
+      if (location.protocol === "https:"
+        && (location.hostname === "graph.microsoft.com" || location.hostname === "management.azure.com")) {
+        return location.toString().slice(0, 2_048);
+      }
+    } catch {
+      // Ignore untrusted or malformed response metadata.
     }
   }
   return undefined;

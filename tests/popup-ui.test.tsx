@@ -908,7 +908,7 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "closePortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
   });
 
-  test("recovers both enabled Graph features when only cached Azure data is visible", async () => {
+  test("automatically starts recovery for both enabled Graph features when only cached Azure data is visible", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const missingGraphTokens = {
       graph: { hasToken: false },
@@ -1039,17 +1039,6 @@ describe("popup compact controls", () => {
     await import("../src/popup/main");
 
     await waitFor(() => expect(document.body.textContent).toContain("Contributor"));
-    await waitFor(() => {
-      const tabLabels = [...document.querySelectorAll(".tab-button")].map((button) => button.textContent?.trim());
-      expect(tabLabels).toEqual(["Azure Roles", "Bundles"]);
-    });
-    expect(document.body.textContent).toContain("2 role sources need a refresh.");
-    expect(document.body.textContent).toContain("Use Refresh in the top-right.");
-    expect(document.body.textContent).not.toContain("Fix access");
-    sendMessage.mockClear();
-    const refreshLabel = "Refresh all enabled data and recover missing portal access";
-    document.querySelector<HTMLButtonElement>(`button[aria-label="${refreshLabel}"]`)?.click();
-
     await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
       action: "openPortalRecoveryTabs",
       targets: ["directoryRole", "pimGroup"]
@@ -1058,10 +1047,6 @@ describe("popup compact controls", () => {
       action: "openPortalRecoveryTabs",
       targets: expect.arrayContaining(["azureRole"])
     });
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
-      action: "closePortalRecoveryTabs",
-      targets: ["directoryRole", "pimGroup"]
-    }), 2500);
   });
 
   test("presents first use as one calm refresh step without duplicate access warnings", async () => {
@@ -1387,13 +1372,12 @@ describe("popup compact controls", () => {
       }
       if (message.action === "getActivationSnapshot") {
         snapshotChecks += 1;
-        const hasRole = snapshotChecks > 1;
         return {
           success: true,
           data: {
-            eligible: { items: hasRole ? [role] : [], errors: hasRole ? [] : ["Graph token is missing."], diagnostics: [] },
+            eligible: { items: [role], errors: [], diagnostics: [] },
             active: { items: [], errors: [], diagnostics: [] },
-            tokenStatus: hasRole ? readyTokens : missingTokens
+            tokenStatus: readyTokens
           }
         };
       }
@@ -1415,7 +1399,7 @@ describe("popup compact controls", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("Microsoft sign-in needed"));
     await waitFor(() => expect(document.body.textContent).toContain("Global Reader"), 3_000);
-    expect(snapshotChecks).toBeGreaterThan(1);
+    expect(snapshotChecks).toBe(1);
     expect(document.body.textContent).not.toContain("Load your PIM roles");
   });
 
@@ -1487,6 +1471,161 @@ describe("popup compact controls", () => {
     await waitFor(() => expect(document.body.textContent).toContain("Global Reader"));
     expect(document.body.textContent).toContain("Microsoft sign-in is needed to finish refreshing access.");
     expect(document.body.textContent).toContain("Continue sign-in");
+    expect(sendMessage).not.toHaveBeenCalledWith({ action: "refreshPortalTokens" });
+  });
+
+  test("starts limited PIM access recovery once in the background without blocking cached roles", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const role: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Global Reader",
+      displayName: "Global Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/"
+    };
+    const group: ActivationItem = {
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Privileged Group",
+      displayName: "Privileged Group",
+      principalId: "principal-1",
+      scopeLabel: "Member",
+      status: "eligible",
+      groupId: "group-1",
+      accessId: "member"
+    };
+    const previousTokens = {
+      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          expiresInMinutes: 45,
+          grantedScopes: ["RoleAssignmentSchedule.ReadWrite.Directory"]
+        },
+        pimGroup: {
+          hasToken: true,
+          tenantId: "tenant-1",
+          principalId: "principal-1",
+          expiresInMinutes: 45,
+          grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+        }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const limitedTokens = {
+      ...previousTokens,
+      graphTargets: {
+        ...previousTokens.graphTargets,
+        pimGroup: {
+          ...previousTokens.graphTargets.pimGroup,
+          capturedAt: 2,
+          grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
+        }
+      }
+    };
+    const fetchedAt = Date.now();
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      },
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          directoryRole: {
+            fetchedAt,
+            cacheKey: buildTargetCacheKey(previousTokens, "directoryRole"),
+            errors: [],
+            items: [role]
+          },
+          pimGroup: {
+            fetchedAt,
+            cacheKey: buildTargetCacheKey(previousTokens, "pimGroup"),
+            errors: [],
+            items: [group]
+          }
+        },
+        activeByTarget: {
+          directoryRole: {
+            fetchedAt,
+            cacheKey: buildTargetCacheKey(previousTokens, "directoryRole"),
+            errors: [],
+            items: []
+          },
+          pimGroup: {
+            fetchedAt,
+            cacheKey: buildTargetCacheKey(previousTokens, "pimGroup"),
+            errors: [],
+            items: []
+          }
+        }
+      }
+    };
+    const recoveryOpen = deferred<{
+      success: true;
+      data: { requestedCount: number; openedCount: number; reusedCount: number; managedCount: number; grouped: boolean };
+    }>();
+    let recoveryStarted = false;
+    const sendMessage = vi.fn((message: { action: string; targets?: string[] }) => {
+      if (message.action === "getTokenStatus") return Promise.resolve({ success: true, data: limitedTokens });
+      if (message.action === "getPortalRecoveryStatus") {
+        return Promise.resolve({
+          success: true,
+          data: recoveryStarted
+            ? { state: "waiting", managedTargets: ["pimGroup"], interactionTargets: [], grouped: true }
+            : { state: "idle", managedTargets: [], interactionTargets: [], grouped: false }
+        });
+      }
+      if (message.action === "openPortalRecoveryTabs") {
+        recoveryStarted = true;
+        return recoveryOpen.promise;
+      }
+      if (message.action === "getActivationSnapshot") {
+        throw new Error("A managed PIM recovery must not refetch the limited source before its token changes.");
+      }
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Global Reader"));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "openPortalRecoveryTabs", targets: ["pimGroup"] }));
+    expect(document.body.textContent).not.toContain("Loading access data");
+    expect(document.querySelector(".refresh-progress-panel")).toBeFalsy();
+    const refreshButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Refresh all enabled data and recover missing portal access"]'
+    );
+    expect(refreshButton?.disabled).toBe(false);
+    expect(refreshButton?.classList.contains("spinning")).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalledWith({ action: "refreshPortalTokens" });
+
+    recoveryOpen.resolve({
+      success: true,
+      data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true }
+    });
+    await waitFor(() => expect(document.body.textContent).toContain("Refreshing one role source in the background."));
+    expect(document.body.textContent).toContain("Available roles remain usable.");
   });
 
   test("renders pending approval rows as readonly and excludes them from eligible count", async () => {

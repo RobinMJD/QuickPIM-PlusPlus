@@ -223,6 +223,7 @@ export function getTargetCacheStatus(options: {
   bucket: CacheBucket;
   target: AccessSetupTarget;
   cacheKey?: string;
+  compatibleCacheKey?: (cacheKey: string | undefined) => boolean;
   legacyCacheKey?: string;
   now?: number;
   freshTtlMs: number;
@@ -231,11 +232,27 @@ export function getTargetCacheStatus(options: {
   const now = options.now ?? Date.now();
   const usableTtlMs = options.usableTtlMs ?? options.freshTtlMs;
   const entry = getTargetEntry(options.cache, options.bucket, options.target);
-  if (isCacheEntryFresh(entry, usableTtlMs, now, options.cacheKey)) {
+  const exactEntry = entry;
+  if (isCacheEntryFresh(exactEntry, usableTtlMs, now, options.cacheKey)) {
+    return {
+      target: options.target,
+      entry: markDiagnosticsFromCache({ ...exactEntry, errors: [] }, true),
+      isFresh: isCacheEntryFresh(exactEntry, options.freshTtlMs, now, options.cacheKey),
+      isUsable: true
+    };
+  }
+
+  if (
+    entry
+    && options.compatibleCacheKey?.(entry.cacheKey)
+    && isCacheEntryFresh(entry, usableTtlMs, now)
+  ) {
     return {
       target: options.target,
       entry: markDiagnosticsFromCache({ ...entry, errors: [] }, true),
-      isFresh: isCacheEntryFresh(entry, options.freshTtlMs, now, options.cacheKey),
+      // A scope change can keep same-account display data usable, but it must
+      // still trigger a fresh API check before request capabilities are trusted.
+      isFresh: false,
       isUsable: true
     };
   }
@@ -269,7 +286,13 @@ export function getTargetEntriesFromCache(
   bucket: CacheBucket,
   targets: AccessSetupTarget[],
   cacheKeys: Partial<Record<AccessSetupTarget, string>>,
-  options: { legacyCacheKey?: string; now?: number; freshTtlMs: number; usableTtlMs?: number }
+  options: {
+    compatibleCacheKey?: (target: AccessSetupTarget, cacheKey: string | undefined) => boolean;
+    legacyCacheKey?: string;
+    now?: number;
+    freshTtlMs: number;
+    usableTtlMs?: number;
+  }
 ): Partial<Record<AccessSetupTarget, TargetCacheStatus>> {
   return Object.fromEntries(
     targets.map((target) => [
@@ -279,6 +302,9 @@ export function getTargetEntriesFromCache(
         bucket,
         target,
         cacheKey: cacheKeys[target],
+        compatibleCacheKey: options.compatibleCacheKey
+          ? (cacheKey) => options.compatibleCacheKey!(target, cacheKey)
+          : undefined,
         legacyCacheKey: options.legacyCacheKey,
         now: options.now,
         freshTtlMs: options.freshTtlMs,

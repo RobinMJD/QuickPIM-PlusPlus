@@ -147,6 +147,49 @@ describe("managed portal recovery tabs", () => {
     expect(fixture.group).toHaveBeenCalledWith({ groupId: 44, tabIds: [2] });
   });
 
+  test("does not let an unrelated Azure token bypass staged sign-in for missing Graph targets", async () => {
+    const fixture = createApis();
+    const azureOnly = missingTokenStatus();
+    azureOnly.azureManagement = { hasToken: true, capturedAt: 2 };
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole", "pimGroup"],
+      azureOnly,
+      fixture.apis,
+      1000
+    )).resolves.toEqual({
+      requestedCount: 2,
+      openedCount: 1,
+      reusedCount: 0,
+      managedCount: 2,
+      grouped: true
+    });
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+    expect(fixture.create).toHaveBeenCalledWith({
+      url: ENTRA_PORTAL_URLS.directoryRole,
+      active: false
+    });
+  });
+
+  test("ignores a recovery session dated implausibly far in the future", async () => {
+    const fixture = createApis();
+    fixture.storageData[PORTAL_RECOVERY_SESSION_KEY] = {
+      version: 1,
+      createdAt: 10 * 60_000,
+      tabsByTarget: { directoryRole: 99 },
+      baselineTokenSignatures: {},
+      deferredTargets: []
+    };
+
+    await expect(getPortalRecoveryStatus(fixture.apis, 1000)).resolves.toEqual({
+      state: "idle",
+      managedTargets: [],
+      interactionTargets: [],
+      grouped: false
+    });
+    expect(fixture.apis.tabs.get).not.toHaveBeenCalled();
+  });
+
   test("releases deferred pages when the leader captures a token without showing a sign-in prompt", async () => {
     const fixture = createApis();
     await openPortalRecoveryTabs(["directoryRole", "pimGroup", "azureRole"], missingTokenStatus(), fixture.apis, 1000);

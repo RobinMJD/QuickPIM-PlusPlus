@@ -3,6 +3,7 @@ import {
   DEFAULT_EXTENSION_DURATION_HOURS,
   buildTrackedRequestExtensionPlan,
   formatExtensionDuration,
+  requireTrackedRequestExtensionRequestId,
   sanitizeExtensionDurationHours
 } from "../src/lib/requestExtension";
 import { createTrackedPimRequest } from "../src/lib/requestTracking";
@@ -64,6 +65,20 @@ describe("tracked PIM request extension", () => {
     expect(sanitizeExtensionDurationHours(3)).toBe(0.5);
     expect(formatExtensionDuration(0.5)).toBe("30 minutes");
     expect(formatExtensionDuration(1)).toBe("1 hour");
+  });
+
+  test("does not leave an accepted extension permanently queued without a tracking id", () => {
+    expect(requireTrackedRequestExtensionRequestId({
+      itemId: "directoryRole:global-reader:/",
+      itemName: "Global Reader",
+      success: true,
+      requestId: " request-123 "
+    })).toBe("request-123");
+    expect(() => requireTrackedRequestExtensionRequestId({
+      itemId: "directoryRole:global-reader:/",
+      itemName: "Global Reader",
+      success: true
+    })).toThrow(/did not return a tracking identifier/i);
   });
 
   test("queues the continuation one second after expiry and caps it to role policy", () => {

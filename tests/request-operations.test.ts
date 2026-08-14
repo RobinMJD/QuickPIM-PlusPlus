@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   REQUEST_OPERATIONS_SESSION_KEY,
+  REQUEST_OPERATION_RECONCILIATION_GRACE_MS,
   REQUEST_OPERATION_TTL_MS,
   beginRequestOperation,
   completeRequestOperation,
@@ -8,12 +9,60 @@ import {
   failRequestOperation,
   getRequestOperationFingerprint,
   loadRequestOperations,
-  sanitizeRequestOperations
+  sanitizeRequestOperations,
+  trackedRequestMatchesOperation,
+  touchRequestOperation
 } from "../src/lib/requestOperations";
 
 const NOW = Date.parse("2026-07-22T10:00:00.000Z");
 
 describe("background request operation journal", () => {
+  test("correlates recovered Microsoft requests by operation id and bounds legacy matches", () => {
+    const operation = {
+      id: "request_operation_recovery",
+      action: "activate" as const,
+      itemIds: ["pimGroup:group-1:member"],
+      targets: ["pimGroup" as const],
+      state: "running" as const,
+      startedAt: NOW,
+      updatedAt: NOW + 60_000,
+      durationHours: 2,
+      justification: "Approved change",
+      ticketInfo: { ticketSystem: "ServiceNow", ticketNumber: "CHG-123" }
+    };
+    const request = {
+      id: "pimGroup:microsoft-request",
+      requestId: "microsoft-request",
+      operationId: operation.id,
+      action: "activate" as const,
+      itemId: "pimGroup:group-1:member",
+      itemName: "Group 1",
+      itemType: "pimGroup" as const,
+      principalId: "principal-1",
+      status: "submitted" as const,
+      requestedAt: new Date(NOW + 10_000).toISOString(),
+      updatedAt: new Date(NOW + 10_000).toISOString(),
+      durationHours: 2,
+      justification: "Approved change",
+      ticketSystem: "ServiceNow",
+      ticketNumber: "CHG-123",
+      checkCount: 0
+    };
+
+    expect(trackedRequestMatchesOperation(request, operation)).toBe(true);
+    expect(trackedRequestMatchesOperation({ ...request, operationId: "another_operation" }, operation)).toBe(false);
+    expect(trackedRequestMatchesOperation({
+      ...request,
+      operationId: undefined,
+      requestedAt: new Date(operation.updatedAt + REQUEST_OPERATION_RECONCILIATION_GRACE_MS + 1).toISOString()
+    }, operation)).toBe(false);
+    expect(trackedRequestMatchesOperation({
+      ...request,
+      operationId: undefined,
+      ticketNumber: "CHG-999"
+    }, operation)).toBe(false);
+  });
+
   test("matches safe retries but distinguishes reused IDs with different work", () => {
     const original = {
       id: "request_operation_identity",
@@ -42,6 +91,33 @@ describe("background request operation journal", () => {
     expect(getRequestOperationFingerprint({ ...original, ticketInfo: {} })).toBe(
       getRequestOperationFingerprint(original)
     );
+    expect(getRequestOperationFingerprint({
+      ...original,
+      itemIds: original.itemIds.map((itemId) => itemId.toUpperCase())
+    })).toBe(getRequestOperationFingerprint(original));
+  });
+
+  test("does not let a late heartbeat revert a completed operation", async () => {
+    const data: Record<string, unknown> = {};
+    const storage = makeStorage(data);
+    await beginRequestOperation({
+      id: "request_operation_heartbeat",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      startedAt: NOW
+    }, { storage, now: NOW });
+    await completeRequestOperation("request_operation_heartbeat", {
+      success: true,
+      results: [{ itemId: "directoryRole:reader:/", itemName: "Reader", success: true }],
+      errors: []
+    }, { storage, now: NOW + 1_000 });
+
+    await touchRequestOperation("request_operation_heartbeat", { storage, now: NOW + 2_000 });
+
+    expect(await loadRequestOperations({ storage, now: NOW + 2_000 })).toEqual([
+      expect.objectContaining({ state: "complete", updatedAt: NOW + 1_000 })
+    ]);
   });
 
   test("persists a running request and its completed response until the popup acknowledges it", async () => {

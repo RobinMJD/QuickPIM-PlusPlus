@@ -13,6 +13,7 @@ import type {
   TokenStatus,
   TokenStatusEntry
 } from "./types";
+import { normalizeActivationItemId } from "./activationIdentity";
 export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
@@ -167,21 +168,23 @@ export function getRemainingSelectedIdsAfterActivationResults(
   selectedIds: Iterable<string>,
   results: ActivationResult[]
 ): Set<string> {
-  const successfulIds = new Set(results.filter((result) => result.success).map((result) => result.itemId));
-  return new Set([...selectedIds].filter((itemId) => !successfulIds.has(itemId)));
+  const successfulIds = new Set(results
+    .filter((result) => result.success)
+    .map((result) => normalizeActivationItemId(result.itemId)));
+  return new Set([...selectedIds].filter((itemId) => !successfulIds.has(normalizeActivationItemId(itemId))));
 }
 
 export function getRequestReconciliationTargets(
   results: ActivationResult[],
   items: ActivationItem[]
 ): AccessSetupTarget[] {
-  const itemTargets = new Map(items.map((item) => [item.id, item.type]));
+  const itemTargets = new Map(items.map((item) => [normalizeActivationItemId(item.id), item.type]));
   const requested = new Set<AccessSetupTarget>();
   for (const result of results) {
     if (!result.success && !result.outcomeUnknown) {
       continue;
     }
-    const target = itemTargets.get(result.itemId);
+    const target = itemTargets.get(normalizeActivationItemId(result.itemId));
     if (target) {
       requested.add(target);
     }

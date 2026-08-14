@@ -11,29 +11,31 @@ import {
 
 describe("shared Chromium Store packaging", () => {
   test("uses one neutral package for Chrome and Edge", () => {
-    const path = getStorePackagePath("2.16.5", "release");
-    const paths = getStorePackagePaths("2.16.5", "release");
-    expect(path).toMatch(/quickpim-plusplus-v2\.16\.5-chromium-stores\.zip$/);
+    const version = "9.8.7";
+    const path = getStorePackagePath(version, "release");
+    const paths = getStorePackagePaths(version, "release");
+    expect(path).toMatch(/quickpim-plusplus-v9\.8\.7-chromium-stores\.zip$/);
     expect(paths).toEqual({ shared: path, chrome: path, edge: path });
     expect(STORE_PACKAGE_SUFFIX).toBe("chromium-stores");
   });
 
   test("writes one archive and removes same-version legacy duplicates", () => {
+    const version = "9.8.7";
     const root = mkdtempSync(join(tmpdir(), "quickpim-store-package-"));
     const distDir = join(root, "dist");
     const releaseDir = join(root, "release");
     mkdirSync(distDir);
     mkdirSync(releaseDir);
-    writeFileSync(join(distDir, "manifest.json"), JSON.stringify({ manifest_version: 3, version: "2.16.5" }));
+    writeFileSync(join(distDir, "manifest.json"), JSON.stringify({ manifest_version: 3, version }));
     writeFileSync(join(distDir, "popup.html"), "<!doctype html>");
-    const legacyChrome = join(releaseDir, "quickpim-plusplus-v2.16.5-chrome-webstore.zip");
-    const legacyEdge = join(releaseDir, "quickpim-plusplus-v2.16.5-edge-addons.zip");
+    const legacyChrome = join(releaseDir, `quickpim-plusplus-v${version}-chrome-webstore.zip`);
+    const legacyEdge = join(releaseDir, `quickpim-plusplus-v${version}-edge-addons.zip`);
     writeFileSync(legacyChrome, "stale");
     writeFileSync(legacyEdge, "stale");
 
     try {
-      const paths = packageStores({ distDir, releaseDir, version: "2.16.5" });
-      expect(readdirSync(releaseDir)).toEqual(["quickpim-plusplus-v2.16.5-chromium-stores.zip"]);
+      const paths = packageStores({ distDir, releaseDir, version });
+      expect(readdirSync(releaseDir)).toEqual([`quickpim-plusplus-v${version}-chromium-stores.zip`]);
       expect(existsSync(paths.shared)).toBe(true);
       expect(paths.chrome).toBe(paths.shared);
       expect(paths.edge).toBe(paths.shared);

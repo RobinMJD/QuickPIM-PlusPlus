@@ -21,6 +21,7 @@ export interface SupportReportInput {
   trackedRequests: TrackedPimRequestStore;
   distribution?: ExtensionDistributionInfo | null;
   browserSync?: BrowserSyncStatus | null;
+  notificationPermissionGranted?: boolean;
   userAgent?: string;
   now?: Date;
 }
@@ -65,6 +66,8 @@ export function buildSupportReport(input: SupportReportInput): Record<string, un
       darkMode: input.settings.preferences.darkMode,
       backgroundPreRefreshEnabled: input.settings.preferences.backgroundPreRefreshEnabled,
       requestNotificationsEnabled: input.settings.preferences.requestNotificationsEnabled,
+      notificationPermissionGranted: input.notificationPermissionGranted,
+      notificationDeliveryReady: input.settings.preferences.requestNotificationsEnabled && input.notificationPermissionGranted === true,
       showAssignedRoles: input.settings.preferences.showAssignedRoles,
       counts: {
         aliases: Object.keys(input.settings.aliasesByItemId).length,
