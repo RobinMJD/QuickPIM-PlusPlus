@@ -1,4 +1,5 @@
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
+import { normalizeActivationItemId } from "./activationIdentity";
 import type { AccessSetupTarget, ActivationResponse } from "./types";
 
 export function getAccessRecoveryTargets(response: ActivationResponse): AccessSetupTarget[] {
@@ -30,8 +31,8 @@ export function mergeRetriedActivationResponse(
   initialResponse: ActivationResponse,
   retryResponse: ActivationResponse
 ): ActivationResponse {
-  const retryResults = new Map(retryResponse.results.map((result) => [result.itemId, result]));
-  const results = initialResponse.results.map((result) => retryResults.get(result.itemId) || result);
+  const retryResults = new Map(retryResponse.results.map((result) => [normalizeActivationItemId(result.itemId), result]));
+  const results = initialResponse.results.map((result) => retryResults.get(normalizeActivationItemId(result.itemId)) || result);
   const errors = results.filter((result) => !result.success);
   return {
     success: errors.length === 0,

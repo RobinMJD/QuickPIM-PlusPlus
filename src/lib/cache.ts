@@ -25,6 +25,8 @@ const MAX_CACHE_INPUT_ITEMS = MAX_CACHE_ITEMS * 4;
 const MAX_CACHE_INPUT_ERRORS = MAX_CACHE_ERRORS * 4;
 const MAX_CACHE_INPUT_DIAGNOSTICS = MAX_CACHE_DIAGNOSTICS * 4;
 const MAX_CACHE_STRING_LENGTH = 512;
+const MAX_CACHE_IDENTITY_LENGTH = 4_096;
+const MAX_CACHE_KEY_LENGTH = 8_192;
 const MAX_CACHE_ERROR_LENGTH = 500;
 const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
@@ -65,12 +67,34 @@ export function isCacheEntryFresh(
   cacheKey?: string
 ): entry is CachedActivationEntry {
   const age = entry ? now - entry.fetchedAt : Number.POSITIVE_INFINITY;
+  const latestAttemptFailed = Boolean(
+    entry?.errors.length
+    && entry.refreshStartedAt !== undefined
+    && entry.refreshStartedAt >= entry.fetchedAt
+  );
   return Boolean(
     entry &&
       Number.isFinite(entry.fetchedAt) &&
       age >= -5 * 60 * 1000 &&
       age < ttlMs &&
+      !latestAttemptFailed &&
       (cacheKey === undefined || entry.cacheKey === cacheKey)
+  );
+}
+
+function isCacheSnapshotUsable(
+  entry: CachedActivationEntry | undefined,
+  ttlMs: number,
+  now: number,
+  cacheKey?: string
+): entry is CachedActivationEntry {
+  const age = entry ? now - entry.fetchedAt : Number.POSITIVE_INFINITY;
+  return Boolean(
+    entry
+    && Number.isFinite(entry.fetchedAt)
+    && age >= -5 * 60 * 1000
+    && age < ttlMs
+    && (cacheKey === undefined || entry.cacheKey === cacheKey)
   );
 }
 
@@ -112,6 +136,7 @@ export function mergeDataCachesForSave(current: QuickPimDataCache, incoming: Qui
   const safeCurrent = sanitizeDataCache(current);
   const safeIncoming = sanitizeDataCache(incoming);
   return {
+    version: 2,
     eligible: chooseCacheEntry(safeCurrent.eligible, safeIncoming.eligible),
     active: chooseCacheEntry(safeCurrent.active, safeIncoming.active),
     eligibleByTarget: mergeTargetCache(safeCurrent.eligibleByTarget, safeIncoming.eligibleByTarget),
@@ -126,6 +151,7 @@ export function sanitizeDataCache(value: unknown, now = Date.now()): QuickPimDat
   const eligibleByTarget = sanitizeTargetCache(value.eligibleByTarget, now);
   const activeByTarget = sanitizeTargetCache(value.activeByTarget, now);
   return {
+    version: 2,
     ...(eligible ? { eligible } : {}),
     ...(active ? { active } : {}),
     ...(eligibleByTarget ? { eligibleByTarget } : {}),
@@ -233,7 +259,7 @@ export function getTargetCacheStatus(options: {
   const usableTtlMs = options.usableTtlMs ?? options.freshTtlMs;
   const entry = getTargetEntry(options.cache, options.bucket, options.target);
   const exactEntry = entry;
-  if (isCacheEntryFresh(exactEntry, usableTtlMs, now, options.cacheKey)) {
+  if (isCacheSnapshotUsable(exactEntry, usableTtlMs, now, options.cacheKey)) {
     return {
       target: options.target,
       entry: markDiagnosticsFromCache({ ...exactEntry, errors: [] }, true),
@@ -245,7 +271,7 @@ export function getTargetCacheStatus(options: {
   if (
     entry
     && options.compatibleCacheKey?.(entry.cacheKey)
-    && isCacheEntryFresh(entry, usableTtlMs, now)
+    && isCacheSnapshotUsable(entry, usableTtlMs, now)
   ) {
     return {
       target: options.target,
@@ -258,7 +284,7 @@ export function getTargetCacheStatus(options: {
   }
 
   const legacyEntry = getLegacyTargetEntry(options.cache, options.bucket, options.target);
-  if (isCacheEntryFresh(legacyEntry, usableTtlMs, now, options.legacyCacheKey)) {
+  if (isCacheSnapshotUsable(legacyEntry, usableTtlMs, now, options.legacyCacheKey)) {
     return {
       target: options.target,
       entry: markDiagnosticsFromCache({ ...legacyEntry, errors: [] }, true),
@@ -277,7 +303,11 @@ export function mergeTargetEntries(entries: Array<CachedActivationEntry | undefi
     errors: present.flatMap((entry) => entry.errors || []),
     diagnostics: present.flatMap((entry) => entry.diagnostics || []),
     fetchedAt: present.length ? Math.max(...present.map((entry) => entry.fetchedAt)) : fetchedAt,
-    cacheKey
+    cacheKey,
+    ...(present.some((entry) => entry.truncated) ? { truncated: true } : {}),
+    ...(present.some((entry) => entry.totalItems !== undefined)
+      ? { totalItems: present.reduce((total, entry) => total + (entry.totalItems ?? entry.items.length), 0) }
+      : {})
   };
 }
 
@@ -338,7 +368,8 @@ export function updateCacheFromTargetResults(
       nextByTarget[target] = {
         ...previous,
         errors: result.errors || [],
-        diagnostics: mergeDiagnostics(previous.diagnostics, diagnostics)
+        diagnostics: mergeDiagnostics(previous.diagnostics, diagnostics),
+        refreshStartedAt
       };
       continue;
     }
@@ -503,7 +534,8 @@ function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | 
   if (fetchedAt === undefined || fetchedAt > now + MAX_FUTURE_CLOCK_SKEW_MS) return undefined;
 
   const seen = new Set<string>();
-  const items = value.items.slice(0, MAX_CACHE_INPUT_ITEMS).flatMap((candidate) => {
+  const inputItems = value.items.slice(0, MAX_CACHE_INPUT_ITEMS);
+  const items = inputItems.flatMap((candidate) => {
     const item = sanitizeCachedActivationItem(candidate);
     if (!item || (expectedTarget && item.type !== expectedTarget)) return [];
     const key = item.id.toLowerCase();
@@ -515,29 +547,38 @@ function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | 
     ? value.errors.slice(0, MAX_CACHE_INPUT_ERRORS).flatMap((error) => sanitizeOptionalString(error, MAX_CACHE_ERROR_LENGTH) || []).slice(0, MAX_CACHE_ERRORS)
     : [];
   const diagnostics = Array.isArray(value.diagnostics)
-    ? value.diagnostics.slice(-MAX_CACHE_INPUT_DIAGNOSTICS).flatMap((diagnostic) => sanitizeDiagnostic(diagnostic) || []).slice(-MAX_CACHE_DIAGNOSTICS)
+    ? value.diagnostics.slice(-MAX_CACHE_INPUT_DIAGNOSTICS).flatMap((diagnostic) => sanitizeDiagnostic(diagnostic, now) || []).slice(-MAX_CACHE_DIAGNOSTICS)
     : undefined;
   const rawRefreshStartedAt = getFiniteTimestamp(typeof value.refreshStartedAt === "number" ? value.refreshStartedAt : undefined);
   const refreshStartedAt = rawRefreshStartedAt !== undefined && rawRefreshStartedAt <= now + MAX_FUTURE_CLOCK_SKEW_MS
     ? rawRefreshStartedAt
     : undefined;
-  const cacheKey = sanitizeOptionalString(value.cacheKey, 1_024);
+  const cacheKey = sanitizeIdentityString(value.cacheKey, MAX_CACHE_KEY_LENGTH);
+  const sourceTotalItems = Number(value.totalItems);
+  const totalItems = Number.isSafeInteger(sourceTotalItems) && sourceTotalItems >= items.length
+    ? sourceTotalItems
+    : value.items.length;
+  const truncated = value.truncated === true || value.items.length > MAX_CACHE_ITEMS || value.items.length > MAX_CACHE_INPUT_ITEMS;
+  const boundedErrors = truncated
+    ? [...errors, `Cached role data is incomplete: showing ${items.length} of at least ${totalItems} items.`].slice(-MAX_CACHE_ERRORS)
+    : errors;
   return {
     items,
-    errors,
+    errors: boundedErrors,
     fetchedAt,
     ...(refreshStartedAt !== undefined ? { refreshStartedAt } : {}),
     ...(cacheKey ? { cacheKey } : {}),
-    ...(diagnostics?.length ? { diagnostics } : {})
+    ...(diagnostics?.length ? { diagnostics } : {}),
+    ...(truncated ? { truncated: true, totalItems } : {})
   };
 }
 
 function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefined {
   if (!isRecord(value) || !ITEM_STATUSES.has(String(value.status))) return undefined;
-  const id = sanitizeRequiredString(value.id);
+  const id = sanitizeIdentityString(value.id);
   const sourceName = sanitizeRequiredString(value.sourceName);
   const displayName = sanitizeRequiredString(value.displayName);
-  const principalId = typeof value.principalId === "string" ? value.principalId.trim().slice(0, MAX_CACHE_STRING_LENGTH) : undefined;
+  const principalId = sanitizeIdentityString(value.principalId, 256);
   const scopeLabel = sanitizeRequiredString(value.scopeLabel);
   if (!id || !sourceName || !displayName || principalId === undefined || !scopeLabel) return undefined;
   const activationPolicyState = value.activationPolicyState === "pending" || value.activationPolicyState === "ready"
@@ -554,20 +595,20 @@ function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefine
     ...(sanitizeOptionalString(value.sourceScopeLabel) ? { sourceScopeLabel: sanitizeOptionalString(value.sourceScopeLabel) } : {}),
     ...(ASSIGNMENT_TYPES.has(String(value.activeAssignmentType)) ? { activeAssignmentType: value.activeAssignmentType as ActivationItem["activeAssignmentType"] } : {}),
     ...(sanitizeTimestamp(value.activeUntil) ? { activeUntil: sanitizeTimestamp(value.activeUntil) } : {}),
-    ...(sanitizeOptionalString(value.assignmentScheduleId) ? { assignmentScheduleId: sanitizeOptionalString(value.assignmentScheduleId) } : {}),
-    ...(sanitizeOptionalString(value.assignmentScheduleInstanceId) ? { assignmentScheduleInstanceId: sanitizeOptionalString(value.assignmentScheduleInstanceId) } : {}),
+    ...(sanitizeIdentityString(value.assignmentScheduleId) ? { assignmentScheduleId: sanitizeIdentityString(value.assignmentScheduleId) } : {}),
+    ...(sanitizeIdentityString(value.assignmentScheduleInstanceId) ? { assignmentScheduleInstanceId: sanitizeIdentityString(value.assignmentScheduleInstanceId) } : {}),
     ...(typeof value.isPrivileged === "boolean" ? { isPrivileged: value.isPrivileged } : {}),
     ...(activationPolicyState ? { activationPolicyState } : {}),
     ...(sanitizeActivationRequirements(value.activationRequirements) ? { activationRequirements: sanitizeActivationRequirements(value.activationRequirements) } : {})
   };
 
   if (value.type === "directoryRole") {
-    const roleDefinitionId = sanitizeRequiredString(value.roleDefinitionId);
-    const directoryScopeId = sanitizeRequiredString(value.directoryScopeId);
+    const roleDefinitionId = sanitizeIdentityString(value.roleDefinitionId);
+    const directoryScopeId = sanitizeIdentityString(value.directoryScopeId);
     return roleDefinitionId && directoryScopeId ? { ...common, type: "directoryRole", roleDefinitionId, directoryScopeId } : undefined;
   }
   if (value.type === "pimGroup") {
-    const groupId = sanitizeRequiredString(value.groupId);
+    const groupId = sanitizeIdentityString(value.groupId);
     if (!groupId || (value.accessId !== "member" && value.accessId !== "owner")) return undefined;
     return {
       ...common,
@@ -578,17 +619,17 @@ function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefine
     };
   }
   if (value.type === "azureRole") {
-    const roleDefinitionId = sanitizeRequiredString(value.roleDefinitionId);
-    const scope = sanitizeRequiredString(value.scope);
+    const roleDefinitionId = sanitizeIdentityString(value.roleDefinitionId);
+    const scope = sanitizeIdentityString(value.scope);
     if (!roleDefinitionId || !scope) return undefined;
     return {
       ...common,
       type: "azureRole",
       roleDefinitionId,
       scope,
-      ...(sanitizeOptionalString(value.subscriptionId) ? { subscriptionId: sanitizeOptionalString(value.subscriptionId) } : {}),
+      ...(sanitizeIdentityString(value.subscriptionId) ? { subscriptionId: sanitizeIdentityString(value.subscriptionId) } : {}),
       ...(sanitizeOptionalString(value.subscriptionName) ? { subscriptionName: sanitizeOptionalString(value.subscriptionName) } : {}),
-      ...(sanitizeOptionalString(value.roleEligibilityScheduleId) ? { roleEligibilityScheduleId: sanitizeOptionalString(value.roleEligibilityScheduleId) } : {})
+      ...(sanitizeIdentityString(value.roleEligibilityScheduleId) ? { roleEligibilityScheduleId: sanitizeIdentityString(value.roleEligibilityScheduleId) } : {})
     };
   }
   return undefined;
@@ -606,10 +647,11 @@ function sanitizeActivationRequirements(value: unknown): ActivationItem["activat
   return Object.keys(result).length ? result : undefined;
 }
 
-function sanitizeDiagnostic(value: unknown): AccessDiagnostic | undefined {
+function sanitizeDiagnostic(value: unknown, now: number): AccessDiagnostic | undefined {
   if (!isRecord(value) || !CACHE_TARGETS.includes(value.target as AccessSetupTarget) || typeof value.success !== "boolean") return undefined;
   const checkedAt = sanitizeTimestamp(value.checkedAt);
   if (!checkedAt) return undefined;
+  if (Date.parse(checkedAt) > now + MAX_FUTURE_CLOCK_SKEW_MS) return undefined;
   const operation = DIAGNOSTIC_OPERATIONS.has(value.operation as AccessDiagnosticOperation)
     ? value.operation as AccessDiagnosticOperation
     : undefined;
@@ -636,6 +678,12 @@ function sanitizeTimestamp(value: unknown): string | undefined {
 
 function sanitizeRequiredString(value: unknown): string | undefined {
   return sanitizeOptionalString(value, MAX_CACHE_STRING_LENGTH);
+}
+
+function sanitizeIdentityString(value: unknown, maxLength = MAX_CACHE_IDENTITY_LENGTH): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= maxLength ? trimmed : undefined;
 }
 
 function sanitizeOptionalString(value: unknown, maxLength = MAX_CACHE_STRING_LENGTH): string | undefined {

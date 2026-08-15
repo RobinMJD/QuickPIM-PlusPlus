@@ -6,6 +6,7 @@ import {
   BROWSER_SYNC_KEY_PREFIX,
   BROWSER_SYNC_LOCAL_STATE_KEY,
   BROWSER_SYNC_MANIFEST_KEY,
+  BROWSER_SYNC_PENDING_PURGE_KEY,
   BROWSER_SYNC_PURGE_KEY,
   BROWSER_SYNC_REMINDER_INTERVAL_MS,
   BROWSER_SYNC_VERIFICATION_FRESHNESS_MS,
@@ -18,6 +19,7 @@ import {
   isBrowserSyncPayloadStorageKey,
   markBrowserSyncReminderShown,
   purgeBrowserSyncData,
+  queueBrowserSyncPurgeRetry,
   renameBrowserSyncDevice,
   sanitizeBrowserSyncSnapshot,
   setBrowserSyncEnabled,
@@ -72,6 +74,15 @@ class CountingStorage extends MemoryStorage {
     if (Object.keys(items).some((key) => key.startsWith("quickPimSync.device.v1."))) {
       this.deviceWrites += 1;
     }
+    await super.set(items);
+  }
+}
+
+class WriteCountingStorage extends MemoryStorage {
+  writes = 0;
+
+  override async set(items: Record<string, unknown>): Promise<void> {
+    this.writes += 1;
     await super.set(items);
   }
 }
@@ -406,7 +417,7 @@ describe("native browser sync", () => {
     }
   });
 
-  test("removes superseded atomic generations before a reconciliation write", async () => {
+  test("removes only aged superseded generations before a reconciliation write", async () => {
     const sync = new QuotaStorage();
     const settings = structuredClone(DEFAULT_SETTINGS);
     settings.activityHistory = Array.from({ length: 100 }, (_, index) => ({
@@ -424,7 +435,8 @@ describe("native browser sync", () => {
 
     const manifest = sync.data[BROWSER_SYNC_MANIFEST_KEY] as { generation: string };
     const currentPrefix = `quickPimSync.chunk.v1.${manifest.generation}.`;
-    const orphanGeneration = `${(900).toString(36)}-a1-orphan-device`;
+    const reconciliationNow = 200_000_000;
+    const orphanGeneration = `${(reconciliationNow - 48 * 60 * 60_000 - 1).toString(36)}-a1-orphan-device`;
     const orphanChunks = Object.fromEntries(Object.entries(sync.data).flatMap(([key, value]) =>
       key.startsWith(currentPrefix)
         ? [[key.replace(manifest.generation, orphanGeneration), value] as const]
@@ -436,7 +448,7 @@ describe("native browser sync", () => {
       ...current,
       aliasesByItemId: { ...current.aliasesByItemId, "directoryRole:orphan:/": "Reconciled" }
     }));
-    const status = await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: 2_000, platform: "Windows" });
+    const status = await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: reconciliationNow, platform: "Windows" });
 
     expect(status.lastError).toBeUndefined();
     expect(Object.keys(sync.data).some((key) => key.includes(orphanGeneration))).toBe(false);
@@ -858,6 +870,25 @@ describe("native browser sync", () => {
     expect(completeLocalCopy.activityHistory[0]?.id).toBe("activity-99");
   });
 
+  test("omits an oversized alias category instead of failing every sync run", async () => {
+    const sync = new QuotaStorage();
+    const settings = structuredClone(DEFAULT_SETTINGS);
+    settings.aliasesByItemId = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [
+      `directoryRole:${index}:${"scope".repeat(12)}`,
+      `Long but valid alias ${index} ${"x".repeat(95)}`
+    ]));
+    const local = new MemoryStorage({ [SETTINGS_KEY]: settings });
+
+    const first = await synchronizeBrowserData({ local, sync, distribution: edgeStore, now: 1_000, platform: "Windows" });
+    const second = await synchronizeBrowserData({ local, sync, distribution: edgeStore, now: 2_000, platform: "Windows" });
+    const preserved = (await local.get(SETTINGS_KEY))[SETTINGS_KEY] as QuickPimSettings;
+
+    expect(first.lastError).toBeUndefined();
+    expect(second.lastError).toBeUndefined();
+    expect(first.omittedCategories).toContain("aliasesByItemId");
+    expect(preserved.aliasesByItemId).toHaveProperty(`directoryRole:299:${"scope".repeat(12)}`);
+  });
+
   test("keeps a new concurrent activity event when another installation clears earlier history", async () => {
     const sync = new MemoryStorage();
     const base = structuredClone(DEFAULT_SETTINGS);
@@ -897,7 +928,7 @@ describe("native browser sync", () => {
     expect(merged.activityHistory.map((entry) => entry.id)).toEqual(["new-event"]);
   });
 
-  test("removes only the prior committed chunk generation and preserves a concurrent upload", async () => {
+  test("retains recent prior chunks and preserves a concurrent upload until the cleanup grace period", async () => {
     const sync = new MemoryStorage();
     const local = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
     await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: 1_000, platform: "Windows" });
@@ -910,7 +941,7 @@ describe("native browser sync", () => {
     await local.set({ [SETTINGS_KEY]: edited });
     await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: 2_000, platform: "Windows" });
 
-    expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${firstGeneration}.`))).toBe(false);
+    expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${firstGeneration}.`))).toBe(true);
     expect(sync.data[concurrentChunkKey]).toBe("pending");
     const currentGeneration = (sync.data[BROWSER_SYNC_MANIFEST_KEY] as { generation: string }).generation;
     expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${currentGeneration}.`))).toBe(true);
@@ -1198,6 +1229,33 @@ describe("native browser sync", () => {
     ].sort());
   });
 
+  test("blocks stale cloud restoration while a reset purge is pending and retries it later", async () => {
+    const sync = new ToggleFailingStorage();
+    const sourceLocal = new MemoryStorage({
+      [SETTINGS_KEY]: { ...structuredClone(DEFAULT_SETTINGS), savedJustifications: ["Stale cloud reason"] }
+    });
+    await synchronizeBrowserData({ local: sourceLocal, sync, distribution: edgeStore, now: 1_000, platform: "Windows" });
+
+    const resetLocal = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
+    await queueBrowserSyncPurgeRetry(resetLocal, new Error("sync unavailable"), 2_000);
+    sync.failReads = true;
+
+    const interrupted = await synchronizeBrowserData({ local: resetLocal, sync, distribution: edgeStore, now: 3_000, platform: "macOS" });
+    expect(interrupted.lastError).toMatch(/still needs deletion/i);
+    expect(resetLocal.data[BROWSER_SYNC_PENDING_PURGE_KEY]).toBeDefined();
+    expect((resetLocal.data[SETTINGS_KEY] as QuickPimSettings).savedJustifications).toEqual([]);
+
+    sync.failReads = false;
+    const recovered = await synchronizeBrowserData({ local: resetLocal, sync, distribution: edgeStore, now: 4_000, platform: "macOS" });
+    expect(recovered.enabled).toBe(false);
+    expect(resetLocal.data[BROWSER_SYNC_PENDING_PURGE_KEY]).toBeUndefined();
+    expect((resetLocal.data[SETTINGS_KEY] as QuickPimSettings).savedJustifications).toEqual([]);
+    expect(Object.keys(sync.data).filter((key) => key.startsWith(BROWSER_SYNC_KEY_PREFIX)).sort()).toEqual([
+      BROWSER_SYNC_CONTROL_KEY,
+      BROWSER_SYNC_PURGE_KEY
+    ].sort());
+  });
+
   test("advances the purge marker monotonically when this computer's clock is behind", async () => {
     const sync = new MemoryStorage({
       [BROWSER_SYNC_CONTROL_KEY]: { version: 1, purgedAt: 10_000, epochAt: 12_000 }
@@ -1447,6 +1505,46 @@ describe("native browser sync", () => {
     const status = await getBrowserSyncStatus({ local, sync, distribution: edgeStore, now, platform: "macOS" });
     expect(status.devices).toEqual([]);
     expect(status.crossDeviceState).toBe("waiting");
+  });
+
+  test("clamps plausible future device timestamps to the local observation time", async () => {
+    const now = 1_000_000;
+    const sync = new MemoryStorage({
+      "quickPimSync.device.v1.skewed-device": {
+        installationId: "skewed-device",
+        name: "Clock-skewed device",
+        browser: "Microsoft Edge",
+        platform: "Windows",
+        appVersion: "2.18.0",
+        lastSyncAt: now + 60_000,
+        syncEnabled: true,
+        nameUpdatedAt: now + 60_000
+      }
+    });
+    const local = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
+
+    const status = await getBrowserSyncStatus({ local, sync, distribution: edgeStore, now, platform: "macOS" });
+
+    expect(status.devices[0]).toMatchObject({ lastSyncAt: now, nameUpdatedAt: now });
+  });
+
+  test("does not rewrite existing local sync state while rendering status", async () => {
+    const local = new WriteCountingStorage({
+      [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS),
+      [BROWSER_SYNC_LOCAL_STATE_KEY]: {
+        version: 1,
+        enabled: true,
+        installationId: "existing-installation",
+        deviceName: "Admin workstation",
+        legacyNoise: "retained until a mutating sync pass"
+      }
+    });
+    const sync = new MemoryStorage();
+
+    const status = await getBrowserSyncStatus({ local, sync, distribution: edgeStore, now: 1_000, platform: "Windows" });
+
+    expect(status.installationId).toBe("existing-installation");
+    expect(local.writes).toBe(0);
   });
 
   test("migrates the legacy device registry before removing its aggregate key", async () => {

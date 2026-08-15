@@ -1,10 +1,12 @@
-import type { AccessSetupTarget, ActivationItem, TicketInfo } from "./types";
+import type { AccessSetupTarget, ActivationItem, QuickPimSettings, TicketInfo, TrackedPimRequestStore } from "./types";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { getActivationItemIdentity } from "./activationIdentity";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "./justifications";
 
 export type QuickPimMessage =
   | { action: "getTokenStatus" }
+  | { action: "getSettingsSnapshot" }
+  | { action: "compareAndSetSettings"; expectedRevision: number; settings: QuickPimSettings }
   | { action: "getBrowserSyncStatus" }
   | { action: "getBrowserSyncPopupStatus" }
   | { action: "syncBrowserData" }
@@ -25,6 +27,9 @@ export type QuickPimMessage =
   | { action: "getActivationSnapshot"; targets?: AccessSetupTarget[]; detail?: "core" | "full" }
   | { action: "enrichActivationPolicies"; items: ActivationItem[] }
   | { action: "refreshTrackedRequests"; requestIds?: string[] }
+  | { action: "clearTrackedRequests" }
+  | { action: "restoreTrackedRequests"; store: TrackedPimRequestStore }
+  | { action: "restoreSettingsBackup"; settings: QuickPimSettings; store: TrackedPimRequestStore }
   | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
   | { action: "dismissRequestOperations"; operationIds: string[] }
@@ -48,6 +53,7 @@ export type QuickPimMessage =
 
 const SIMPLE_ACTIONS = new Set([
   "getTokenStatus",
+  "getSettingsSnapshot",
   "getBrowserSyncStatus",
   "getBrowserSyncPopupStatus",
   "syncBrowserData",
@@ -57,7 +63,8 @@ const SIMPLE_ACTIONS = new Set([
   "focusPortalRecoveryTabs",
   "clearToken",
   "resetExtensionData",
-  "getRequestOperations"
+  "getRequestOperations",
+  "clearTrackedRequests"
 ]);
 const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", "getActivationSnapshot"]);
 const MAX_PORTAL_TOKEN_INPUTS = 200;
@@ -72,6 +79,7 @@ const MAX_TICKET_FIELD_LENGTH = 128;
 const MAX_REQUEST_IDS = 100;
 const MAX_REQUEST_ID_LENGTH = 512;
 const MAX_BUNDLE_NAME_LENGTH = 80;
+const MAX_SETTINGS_MESSAGE_LENGTH = 1024 * 1024;
 
 export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (!isRecord(message) || typeof message.action !== "string") {
@@ -90,6 +98,29 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
         ? { detail: message.detail }
         : {})
     } as QuickPimMessage;
+  }
+
+  if (message.action === "compareAndSetSettings") {
+    if (!Number.isSafeInteger(message.expectedRevision) || Number(message.expectedRevision) < 0) {
+      throw new Error("Settings revision is invalid.");
+    }
+    if (!isRecord(message.settings)) {
+      throw new Error("Settings payload is invalid.");
+    }
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(message.settings);
+    } catch {
+      throw new Error("Settings payload is invalid.");
+    }
+    if (serialized.length > MAX_SETTINGS_MESSAGE_LENGTH) {
+      throw new Error("Settings payload is too large.");
+    }
+    return {
+      action: "compareAndSetSettings",
+      expectedRevision: Number(message.expectedRevision),
+      settings: message.settings as unknown as QuickPimSettings
+    };
   }
 
   if (message.action === "setBrowserSyncEnabled") {
@@ -157,6 +188,42 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     };
   }
 
+  if (message.action === "restoreTrackedRequests") {
+    if (!isRecord(message.store)) {
+      throw new Error("Tracked request backup is invalid.");
+    }
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(message.store);
+    } catch {
+      throw new Error("Tracked request backup is invalid.");
+    }
+    if (serialized.length > MAX_SETTINGS_MESSAGE_LENGTH) {
+      throw new Error("Tracked request backup is too large.");
+    }
+    return { action: "restoreTrackedRequests", store: message.store as unknown as TrackedPimRequestStore };
+  }
+
+  if (message.action === "restoreSettingsBackup") {
+    if (!isRecord(message.settings) || !isRecord(message.store)) {
+      throw new Error("Settings backup payload is invalid.");
+    }
+    let serialized = "";
+    try {
+      serialized = JSON.stringify({ settings: message.settings, store: message.store });
+    } catch {
+      throw new Error("Settings backup payload is invalid.");
+    }
+    if (serialized.length > MAX_SETTINGS_MESSAGE_LENGTH) {
+      throw new Error("Settings backup payload is too large.");
+    }
+    return {
+      action: "restoreSettingsBackup",
+      settings: message.settings as unknown as QuickPimSettings,
+      store: message.store as unknown as TrackedPimRequestStore
+    };
+  }
+
   if (message.action === "extendTrackedRequest") {
     const requestId = sanitizeSingleRequestId(message.requestId);
     return { action: "extendTrackedRequest", requestId };
@@ -192,6 +259,8 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   const expectedStatus = message.action === "activateItems" ? "eligible" : "active";
   const items = message.items.map((item) => validateActivationItem(item, expectedStatus));
   assertUniqueActivationItems(items);
+  assertSingleTenant(items);
+  assertSinglePrincipal(items);
   const operationId = sanitizeOperationId(message.operationId);
 
   if (message.action === "deactivateItems") {
@@ -202,11 +271,14 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
       throw new Error("Deactivation justification must be text.");
     }
 
+    const justification = typeof message.justification === "string" ? message.justification : "";
+    const ticketInfo = validateTicketInfo(message.ticketInfo);
+    assertPolicyRequirements(items, justification, ticketInfo);
     return {
       action: "deactivateItems",
       items,
-      justification: typeof message.justification === "string" ? message.justification : undefined,
-      ticketInfo: validateTicketInfo(message.ticketInfo),
+      justification: justification || undefined,
+      ticketInfo,
       operationId
     };
   }
@@ -236,12 +308,14 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     throw new Error("Activation justification is required.");
   }
 
+  const ticketInfo = validateTicketInfo(message.ticketInfo);
+  assertPolicyRequirements(items, message.justification, ticketInfo);
   return {
     action: "activateItems",
     items,
     durationHours,
     justification: message.justification,
-    ticketInfo: validateTicketInfo(message.ticketInfo),
+    ticketInfo,
     bundleName: typeof message.bundleName === "string" ? message.bundleName.trim().slice(0, MAX_BUNDLE_NAME_LENGTH) || undefined : undefined,
     operationId
   };
@@ -277,12 +351,41 @@ function assertUniqueActivationItems(items: ActivationItem[]): void {
   }
 }
 
+function assertSingleTenant(items: ActivationItem[]): void {
+  const tenantIds = items.map((item) => item.tenantId?.trim().toLowerCase()).filter(Boolean) as string[];
+  if (tenantIds.length !== items.length || new Set(tenantIds).size !== 1) {
+    throw new Error("Every activation item must belong to the same known Microsoft tenant.");
+  }
+}
+
+function assertSinglePrincipal(items: ActivationItem[]): void {
+  const principalIds = items.map((item) => item.principalId.trim().toLowerCase());
+  if (new Set(principalIds).size !== 1) {
+    throw new Error("One activation request cannot contain items for multiple Microsoft principals.");
+  }
+}
+
+function assertPolicyRequirements(items: ActivationItem[], justification: string, ticketInfo: TicketInfo | undefined): void {
+  if (items.some((item) => item.activationRequirements?.justification) && !justification.trim()) {
+    throw new Error("A justification is required by at least one selected role policy.");
+  }
+  if (
+    items.some((item) => item.activationRequirements?.ticket)
+    && (!ticketInfo?.ticketSystem?.trim() || !ticketInfo.ticketNumber?.trim())
+  ) {
+    throw new Error("Ticket system and ticket number are required by at least one selected role policy.");
+  }
+}
+
 function validateActivationItem(value: unknown, expectedStatus: ActivationItem["status"]): ActivationItem {
   if (!isRecord(value) || !isBoundedString(value.id) || !isBoundedString(value.principalId) || value.status !== expectedStatus) {
     throw new Error(`Activation items must be valid ${expectedStatus} items.`);
   }
   if (value.activeAssignmentType !== undefined && value.activeAssignmentType !== "activated" && value.activeAssignmentType !== "assigned" && value.activeAssignmentType !== "unknown") {
     throw new Error("Activation assignment type is invalid.");
+  }
+  if (value.tenantId !== undefined && (!isBoundedString(value.tenantId) || !/^[a-zA-Z0-9-]{1,128}$/.test(value.tenantId))) {
+    throw new Error("Activation item tenant identifier is invalid.");
   }
   if (value.type === "directoryRole") {
     if (!isBoundedString(value.roleDefinitionId) || !isBoundedString(value.directoryScopeId)) {

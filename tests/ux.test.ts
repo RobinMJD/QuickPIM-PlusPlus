@@ -108,7 +108,7 @@ describe("popup cache helpers", () => {
         fetchedAt: now + 10 * 60_000,
         cacheKey: "stale-account"
       }
-    }, now)).toEqual({});
+    }, now)).toEqual({ version: 2 });
   });
 
   test("bounds malformed cache arrays before normalizing their contents", () => {
@@ -127,7 +127,10 @@ describe("popup cache helpers", () => {
     }, now);
 
     expect(cache.eligible?.items).toEqual([]);
-    expect(cache.eligible?.errors).toEqual([]);
+    expect(cache.eligible?.errors).toEqual([
+      "Cached role data is incomplete: showing 0 of at least 4001 items."
+    ]);
+    expect(cache.eligible).toMatchObject({ truncated: true, totalItems: 4001 });
     expect(cache.eligible?.diagnostics).toEqual([
       expect.objectContaining({ target: "pimGroup", success: true })
     ]);
@@ -171,6 +174,8 @@ describe("popup cache helpers", () => {
     );
     expect(cache.eligibleByTarget?.directoryRole?.items).toEqual([directoryRole]);
     expect(cache.eligibleByTarget?.directoryRole?.fetchedAt).toBe(now - 60_000);
+    expect(cache.eligibleByTarget?.directoryRole?.refreshStartedAt).toBe(now);
+    expect(isCacheEntryFresh(cache.eligibleByTarget?.directoryRole, DEFAULT_ELIGIBLE_CACHE_TTL_MS, now, "tenant-a")).toBe(false);
   });
 
   test("preserves disjoint target refreshes when cache writers save different feature areas", () => {

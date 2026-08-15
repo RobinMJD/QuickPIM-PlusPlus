@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   assertEdgeCompatibility,
@@ -40,6 +42,22 @@ describe("Microsoft Edge compatibility gate", () => {
     expect(issues).toContain("Remove update_url before publishing to Microsoft Edge Add-ons.");
     expect(issues).toContain("chrome.identity has not been reviewed for Microsoft Edge compatibility.");
     expect(issues.filter((issue) => issue.includes("Chrome branding"))).toHaveLength(2);
+  });
+
+  test("detects bracket, alias, destructured, and dynamic API access", () => {
+    const root = mkdtempSync(join(tmpdir(), "quickpim-edge-scan-"));
+    writeFileSync(join(root, "apis.ts"), `
+      chrome["storage"].local;
+      const browserApi = chrome;
+      browserApi.tabs.query({});
+      const { alarms, notifications: notices } = chrome;
+      chrome[apiName];
+    `);
+    try {
+      expect(getUsedChromeApis(root)).toEqual(["<dynamic>", "alarms", "notifications", "storage", "tabs"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("CI and release workflows run the compatibility gate", () => {

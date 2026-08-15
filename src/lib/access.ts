@@ -10,6 +10,7 @@ import type {
   AccessDiagnosticOperation,
   AccessFailureKind,
   AccessSetupTarget,
+  ActivationItem,
   QuickPimDataCache,
   TokenStatus,
   TokenStatusEntry
@@ -34,23 +35,6 @@ const TARGET_LABELS: Record<AccessSetupTarget, string> = {
   directoryRole: "Entra Roles",
   pimGroup: "PIM Groups",
   azureRole: "Azure Roles"
-};
-
-const TARGET_READ_SCOPES: Record<AccessSetupTarget, string[]> = {
-  directoryRole: [
-    "RoleEligibilitySchedule.Read.Directory",
-    "RoleEligibilitySchedule.ReadWrite.Directory",
-    "RoleManagement.Read.All",
-    "RoleManagement.Read.Directory",
-    "RoleManagement.ReadWrite.Directory"
-  ],
-  pimGroup: [
-    "PrivilegedEligibilitySchedule.Read.AzureADGroup",
-    "PrivilegedEligibilitySchedule.ReadWrite.AzureADGroup",
-    "PrivilegedAccess.Read.AzureADGroup",
-    "PrivilegedAccess.ReadWrite.AzureADGroup"
-  ],
-  azureRole: []
 };
 
 export function buildAccessCapabilityItems(
@@ -100,11 +84,58 @@ export function classifyAccessFailure(error: string | undefined): AccessFailureK
   return "unknown";
 }
 
+export function buildNameLookupDiagnostic(
+  target: AccessSetupTarget,
+  items: ActivationItem[],
+  sourceOperation: "eligible" | "active",
+  checkedAt = new Date().toISOString()
+): AccessDiagnostic | undefined {
+  const targetItems = items.filter((item) => item.type === target);
+  if (!targetItems.length) {
+    return undefined;
+  }
+
+  const unresolvedNames = targetItems.filter(hasUnresolvedItemName).length;
+  const unresolvedScopes = targetItems.filter(hasUnresolvedScopeName).length;
+  const unresolvedItems = targetItems.filter((item) => hasUnresolvedItemName(item) || hasUnresolvedScopeName(item)).length;
+  const endpointLabel = `${sourceOperation === "eligible" ? "Eligible" : "Active"} ${TARGET_LABELS[target]} display names`;
+
+  if (!unresolvedItems) {
+    return {
+      target,
+      success: true,
+      checkedAt,
+      operation: "nameLookup",
+      endpointLabel
+    };
+  }
+
+  const details = [
+    unresolvedNames ? `${unresolvedNames} role or group name${unresolvedNames === 1 ? "" : "s"}` : "",
+    unresolvedScopes ? `${unresolvedScopes} scope name${unresolvedScopes === 1 ? "" : "s"}` : ""
+  ].filter(Boolean).join(" and ");
+  return {
+    target,
+    success: false,
+    checkedAt,
+    operation: "nameLookup",
+    endpointLabel,
+    failureKind: "unknown",
+    error: `${details} could not be resolved for ${unresolvedItems} of ${targetItems.length} item${targetItems.length === 1 ? "" : "s"}. Raw identifiers remain available.`
+  };
+}
+
 export function summarizeAccessDiagnostics(diagnostics: AccessDiagnostic[]): {
   lastSuccess?: AccessDiagnostic;
   lastFailure?: AccessDiagnostic;
 } {
-  const sorted = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
+  const maximum = Date.now() + 5 * 60_000;
+  const sorted = diagnostics
+    .filter((item) => {
+      const checkedAt = Date.parse(item.checkedAt);
+      return Number.isFinite(checkedAt) && checkedAt <= maximum;
+    })
+    .sort((a, b) => b.checkedAt.localeCompare(a.checkedAt));
   const latestSuccessByOperation = new Map<string, AccessDiagnostic>();
   for (const diagnostic of sorted) {
     if (diagnostic.success && !latestSuccessByOperation.has(diagnosticOperationKey(diagnostic))) {
@@ -123,6 +154,42 @@ export function summarizeAccessDiagnostics(diagnostics: AccessDiagnostic[]): {
 
 function diagnosticOperationKey(diagnostic: AccessDiagnostic): string {
   return `${diagnostic.operation || "unknown"}|${diagnostic.endpointLabel || ""}`;
+}
+
+function hasUnresolvedItemName(item: ActivationItem): boolean {
+  const names = [item.sourceName, item.displayName]
+    .filter((value): value is string => Boolean(value))
+    .map(normalizeLookupValue);
+  const identifiers = item.type === "directoryRole"
+    ? [item.roleDefinitionId]
+    : item.type === "pimGroup"
+      ? [item.groupId]
+      : [item.roleDefinitionId, leafIdentifier(item.roleDefinitionId)];
+
+  return !names.length || names.some((name) =>
+    name === "unknown-role" ||
+    name === "unknown-group" ||
+    name === "unknown azure role" ||
+    identifiers.some((identifier) => normalizeLookupValue(identifier) === name)
+  );
+}
+
+function hasUnresolvedScopeName(item: ActivationItem): boolean {
+  if (item.type === "pimGroup") {
+    return false;
+  }
+  if (item.type === "directoryRole") {
+    return item.directoryScopeId !== "/" && normalizeLookupValue(item.scopeLabel) === normalizeLookupValue(item.directoryScopeId);
+  }
+  return normalizeLookupValue(item.scopeLabel) === normalizeLookupValue(item.scope);
+}
+
+function normalizeLookupValue(value: string | undefined): string {
+  return (value || "").trim().toLowerCase();
+}
+
+function leafIdentifier(value: string | undefined): string {
+  return (value || "").split("/").filter(Boolean).pop() || "";
 }
 
 export function buildTokenCacheKey(tokenStatus: TokenStatus | null | undefined): string {
@@ -188,7 +255,15 @@ function buildTokenCachePart(label: string, token: TokenStatusEntry | undefined)
 
   const scopes = [...(token.grantedScopes || [])].sort((a, b) => a.localeCompare(b)).join(",");
   const identity = token.tenantId && token.principalId ? `${token.tenantId}:${token.principalId}:` : "";
-  return `${label}:${identity}${scopes}`;
+  // The capture timestamp is a non-secret token-generation marker. A new
+  // portal token can carry the same visible scopes but different effective
+  // capability, so it must trigger one authoritative API recheck.
+  const now = Date.now();
+  const capturedAt = Number(token.capturedAt);
+  const generation = Number.isFinite(capturedAt) && capturedAt > 0 && capturedAt <= now + 5 * 60_000
+    ? String(Math.floor(capturedAt))
+    : "unknown";
+  return `${label}:${identity}${scopes}:generation=${generation}`;
 }
 
 function buildAccessCapabilityItem(
@@ -199,8 +274,20 @@ function buildAccessCapabilityItem(
 ): AccessCapabilityItem {
   const token = getTokenStatusForTarget(target, tokenStatus);
   const summary = summarizeAccessDiagnostics(diagnostics);
-  const latestDiagnostic = [...diagnostics].sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))[0];
-  const latestSuccess = summary.lastSuccess;
+  const latestEligibleDiagnostic = getLatestDiagnosticForOperation(diagnostics, "eligible");
+  const latestActiveDiagnostic = getLatestDiagnosticForOperation(diagnostics, "active");
+  const latestBlockedCoreDiagnostic = [latestEligibleDiagnostic, latestActiveDiagnostic]
+    .filter((diagnostic): diagnostic is AccessDiagnostic => Boolean(
+      diagnostic
+      && !diagnostic.success
+      && isPermissionOrAuthFailure(diagnostic.error)
+    ))
+    .sort((left, right) => right.checkedAt.localeCompare(left.checkedAt))[0];
+  const latestCoreSuccess = latestEligibleDiagnostic?.success
+    ? latestEligibleDiagnostic
+    : latestActiveDiagnostic?.success
+      ? latestActiveDiagnostic
+      : undefined;
   const diagnosticMetadata = getCapabilityDiagnosticMetadata(target, summary);
 
   if (!token?.hasToken || token.isExpired) {
@@ -226,7 +313,7 @@ function buildAccessCapabilityItem(
     };
   }
 
-  if (latestDiagnostic && !latestDiagnostic.success && isPermissionOrAuthFailure(latestDiagnostic.error)) {
+  if (latestBlockedCoreDiagnostic) {
     return {
       target,
       label: TARGET_LABELS[target],
@@ -234,19 +321,22 @@ function buildAccessCapabilityItem(
       detail: hasLoadedItems
         ? "Cached data is available, but the latest Microsoft API check was blocked."
         : "The portal token was captured, but this feature is still blocked by Microsoft API access.",
-      lastError: latestDiagnostic.error,
-      recommendedAction: getRecommendedAction(target, latestDiagnostic.failureKind || classifyAccessFailure(latestDiagnostic.error)),
+      lastError: latestBlockedCoreDiagnostic.error,
+      recommendedAction: getRecommendedAction(
+        target,
+        latestBlockedCoreDiagnostic.failureKind || classifyAccessFailure(latestBlockedCoreDiagnostic.error)
+      ),
       ...diagnosticMetadata
     };
   }
 
-  if (latestSuccess) {
+  if (latestCoreSuccess) {
     return {
       target,
       label: TARGET_LABELS[target],
       status: "ready",
       detail: "Last API check succeeded.",
-      lastSuccessAt: latestSuccess.checkedAt,
+      lastSuccessAt: latestCoreSuccess.checkedAt,
       ...diagnosticMetadata
     };
   }
@@ -261,35 +351,28 @@ function buildAccessCapabilityItem(
     };
   }
 
-  if (target === "azureRole") {
-    return {
-      target,
-      label: TARGET_LABELS[target],
-      status: "ready",
-      detail: "Azure Management token captured.",
-      ...diagnosticMetadata
-    };
-  }
-
-  const grantedScopes = new Set(token.grantedScopes || []);
-  const matchedScope = TARGET_READ_SCOPES[target].find((scope) => grantedScopes.has(scope));
-  if (matchedScope) {
-    return {
-      target,
-      label: TARGET_LABELS[target],
-      status: "ready",
-      detail: `Token includes ${matchedScope}.`,
-      ...diagnosticMetadata
-    };
-  }
-
   return {
     target,
     label: TARGET_LABELS[target],
-    status: "needsPortalRefresh",
-    detail: "Open the matching portal page so Microsoft can request the needed access.",
+    status: "limited",
+    detail: "A portal token is available, but QuickPIM++ has not yet verified this role source with Microsoft.",
+    recommendedAction: "Recheck access. If Microsoft blocks the request, reload the matching portal page.",
     ...diagnosticMetadata
   };
+}
+
+function getLatestDiagnosticForOperation(
+  diagnostics: AccessDiagnostic[],
+  operation: AccessDiagnosticOperation
+): AccessDiagnostic | undefined {
+  const maximum = Date.now() + 5 * 60_000;
+  return diagnostics
+    .filter((item) => {
+      const checkedAt = Date.parse(item.checkedAt);
+      const matchesOperation = item.operation === operation || (operation === "eligible" && item.operation === undefined);
+      return matchesOperation && Number.isFinite(checkedAt) && checkedAt <= maximum;
+    })
+    .sort((a, b) => b.checkedAt.localeCompare(a.checkedAt))[0];
 }
 
 function getCapabilityDiagnosticMetadata(

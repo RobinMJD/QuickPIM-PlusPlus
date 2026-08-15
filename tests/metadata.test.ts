@@ -38,6 +38,7 @@ describe("versioning and extension manifest", () => {
       {
         matches: ["https://entra.microsoft.com/*"],
         js: ["portalTokenCollector.js"],
+        all_frames: true,
         run_at: "document_idle"
       }
     ]);

@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import {
   EXPIRY_REMINDER_CATCH_UP_GRACE_MS,
   EXPIRY_REMINDER_RETRY_DELAY_MS,
+  ACTIVE_ASSIGNMENT_VISIBILITY_GRACE_MS,
   REQUEST_TRACKING_KEY,
   REQUEST_TRACKING_MAX_DUE_PER_RUN,
   REQUEST_TRACKING_TTL_MS,
@@ -17,6 +18,7 @@ import {
   mutateTrackedRequests,
   normalizeTrackedRequestStatus,
   reconcileTrackedExtensionSources,
+  reconcileTrackedRequestWithActiveAssignments,
   sanitizeTrackedRequestStore,
   trackedRequestMatchesValidatedToken,
   trackedRequestMatchesTokenIdentity,
@@ -34,6 +36,7 @@ const directoryRole: ActivationItem = {
   sourceName: "Global Reader",
   displayName: "Global Reader",
   principalId: "principal-1",
+  tenantId: "tenant-1",
   scopeLabel: "Tenant",
   status: "eligible",
   roleDefinitionId: "role-1",
@@ -48,6 +51,7 @@ function createRequest(overrides: Partial<TrackedPimRequest> = {}): TrackedPimRe
     payload: { status: "PendingApproval" },
     requestedAt: new Date(NOW).toISOString(),
     durationHours: 4,
+    tenantId: "tenant-1",
     justification: "Review production access",
     now: NOW
   });
@@ -93,7 +97,7 @@ describe("tracked PIM requests", () => {
     });
 
     expect(request).toMatchObject({
-      id: "directoryRole:request-1",
+      id: "tenant:tenant-1:directoryRole:9892023467d422c8",
       status: "pendingApproval",
       rawStatus: "PendingApproval",
       itemName: "Global Reader",
@@ -241,7 +245,7 @@ describe("tracked PIM requests", () => {
 
     expect(trackedRequestMatchesTokenIdentity({ ...request, tenantId: undefined }, {
       principalId: "PRINCIPAL-1"
-    })).toBe(true);
+    })).toBe(false);
   });
 
   test("does not consume tracking checks with expired or wrong-audience portal tokens", () => {
@@ -285,6 +289,44 @@ describe("tracked PIM requests", () => {
     );
 
     expect(active.activeUntil).toBe("2026-07-14T16:00:00.000Z");
+  });
+
+  test("reconciles active requests without an end time against active assignments", () => {
+    const activeWithoutEnd = createRequest({
+      status: "active",
+      rawStatus: "Provisioned",
+      activeUntil: undefined,
+      nextCheckAt: new Date(NOW).toISOString()
+    });
+    const matchingActive: ActivationItem = {
+      ...directoryRole,
+      status: "active",
+      activeAssignmentType: "activated",
+      activeUntil: "2026-07-14T14:00:00.000Z"
+    };
+
+    expect(reconcileTrackedRequestWithActiveAssignments(activeWithoutEnd, [matchingActive], NOW)).toMatchObject({
+      status: "active",
+      activeUntil: "2026-07-14T14:00:00.000Z",
+      nextCheckAt: undefined,
+      lastError: undefined
+    });
+
+    const assignedOnly = { ...matchingActive, activeAssignmentType: "assigned" as const };
+    const waiting = reconcileTrackedRequestWithActiveAssignments(activeWithoutEnd, [assignedOnly], NOW);
+    expect(waiting).toMatchObject({
+      status: "active",
+      activeAssignmentMissingSince: "2026-07-14T10:00:00.000Z",
+      lastError: "Waiting for the active assignment to become visible."
+    });
+
+    const expired = reconcileTrackedRequestWithActiveAssignments(
+      waiting,
+      [],
+      NOW + ACTIVE_ASSIGNMENT_VISIBILITY_GRACE_MS
+    );
+    expect(expired).toMatchObject({ status: "expired", nextCheckAt: undefined });
+    expect(expired.activeAssignmentMissingSince).toBeUndefined();
   });
 
   test("keeps a future accepted continuation scheduled until its exact start", () => {
@@ -363,8 +405,34 @@ describe("tracked PIM requests", () => {
     expect(store.requests[0].justification).toHaveLength(1024);
   });
 
+  test("sorts every bounded-storage candidate before retaining the newest requests", () => {
+    const oldRequests = Array.from({ length: 1_001 }, (_, index) => createRequest({
+      id: `old-${index}`,
+      requestId: `old-${index}`,
+      requestedAt: new Date(NOW - 2 * 60 * 60_000 - index).toISOString(),
+      updatedAt: new Date(NOW - 2 * 60 * 60_000 - index).toISOString()
+    }));
+    const newest = createRequest({
+      id: "newest-after-input-cap",
+      requestId: "newest-after-input-cap",
+      requestedAt: new Date(NOW - 1_000).toISOString(),
+      updatedAt: new Date(NOW - 1_000).toISOString()
+    });
+
+    const store = sanitizeTrackedRequestStore({ version: 1, requests: [...oldRequests, newest] }, NOW);
+
+    expect(store.requests).toHaveLength(100);
+    expect(store.requests[0].requestId).toBe(newest.requestId);
+    expect(store.requests.some((request) => request.requestId === newest.requestId)).toBe(true);
+  });
+
   test("rejects impossible request chronology and repairs stalled future checks", () => {
     const valid = createRequest();
+    const delayed = createRequest({
+      id: "delayed",
+      requestId: "delayed",
+      nextCheckAt: new Date(NOW + 60 * 60_000).toISOString()
+    });
     const future = createRequest({
       id: "future",
       requestId: "future",
@@ -383,14 +451,19 @@ describe("tracked PIM requests", () => {
       lastCheckedAt: "2099-01-01T00:00:00.000Z"
     });
 
-    const store = sanitizeTrackedRequestStore({ version: 1, requests: [valid, future, reversed, stalled] }, NOW);
+    const store = sanitizeTrackedRequestStore({ version: 1, requests: [valid, delayed, future, reversed, stalled] }, NOW);
 
-    expect(store.requests.map((request) => request.id).sort()).toEqual(["directoryRole:request-1", "stalled"]);
-    expect(store.requests.find((request) => request.id === "stalled")).toMatchObject({
+    expect(store.requests.map((request) => request.requestId).sort()).toEqual([
+      valid.requestId,
+      "delayed",
+      "stalled"
+    ].sort());
+    expect(store.requests.find((request) => request.requestId === "delayed")?.nextCheckAt).toBe("2026-07-14T11:00:00.000Z");
+    expect(store.requests.find((request) => request.requestId === "stalled")).toMatchObject({
       nextCheckAt: undefined,
       lastCheckedAt: undefined
     });
-    expect(getDueTrackedRequests(store, NOW).map((request) => request.id)).toContain("stalled");
+    expect(getDueTrackedRequests(store, NOW).map((request) => request.requestId)).toContain("stalled");
   });
 
   test("serializes concurrent local mutations so submissions are not lost", async () => {
@@ -404,7 +477,7 @@ describe("tracked PIM requests", () => {
     ]);
 
     const saved = sanitizeTrackedRequestStore(storage.values[REQUEST_TRACKING_KEY]);
-    expect(saved.requests.map((request) => request.id).sort()).toEqual(["first", "second"]);
+    expect(saved.requests.map((request) => request.requestId).sort()).toEqual(["first", "second"]);
   });
 });
 

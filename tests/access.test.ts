@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildAccessCapabilityItems,
+  buildNameLookupDiagnostic,
   buildTargetCacheKey,
   buildTokenCacheKey,
   getAccessSetupTargets,
@@ -52,6 +53,56 @@ const freshTokensWithPimGroupReadOnlyScope: TokenStatus = {
 };
 
 describe("portal-driven access setup", () => {
+  test("reports unresolved role and scope display names without blocking loaded data", () => {
+    const diagnostic = buildNameLookupDiagnostic("directoryRole", [{
+      id: "directoryRole:role-1:/administrativeUnits/unit-1",
+      type: "directoryRole",
+      sourceName: "role-1",
+      displayName: "role-1",
+      principalId: "user-1",
+      roleDefinitionId: "role-1",
+      directoryScopeId: "/administrativeUnits/unit-1",
+      scopeLabel: "/administrativeUnits/unit-1",
+      status: "eligible"
+    }], "eligible", "2026-05-18T12:00:00.000Z");
+
+    expect(diagnostic).toMatchObject({
+      target: "directoryRole",
+      success: false,
+      checkedAt: "2026-05-18T12:00:00.000Z",
+      operation: "nameLookup",
+      endpointLabel: "Eligible Entra Roles display names",
+      failureKind: "unknown",
+      error: expect.stringContaining("Raw identifiers remain available")
+    });
+  });
+
+  test("records successful name resolution so a prior lookup warning can recover", () => {
+    const diagnostic = buildNameLookupDiagnostic("pimGroup", [{
+      id: "pimGroup:group-1:member",
+      type: "pimGroup",
+      sourceName: "Privileged Operations",
+      displayName: "Privileged Operations",
+      principalId: "user-1",
+      groupId: "group-1",
+      accessId: "member",
+      scopeLabel: "Member",
+      status: "eligible"
+    }], "eligible", "2026-05-18T12:01:00.000Z");
+
+    expect(diagnostic).toEqual({
+      target: "pimGroup",
+      success: true,
+      checkedAt: "2026-05-18T12:01:00.000Z",
+      operation: "nameLookup",
+      endpointLabel: "Eligible PIM Groups display names"
+    });
+  });
+
+  test("does not invent a name lookup result for an empty role source", () => {
+    expect(buildNameLookupDiagnostic("azureRole", [], "active")).toBeUndefined();
+  });
+
   test("selects only portal targets that need setup", () => {
     const items = buildAccessCapabilityItems(missingTokens, {});
 
@@ -159,7 +210,8 @@ describe("portal-driven access setup", () => {
     const status = buildAccessCapabilityItems(freshTokensWithoutVisibleScopes, cache);
 
     expect(status.find((item) => item.target === "directoryRole")).toMatchObject({
-      status: "needsPortalRefresh"
+      status: "limited",
+      detail: expect.stringContaining("has not yet verified")
     });
   });
 
@@ -189,6 +241,19 @@ describe("portal-driven access setup", () => {
               success: false,
               checkedAt: "2026-05-18T12:01:00.000Z",
               error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
+            }
+          ]
+        },
+        azureRole: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "azureRole"),
+          diagnostics: [
+            {
+              target: "azureRole",
+              success: true,
+              checkedAt: "2026-05-18T12:00:00.000Z"
             }
           ]
         }
@@ -232,6 +297,19 @@ describe("portal-driven access setup", () => {
               error: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.Read.AzureADGroup"
             }
           ]
+        },
+        azureRole: {
+          items: [],
+          errors: [],
+          fetchedAt: Date.parse("2026-05-18T12:00:00.000Z"),
+          cacheKey: buildTargetCacheKey(freshTokensWithoutVisibleScopes, "azureRole"),
+          diagnostics: [
+            {
+              target: "azureRole",
+              success: true,
+              checkedAt: "2026-05-18T12:00:00.000Z"
+            }
+          ]
         }
       }
     };
@@ -265,11 +343,12 @@ describe("portal-driven access setup", () => {
     };
 
     expect(buildAccessCapabilityItems(currentStatus, cache, ["directoryRole"])[0]).toMatchObject({
-      status: "needsPortalRefresh"
+      status: "limited",
+      detail: expect.stringContaining("has not yet verified")
     });
   });
 
-  test("builds cache keys from token capability instead of capture time", () => {
+  test("includes the token generation in cache keys even when visible capability is unchanged", () => {
     const first = buildTokenCacheKey({
       graph: {
         hasToken: true,
@@ -297,13 +376,14 @@ describe("portal-driven access setup", () => {
       }
     });
 
-    expect(second).toBe(first);
+    expect(second).not.toBe(first);
   });
 
-  test("keeps cache keys stable when a token is renewed with the same identity and scopes", () => {
+  test("invalidates target cache once when a token is renewed with the same identity and scopes", () => {
     const first: TokenStatus = {
       graph: {
         hasToken: true,
+        capturedAt: 1,
         tenantId: "tenant-a",
         principalId: "user-a",
         expiresAt: "2026-05-18T14:00:00.000Z",
@@ -311,6 +391,7 @@ describe("portal-driven access setup", () => {
       },
       azureManagement: {
         hasToken: true,
+        capturedAt: 1,
         tenantId: "tenant-a",
         principalId: "user-a",
         expiresAt: "2026-05-18T14:00:00.000Z"
@@ -329,9 +410,9 @@ describe("portal-driven access setup", () => {
       }
     };
 
-    expect(buildTokenCacheKey(renewed)).toBe(buildTokenCacheKey(first));
-    expect(buildTargetCacheKey(renewed, "directoryRole")).toBe(buildTargetCacheKey(first, "directoryRole"));
-    expect(buildTargetCacheKey(renewed, "azureRole")).toBe(buildTargetCacheKey(first, "azureRole"));
+    expect(buildTokenCacheKey(renewed)).not.toBe(buildTokenCacheKey(first));
+    expect(buildTargetCacheKey(renewed, "directoryRole")).not.toBe(buildTargetCacheKey(first, "directoryRole"));
+    expect(buildTargetCacheKey(renewed, "azureRole")).not.toBe(buildTargetCacheKey(first, "azureRole"));
   });
 
   test("includes target-specific Graph tokens in cache keys", () => {

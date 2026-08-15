@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { OperationTimeoutError, withTimeout } from "../src/lib/async";
+import { OperationTimeoutError, withAbortableTimeout, withTimeout } from "../src/lib/async";
 import { sendRuntimeMessage } from "../src/lib/runtimeMessaging";
 
 afterEach(() => {
@@ -11,6 +11,21 @@ describe("bounded asynchronous operations", () => {
     await expect(withTimeout(new Promise(() => undefined), 5, "Refresh timed out.")).rejects.toEqual(
       expect.objectContaining({ name: "OperationTimeoutError", message: "Refresh timed out." })
     );
+  });
+
+  test("aborts underlying work when an abortable deadline expires", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const operation = withAbortableTimeout(
+      (signal) => {
+        receivedSignal = signal;
+        return new Promise(() => undefined);
+      },
+      5,
+      "Snapshot timed out."
+    );
+
+    await expect(operation).rejects.toBeInstanceOf(OperationTimeoutError);
+    expect(receivedSignal?.aborted).toBe(true);
   });
 
   test("bounds Chrome runtime messages so UI callers can leave loading state", async () => {

@@ -29,8 +29,23 @@ function collectSourceFiles(directory) {
 export function getUsedChromeApis(sourceDir = "src") {
   const names = new Set();
   for (const file of collectSourceFiles(resolve(sourceDir))) {
-    for (const match of readFileSync(file, "utf8").matchAll(/\bchrome\.([A-Za-z][A-Za-z0-9_]*)/g)) {
-      names.add(match[1]);
+    const source = readFileSync(file, "utf8");
+    for (const match of source.matchAll(/\bchrome\s*(?:\.\s*([A-Za-z][A-Za-z0-9_]*)|\[\s*["']([^"']+)["']\s*\])/g)) {
+      names.add(match[1] || match[2]);
+    }
+    for (const match of source.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*chrome\s*;/g)) {
+      const alias = match[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const aliasPattern = new RegExp(`\\b${alias}\\s*(?:\\.\\s*([A-Za-z][A-Za-z0-9_]*)|\\[\\s*["']([^"']+)["']\\s*\\])`, "g");
+      for (const aliasMatch of source.matchAll(aliasPattern)) names.add(aliasMatch[1] || aliasMatch[2]);
+    }
+    for (const match of source.matchAll(/\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*chrome\s*;/g)) {
+      for (const binding of match[1].split(",")) {
+        const api = binding.trim().match(/^([A-Za-z][A-Za-z0-9_]*)/)?.[1];
+        if (api) names.add(api);
+      }
+    }
+    if (/\bchrome\s*\[(?!\s*["'])/.test(source)) {
+      names.add("<dynamic>");
     }
   }
   return [...names].sort();

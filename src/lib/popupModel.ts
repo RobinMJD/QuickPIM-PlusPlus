@@ -1,9 +1,10 @@
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./apiErrors";
-import { getActivationItemIdentity } from "./activationIdentity";
+import { getActivationItemIdentity, getActivationItemIdentityCandidates } from "./activationIdentity";
 import type { AccessCapabilityItem } from "./access";
 import type {
   AccessSetupTarget,
   ActivationItem,
+  ActivationResponse,
   ActivationResult,
   ActivationStatus,
   PopupRequestMode,
@@ -174,9 +175,68 @@ export function getRemainingSelectedIdsAfterActivationResults(
   return new Set([...selectedIds].filter((itemId) => !successfulIds.has(normalizeActivationItemId(itemId))));
 }
 
+export function normalizeActivationResponse(response: ActivationResponse): ActivationResponse {
+  const byItemId = new Map<string, ActivationResult>();
+  for (const result of [...response.results, ...response.errors]) {
+    const key = normalizeActivationItemId(result.itemId);
+    const current = byItemId.get(key);
+    if (!current) {
+      byItemId.set(key, { ...result });
+      continue;
+    }
+    if (current.success !== result.success) {
+      byItemId.set(key, {
+        ...current,
+        ...result,
+        success: false,
+        error: result.error || current.error || "QuickPIM++ received conflicting results for this item. Refresh its status before retrying."
+      });
+      continue;
+    }
+    byItemId.set(key, {
+      ...current,
+      ...result,
+      error: result.error || current.error
+    });
+  }
+  const results = [...byItemId.values()];
+  const errors = results.filter((result) => !result.success);
+  return {
+    ...response,
+    success: results.length > 0 && errors.length === 0,
+    results,
+    errors
+  };
+}
+
+export function buildActivationItemLookup(items: ActivationItem[]): Map<string, ActivationItem> {
+  const lookup = new Map<string, ActivationItem>();
+  const ambiguous = new Set<string>();
+  for (const item of items) {
+    const canonicalIdentity = getActivationItemIdentity(item);
+    const keys = new Set([
+      canonicalIdentity,
+      item.id,
+      normalizeActivationItemId(item.id),
+      ...getActivationItemIdentityCandidates(item)
+    ].filter(Boolean));
+    for (const key of keys) {
+      if (ambiguous.has(key)) continue;
+      const current = lookup.get(key);
+      if (current && getActivationItemIdentity(current) !== canonicalIdentity) {
+        lookup.delete(key);
+        ambiguous.add(key);
+      } else {
+        lookup.set(key, item);
+      }
+    }
+  }
+  return lookup;
+}
+
 export function getRequestReconciliationTargets(
   results: ActivationResult[],
-  items: ActivationItem[]
+  items: Array<Pick<ActivationItem, "id" | "type">>
 ): AccessSetupTarget[] {
   const itemTargets = new Map(items.map((item) => [normalizeActivationItemId(item.id), item.type]));
   const requested = new Set<AccessSetupTarget>();

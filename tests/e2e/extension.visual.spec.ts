@@ -28,15 +28,19 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   const idleFooter = page.locator(".activation-footer-actions");
   const idleFooterHeight = await idleFooter.evaluate((element) => element.getBoundingClientRect().height);
   await expect(idleFooter).toHaveCSS("justify-content", "flex-end");
-  const idleSettingsBox = await idleFooter.getByRole("button", { name: "Settings" }).boundingBox();
-  expect((idleSettingsBox?.x || 0) + (idleSettingsBox?.width || 0)).toBeGreaterThan(500);
+  const idleSettings = idleFooter.getByRole("button", { name: "Settings" });
+  await expect(idleSettings).toBeVisible();
+  const idleSettingsRight = await idleSettings.evaluate((element) => element.getBoundingClientRect().right);
+  expect(idleSettingsRight).toBeGreaterThan(500);
   const row = page.locator(".role-row.selectable").first();
   await expect(row).toBeVisible();
   await row.focus();
   await page.keyboard.press("Space");
   await expect(page.getByRole("button", { name: /Continue with 1 selected/i })).toBeVisible();
-  const selectedSettingsBox = await page.locator(".activation-footer-actions").getByRole("button", { name: "Settings" }).boundingBox();
-  expect((selectedSettingsBox?.x || 0) + (selectedSettingsBox?.width || 0)).toBeGreaterThan(500);
+  const selectedSettings = page.locator(".activation-footer-actions").getByRole("button", { name: "Settings" });
+  await expect(selectedSettings).toBeVisible();
+  const selectedSettingsRight = await selectedSettings.evaluate((element) => element.getBoundingClientRect().right);
+  expect(selectedSettingsRight).toBeGreaterThan(500);
 
   const geometry = await page.evaluate(() => {
     const content = document.querySelector<HTMLElement>(".content");

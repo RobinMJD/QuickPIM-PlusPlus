@@ -25,6 +25,36 @@ export function withTimeout<T>(operation: PromiseLike<T>, timeoutMs: number, mes
   });
 }
 
+export function withAbortableTimeout<T>(
+  operation: (signal: AbortSignal) => PromiseLike<T>,
+  timeoutMs: number,
+  message: string
+): Promise<T> {
+  const controller = new AbortController();
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.resolve().then(() => operation(controller.signal));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      controller.abort();
+      reject(new OperationTimeoutError(message));
+    }, timeoutMs);
+    Promise.resolve()
+      .then(() => operation(controller.signal))
+      .then(
+        (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      );
+  });
+}
+
 export function isOperationTimeoutError(error: unknown): error is OperationTimeoutError {
   return error instanceof OperationTimeoutError || (
     error instanceof Error && error.name === "OperationTimeoutError"

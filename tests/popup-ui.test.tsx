@@ -87,10 +87,12 @@ function createBlockedEdgeChrome(settings: typeof DEFAULT_SETTINGS) {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((nextResolve) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
     resolve = nextResolve;
+    reject = nextReject;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function waitFor(assertion: () => void | boolean, timeoutMs = 1000): Promise<void> {
@@ -389,11 +391,98 @@ describe("popup loading UI", () => {
       }]
     });
     await waitFor(() => {
-      const cache = storageData[DATA_CACHE_KEY] as { eligibleByTarget?: { directoryRole?: { items: ActivationItem[] } } };
+      const cache = storageData[DATA_CACHE_KEY] as {
+        eligibleByTarget?: { directoryRole?: { items: ActivationItem[]; diagnostics?: Array<{ success: boolean; operation?: string }> } };
+      };
       expect(cache.eligibleByTarget?.directoryRole?.items[0]).toMatchObject({
         activationPolicyState: "ready",
         activationRequirements: { maxDurationHours: 1 }
       });
+      expect(cache.eligibleByTarget?.directoryRole?.diagnostics).toContainEqual(expect.objectContaining({
+        success: true,
+        operation: "policy"
+      }));
+    });
+  });
+
+  test("retains core role data and records a sanitized policy lookup failure", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const policyResponse = deferred<{ success: true; data: ActivationItem[] }>();
+    const role: ActivationItem = {
+      id: "directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "principal-1",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      activationPolicyState: "pending"
+    };
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["directoryRole", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    const sendMessage = vi.fn((message: { action: string }) => {
+      if (message.action === "getTokenStatus") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            graph: { hasToken: true, isExpired: false },
+            graphTargets: { directoryRole: { hasToken: true, isExpired: false } },
+            azureManagement: { hasToken: false }
+          }
+        });
+      }
+      if (message.action === "getActivationSnapshot") {
+        return Promise.resolve({
+          success: true,
+          data: {
+            eligible: { items: [role], errors: [], diagnostics: [] },
+            active: { items: [], errors: [], diagnostics: [] }
+          }
+        });
+      }
+      if (message.action === "enrichActivationPolicies") return policyResponse.promise;
+      return Promise.resolve({ success: true, data: true });
+    });
+
+    vi.stubGlobal("chrome", {
+      runtime: { sendMessage },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ action: "enrichActivationPolicies" })));
+    policyResponse.reject(new Error(`Bearer aaa.${"b".repeat(300)}.ccc policy lookup failed`));
+
+    await waitFor(() => {
+      const cache = storageData[DATA_CACHE_KEY] as {
+        eligibleByTarget?: { directoryRole?: { items: ActivationItem[]; diagnostics?: Array<{ success: boolean; operation?: string; error?: string }> } };
+      };
+      expect(cache.eligibleByTarget?.directoryRole?.items[0]?.displayName).toBe("Reader");
+      expect(cache.eligibleByTarget?.directoryRole?.diagnostics).toContainEqual(expect.objectContaining({
+        success: false,
+        operation: "policy",
+        error: expect.stringContaining("[redacted token]")
+      }));
+      expect(cache.eligibleByTarget?.directoryRole?.diagnostics?.[0]?.error).not.toContain("aaa.");
     });
   });
 
@@ -919,6 +1008,7 @@ describe("popup compact controls", () => {
       azureManagement: {
         hasToken: true,
         capturedAt: 1,
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
         tenantId: "tenant-1",
         principalId: "principal-1"
       }
@@ -927,6 +1017,7 @@ describe("popup compact controls", () => {
       graph: {
         hasToken: true,
         capturedAt: 2,
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
         tenantId: "tenant-1",
         principalId: "principal-1"
       },
@@ -934,6 +1025,7 @@ describe("popup compact controls", () => {
         directoryRole: {
           hasToken: true,
           capturedAt: 2,
+          expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
           tenantId: "tenant-1",
           principalId: "principal-1",
           grantedScopes: ["RoleAssignmentSchedule.ReadWrite.Directory"]
@@ -941,6 +1033,7 @@ describe("popup compact controls", () => {
         pimGroup: {
           hasToken: true,
           capturedAt: 2,
+          expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
           tenantId: "tenant-1",
           principalId: "principal-1",
           grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
@@ -1499,10 +1592,11 @@ describe("popup compact controls", () => {
       accessId: "member"
     };
     const previousTokens = {
-      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" },
+      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1", expiresAt: new Date(Date.now() + 60 * 60_000).toISOString() },
       graphTargets: {
         directoryRole: {
           hasToken: true,
+          expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
           tenantId: "tenant-1",
           principalId: "principal-1",
           expiresInMinutes: 45,
@@ -1510,6 +1604,7 @@ describe("popup compact controls", () => {
         },
         pimGroup: {
           hasToken: true,
+          expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
           tenantId: "tenant-1",
           principalId: "principal-1",
           expiresInMinutes: 45,
@@ -2045,8 +2140,13 @@ describe("popup compact controls", () => {
             return Promise.resolve({
               success: true,
               data: {
-                graph: { hasToken: true, capturedAt: 1 },
-                azureManagement: { hasToken: true, capturedAt: 1 }
+                graph: { hasToken: false },
+                azureManagement: {
+                  hasToken: true,
+                  capturedAt: 1,
+                  tenantId: "tenant-1",
+                  principalId: "principal-1"
+                }
               }
             });
           }
@@ -2155,13 +2255,42 @@ describe("popup compact controls", () => {
             return Promise.resolve({
               success: true,
               data: {
-                graph: { hasToken: true, capturedAt: 1 },
-                azureManagement: { hasToken: true, capturedAt: 1 }
+                graph: { hasToken: false },
+                azureManagement: {
+                  hasToken: true,
+                  capturedAt: 1,
+                  tenantId: "tenant-1",
+                  principalId: "principal-1"
+                }
               }
             });
           }
-          if (message.action === "getActivationItems" || message.action === "getActiveItems") {
-            return Promise.resolve({ success: true, data: { items: [], errors: [], diagnostics: [] } });
+          if (message.action === "getActivationSnapshot") {
+            return Promise.resolve({
+              success: true,
+              data: {
+                eligible: {
+                  items: [],
+                  errors: [],
+                  diagnostics: [{
+                    target: "azureRole",
+                    success: true,
+                    checkedAt: new Date().toISOString(),
+                    operation: "eligible"
+                  }]
+                },
+                active: {
+                  items: [],
+                  errors: [],
+                  diagnostics: [{
+                    target: "azureRole",
+                    success: true,
+                    checkedAt: new Date().toISOString(),
+                    operation: "active"
+                  }]
+                }
+              }
+            });
           }
           return Promise.resolve({ success: true, data: true });
         })
@@ -2182,20 +2311,24 @@ describe("popup compact controls", () => {
     vi.resetModules();
     await import("../src/popup/main");
 
-    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    await waitFor(() => expect(
+      chromeMock.runtime.sendMessage.mock.calls.some(([message]) => message.action === "getActivationSnapshot")
+    ).toBe(true));
     const fetchMessages = chromeMock.runtime.sendMessage.mock.calls
       .map(([message]) => message)
-      .filter((message) => message.action === "getActivationItems" || message.action === "getActiveItems");
-    expect(fetchMessages.map((message) => message.targets)).toEqual([["azureRole"], ["azureRole"]]);
+      .filter((message) => message.action === "getActivationSnapshot");
+    expect(fetchMessages.map((message) => message.targets)).toEqual([["azureRole"]]);
   });
 
   test("manual popup refresh targets every enabled role source through the snapshot endpoint", async () => {
     document.body.innerHTML = '<div id="root"></div>';
+    const tokenExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
     const tokens = {
-      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" },
+      graph: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1", expiresAt: tokenExpiresAt },
       graphTargets: {
         directoryRole: {
           hasToken: true,
+          expiresAt: tokenExpiresAt,
           tenantId: "tenant-1",
           principalId: "principal-1",
           grantedScopes: [
@@ -2205,6 +2338,7 @@ describe("popup compact controls", () => {
         },
         pimGroup: {
           hasToken: true,
+          expiresAt: tokenExpiresAt,
           tenantId: "tenant-1",
           principalId: "principal-1",
           grantedScopes: [
@@ -2213,7 +2347,7 @@ describe("popup compact controls", () => {
           ]
         }
       },
-      azureManagement: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1" }
+      azureManagement: { hasToken: true, tenantId: "tenant-1", principalId: "principal-1", expiresAt: tokenExpiresAt }
     };
     const eligibleItem: ActivationItem = {
       id: "directoryRole:reader:/",
@@ -2241,7 +2375,22 @@ describe("popup compact controls", () => {
             fetchedAt: Date.now(),
             cacheKey: buildTargetCacheKey(tokens, "directoryRole"),
             errors: [],
-            items: [eligibleItem]
+            items: [eligibleItem],
+            diagnostics: [{ target: "directoryRole", success: true, checkedAt: new Date().toISOString(), operation: "eligible" }]
+          },
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "pimGroup"),
+            errors: [],
+            items: [],
+            diagnostics: [{ target: "pimGroup", success: true, checkedAt: new Date().toISOString(), operation: "eligible" }]
+          },
+          azureRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "azureRole"),
+            errors: [],
+            items: [],
+            diagnostics: [{ target: "azureRole", success: true, checkedAt: new Date().toISOString(), operation: "eligible" }]
           }
         },
         activeByTarget: {
@@ -2249,7 +2398,22 @@ describe("popup compact controls", () => {
             fetchedAt: Date.now(),
             cacheKey: buildTargetCacheKey(tokens, "directoryRole"),
             errors: [],
-            items: []
+            items: [],
+            diagnostics: [{ target: "directoryRole", success: true, checkedAt: new Date().toISOString(), operation: "active" }]
+          },
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "pimGroup"),
+            errors: [],
+            items: [],
+            diagnostics: [{ target: "pimGroup", success: true, checkedAt: new Date().toISOString(), operation: "active" }]
+          },
+          azureRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "azureRole"),
+            errors: [],
+            items: [],
+            diagnostics: [{ target: "azureRole", success: true, checkedAt: new Date().toISOString(), operation: "active" }]
           }
         }
       }
@@ -3363,6 +3527,11 @@ describe("popup compact controls", () => {
       assignmentScheduleId: undefined,
       activeUntil: undefined
     };
+    const tokens = {
+      graph: { hasToken: true, capturedAt: 1 },
+      graphTargets: { pimGroup: { hasToken: true, capturedAt: 1 } },
+      azureManagement: { hasToken: false }
+    };
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: {
         ...DEFAULT_SETTINGS,
@@ -3377,7 +3546,7 @@ describe("popup compact controls", () => {
         eligibleByTarget: {
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup:",
+            cacheKey: buildTargetCacheKey(tokens, "pimGroup"),
             errors: [],
             items: [eligibleItem, activeEligibleItem]
           }
@@ -3385,7 +3554,7 @@ describe("popup compact controls", () => {
         activeByTarget: {
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup:",
+            cacheKey: buildTargetCacheKey(tokens, "pimGroup"),
             errors: [],
             items: [activeItem, assignedItem]
           }
@@ -3407,18 +3576,15 @@ describe("popup compact controls", () => {
         return Promise.resolve({
           success: true,
           data: {
-            eligible: { items: [eligibleItem], errors: [], diagnostics: [] },
-            active: { items: [], errors: [], diagnostics: [] }
+            eligible: { items: [eligibleItem, activeEligibleItem], errors: [], diagnostics: [] },
+            active: { items: [activeItem, assignedItem], errors: [], diagnostics: [] }
           }
         });
       }
       if (message.action === "getTokenStatus") {
         return Promise.resolve({
           success: true,
-          data: {
-            graph: { hasToken: true, capturedAt: 1 },
-            azureManagement: { hasToken: false }
-          }
+          data: tokens
         });
       }
       return Promise.resolve({ success: true, data: true });

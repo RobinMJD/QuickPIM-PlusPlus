@@ -9,6 +9,7 @@ import {
   failRequestOperation,
   getRequestOperationFingerprint,
   loadRequestOperations,
+  selectNextRequestOperation,
   sanitizeRequestOperations,
   trackedRequestMatchesOperation,
   touchRequestOperation
@@ -23,6 +24,8 @@ describe("background request operation journal", () => {
       action: "activate" as const,
       itemIds: ["pimGroup:group-1:member"],
       targets: ["pimGroup" as const],
+      tenantId: "tenant-1",
+      principalId: "principal-1",
       state: "running" as const,
       startedAt: NOW,
       updatedAt: NOW + 60_000,
@@ -38,6 +41,7 @@ describe("background request operation journal", () => {
       itemId: "pimGroup:group-1:member",
       itemName: "Group 1",
       itemType: "pimGroup" as const,
+      tenantId: "tenant-1",
       principalId: "principal-1",
       status: "submitted" as const,
       requestedAt: new Date(NOW + 10_000).toISOString(),
@@ -82,6 +86,13 @@ describe("background request operation journal", () => {
     })).not.toBe(getRequestOperationFingerprint(original));
     expect(getRequestOperationFingerprint({
       ...original,
+      sourceInstallationId: "installation-a"
+    })).not.toBe(getRequestOperationFingerprint({
+      ...original,
+      sourceInstallationId: "installation-b"
+    }));
+    expect(getRequestOperationFingerprint({
+      ...original,
       itemIds: ["pimGroup:another-group:member"]
     })).not.toBe(getRequestOperationFingerprint(original));
     expect(getRequestOperationFingerprint({
@@ -118,6 +129,52 @@ describe("background request operation journal", () => {
     expect(await loadRequestOperations({ storage, now: NOW + 2_000 })).toEqual([
       expect.objectContaining({ state: "complete", updatedAt: NOW + 1_000 })
     ]);
+  });
+
+  test("drains the oldest terminal result before unresolved or newer terminal operations", () => {
+    const operations = sanitizeRequestOperations([
+      {
+        id: "request_operation_running",
+        action: "activate",
+        itemIds: ["directoryRole:reader:/"],
+        targets: ["directoryRole"],
+        state: "running",
+        startedAt: NOW - 30_000,
+        updatedAt: NOW - 10_000
+      },
+      {
+        id: "request_operation_new_terminal",
+        action: "activate",
+        itemIds: ["directoryRole:writer:/"],
+        targets: ["directoryRole"],
+        state: "complete",
+        startedAt: NOW - 20_000,
+        updatedAt: NOW - 2_000,
+        terminalAt: NOW - 2_000,
+        response: {
+          success: true,
+          results: [{ itemId: "directoryRole:writer:/", itemName: "Writer", success: true }],
+          errors: []
+        }
+      },
+      {
+        id: "request_operation_old_terminal",
+        action: "activate",
+        itemIds: ["directoryRole:admin:/"],
+        targets: ["directoryRole"],
+        state: "error",
+        startedAt: NOW - 40_000,
+        updatedAt: NOW - 5_000,
+        terminalAt: NOW - 5_000,
+        error: "Stopped"
+      }
+    ], NOW);
+
+    expect(selectNextRequestOperation(operations)?.id).toBe("request_operation_old_terminal");
+    expect(selectNextRequestOperation(
+      operations,
+      new Set(["request_operation_old_terminal", "request_operation_new_terminal"])
+    )?.id).toBe("request_operation_running");
   });
 
   test("persists a running request and its completed response until the popup acknowledges it", async () => {
@@ -296,6 +353,34 @@ describe("background request operation journal", () => {
       })
     ]);
     expect(sanitizeRequestOperations([{ ...base, durationHours: 100 }], NOW)[0]).not.toHaveProperty("durationHours");
+  });
+
+  test("retains unresolved work even when it appears after a large terminal journal", () => {
+    const terminal = Array.from({ length: 1_001 }, (_, index) => ({
+      id: `request_operation_terminal_${index}`,
+      action: "activate",
+      itemIds: [`directoryRole:reader-${index}:/`],
+      targets: ["directoryRole"],
+      state: "complete",
+      startedAt: NOW - index - 1,
+      updatedAt: NOW - index - 1,
+      terminalAt: NOW - index - 1
+    }));
+    const running = {
+      id: "request_operation_still_running",
+      action: "activate",
+      itemIds: ["directoryRole:critical:/"],
+      targets: ["directoryRole"],
+      state: "running",
+      startedAt: NOW,
+      updatedAt: NOW
+    };
+
+    const sanitized = sanitizeRequestOperations([...terminal, running], NOW);
+
+    expect(sanitized).toHaveLength(101);
+    expect(sanitized[0]).toMatchObject({ id: running.id, state: "running" });
+    expect(sanitized.filter((operation) => operation.state === "complete")).toHaveLength(100);
   });
 });
 

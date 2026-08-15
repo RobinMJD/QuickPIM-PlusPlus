@@ -5,8 +5,9 @@ import {
 } from "./distribution";
 import {
   DEFAULT_SETTINGS,
-  mergeSettings,
-  mutateSettingsInStorage
+  compareAndSetSettingsInStorage,
+  loadSettingsSnapshotInStorage,
+  mergeSettings
 } from "./settings";
 import { isSafeRecordKey } from "./security";
 import { createStorageMutationLock } from "./storageMutation";
@@ -14,6 +15,7 @@ import type { ActivityHistoryEntry, QuickPimPreferences, QuickPimSettings, Usage
 
 export const BROWSER_SYNC_ALARM_NAME = "quickPimBrowserSync";
 export const BROWSER_SYNC_LOCAL_STATE_KEY = "quickPimBrowserSyncState.v1";
+export const BROWSER_SYNC_PENDING_PURGE_KEY = "quickPimBrowserSyncPendingPurge.v1";
 export const BROWSER_SYNC_CONTROL_KEY = "quickPimSync.control.v1";
 export const BROWSER_SYNC_PURGE_KEY = "quickPimSync.purge.v1";
 export const BROWSER_SYNC_EPOCH_KEY = "quickPimSync.epoch.v1";
@@ -31,8 +33,8 @@ const BROWSER_SYNC_ATOMIC_GENERATION_MARKER = "a1";
 // small enough for the previous and next generations to coexist atomically.
 const BROWSER_SYNC_CHUNK_QUOTA_BYTES = 8_000;
 const BROWSER_SYNC_ORPHAN_GRACE_MS = 48 * 60 * 60_000;
-const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 10 * 60_000;
-const BROWSER_SYNC_READ_RETRY_DELAYS_MS = [50, 200] as const;
+const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 2 * 60_000;
+const BROWSER_SYNC_READ_RETRY_DELAYS_MS = [100, 500, 1_500] as const;
 const MAX_SYNC_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
 const SYNC_VERIFICATION_FUTURE_TOLERANCE_MS = 5 * 60_000;
 const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
@@ -41,7 +43,7 @@ const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const BROWSER_SYNC_PAYLOAD_QUOTA_BYTES = 42_000;
 const MAX_SYNC_DEVICES = 20;
 const MAX_DEVICE_NAME_LENGTH = 60;
-const MAX_SYNC_ACTIVITY_ENTRIES = 100;
+const MAX_SYNC_ACTIVITY_ENTRIES = 200;
 const withBrowserSyncOperationLock = createStorageMutationLock("quickPimBrowserSyncOperation");
 
 type SyncCategoryName =
@@ -124,6 +126,13 @@ interface BrowserSyncPurgeMarker {
 interface BrowserSyncEpochMarker {
   version: 1;
   epochAt: number;
+}
+
+interface BrowserSyncPendingPurge {
+  version: 1;
+  createdAt: number;
+  completedAt?: number;
+  lastError?: string;
 }
 
 export interface BrowserSyncDevice {
@@ -326,7 +335,7 @@ export async function getBrowserSyncStatus(apis: BrowserSyncApis): Promise<Brows
 async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
-  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
+  const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now, false);
   let control: BrowserSyncControl = { version: 1 };
   let registry: BrowserSyncDeviceRegistry = { version: 1, devices: [] };
   let statusReadError: string | undefined;
@@ -383,11 +392,57 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
   let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
-  if (!capability.supported || !apis.sync || !state.enabled) {
+  if (!capability.supported || !apis.sync) {
     return getBrowserSyncStatusUnlocked(apis);
   }
 
   const sync = apis.sync;
+  const pendingPurge = await loadPendingBrowserSyncPurge(apis.local, now);
+  if (pendingPurge) {
+    if (pendingPurge.completedAt) {
+      try {
+        await apis.local.remove(BROWSER_SYNC_PENDING_PURGE_KEY);
+      } catch (error) {
+        state = {
+          ...state,
+          enabled: false,
+          lastSyncAt: now,
+          lastError: `Browser-synced data was deleted, but the local completion marker still needs cleanup: ${sanitizeSyncError(error)}`
+        };
+        await saveLocalState(apis.local, state);
+        return getBrowserSyncStatusUnlocked(apis);
+      }
+    } else {
+      try {
+        const status = await purgeBrowserSyncDataUnlocked(apis);
+        await apis.local.set({
+          [BROWSER_SYNC_PENDING_PURGE_KEY]: {
+            ...pendingPurge,
+            completedAt: now,
+            lastError: undefined
+          } satisfies BrowserSyncPendingPurge
+        });
+        try {
+          await apis.local.remove(BROWSER_SYNC_PENDING_PURGE_KEY);
+        } catch {
+          // The completed marker prevents a destructive purge from being repeated.
+        }
+        return status;
+      } catch (error) {
+        state = {
+          ...state,
+          enabled: false,
+          lastSyncAt: now,
+          lastError: `Local data was reset, but browser-synced data still needs deletion: ${sanitizeSyncError(error)}`
+        };
+        await saveLocalState(apis.local, state);
+        return getBrowserSyncStatusUnlocked(apis);
+      }
+    }
+  }
+  if (!state.enabled) {
+    return getBrowserSyncStatusUnlocked(apis);
+  }
   try {
     await initializeBrowserSyncAccess(sync);
     state = await reconcileLocalDeviceName(apis.local, sync, state, now);
@@ -408,31 +463,35 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       ? state.pendingCategoryBaselines || state.categoryBaselines
       : state.categoryBaselines;
     const incompleteCategories = reconcileIncompleteCategories(state, remote);
-    let merged: BrowserSyncSnapshot = { version: 1, categories: {} };
-    let mergedHashes: Partial<Record<SyncCategoryName, string>> = {};
-    let mergedValues: Partial<Record<SyncCategoryName, unknown>> = {};
-    await mutateSettingsInStorage(apis.local, (latestSettings) => {
-      const localSnapshot = buildLocalSnapshot(latestSettings, state, now, remote?.snapshot);
-      merged = mergeSnapshots(
-        localSnapshot.snapshot,
-        remote?.snapshot,
-        mergeBaselines,
-        remote?.manifest.omittedCategories,
-        localSnapshot.changedCategories
-      );
-      const mergedSettings = applySnapshotToSettings(latestSettings, merged);
-      merged = normalizeSnapshotValues(merged, mergedSettings);
-      mergedHashes = getCategoryHashes(mergedSettings);
-      mergedValues = getSyncCategoryValues(mergedSettings);
-      return mergedSettings;
-    });
+    const localSettingsSnapshot = await loadSettingsSnapshotInStorage(apis.local);
+    const localSnapshot = buildLocalSnapshot(localSettingsSnapshot.settings, state, now, remote?.snapshot);
+    let merged = mergeSnapshots(
+      localSnapshot.snapshot,
+      remote?.snapshot,
+      mergeBaselines,
+      remote?.manifest.omittedCategories,
+      localSnapshot.changedCategories
+    );
+    const mergedSettings = applySnapshotToSettings(localSettingsSnapshot.settings, merged);
+    merged = normalizeSnapshotValues(merged, mergedSettings);
+    const mergedHashes = getCategoryHashes(mergedSettings);
+    const mergedValues = getSyncCategoryValues(mergedSettings);
     const fitted = fitSnapshotForSync(merged, incompleteCategories);
     const remoteHash = remote?.manifest.hash;
-    const fittedHash = hashString(canonicalStringify(fitted.snapshot));
+    const fittedHash = await hashSnapshot(canonicalStringify(fitted.snapshot));
     const omissionMetadataChanged = !valuesEqual(
       sanitizeCategoryNames(remote?.manifest.omittedCategories),
       fitted.omittedCategories
     );
+    const localCommit = await compareAndSetSettingsInStorage(
+      apis.local,
+      localSettingsSnapshot.revision,
+      mergedSettings
+    );
+    if (!localCommit.applied) {
+      throw new Error("Local settings changed while browser sync was running. QuickPIM++ kept the newer local edit and will merge it on the next sync.");
+    }
+
     let generation = remote?.manifest.generation;
     let wroteRemoteSnapshot = false;
     if (fittedHash !== remoteHash || omissionMetadataChanged) {
@@ -467,7 +526,7 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
         ? [[name, merged.categories[name]!.updatedAt] as const]
         : [])
     );
-    state = {
+    const completedState: BrowserSyncLocalState = {
       ...state,
       lastSyncAt: now,
       lastSuccessAt: now,
@@ -485,8 +544,9 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       omittedCategories: fitted.omittedCategories,
       incompleteCategories
     };
+    await updateDeviceRegistry(sync, completedState, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, true);
+    state = completedState;
     await saveLocalState(apis.local, state);
-    await updateDeviceRegistry(sync, state, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, true);
   } catch (error) {
     state = {
       ...state,
@@ -496,6 +556,53 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
     await saveLocalState(apis.local, state);
   }
   return getBrowserSyncStatusUnlocked(apis);
+}
+
+export async function queueBrowserSyncPurgeRetry(
+  local: StorageAreaLike,
+  error: unknown,
+  now = Date.now()
+): Promise<void> {
+  const marker: BrowserSyncPendingPurge = {
+    version: 1,
+    createdAt: now,
+    lastError: sanitizeSyncError(error)
+  };
+  await local.set({ [BROWSER_SYNC_PENDING_PURGE_KEY]: marker });
+}
+
+async function loadPendingBrowserSyncPurge(
+  local: StorageAreaLike,
+  now: number
+): Promise<BrowserSyncPendingPurge | undefined> {
+  const result = await local.get(BROWSER_SYNC_PENDING_PURGE_KEY);
+  const value = result[BROWSER_SYNC_PENDING_PURGE_KEY];
+  if (value === undefined || value === null) return undefined;
+  if (!isRecord(value) || value.version !== 1) {
+    const marker: BrowserSyncPendingPurge = {
+      version: 1,
+      createdAt: now,
+      lastError: "The local browser-sync purge marker was damaged. QuickPIM++ will repeat the safe cloud deletion before sync can resume."
+    };
+    await local.set({ [BROWSER_SYNC_PENDING_PURGE_KEY]: marker });
+    return marker;
+  }
+  const createdAt = sanitizeTimestamp(value.createdAt, now);
+  if (!createdAt) {
+    const marker: BrowserSyncPendingPurge = {
+      version: 1,
+      createdAt: now,
+      lastError: "The local browser-sync purge timestamp was invalid. QuickPIM++ will repeat the safe cloud deletion before sync can resume."
+    };
+    await local.set({ [BROWSER_SYNC_PENDING_PURGE_KEY]: marker });
+    return marker;
+  }
+  return {
+    version: 1,
+    createdAt,
+    completedAt: sanitizeTimestamp(value.completedAt, now),
+    lastError: sanitizeText(value.lastError, 260) || undefined
+  };
 }
 
 export async function setBrowserSyncEnabled(apis: BrowserSyncApis, enabled: boolean): Promise<BrowserSyncStatus> {
@@ -705,7 +812,11 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
   const keys = Object.keys(all).filter((key) =>
     key.startsWith(BROWSER_SYNC_KEY_PREFIX) && !coordinationKeys.has(key)
   );
-  if (keys.length) await apis.sync.remove(keys);
+  if (keys.length) {
+    const latest = await apis.sync.get(keys);
+    const unchangedKeys = keys.filter((key) => valuesEqual(latest[key], all[key]));
+    if (unchangedKeys.length) await apis.sync.remove(unchangedKeys);
+  }
   const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   await saveLocalState(apis.local, {
     ...state,
@@ -1328,8 +1439,25 @@ function fitSnapshotForSync(
     delete fitted.categories.activityHistory;
     markLimited("activityHistory");
   }
+  // A single valid but unusually large category must not make every later sync
+  // fail. Preserve preferences, then omit lower-priority portable categories in
+  // a deterministic order. The omitted-category handshake keeps the complete
+  // local copy authoritative and retries it when a later snapshot has room.
+  for (const name of [
+    "usageStatsByItemId",
+    "recentJustifications",
+    "savedJustifications",
+    "favoriteItemIds",
+    "aliasesByItemId",
+    "bundles"
+  ] as SyncCategoryName[]) {
+    if (snapshotStoragePayloadBytes(fitted) <= BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) break;
+    if (!fitted.categories[name]) continue;
+    delete fitted.categories[name];
+    markLimited(name);
+  }
   if (snapshotStoragePayloadBytes(fitted) > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES) {
-    throw new Error("Portable settings exceed the browser sync quota. Reduce aliases or bundle size, or use Backup & Restore.");
+    throw new Error("Core preferences exceed the browser sync quota. QuickPIM++ kept local data unchanged; use Backup & Restore for this installation.");
   }
   return { snapshot: fitted, omittedCategories };
 }
@@ -1369,7 +1497,7 @@ async function readRemoteSnapshot(
     const keys = Array.from({ length: manifest.chunkCount }, (_, index) => chunkKey(manifest.generation, index));
     const chunks = await sync.get(keys);
     const serialized = keys.map((key) => typeof chunks[key] === "string" ? chunks[key] : "").join("");
-    if (utf8Length(serialized) === manifest.byteLength && hashString(serialized) === manifest.hash) {
+    if (utf8Length(serialized) === manifest.byteLength && await hashMatchesManifest(serialized, manifest.hash)) {
       let parsed: unknown;
       try {
         parsed = JSON.parse(serialized);
@@ -1410,31 +1538,62 @@ async function writeRemoteSnapshot(
   const serialized = canonicalStringify(snapshot);
   const generation = `${now.toString(36)}-${BROWSER_SYNC_ATOMIC_GENERATION_MARKER}-${installationId.slice(-8)}-${randomId().slice(-6)}`;
   const chunks = splitForStorageItems(serialized, generation);
-  await removeStaleOrphanedChunks(sync, now, new Set(previousGeneration ? [previousGeneration] : []));
+  await removeStaleOrphanedChunks(
+    sync,
+    now,
+    new Set(previousGeneration ? [previousGeneration] : [])
+  );
   const manifest: BrowserSyncManifest = {
     version: 1,
     generation,
     chunkCount: chunks.length,
     byteLength: utf8Length(serialized),
-    hash: hashString(serialized),
+    hash: await hashSnapshot(serialized),
     updatedAt: now,
     updatedBy: installationId,
     ...(epochAt ? { epochAt } : {}),
     ...(omittedCategories.length ? { omittedCategories } : {})
   };
-  await sync.set({
-    ...Object.fromEntries(chunks.map((chunk, index) => [chunkKey(generation, index), chunk])),
-    [BROWSER_SYNC_MANIFEST_KEY]: manifest
-  });
-  // Delete only the committed generation this write replaced. Removing every
-  // other generation can erase chunks another installation is uploading
-  // concurrently before that installation publishes its manifest.
-  if (previousGeneration && previousGeneration !== generation) {
-    const all = await sync.get(null);
-    const previousPrefix = `${BROWSER_SYNC_CHUNK_PREFIX}${previousGeneration}.`;
-    const previousChunks = Object.keys(all).filter((key) => key.startsWith(previousPrefix));
-    if (previousChunks.length) await sync.remove(previousChunks);
+  const writtenKeys: string[] = [];
+  try {
+    // Individual writes stay below both the per-item and per-call sync quotas.
+    // The manifest is committed last, so readers never treat a partial upload
+    // as the current generation.
+    for (let index = 0; index < chunks.length; index += 1) {
+      const key = chunkKey(generation, index);
+      await sync.set({ [key]: chunks[index] });
+      writtenKeys.push(key);
+    }
+
+    const latestManifestValue = (await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY];
+    const latestManifest = latestManifestValue === undefined || latestManifestValue === null
+      ? undefined
+      : sanitizeManifest(latestManifestValue, now);
+    if (latestManifestValue !== undefined && latestManifestValue !== null && !latestManifest) {
+      throw new Error("Synced settings metadata changed to an invalid value while publishing. QuickPIM++ kept the existing cloud generation unchanged.");
+    }
+    const latestGenerationIsFromOlderEpoch = Boolean(
+      latestManifest
+      && (latestManifest.epochAt || 0) < epochAt
+    );
+    if (!latestGenerationIsFromOlderEpoch && (latestManifest?.generation || undefined) !== previousGeneration) {
+      throw new Error("Another installation updated browser sync at the same time. QuickPIM++ will merge that generation on the next run.");
+    }
+
+    await sync.set({ [BROWSER_SYNC_MANIFEST_KEY]: manifest });
+    const committed = sanitizeManifest((await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY], now);
+    if (committed?.generation !== generation || committed.hash !== manifest.hash) {
+      throw new Error("Another installation completed browser sync at the same time. QuickPIM++ will reconcile both changes on the next run.");
+    }
+  } catch (error) {
+    if (writtenKeys.length) {
+      const latest = await sync.get(writtenKeys);
+      const ownedKeys = writtenKeys.filter((key, index) => latest[key] === chunks[index]);
+      if (ownedKeys.length) await sync.remove(ownedKeys);
+    }
+    throw error;
   }
+  await removeStaleOrphanedChunks(sync, now, new Set([generation]));
   return generation;
 }
 
@@ -1453,11 +1612,6 @@ async function removeStaleOrphanedChunks(
     if (chunkSeparator <= 0) return false;
     const generation = suffix.slice(0, chunkSeparator);
     if (protectedGenerations.has(generation)) return false;
-    // Atomic generations publish chunks and their manifest in one storage.set,
-    // so any non-current atomic generation is already superseded. Older
-    // two-phase generations keep the grace period to avoid deleting chunks
-    // that a previous QuickPIM++ version may still be uploading.
-    if (generation.split("-")[1] === BROWSER_SYNC_ATOMIC_GENERATION_MARKER) return true;
     const timestampPart = generation.split("-", 1)[0];
     if (!/^[0-9a-z]+$/i.test(timestampPart)) return false;
     const generatedAt = Number.parseInt(timestampPart, 36);
@@ -1465,14 +1619,19 @@ async function removeStaleOrphanedChunks(
       && generatedAt > 0
       && now - generatedAt >= BROWSER_SYNC_ORPHAN_GRACE_MS;
   });
-  if (staleKeys.length) await sync.remove(staleKeys);
+  if (staleKeys.length) {
+    const latest = await sync.get(staleKeys);
+    const unchangedKeys = staleKeys.filter((key) => valuesEqual(latest[key], all[key]));
+    if (unchangedKeys.length) await sync.remove(unchangedKeys);
+  }
 }
 
 async function loadBrowserSyncLocalState(
   local: StorageAreaLike,
   distribution: ExtensionDistributionInfo,
   platform?: string,
-  now = Date.now()
+  now = Date.now(),
+  persistNormalization = true
 ): Promise<BrowserSyncLocalState> {
   const value = (await local.get(BROWSER_SYNC_LOCAL_STATE_KEY))[BROWSER_SYNC_LOCAL_STATE_KEY];
   const source = isRecord(value) ? value : {};
@@ -1482,7 +1641,7 @@ async function loadBrowserSyncLocalState(
     : getSyncCategoryValues(DEFAULT_SETTINGS);
   const state: BrowserSyncLocalState = {
     version: 1,
-    enabled: source.enabled !== false,
+    enabled: !isRecord(value) ? true : source.enabled === true,
     installationId,
     deviceName: sanitizeDeviceName(source.deviceName) || buildDefaultDeviceName(distribution, platform),
     deviceNameUpdatedAt: sanitizeTimestamp(source.deviceNameUpdatedAt, now) || 0,
@@ -1502,7 +1661,10 @@ async function loadBrowserSyncLocalState(
     omittedCategories: sanitizeCategoryNames(source.omittedCategories),
     incompleteCategories: sanitizeCategoryNames(source.incompleteCategories)
   };
-  if (!isRecord(value) || canonicalStringify(value) !== canonicalStringify(state)) {
+  // Persist a newly generated identity immediately. Existing state is only
+  // rewritten by mutating flows; status rendering stays read-only and cannot
+  // wake storage listeners just because it normalized a legacy field.
+  if (!isRecord(value) || (persistNormalization && canonicalStringify(value) !== canonicalStringify(state))) {
     await saveLocalState(local, state);
   }
   return state;
@@ -1696,8 +1858,11 @@ function sanitizeDevices(value: unknown, now = Date.now()): BrowserSyncDevice[] 
   for (const item of value) {
     if (!isRecord(item)) continue;
     const installationId = sanitizeInstallationId(item.installationId);
-    const lastSyncAt = sanitizeTimestamp(item.lastSyncAt, now);
+    const parsedLastSyncAt = sanitizeTimestamp(item.lastSyncAt, now);
+    if (parsedLastSyncAt && parsedLastSyncAt > now + SYNC_VERIFICATION_FUTURE_TOLERANCE_MS) continue;
+    const lastSyncAt = parsedLastSyncAt ? Math.min(parsedLastSyncAt, now) : undefined;
     if (!installationId || !lastSyncAt) continue;
+    const parsedNameUpdatedAt = sanitizeTimestamp(item.nameUpdatedAt, now);
     const device: BrowserSyncDevice = {
       installationId,
       name: sanitizeDeviceName(item.name) || "QuickPIM++ installation",
@@ -1706,7 +1871,9 @@ function sanitizeDevices(value: unknown, now = Date.now()): BrowserSyncDevice[] 
       appVersion: sanitizeText(item.appVersion, 30) || "Unknown version",
       lastSyncAt,
       syncEnabled: item.syncEnabled !== false,
-      nameUpdatedAt: sanitizeTimestamp(item.nameUpdatedAt, now) || 0
+      nameUpdatedAt: parsedNameUpdatedAt && parsedNameUpdatedAt <= now + SYNC_VERIFICATION_FUTURE_TOLERANCE_MS
+        ? Math.min(parsedNameUpdatedAt, now)
+        : 0
     };
     devicesById.set(installationId, mergeDeviceRecords(devicesById.get(installationId), device));
   }
@@ -1785,7 +1952,7 @@ function sanitizeManifest(value: unknown, now = Date.now()): BrowserSyncManifest
   const generation = sanitizeGeneration(value.generation);
   const chunkCount = Number(value.chunkCount);
   const byteLength = Number(value.byteLength);
-  const hash = sanitizeText(value.hash, 32);
+  const hash = sanitizeText(value.hash, 64);
   const updatedAt = Number(value.updatedAt);
   const updatedBy = sanitizeInstallationId(value.updatedBy);
   const epochAt = sanitizeTimestamp(value.epochAt, now);
@@ -1793,7 +1960,7 @@ function sanitizeManifest(value: unknown, now = Date.now()): BrowserSyncManifest
     && value.epochAt !== undefined
     && Number(value.epochAt) !== 0
     && !epochAt;
-  if (!generation || !Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 20 || !Number.isInteger(byteLength) || byteLength < 1 || byteLength > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES || !/^[0-9a-f]{8}$/i.test(hash) || !Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt > maximumSyncTimestamp(now) || !updatedBy || hasInvalidEpoch) return undefined;
+  if (!generation || !Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 20 || !Number.isInteger(byteLength) || byteLength < 1 || byteLength > BROWSER_SYNC_PAYLOAD_QUOTA_BYTES || !/^(?:[0-9a-f]{8}|[0-9a-f]{64})$/i.test(hash) || !Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt > maximumSyncTimestamp(now) || !updatedBy || hasInvalidEpoch) return undefined;
   return {
     version: 1,
     generation,
@@ -1897,7 +2064,7 @@ function wait(delayMs: number): Promise<void> {
 function randomId(): string {
   return typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
-    : `install-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`;
+    : `install-${Date.now().toString(36)}-${Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function chunkKey(generation: string, index: number): string {
@@ -1945,6 +2112,22 @@ function hashString(value: string): string {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+async function hashSnapshot(value: string): Promise<string> {
+  if (!crypto.subtle) {
+    throw new Error("This browser cannot verify browser-sync snapshot integrity safely.");
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function hashMatchesManifest(value: string, expected: string): Promise<boolean> {
+  if (/^[0-9a-f]{8}$/i.test(expected)) {
+    // Read-only compatibility with snapshots produced before SHA-256 support.
+    return hashString(value) === expected.toLowerCase();
+  }
+  return await hashSnapshot(value) === expected.toLowerCase();
 }
 
 function canonicalStringify(value: unknown): string {

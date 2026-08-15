@@ -42,6 +42,7 @@ export const TOKEN_STORAGE_KEYS = [
   "azureManagementTokenTimestamp",
   "azureManagementTokenSource"
 ];
+export const TOKEN_MIGRATION_STATE_KEY = "quickPimTokenMigration.v2";
 
 const TOKEN_GROUPS: Array<{ tokenKey: keyof StoredTokens; timestampKey: keyof StoredTokens; sourceKey: keyof StoredTokens; kind: TokenKind }> = [
   { tokenKey: "graphToken", timestampKey: "tokenTimestamp", sourceKey: "tokenSource", kind: "graph" },
@@ -87,7 +88,11 @@ export async function updateStoredTokensInSession<T>(
     const current = compactStoredTokens(await session.get(TOKEN_STORAGE_KEYS));
     const update = await mutation(current);
     if (update.remove?.length) {
-      await Promise.all([session.remove(update.remove), local.remove(update.remove)]);
+      // Remove the legacy local copy first. If that fails, keep the session
+      // token usable and surface the failure instead of resurrecting it during
+      // the next browser session.
+      await local.remove(update.remove);
+      await session.remove(update.remove);
     }
     if (update.set && Object.keys(update.set).length) {
       await session.set(update.set as Record<string, unknown>);
@@ -98,10 +103,8 @@ export async function updateStoredTokensInSession<T>(
 
 export async function removeStoredTokenKeys(keys: string[]): Promise<void> {
   await enqueueTokenMutation(async () => {
-    await Promise.all([
-      chrome.storage.session.remove(keys),
-      chrome.storage.local.remove(keys)
-    ]);
+    await chrome.storage.local.remove(keys);
+    await chrome.storage.session.remove(keys);
   });
 }
 
@@ -130,7 +133,8 @@ export async function removeStoredTokenGroupsIfMatching(
     const current = await session.get(groups.map((group) => String(group.tokenKey)));
     const keys = groups.flatMap((group) => current[group.tokenKey] === group.expectedToken ? group.keys : []);
     if (keys.length) {
-      await Promise.all([session.remove(keys), local.remove(keys)]);
+      await local.remove(keys);
+      await session.remove(keys);
     }
   });
 }
@@ -141,45 +145,40 @@ async function migrateLegacyTokens(options: {
   now: number;
 }): Promise<boolean> {
   const { local, session, now } = options;
-  const legacy = await local.get(TOKEN_STORAGE_KEYS);
+  const legacy = await local.get([...TOKEN_STORAGE_KEYS, TOKEN_MIGRATION_STATE_KEY]);
   const current = await session.get(TOKEN_STORAGE_KEYS);
+  const migrationComplete = isMigrationMarker(legacy[TOKEN_MIGRATION_STATE_KEY]);
+  const candidates = collectTokenGroupCandidates(current, migrationComplete ? {} : legacy, now);
+  const selectedIdentity = selectCoherentIdentity(candidates);
   const updates: Partial<StoredTokens> = {};
-  let expectedIdentity = getFirstValidIdentity(current, now);
+  const removals: string[] = [];
+  let copiedLegacyToken = false;
 
   for (const group of TOKEN_GROUPS) {
-    const currentToken = current[group.tokenKey];
-    if (typeof currentToken === "string" && validateCapturedToken(currentToken, group.kind, now).ok) {
+    const selected = candidates
+      .filter((candidate) => candidate.group.tokenKey === group.tokenKey && candidate.identity === selectedIdentity)
+      .sort(compareTokenGroupCandidates)[0];
+    if (!selected) {
+      if (current[group.tokenKey] !== undefined || current[group.timestampKey] !== undefined || current[group.sourceKey] !== undefined) {
+        removals.push(String(group.tokenKey), String(group.timestampKey), String(group.sourceKey));
+      }
       continue;
     }
-    const token = legacy[group.tokenKey];
-    if (typeof token !== "string") {
-      continue;
-    }
-    const validation = validateCapturedToken(token, group.kind, now);
-    if (!validation.ok) {
-      continue;
-    }
-    const identity = getTokenIdentity(validation.decoded);
-    if (expectedIdentity && identity && expectedIdentity !== identity) {
-      continue;
-    }
-    expectedIdentity ||= identity;
-    setTokenUpdateValue(updates, group.tokenKey, token);
-    const timestamp = legacy[group.timestampKey];
-    const source = legacy[group.sourceKey];
-    if (typeof timestamp === "number") {
-      setTokenUpdateValue(updates, group.timestampKey, timestamp);
-    }
-    if (typeof source === "string") {
-      setTokenUpdateValue(updates, group.sourceKey, source);
-    }
+    setTokenUpdateValue(updates, group.tokenKey, selected.token as StoredTokens[typeof group.tokenKey]);
+    setTokenUpdateValue(updates, group.timestampKey, selected.timestamp as StoredTokens[typeof group.timestampKey]);
+    if (selected.source) setTokenUpdateValue(updates, group.sourceKey, selected.source as StoredTokens[typeof group.sourceKey]);
+    copiedLegacyToken ||= selected.origin === "legacy";
   }
 
-  if (Object.keys(updates).length) {
-    await session.set(updates as Record<string, unknown>);
-  }
+  if (removals.length) await session.remove([...new Set(removals)]);
+  if (Object.keys(updates).length) await session.set(updates as Record<string, unknown>);
+
+  // Mark migration complete even if a browser-specific local removal problem
+  // occurs, so a stale legacy generation can never be selected again. The
+  // removal is still awaited and reported to the caller.
+  await local.set({ [TOKEN_MIGRATION_STATE_KEY]: { version: 2, completedAt: now } });
   await local.remove(TOKEN_STORAGE_KEYS);
-  return Object.keys(updates).length > 0;
+  return copiedLegacyToken;
 }
 
 async function enqueueTokenMutation<T>(mutation: () => Promise<T>): Promise<T> {
@@ -188,21 +187,86 @@ async function enqueueTokenMutation<T>(mutation: () => Promise<T>): Promise<T> {
   return result;
 }
 
-function getFirstValidIdentity(values: Record<string, unknown>, now: number): string | undefined {
-  for (const group of TOKEN_GROUPS) {
-    const token = values[group.tokenKey];
-    if (typeof token !== "string") {
-      continue;
-    }
-    const validation = validateCapturedToken(token, group.kind, now);
-    if (validation.ok) {
+interface TokenGroupCandidate {
+  group: typeof TOKEN_GROUPS[number];
+  token: string;
+  identity: string;
+  timestamp: number;
+  source?: string;
+  expiry: number;
+  origin: "session" | "legacy";
+}
+
+function collectTokenGroupCandidates(
+  current: Record<string, unknown>,
+  legacy: Record<string, unknown>,
+  now: number
+): TokenGroupCandidate[] {
+  const candidates: TokenGroupCandidate[] = [];
+  for (const [origin, values] of [["session", current], ["legacy", legacy]] as const) {
+    for (const group of TOKEN_GROUPS) {
+      const token = values[group.tokenKey];
+      if (typeof token !== "string") continue;
+      const validation = validateCapturedToken(token, group.kind, now);
+      if (!validation.ok) continue;
       const identity = getTokenIdentity(validation.decoded);
-      if (identity) {
-        return identity;
-      }
+      if (!identity) continue;
+      candidates.push({
+        group,
+        token,
+        identity,
+        timestamp: sanitizeCaptureTimestamp(values[group.timestampKey], validation.decoded, now),
+        ...(typeof values[group.sourceKey] === "string" ? { source: String(values[group.sourceKey]).slice(0, 256) } : {}),
+        expiry: Number(validation.decoded.exp) || 0,
+        origin
+      });
     }
   }
-  return undefined;
+  return candidates;
+}
+
+function selectCoherentIdentity(candidates: TokenGroupCandidate[]): string | undefined {
+  const identities = new Map<string, TokenGroupCandidate[]>();
+  for (const candidate of candidates) {
+    identities.set(candidate.identity, [...(identities.get(candidate.identity) || []), candidate]);
+  }
+  return [...identities.entries()]
+    .sort((left, right) => {
+      const leftSessionCoverage = new Set(left[1].filter((item) => item.origin === "session").map((item) => item.group.tokenKey)).size;
+      const rightSessionCoverage = new Set(right[1].filter((item) => item.origin === "session").map((item) => item.group.tokenKey)).size;
+      const leftCoverage = new Set(left[1].map((item) => item.group.tokenKey)).size;
+      const rightCoverage = new Set(right[1].map((item) => item.group.tokenKey)).size;
+      const leftFreshness = Math.max(0, ...left[1].map((item) => item.expiry));
+      const rightFreshness = Math.max(0, ...right[1].map((item) => item.expiry));
+      return rightSessionCoverage - leftSessionCoverage
+        || rightCoverage - leftCoverage
+        || rightFreshness - leftFreshness
+        || left[0].localeCompare(right[0]);
+    })[0]?.[0];
+}
+
+function compareTokenGroupCandidates(left: TokenGroupCandidate, right: TokenGroupCandidate): number {
+  return Number(right.origin === "session") - Number(left.origin === "session")
+    || right.expiry - left.expiry
+    || right.timestamp - left.timestamp
+    || left.token.localeCompare(right.token);
+}
+
+function sanitizeCaptureTimestamp(value: unknown, decoded: Record<string, unknown>, now: number): number {
+  const issuedAt = Number(decoded.iat) * 1_000;
+  const minimum = Number.isFinite(issuedAt) && issuedAt > 0 ? issuedAt - 5 * 60_000 : now - 24 * 60 * 60_000;
+  const timestamp = Number(value);
+  if (Number.isFinite(timestamp) && timestamp >= minimum && timestamp <= now + 5 * 60_000) {
+    return Math.min(timestamp, now);
+  }
+  return Number.isFinite(issuedAt) && issuedAt > 0 && issuedAt <= now + 5 * 60_000
+    ? Math.min(issuedAt, now)
+    : now;
+}
+
+function isMigrationMarker(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && (value as { version?: unknown }).version === 2);
 }
 
 function getTokenIdentity(decoded: Record<string, unknown>): string | undefined {

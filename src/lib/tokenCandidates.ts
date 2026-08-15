@@ -5,7 +5,7 @@ import {
   type GraphTokenTarget
 } from "./graphTokenCapabilities";
 import { validateCapturedToken } from "./security";
-import type { TokenKind } from "./types";
+import type { AccessSetupTarget, TokenKind } from "./types";
 
 export interface SelectedPortalTokenCandidate {
   token: string;
@@ -21,7 +21,6 @@ export interface StoredGraphTokenCandidate {
 
 interface ValidatedCandidate extends SelectedPortalTokenCandidate {
   decoded: Record<string, unknown>;
-  index: number;
 }
 
 interface IdentitySelection {
@@ -30,29 +29,30 @@ interface IdentitySelection {
   coverage: number;
   quality: number;
   latestExpiry: number;
+  targetFreshness: number;
 }
 
 export function selectPortalTokenCandidates(
   tokens: string[],
-  options: { preferredIdentity?: string; now?: number } = {}
+  options: { preferredIdentity?: string; requiredTargets?: AccessSetupTarget[]; now?: number } = {}
 ): SelectedPortalTokenCandidate[] {
   const now = options.now ?? Date.now();
   const byIdentity = new Map<string, ValidatedCandidate[]>();
 
-  tokens.forEach((token, index) => {
+  [...new Set(tokens)].sort().forEach((token) => {
     for (const tokenKind of ["graph", "azureManagement"] as const) {
       const validation = validateCapturedToken(token, tokenKind, now);
       if (!validation.ok) continue;
       const identity = getCandidateIdentity(validation.decoded);
       if (!identity) continue;
       const candidates = byIdentity.get(identity) || [];
-      candidates.push({ token, tokenKind, identity, decoded: validation.decoded, index });
+      candidates.push({ token, tokenKind, identity, decoded: validation.decoded });
       byIdentity.set(identity, candidates);
     }
   });
 
   const selections = [...byIdentity.entries()].map(([identity, candidates]) =>
-    buildIdentitySelection(identity, candidates)
+    buildIdentitySelection(identity, candidates, options.requiredTargets)
   );
   if (!selections.length) {
     return [];
@@ -71,21 +71,25 @@ export function selectBestStoredGraphTokenForTarget(
   now = Date.now()
 ): StoredGraphTokenCandidate | undefined {
   return candidates
-    .flatMap((candidate, index) => {
+    .flatMap((candidate) => {
       if (!candidate.token) return [];
       const validation = validateCapturedToken(candidate.token, "graph", now);
-      return validation.ok ? [{ candidate, decoded: validation.decoded, index }] : [];
+      return validation.ok ? [{ candidate, decoded: validation.decoded }] : [];
     })
     .sort((left, right) =>
       getGraphTokenTargetScore(right.decoded, target) - getGraphTokenTargetScore(left.decoded, target)
       || getGraphTokenAuthStrengthScore(right.decoded) - getGraphTokenAuthStrengthScore(left.decoded)
       || (Number(right.decoded.exp) || 0) - (Number(left.decoded.exp) || 0)
       || (right.candidate.timestamp || 0) - (left.candidate.timestamp || 0)
-      || left.index - right.index
+      || String(left.candidate.token).localeCompare(String(right.candidate.token))
     )[0]?.candidate;
 }
 
-function buildIdentitySelection(identity: string, candidates: ValidatedCandidate[]): IdentitySelection {
+function buildIdentitySelection(
+  identity: string,
+  candidates: ValidatedCandidate[],
+  requiredTargets?: AccessSetupTarget[]
+): IdentitySelection {
   const graphCandidates = candidates.filter((candidate) => candidate.tokenKind === "graph");
   const azureCandidates = candidates.filter((candidate) => candidate.tokenKind === "azureManagement");
   const genericGraph = selectBestCandidate(graphCandidates, (candidate) => getGraphTokenOverallScore(candidate.decoded));
@@ -93,10 +97,13 @@ function buildIdentitySelection(identity: string, candidates: ValidatedCandidate
   const pimGroupGraph = selectTargetGraphCandidate(graphCandidates, "pimGroup");
   const azure = selectBestCandidate(azureCandidates, () => 1);
   const selected = dedupeCandidates([genericGraph, directoryGraph, pimGroupGraph, azure]);
-  const coverage = Number(Boolean(genericGraph))
-    + Number(Boolean(directoryGraph))
-    + Number(Boolean(pimGroupGraph))
-    + Number(Boolean(azure));
+  const required = new Set(requiredTargets?.length ? requiredTargets : ["directoryRole", "pimGroup", "azureRole"]);
+  const targetCandidates = [
+    required.has("directoryRole") ? directoryGraph : undefined,
+    required.has("pimGroup") ? pimGroupGraph : undefined,
+    required.has("azureRole") ? azure : undefined
+  ].filter((candidate): candidate is ValidatedCandidate => Boolean(candidate));
+  const coverage = targetCandidates.length;
   const quality = candidateScore(genericGraph, (candidate) => getGraphTokenOverallScore(candidate.decoded))
     + candidateScore(directoryGraph, (candidate) => getGraphTokenTargetScore(candidate.decoded, "directoryRole"))
     + candidateScore(pimGroupGraph, (candidate) => getGraphTokenTargetScore(candidate.decoded, "pimGroup"))
@@ -111,7 +118,10 @@ function buildIdentitySelection(identity: string, candidates: ValidatedCandidate
     })),
     coverage,
     quality,
-    latestExpiry: Math.max(0, ...selected.map((candidate) => Number(candidate.decoded.exp) || 0))
+    latestExpiry: Math.max(0, ...selected.map((candidate) => Number(candidate.decoded.exp) || 0)),
+    targetFreshness: targetCandidates.length
+      ? Math.min(...targetCandidates.map((candidate) => Number(candidate.decoded.exp) || 0))
+      : 0
   };
 }
 
@@ -133,7 +143,7 @@ function selectBestCandidate(
     getScore(right) - getScore(left)
     || getGraphAuthScore(right) - getGraphAuthScore(left)
     || (Number(right.decoded.exp) || 0) - (Number(left.decoded.exp) || 0)
-    || left.index - right.index
+    || left.token.localeCompare(right.token)
   )[0];
 }
 
@@ -161,6 +171,7 @@ function getGraphAuthScore(candidate: ValidatedCandidate): number {
 
 function compareIdentitySelections(left: IdentitySelection, right: IdentitySelection): number {
   return right.coverage - left.coverage
+    || right.targetFreshness - left.targetFreshness
     || right.quality - left.quality
     || right.latestExpiry - left.latestExpiry
     || left.identity.localeCompare(right.identity);

@@ -17,6 +17,7 @@ import {
   buildAccessCapabilityItems,
   buildTokenCacheKey,
   buildTargetCacheKeys,
+  classifyAccessFailure,
   getAccessSetupTargets,
   isTargetCacheKeyForCurrentIdentity,
   type AccessCapabilityItem
@@ -24,6 +25,7 @@ import {
 import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
 import {
   coerceDurationForItems,
+  buildActivationItemLookup,
   filterAssignedActiveItems,
   formatLoadMessages,
   getActivationRequirements,
@@ -33,6 +35,7 @@ import {
   getBundlePreflight,
   getDurationOptions,
   getRemainingSelectedIdsAfterActivationResults,
+  normalizeActivationResponse,
   getRequestReconciliationTargets,
   getRowActionState,
   mergeEligibleWithActive,
@@ -58,8 +61,7 @@ import {
   getDefaultSortDirection,
   getScopeLabel,
   loadSettings,
-  mutateSettings,
-  recordOperationActivity,
+  mutateSettingsViaBackground,
   sortItems
 } from "../lib/settings";
 import {
@@ -77,7 +79,13 @@ import {
 import { isOperationTimeoutError } from "../lib/async";
 import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
-import { getActivationItemIdentity, normalizeActivationItemId } from "../lib/activationIdentity";
+import { sanitizeErrorMessage } from "../lib/security";
+import {
+  activationItemMatchesIdentity,
+  getActivationItemIdentity,
+  getActivationItemTypeFromIdentity,
+  normalizeActivationItemId
+} from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
 import {
   EDGE_ADDONS_URL,
@@ -94,6 +102,7 @@ import {
   hasPortableSettingsData,
   stringifySettingsBackup
 } from "../lib/settingsBackup";
+import { selectNextRequestOperation } from "../lib/requestOperations";
 import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
@@ -112,8 +121,8 @@ import {
   type PopupDraftInput
 } from "../lib/popupDraft";
 import type {
+  AccessDiagnostic,
   AccessSetupTarget,
-  ActivitySource,
   ActivationSnapshot,
   ActivationItem,
   ActivationResponse,
@@ -193,7 +202,12 @@ function createRequestOperationId(): string {
   if (typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
-  return `request_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+  if (typeof crypto.getRandomValues !== "function") {
+    throw new Error("Secure request identifiers are unavailable in this browser context.");
+  }
+  const entropy = new Uint32Array(3);
+  crypto.getRandomValues(entropy);
+  return `request_${Date.now().toString(36)}_${[...entropy].map((value) => value.toString(36)).join("")}`;
 }
 
 function buildRefreshProgressSteps(includePortalRecovery: boolean): readonly ProgressStepDefinition[] {
@@ -292,7 +306,7 @@ async function waitForManagedPortalRecovery(
 
 function buildActivationFailureNotice(
   errors: ActivationResponse["errors"],
-  activatableItems: ActivationItem[]
+  activatableItems: Array<Pick<ActivationItem, "id" | "type">>
 ): ActivationFailureNotice {
   const itemsById = new Map(activatableItems.map((item) => [item.id, item.type]));
   const recoveryTargets = new Set<RoleTab>();
@@ -330,11 +344,7 @@ function formatActivationError(item: ActivationResponse["errors"][number]): stri
 }
 
 function inferRoleTabFromItemId(itemId: string): RoleTab | undefined {
-  const [prefix] = itemId.split(":");
-  if (prefix === "directoryRole" || prefix === "pimGroup" || prefix === "azureRole") {
-    return prefix;
-  }
-  return undefined;
+  return getActivationItemTypeFromIdentity(itemId);
 }
 
 function PopupApp() {
@@ -371,6 +381,7 @@ function PopupApp() {
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
+  const [resolvedActivationTargets, setResolvedActivationTargets] = useState<Set<AccessSetupTarget>>(new Set());
   const [distributionInfo, setDistributionInfo] = useState<ExtensionDistributionInfo | null>(null);
   const [portableDataAvailable, setPortableDataAvailable] = useState(false);
   const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
@@ -383,15 +394,22 @@ function PopupApp() {
   const manualRefreshInFlight = useRef(false);
   const requestProgressRunId = useRef(0);
   const activationRequestInFlight = useRef(false);
+  const selectedIdsRef = useRef(selectedIds);
+  const requestModeRef = useRef(requestMode);
+  const backgroundOperationIdRef = useRef<string | undefined>(undefined);
+  const operationPollFailureCount = useRef(0);
   const ownedRequestOperationIds = useRef(new Set<string>());
   const reconciledRequestOperationIds = useRef(new Set<string>());
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
   const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
+  const resolvedActivationIdentityKey = useRef<string | undefined>(undefined);
 
   tokenStatusRef.current = tokenStatus;
   portalRecoveryStatusRef.current = portalRecoveryStatus;
+  selectedIdsRef.current = selectedIds;
+  requestModeRef.current = requestMode;
 
   function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
     portalRecoveryStatusRef.current = nextStatus;
@@ -403,8 +421,30 @@ function PopupApp() {
     setTokenStatus(nextStatus);
   }
 
+  function markActivationTargetsResolved(identityKey: string, targets: Iterable<AccessSetupTarget>): void {
+    const nextTargets = [...targets];
+    if (resolvedActivationIdentityKey.current !== identityKey) {
+      resolvedActivationIdentityKey.current = identityKey;
+      setResolvedActivationTargets(new Set(nextTargets));
+      return;
+    }
+    if (!nextTargets.length) {
+      return;
+    }
+    setResolvedActivationTargets((current) => {
+      const next = new Set(current);
+      nextTargets.forEach((target) => next.add(target));
+      return setsEqual(current, next) ? current : next;
+    });
+  }
+
   useEffect(() => {
-    void initializePopupForDistribution();
+    void initializePopupForDistribution().catch((initializationError) => {
+      setError(initializationError instanceof Error ? initializationError.message : String(initializationError));
+      setIsLoading(false);
+      setIsRefreshing(false);
+      setIsPopupDraftReady(true);
+    });
   }, []);
 
   useEffect(() => {
@@ -446,12 +486,7 @@ function PopupApp() {
     [activeItems, eligibleItems, settings.preferences.showAssignedRoles]
   );
   const activatableItemCount = useMemo(() => getActivatableItems(displayItems).length, [displayItems]);
-  const itemsById = useMemo(() => new Map(
-    displayItems.flatMap((item) => [
-      [item.id, item] as const,
-      [normalizeActivationItemId(item.id), item] as const
-    ])
-  ), [displayItems]);
+  const itemsById = useMemo(() => buildActivationItemLookup(displayItems), [displayItems]);
   const enabledFeatures = useMemo(() => new Set<QuickPimFeature>(settings.preferences.enabledFeatures || []), [settings.preferences.enabledFeatures]);
   const enabledRoleFeatures = useMemo(() => getEnabledRoleFeatures(settings), [settings.preferences.enabledFeatures]);
   const itemTypesWithData = useMemo(() => new Set(displayItems.map((item) => item.type)), [displayItems]);
@@ -570,6 +605,13 @@ function PopupApp() {
       const next = new Set<string>();
       for (const id of current) {
         const item = getItemByPersistedId(itemsById, id);
+        if (!item) {
+          const target = getActivationItemTypeFromIdentity(id);
+          if (target && !resolvedActivationTargets.has(target)) {
+            next.add(id);
+          }
+          continue;
+        }
         if (item && (mode ? getRequestModeForItem(item) === mode : Boolean(getRequestModeForItem(item)))) {
           next.add(item.id);
         }
@@ -587,7 +629,7 @@ function PopupApp() {
       }
       return setsEqual(current, next) ? current : next;
     });
-  }, [hasActivationDataLoaded, itemsById, requestMode]);
+  }, [hasActivationDataLoaded, itemsById, requestMode, resolvedActivationTargets]);
 
   useEffect(() => {
     if (visibleTabs.length && !visibleTabs.includes(tab)) {
@@ -596,10 +638,10 @@ function PopupApp() {
   }, [tab, visibleTabs]);
 
   useEffect(() => {
-    if (hasActivationDataLoaded && !selectedItems.length) {
+    if (hasActivationDataLoaded && !selectedIds.size) {
       setIsActivationReviewOpen(false);
     }
-  }, [hasActivationDataLoaded, selectedItems.length]);
+  }, [hasActivationDataLoaded, selectedIds.size]);
 
   useEffect(() => {
     if (!isPopupDraftReady) {
@@ -618,7 +660,7 @@ function PopupApp() {
     }
     draftSaveTimer.current = setTimeout(() => {
       void savePopupDraft(draft);
-    }, 200);
+    }, 50);
 
     return () => {
       if (draftSaveTimer.current) {
@@ -685,17 +727,21 @@ function PopupApp() {
           return;
         }
         if (!Array.isArray(operations)) {
-          return;
+          throw new Error("Background request status is invalid.");
         }
-        const operation = operations.find((item) =>
-          !ownedRequestOperationIds.current.has(item.id)
-          && !reconciledRequestOperationIds.current.has(item.id)
-        );
+        operationPollFailureCount.current = 0;
+        const excludedOperationIds = new Set([
+          ...ownedRequestOperationIds.current,
+          ...reconciledRequestOperationIds.current
+        ]);
+        const operation = selectNextRequestOperation(operations, excludedOperationIds);
         if (!operation) {
           return;
         }
+        const terminalOperation = operation.state === "complete" || operation.state === "error";
 
-        if (operation.state === "running") {
+        if (!terminalOperation && operation.state === "running") {
+          backgroundOperationIdRef.current = operation.id;
           activationRequestInFlight.current = true;
           setIsActivating(true);
           setRequestMode(operation.action);
@@ -727,13 +773,22 @@ function PopupApp() {
           return;
         }
 
-        if (!hasActivationDataLoaded) {
+        if (!hasActivationDataLoaded && operation.state !== "uncertain") {
           return;
         }
         reconciledRequestOperationIds.current.add(operation.id);
         await reconcileDetachedRequestOperation(operation);
-      } catch {
-        // A short-lived service-worker wake-up must not disturb the current popup state.
+      } catch (pollError) {
+        operationPollFailureCount.current += 1;
+        if (backgroundOperationIdRef.current && operationPollFailureCount.current >= 8) {
+          backgroundOperationIdRef.current = undefined;
+          activationRequestInFlight.current = false;
+          setIsActivating(false);
+          setActivationProgress(null);
+          setError(
+            `QuickPIM++ could not read the background request status after several attempts. ${pollError instanceof Error ? pollError.message : String(pollError)}`
+          );
+        }
       } finally {
         schedule();
       }
@@ -929,9 +984,13 @@ function PopupApp() {
     let liveProgress: OperationProgress | null = null;
     let refreshCompleted = false;
     let progressVisible = false;
-    let surfaceRefreshErrors = !preferQuietCachedRefresh;
+    let surfaceRefreshErrors = !preferQuietCachedRefresh && !options.suppressMessage;
     let cacheDecisionMade = false;
     let canShowCachedData = false;
+
+    if (!options.suppressMessage && !isActivationReviewOpen) {
+      setError("");
+    }
 
     const revealProgress = () => {
       if (!shouldShowProgress || progressVisible || !liveProgress) {
@@ -1023,6 +1082,13 @@ function PopupApp() {
       setReferenceData(loadedReferenceData);
       setAccessCapabilities(buildAccessCapabilityItems(loadedTokens, currentCache, enabledRoleFeatures));
       const initialCacheView = getActivationCacheView(currentCache, loadedTokens, enabledRoleFeatures, now);
+      markActivationTargetsResolved(
+        buildTokenCacheKey(loadedTokens),
+        (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[]).filter((target) =>
+          !enabledRoleFeatures.includes(target)
+          || Boolean(initialCacheView.eligibleCache[target]?.isFresh && initialCacheView.activeCache[target]?.isFresh)
+        )
+      );
       let currentCacheView = initialCacheView;
       let progressiveCache = currentCache;
       let progressiveTokens = loadedTokens;
@@ -1352,6 +1418,7 @@ function PopupApp() {
           targetSucceeded = !eligibleResult.errors.length && !activeResult.errors.length;
           if (targetSucceeded) {
             successfulRefreshTargets.add(target);
+            markActivationTargetsResolved(buildTokenCacheKey(progressiveTokens), [target]);
           }
           if (showBlockingLoading && target === preferredTarget) {
             setIsLoading(false);
@@ -1360,11 +1427,7 @@ function PopupApp() {
           const policyCandidates = getUniquePolicyCandidates([...eligibleResult.items, ...activeResult.items]);
           if (targetSucceeded && policyCandidates.some((item) => item.activationPolicyState === "pending")) {
             showProgressStep(sourceProgressStep, `${tabLabel(target)} ready; checking activation policy`);
-            try {
-              const enriched = await enrichActivationPolicies(policyCandidates);
-              if (!isCurrentRun()) return;
-              eligibleResult.items = applyPolicyEnrichment(eligibleResult.items, enriched);
-              activeResult.items = applyPolicyEnrichment(activeResult.items, enriched);
+            const persistPolicyResult = () => {
               progressiveCache = updateCacheFromTargetResults(
                 progressiveCache,
                 "eligible",
@@ -1393,8 +1456,30 @@ function PopupApp() {
                 enrichedView.active
               );
               cachePersistence.push(saveDataCache(progressiveCache));
-            } catch {
-              // Core role data remains immediately usable for browsing. Selected items are revalidated before activation.
+            };
+            try {
+              const enriched = await enrichActivationPolicies(policyCandidates);
+              if (!isCurrentRun()) return;
+              eligibleResult.items = applyPolicyEnrichment(eligibleResult.items, enriched);
+              activeResult.items = applyPolicyEnrichment(activeResult.items, enriched);
+              const unresolvedPolicyCount = enriched.filter((item) => item.activationPolicyState !== "ready").length;
+              const diagnostic = unresolvedPolicyCount
+                ? createPolicyDiagnostic(
+                    target,
+                    false,
+                    `Microsoft did not return activation policy details for ${unresolvedPolicyCount} item${unresolvedPolicyCount === 1 ? "" : "s"}.`
+                  )
+                : createPolicyDiagnostic(target, true);
+              appendAccessDiagnostic(eligibleResult, diagnostic);
+              appendAccessDiagnostic(activeResult, diagnostic);
+              persistPolicyResult();
+            } catch (policyError) {
+              if (!isCurrentRun()) return;
+              const diagnostic = createPolicyDiagnostic(target, false, sanitizeErrorMessage(policyError));
+              appendAccessDiagnostic(eligibleResult, diagnostic);
+              appendAccessDiagnostic(activeResult, diagnostic);
+              // Core role data remains usable for browsing. Selected items are revalidated before activation.
+              persistPolicyResult();
             }
           }
         } catch (targetError) {
@@ -1468,7 +1553,7 @@ function PopupApp() {
         saveDataCache(progressiveCache),
         saveReferenceData(progressiveReferenceData),
         ...(nextSettings === loadedSettings ? [] : [
-          mutateSettings((latest) => ({
+          mutateSettingsViaBackground((latest) => ({
             ...latest,
             preferences: {
               ...latest.preferences,
@@ -1574,27 +1659,20 @@ function PopupApp() {
       return;
     }
     dismissRequestErrors();
-    setSelectedIds((current) => {
-      const item = getItemByPersistedId(itemsById, itemId);
-      const itemMode = getRequestModeForItem(item);
-      if (!item || !itemMode || (requestMode && requestMode !== itemMode)) {
-        return current;
-      }
-      const next = new Set(current);
-      const selectedItemId = [...next].find((id) => id.toLowerCase() === item.id.toLowerCase());
-      if (selectedItemId) {
-        next.delete(selectedItemId);
-      } else {
-        next.add(item.id);
-      }
-      if (!next.size) {
-        setRequestMode(undefined);
-        setIsActivationReviewOpen(false);
-      } else if (!requestMode) {
-        setRequestMode(itemMode);
-      }
-      return next;
-    });
+    const item = getItemByPersistedId(itemsById, itemId);
+    const itemMode = getRequestModeForItem(item);
+    const currentMode = requestModeRef.current;
+    if (!item || !itemMode || (currentMode && currentMode !== itemMode)) return;
+    const next = new Set(selectedIdsRef.current);
+    const selectedItemId = [...next].find((id) => normalizeActivationItemId(id) === normalizeActivationItemId(item.id));
+    if (selectedItemId) next.delete(selectedItemId);
+    else next.add(item.id);
+    const nextMode = next.size ? currentMode || itemMode : undefined;
+    selectedIdsRef.current = next;
+    requestModeRef.current = nextMode;
+    setSelectedIds(next);
+    setRequestMode(nextMode);
+    if (!next.size) setIsActivationReviewOpen(false);
   }
 
   async function toggleFavorite(itemId: string) {
@@ -1618,32 +1696,6 @@ function PopupApp() {
     setActivationProgress((current) => current?.status === "error" ? null : current);
   }
 
-  async function recordCompletedOperationActivity(
-    operation: RequestOperationRecord,
-    operationItems: ActivationItem[],
-    response: ActivationResponse
-  ): Promise<void> {
-    const completedAt = new Date(operation.updatedAt).toISOString();
-    await mutatePopupSettings((latest) => {
-      let updated = operation.justification
-        ? addRecentJustification(latest, operation.justification)
-        : latest;
-      updated = recordOperationActivity(updated, {
-        operationId: operation.id,
-        action: operation.action,
-        items: operationItems,
-        response,
-        requestedAt: new Date(operation.startedAt).toISOString(),
-        completedAt,
-        durationHours: operation.durationHours,
-        justification: operation.justification,
-        bundleName: operation.bundleName,
-        source: getActivitySource(response, operation)
-      });
-      return updated;
-    });
-  }
-
   async function reconcileDetachedRequestOperation(operation: RequestOperationRecord): Promise<void> {
     const operationLabel = operation.action === "activate" ? "activation" : "deactivation";
     const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
@@ -1653,6 +1705,7 @@ function PopupApp() {
       { label: "Background request completed" }
     );
     activationRequestInFlight.current = false;
+    backgroundOperationIdRef.current = undefined;
     setIsActivating(false);
     setActivationProgress(requestProgress);
     if (operation.durationHours !== undefined) {
@@ -1662,13 +1715,11 @@ function PopupApp() {
       setJustification(operation.justification);
     }
 
+    let reconciliationPersisted = false;
     try {
       if (operation.state === "error" || !operation.response) {
         const detail = operation.error || "The background request stopped before a result was available.";
-        const restorableIds = operation.itemIds.flatMap((id) => {
-          const item = getItemByPersistedId(itemsById, id);
-          return item ? [item.id] : [];
-        });
+        const restorableIds = [...operation.itemIds];
         setActivationFailureNotice(null);
         setError(detail);
         setSelectedIds(new Set(restorableIds));
@@ -1687,21 +1738,27 @@ function PopupApp() {
           `${operationLabel === "activation" ? "Activation" : "Deactivation"} stopped in the background`
         );
         setActivationProgress(requestProgress);
+        reconciliationPersisted = true;
         return;
       }
 
-      const response = operation.response;
-      const operationItems = operation.itemIds
-        .map((id) => getItemByPersistedId(itemsById, id))
-        .filter((item): item is ActivationItem => Boolean(item));
+      const response = normalizeActivationResponse(operation.response);
+      const operationItems: Array<Pick<ActivationItem, "id" | "type">> = operation.items?.length
+        ? operation.items.map((item) => ({ id: item.itemId, type: item.itemType }))
+        : operation.itemIds.flatMap((id) => {
+            const visibleItem = getItemByPersistedId(itemsById, id);
+            const inferredType = inferRoleTabFromItemId(id);
+            return visibleItem
+              ? [{ id: visibleItem.id, type: visibleItem.type }]
+              : inferredType
+                ? [{ id, type: inferredType }]
+                : [];
+          });
       const successfulIds = new Set(response.results
         .filter((result) => result.success)
         .map((result) => normalizeActivationItemId(result.itemId)));
       const failedIds = new Set(response.errors.map((result) => normalizeActivationItemId(result.itemId)));
-      const failedSelectionIds = operation.itemIds.flatMap((id) => {
-        const item = getItemByPersistedId(itemsById, id);
-        return item && failedIds.has(normalizeActivationItemId(id)) ? [item.id] : [];
-      });
+      const failedSelectionIds = operation.itemIds.filter((id) => failedIds.has(normalizeActivationItemId(id)));
       const successCount = successfulIds.size;
       const failureNotice = response.errors.length
         ? buildActivationFailureNotice(response.errors, operationItems)
@@ -1723,8 +1780,6 @@ function PopupApp() {
         response.results.filter((result) => result.success && result.trackingUnavailable).length
       ));
 
-      await recordCompletedOperationActivity(operation, operationItems, response);
-
       const reconciliationTargets = getRequestReconciliationTargets(response.results, operationItems);
 
       if (failedSelectionIds.length) {
@@ -1745,12 +1800,17 @@ function PopupApp() {
       }
 
       if (reconciliationTargets.length) {
-        await refresh({
-          force: true,
-          showLoading: false,
-          suppressMessage: true,
-          targets: reconciliationTargets
-        });
+        try {
+          await refresh({
+            force: true,
+            showLoading: false,
+            suppressMessage: true,
+            targets: reconciliationTargets
+          });
+        } catch {
+          // The Microsoft request result remains authoritative. The normal
+          // cache/background refresh will reconcile display state later.
+        }
       }
 
       if (failureNotice) {
@@ -1770,8 +1830,13 @@ function PopupApp() {
         }, 350);
       }
       setActivationProgress(requestProgress);
+      reconciliationPersisted = true;
     } finally {
-      await acknowledgeRequestOperations([operation.id]);
+      if (reconciliationPersisted) {
+        await acknowledgeRequestOperations([operation.id]);
+      } else {
+        reconciledRequestOperationIds.current.delete(operation.id);
+      }
     }
   }
 
@@ -1912,11 +1977,10 @@ function PopupApp() {
         isActivationReviewOpen: true,
         requestMode: "activate"
       }).catch(() => undefined);
-      const requestedAt = new Date().toISOString();
-      const response = await sendActivationOperation(
+      const response = normalizeActivationResponse(await sendActivationOperation(
         activatableItems,
         "The activation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      );
+      ));
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
       const successItems = response.results
@@ -1924,23 +1988,7 @@ function PopupApp() {
         .map((result) => activatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
         .filter((item): item is ActivationItem => Boolean(item));
 
-      await mutatePopupSettings((latest) => {
-        let updatedSettings = addRecentJustification(latest, effectiveJustification);
-        const completedAt = new Date().toISOString();
-        const source = getActivitySource(response);
-        return recordOperationActivity(updatedSettings, {
-          operationId: operationIds[0],
-          action: "activate",
-          items: activatableItems,
-          response,
-          requestedAt,
-          completedAt,
-          durationHours: effectiveDuration,
-          justification: effectiveJustification,
-          bundleName: bundle?.name,
-          source
-        });
-      });
+      setSettings((current) => addRecentJustification(current, effectiveJustification));
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
       setSelectedIds(remainingSelectedIds);
       requestProgress = advanceOperationProgress(requestProgress, 3);
@@ -1955,12 +2003,17 @@ function PopupApp() {
       }
       const reconciliationTargets = getRequestReconciliationTargets(response.results, activatableItems);
       if (reconciliationTargets.length) {
-        await refresh({
-          force: true,
-          showLoading: false,
-          suppressMessage: true,
-          targets: reconciliationTargets
-        });
+        try {
+          await refresh({
+            force: true,
+            showLoading: false,
+            suppressMessage: true,
+            targets: reconciliationTargets
+          });
+        } catch {
+          // A submitted Microsoft write must not be reported as failed merely
+          // because the follow-up read could not be completed.
+        }
       }
       if (remainingSelectedIds.size) {
         await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "activate" });
@@ -2068,11 +2121,10 @@ function PopupApp() {
         isActivationReviewOpen: true,
         requestMode: "deactivate"
       }).catch(() => undefined);
-      const requestedAt = new Date().toISOString();
-      const response = await sendDeactivationOperation(
+      const response = normalizeActivationResponse(await sendDeactivationOperation(
         deactivatableItems,
         "The deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      );
+      ));
       requestProgress = advanceOperationProgress(requestProgress, 2);
       setActivationProgress(requestProgress);
       const successItems = response.results
@@ -2081,29 +2133,7 @@ function PopupApp() {
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
-        await mutatePopupSettings((latest) => {
-          const updatedSettings = addRecentJustification(latest, justification);
-          return recordOperationActivity(updatedSettings, {
-            operationId: operationIds[0],
-            action: "deactivate",
-            items: deactivatableItems,
-            response,
-            requestedAt,
-            completedAt: new Date().toISOString(),
-            justification,
-            source: getActivitySource(response)
-          });
-        });
-      } else {
-        await mutatePopupSettings((latest) => recordOperationActivity(latest, {
-          operationId: operationIds[0],
-          action: "deactivate",
-          items: deactivatableItems,
-          response,
-          requestedAt,
-          completedAt: new Date().toISOString(),
-          source: getActivitySource(response)
-        }));
+        setSettings((current) => addRecentJustification(current, justification));
       }
 
       const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
@@ -2120,12 +2150,17 @@ function PopupApp() {
       }
       const reconciliationTargets = getRequestReconciliationTargets(response.results, deactivatableItems);
       if (reconciliationTargets.length) {
-        await refresh({
-          force: true,
-          showLoading: false,
-          suppressMessage: true,
-          targets: reconciliationTargets
-        });
+        try {
+          await refresh({
+            force: true,
+            showLoading: false,
+            suppressMessage: true,
+            targets: reconciliationTargets
+          });
+        } catch {
+          // Keep the accepted deactivation result even if reconciliation waits
+          // for the next refresh cycle.
+        }
       }
       if (remainingSelectedIds.size) {
         await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "deactivate" });
@@ -2283,7 +2318,7 @@ function PopupApp() {
   async function mutatePopupSettings(updater: (latest: QuickPimSettings) => QuickPimSettings): Promise<QuickPimSettings> {
     let result = settings;
     const operation = settingsMutationQueue.current.then(async () => {
-      result = await mutateSettings(updater);
+      result = await mutateSettingsViaBackground(updater);
       setSettings(result);
     });
     settingsMutationQueue.current = operation.catch(() => undefined);
@@ -2634,7 +2669,9 @@ function PopupApp() {
               settings.bundles.map((bundle) => {
                 const expansion = expandBundle(bundle, displayItems);
                 const preflight = getBundlePreflight(bundle, displayItems, "");
-                const configuredItems = bundle.itemIds.map((itemId) => displayItems.find((item) => item.id === itemId));
+                const configuredItems = bundle.itemIds.map((itemId) => (
+                  displayItems.find((item) => activationItemMatchesIdentity(item, itemId))
+                ));
                 const itemSummary = configuredItems.map((item, index) => item
                   ? getDisplayName(item, settings, referenceData)
                   : settings.aliasesByItemId[bundle.itemIds[index]] || "Unavailable item"
@@ -3491,18 +3528,6 @@ function applyDisplayData(
   });
 }
 
-function getActivitySource(
-  response: ActivationResponse,
-  operation?: RequestOperationRecord
-): ActivitySource | undefined {
-  const installationId = response.sourceInstallationId || operation?.sourceInstallationId;
-  if (!installationId) return undefined;
-  return {
-    installationId,
-    deviceName: response.sourceDeviceName || operation?.sourceDeviceName || "QuickPIM++ installation"
-  };
-}
-
 function formatBundleDuration(durationHours: number | undefined): string {
   if (!durationHours || !Number.isFinite(durationHours)) return "Not set";
   if (durationHours < 1) return `${Math.round(durationHours * 60)} minutes`;
@@ -3679,6 +3704,32 @@ function applyPolicyEnrichment(items: ActivationItem[], enriched: ActivationItem
       activationRequirements: policyItem.activationRequirements
     };
   });
+}
+
+function createPolicyDiagnostic(
+  target: AccessSetupTarget,
+  success: boolean,
+  error?: string
+): AccessDiagnostic {
+  const sanitizedError = error ? sanitizeErrorMessage(error) : "";
+  return {
+    target,
+    success,
+    checkedAt: new Date().toISOString(),
+    operation: "policy",
+    endpointLabel: `${tabLabel(target)} activation policy`,
+    ...(sanitizedError ? {
+      error: sanitizedError,
+      failureKind: classifyAccessFailure(sanitizedError)
+    } : {})
+  };
+}
+
+function appendAccessDiagnostic(
+  result: ActivationSnapshot["eligible"],
+  diagnostic: AccessDiagnostic
+): void {
+  result.diagnostics = [...(result.diagnostics || []), diagnostic];
 }
 
 function isActivationSnapshot(value: unknown): value is ActivationSnapshot {

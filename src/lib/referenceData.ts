@@ -117,15 +117,15 @@ export function getReferenceDisplayName(item: ActivationItem, referenceData: Ref
   }
 
   if (item.type === "directoryRole" && !isResolvedDirectoryRoleName(item)) {
-    return referenceData.directoryRoleDefinitions[item.roleDefinitionId]?.name;
+    return referenceData.directoryRoleDefinitions[canonicalReferenceKey(item.roleDefinitionId)]?.name;
   }
 
   if (item.type === "pimGroup" && item.displayName === item.groupId) {
-    return referenceData.pimGroups[item.groupId]?.name;
+    return referenceData.pimGroups[canonicalReferenceKey(item.groupId)]?.name;
   }
 
   if (item.type === "azureRole" && !isResolvedAzureRoleName(item)) {
-    return referenceData.azureRoleDefinitions[item.roleDefinitionId]?.name;
+    return referenceData.azureRoleDefinitions[canonicalReferenceKey(item.roleDefinitionId)]?.name;
   }
 
   return undefined;
@@ -137,12 +137,12 @@ export function getReferenceScopeLabel(item: ActivationItem, referenceData: Refe
   }
 
   if (item.type === "directoryRole" && item.directoryScopeId !== "/" && item.scopeLabel === item.directoryScopeId) {
-    return referenceData.directoryScopes[item.directoryScopeId]?.name;
+    return referenceData.directoryScopes[canonicalReferenceKey(item.directoryScopeId)]?.name;
   }
 
   if (item.type === "azureRole") {
     if (item.scopeLabel === item.scope || item.scopeLabel === item.subscriptionId || item.scopeLabel === "Azure") {
-      return referenceData.scopes[item.scope]?.name || (item.subscriptionId ? referenceData.azureSubscriptions[item.subscriptionId]?.name : undefined);
+      return referenceData.scopes[canonicalReferenceKey(item.scope)]?.name || (item.subscriptionId ? referenceData.azureSubscriptions[canonicalReferenceKey(item.subscriptionId)]?.name : undefined);
     }
   }
 
@@ -173,12 +173,9 @@ function isResolvedAzureRoleName(item: Extract<ActivationItem, { type: "azureRol
 }
 
 function setReference(target: Record<string, ReferenceValue>, key: string | undefined, name: string | undefined, updatedAt: string): void {
-  const safeKey = sanitizeString(key, MAX_REFERENCE_KEY_LENGTH);
+  const safeKey = canonicalReferenceKey(sanitizeString(key, MAX_REFERENCE_KEY_LENGTH));
   const safeName = sanitizeString(name, MAX_REFERENCE_NAME_LENGTH);
   if (!safeKey || !isSafeRecordKey(safeKey) || !safeName) {
-    return;
-  }
-  if (target[safeKey]?.name === safeName) {
     return;
   }
   target[safeKey] = { name: safeName, updatedAt };
@@ -190,10 +187,13 @@ function mergeReferenceMaps(
 ): Record<string, ReferenceValue> {
   const merged = { ...current };
   for (const [key, value] of Object.entries(incoming)) {
-    if (!isSafeRecordKey(key)) continue;
-    const existing = merged[key];
-    if (!existing || Date.parse(value.updatedAt) >= Date.parse(existing.updatedAt)) {
-      merged[key] = value;
+    const canonicalKey = canonicalReferenceKey(key);
+    if (!isSafeRecordKey(canonicalKey)) continue;
+    const existing = merged[canonicalKey];
+    const incomingTimestamp = Date.parse(value.updatedAt);
+    const existingTimestamp = existing ? Date.parse(existing.updatedAt) : Number.NEGATIVE_INFINITY;
+    if (!existing || incomingTimestamp > existingTimestamp || (incomingTimestamp === existingTimestamp && value.name.localeCompare(existing.name) > 0)) {
+      merged[canonicalKey] = value;
     }
   }
   return merged;
@@ -204,19 +204,14 @@ function sanitizeReferenceMap(value: unknown, now: number): Record<string, Refer
     return {};
   }
 
-  const rawEntries: Array<[string, unknown]> = [];
-  for (const key in value) {
-    if (!Object.hasOwn(value, key)) continue;
-    if (rawEntries.length >= MAX_REFERENCE_INPUT_ITEMS) return {};
-    rawEntries.push([key, value[key]]);
-  }
+  const rawEntries = Object.entries(value).slice(0, MAX_REFERENCE_INPUT_ITEMS);
 
   const entries = rawEntries
     .flatMap(([key, entry]) => {
       if (!isRecord(entry)) {
         return [];
       }
-      const safeKey = sanitizeString(key, MAX_REFERENCE_KEY_LENGTH);
+      const safeKey = canonicalReferenceKey(sanitizeString(key, MAX_REFERENCE_KEY_LENGTH));
       const safeName = sanitizeString(entry.name, MAX_REFERENCE_NAME_LENGTH);
       const rawUpdatedAt = sanitizeString(entry.updatedAt, 64);
       const timestamp = rawUpdatedAt ? Date.parse(rawUpdatedAt) : Number.NaN;
@@ -226,9 +221,21 @@ function sanitizeReferenceMap(value: unknown, now: number): Record<string, Refer
       const updatedAt = new Date(timestamp).toISOString();
       return safeKey && isSafeRecordKey(safeKey) && safeName ? [[safeKey, { name: safeName, updatedAt }] as const] : [];
     })
-    .sort((a, b) => Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt))
+    .sort((a, b) => Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt) || a[0].localeCompare(b[0]))
     .slice(0, MAX_REFERENCE_ITEMS);
-  return Object.fromEntries(entries);
+  const newestByKey = new Map<string, ReferenceValue>();
+  for (const [key, entry] of entries) {
+    const canonicalKey = canonicalReferenceKey(key);
+    const existing = newestByKey.get(canonicalKey);
+    if (!existing || Date.parse(entry.updatedAt) > Date.parse(existing.updatedAt) || (entry.updatedAt === existing.updatedAt && entry.name.localeCompare(existing.name) > 0)) {
+      newestByKey.set(canonicalKey, entry);
+    }
+  }
+  return Object.fromEntries([...newestByKey.entries()].slice(0, MAX_REFERENCE_ITEMS));
+}
+
+function canonicalReferenceKey(value: string | undefined): string {
+  return (value || "").trim().toLowerCase();
 }
 
 function sanitizeString(value: unknown, maxLength: number): string | undefined {

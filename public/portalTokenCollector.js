@@ -1,25 +1,36 @@
 (() => {
   const JWT_PATTERN = /\b[A-Za-z0-9_-]{1,2000}\.[A-Za-z0-9_-]{1,8000}\.[A-Za-z0-9_-]{1,2000}\b/g;
-  const MAX_STORAGE_VALUE_LENGTH = 300000;
+  const MAX_STORAGE_VALUE_LENGTH = 8 * 1024 * 1024;
+  const STORAGE_SCAN_CHUNK_LENGTH = 256 * 1024;
   // MSAL can retain several scoped tokens per account. Keep enough candidates for
   // the background selector to choose coherent Entra, PIM Group, and Azure tokens.
   const MAX_TOKENS = 100;
+  const MAX_TOKEN_CANDIDATES = 500;
   const MAX_JSON_DEPTH = 5;
   const MAX_ATTEMPTS = 45;
-  const MAX_INDEXED_DB_DATABASES = 12;
-  const MAX_INDEXED_DB_STORES = 40;
-  const MAX_INDEXED_DB_RECORDS_PER_STORE = 100;
+  const MAX_INDEXED_DB_DATABASES = 32;
+  const MAX_INDEXED_DB_STORES = 100;
+  const MAX_INDEXED_DB_RECORDS_PER_STORE = 250;
+  const INDEXED_DB_TOTAL_BUDGET_MS = 6000;
   const INDEXED_DB_OPEN_TIMEOUT_MS = 1000;
   const INDEXED_DB_STORE_TIMEOUT_MS = 1500;
   const CAPTURE_RESPONSE_TIMEOUT_MS = 5000;
+  const IDLE_RESCAN_INTERVAL_MS = 30000;
   let attempts = 0;
   let activeScan;
   let interval;
   let lastTokenFingerprint = "";
+  let lastAutomaticScanAt = 0;
+  let forcedFollowUp;
 
   function scan(options = {}) {
     if (activeScan) {
-      return options.force ? activeScan.then(() => scan(options)) : activeScan;
+      if (!options.force) return activeScan;
+      forcedFollowUp ||= activeScan.catch(() => undefined).then(() => {
+        forcedFollowUp = undefined;
+        return scan({ force: true, includeIndexedDb: true });
+      });
+      return forcedFollowUp;
     }
 
     const scanRun = performScan(options);
@@ -27,31 +38,33 @@
       if (activeScan === trackedRun) {
         activeScan = undefined;
       }
-      if (attempts >= MAX_ATTEMPTS && interval !== undefined) {
-        clearInterval(interval);
-      }
     });
     activeScan = trackedRun;
     return trackedRun;
   }
 
   async function performScan({ force = false, includeIndexedDb = false } = {}) {
+    const now = Date.now();
+    if (!force && attempts >= MAX_ATTEMPTS && now - lastAutomaticScanAt < IDLE_RESCAN_INTERVAL_MS) {
+      return { tokenCount: 0, captured: [] };
+    }
+    if (!force) lastAutomaticScanAt = now;
     attempts += 1;
-    const shouldIncludeIndexedDb = window === window.top && (includeIndexedDb || attempts <= 3 || attempts % 5 === 0);
+    const shouldIncludeIndexedDb = includeIndexedDb || attempts <= 3 || attempts % 5 === 0;
     const tokens = await collectPortalTokens(shouldIncludeIndexedDb);
-    const fingerprint = tokens.slice().sort().join("|");
+    const fingerprint = fingerprintTokens(tokens);
     if (!tokens.length || (!force && fingerprint === lastTokenFingerprint)) {
       return { tokenCount: tokens.length, captured: [] };
     }
 
-    const result = await submitTokens(tokens);
+    const result = await submitTokens(tokens, fingerprint);
     if (result.delivered) {
       lastTokenFingerprint = fingerprint;
     }
     return { tokenCount: tokens.length, captured: result.captured };
   }
 
-  function submitTokens(tokens) {
+  function submitTokens(tokens, fingerprint) {
     return new Promise((resolve) => {
       let settled = false;
       const finish = (result) => {
@@ -74,7 +87,12 @@
             const captured = response && response.success && Array.isArray(response.data?.captured)
               ? response.data.captured
               : [];
-            finish({ delivered: !runtimeError && Boolean(response?.success), captured });
+            const delivered = !runtimeError && Boolean(response?.success);
+            // The callback may arrive after our response timeout. Remember a
+            // successful late delivery so the periodic scanner does not keep
+            // resubmitting the same token set.
+            if (delivered) lastTokenFingerprint = fingerprint;
+            finish({ delivered, captured });
           }
         );
       } catch {
@@ -90,13 +108,17 @@
     if (includeIndexedDb) {
       await collectIndexedDbTokens(tokens);
     }
-    return [...tokens].slice(0, MAX_TOKENS);
+    return [...tokens]
+      .sort(compareTokenCandidates)
+      .slice(0, MAX_TOKENS);
   }
 
   function collectStorageTokens(storage, tokens) {
     try {
-      for (let index = 0; index < storage.length && tokens.size < MAX_TOKENS; index += 1) {
-        const key = storage.key(index);
+      const keys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+        .filter(Boolean)
+        .sort((left, right) => storageKeyPriority(right) - storageKeyPriority(left) || left.localeCompare(right));
+      for (const key of keys) {
         if (!key) continue;
         addTokensFromValue(storage.getItem(key), tokens);
       }
@@ -107,7 +129,7 @@
 
   async function collectIndexedDbTokens(tokens) {
     if (
-      tokens.size >= MAX_TOKENS ||
+      tokens.size >= MAX_TOKEN_CANDIDATES ||
       !window.indexedDB ||
       typeof window.indexedDB.databases !== "function"
     ) {
@@ -121,9 +143,14 @@
       return;
     }
 
-    for (const databaseInfo of databases.slice(0, MAX_INDEXED_DB_DATABASES)) {
+    const deadline = Date.now() + INDEXED_DB_TOTAL_BUDGET_MS;
+    const prioritizedDatabases = [...databases].sort((left, right) =>
+      storageKeyPriority(right?.name || "") - storageKeyPriority(left?.name || "")
+      || String(left?.name || "").localeCompare(String(right?.name || ""))
+    );
+    for (const databaseInfo of prioritizedDatabases.slice(0, MAX_INDEXED_DB_DATABASES)) {
       const databaseName = databaseInfo && databaseInfo.name;
-      if (!databaseName || tokens.size >= MAX_TOKENS) {
+      if (!databaseName || tokens.size >= MAX_TOKEN_CANDIDATES || Date.now() >= deadline) {
         continue;
       }
 
@@ -133,9 +160,11 @@
       }
 
       try {
-        const storeNames = Array.from(database.objectStoreNames).slice(0, MAX_INDEXED_DB_STORES);
+        const storeNames = Array.from(database.objectStoreNames)
+          .sort((left, right) => storageKeyPriority(right) - storageKeyPriority(left) || left.localeCompare(right))
+          .slice(0, MAX_INDEXED_DB_STORES);
         for (const storeName of storeNames) {
-          if (tokens.size >= MAX_TOKENS) {
+          if (tokens.size >= MAX_TOKEN_CANDIDATES || Date.now() >= deadline) {
             break;
           }
           await collectObjectStoreTokens(database, storeName, tokens);
@@ -208,7 +237,7 @@
             return;
           }
 
-          if (tokens.size >= MAX_TOKENS || recordsRead >= MAX_INDEXED_DB_RECORDS_PER_STORE) {
+          if (tokens.size >= MAX_TOKEN_CANDIDATES || recordsRead >= MAX_INDEXED_DB_RECORDS_PER_STORE) {
             try {
               transaction.abort();
             } catch {
@@ -239,7 +268,7 @@
   }
 
   function addTokensFromValue(value, tokens, depth = 0) {
-    if (tokens.size >= MAX_TOKENS || value === undefined || value === null || depth > MAX_JSON_DEPTH) {
+    if (tokens.size >= MAX_TOKEN_CANDIDATES || value === undefined || value === null || depth > MAX_JSON_DEPTH) {
       return;
     }
     if (typeof value === "string") {
@@ -260,16 +289,18 @@
   }
 
   function addTokensFromText(value, tokens) {
-    if (!value || value.length > MAX_STORAGE_VALUE_LENGTH || tokens.size >= MAX_TOKENS) {
+    if (!value || tokens.size >= MAX_TOKEN_CANDIDATES) {
       return;
     }
-    for (const match of value.matchAll(JWT_PATTERN)) {
-      if (isSupportedApiToken(match[0])) tokens.add(match[0]);
-      if (tokens.size >= MAX_TOKENS) {
-        return;
+    const boundedValue = value.slice(0, MAX_STORAGE_VALUE_LENGTH);
+    for (let offset = 0; offset < boundedValue.length; offset += STORAGE_SCAN_CHUNK_LENGTH) {
+      const chunk = boundedValue.slice(Math.max(0, offset - 12000), offset + STORAGE_SCAN_CHUNK_LENGTH);
+      for (const match of chunk.matchAll(JWT_PATTERN)) {
+        if (isSupportedApiToken(match[0])) tokens.add(match[0]);
+        if (tokens.size >= MAX_TOKEN_CANDIDATES) return;
       }
     }
-    const parsed = parseJson(value);
+    const parsed = value.length <= 300000 ? parseJson(value) : undefined;
     if (parsed !== undefined) {
       addTokensFromValue(parsed, tokens, 1);
     }
@@ -305,6 +336,53 @@
     } catch {
       return undefined;
     }
+  }
+
+  function compareTokenCandidates(left, right) {
+    const leftMetadata = tokenMetadata(left);
+    const rightMetadata = tokenMetadata(right);
+    return rightMetadata.score - leftMetadata.score
+      || rightMetadata.expiry - leftMetadata.expiry
+      || left.localeCompare(right);
+  }
+
+  function tokenMetadata(token) {
+    try {
+      const payload = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+      const decoded = JSON.parse(atob(payload.padEnd(Math.ceil(payload.length / 4) * 4, "=")));
+      const scopes = String(decoded.scp || "").toLowerCase();
+      const audience = String(decoded.aud || "").toLowerCase();
+      return {
+        expiry: Number(decoded.exp) || 0,
+        score: Number(scopes.includes("readwrite")) * 8
+          + Number(scopes.includes("roleassignmentschedule")) * 4
+          + Number(scopes.includes("privilegedassignmentschedule")) * 4
+          + Number(audience.includes("management")) * 2
+      };
+    } catch {
+      return { expiry: 0, score: 0 };
+    }
+  }
+
+  function storageKeyPriority(value) {
+    const key = String(value || "").toLowerCase();
+    return Number(key.includes("msal")) * 8
+      + Number(key.includes("token")) * 4
+      + Number(key.includes("auth")) * 2
+      + Number(key.includes("cache"));
+  }
+
+  function fingerprintTokens(tokens) {
+    let first = 0x811c9dc5;
+    let second = 0x9e3779b9;
+    for (const token of [...tokens].sort()) {
+      for (let index = 0; index < token.length; index += 1) {
+        const code = token.charCodeAt(index);
+        first = Math.imul(first ^ code, 0x01000193);
+        second = Math.imul(second ^ code, 0x85ebca6b);
+      }
+    }
+    return `${tokens.length}:${(first >>> 0).toString(16)}:${(second >>> 0).toString(16)}`;
   }
 
   void scan();

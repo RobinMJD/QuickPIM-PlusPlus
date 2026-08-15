@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { buildTargetCacheKey } from "../src/lib/access";
 import { DATA_CACHE_KEY } from "../src/lib/cache";
 import { POPUP_DRAFT_KEY } from "../src/lib/popupDraft";
 import { REQUEST_TRACKING_KEY } from "../src/lib/requestTracking";
@@ -91,7 +92,7 @@ function createBasicSettingsChrome(storageData: Record<string, unknown>, options
     runtime: {
       getManifest: () => TEST_MANIFEST,
       getURL: (path: string) => `chrome-extension://quickpim/${path}`,
-      sendMessage: vi.fn(async (message: { action: string }) => {
+      sendMessage: vi.fn(async (message: { action: string; settings?: unknown; store?: unknown }) => {
         if (message.action === "getTokenStatus") {
           return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
         }
@@ -103,6 +104,14 @@ function createBasicSettingsChrome(storageData: Record<string, unknown>, options
               active: { items: [], errors: [], diagnostics: [] },
               tokenStatus: { graph: { hasToken: false }, azureManagement: { hasToken: false } }
             }
+          };
+        }
+        if (message.action === "restoreSettingsBackup") {
+          storageData[SETTINGS_KEY] = message.settings;
+          storageData[REQUEST_TRACKING_KEY] = message.store;
+          return {
+            success: true,
+            data: { settings: message.settings, trackedRequests: message.store }
           };
         }
         return { success: true, data: { items: [], errors: [], diagnostics: [] } };
@@ -409,59 +418,84 @@ describe("settings Access Setup page", () => {
       "pimGroup:group-z:member": "Global Administrator"
     };
 
+    const tokens = {
+      graph: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 },
+      graphTargets: {
+        directoryRole: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 },
+        pimGroup: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 }
+      },
+      azureManagement: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 }
+    };
+    const directoryItems = [
+      {
+        id: "directoryRole:windows-laps:/",
+        type: "directoryRole",
+        sourceName: "Windows LAPS Administrator",
+        displayName: "Windows LAPS Administrator",
+        principalId: "user-1",
+        roleDefinitionId: "windows-laps",
+        directoryScopeId: "/",
+        scopeLabel: "Tenant",
+        status: "eligible"
+      },
+      {
+        id: "directoryRole:application-admin:/",
+        type: "directoryRole",
+        sourceName: "Application Administrator",
+        displayName: "Application Administrator",
+        principalId: "user-1",
+        roleDefinitionId: "application-admin",
+        directoryScopeId: "/",
+        scopeLabel: "Tenant",
+        status: "eligible"
+      }
+    ];
+    const groupItems = [
+      {
+        id: "pimGroup:group-z:member",
+        type: "pimGroup",
+        sourceName: "GRP_Z_Privileged",
+        displayName: "GRP_Z_Privileged",
+        principalId: "user-1",
+        groupId: "group-z",
+        accessId: "member",
+        scopeLabel: "Member",
+        status: "eligible"
+      },
+      {
+        id: "pimGroup:group-a:member",
+        type: "pimGroup",
+        sourceName: "GRP_A_Privileged",
+        displayName: "GRP_A_Privileged",
+        principalId: "user-1",
+        groupId: "group-a",
+        accessId: "member",
+        scopeLabel: "Member",
+        status: "eligible"
+      }
+    ];
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: settings,
       [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:|azure:",
-          errors: [],
-          items: [
-            {
-              id: "directoryRole:windows-laps:/",
-              type: "directoryRole",
-              sourceName: "Windows LAPS Administrator",
-              displayName: "Windows LAPS Administrator",
-              principalId: "user-1",
-              roleDefinitionId: "windows-laps",
-              directoryScopeId: "/",
-              scopeLabel: "Tenant",
-              status: "eligible"
-            },
-            {
-              id: "directoryRole:application-admin:/",
-              type: "directoryRole",
-              sourceName: "Application Administrator",
-              displayName: "Application Administrator",
-              principalId: "user-1",
-              roleDefinitionId: "application-admin",
-              directoryScopeId: "/",
-              scopeLabel: "Tenant",
-              status: "eligible"
-            },
-            {
-              id: "pimGroup:group-z:member",
-              type: "pimGroup",
-              sourceName: "GRP_Z_Privileged",
-              displayName: "GRP_Z_Privileged",
-              principalId: "user-1",
-              groupId: "group-z",
-              accessId: "member",
-              scopeLabel: "Member",
-              status: "eligible"
-            },
-            {
-              id: "pimGroup:group-a:member",
-              type: "pimGroup",
-              sourceName: "GRP_A_Privileged",
-              displayName: "GRP_A_Privileged",
-              principalId: "user-1",
-              groupId: "group-a",
-              accessId: "member",
-              scopeLabel: "Member",
-              status: "eligible"
-            }
-          ]
+        eligibleByTarget: {
+          directoryRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "directoryRole"),
+            errors: [],
+            items: directoryItems
+          },
+          pimGroup: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "pimGroup"),
+            errors: [],
+            items: groupItems
+          },
+          azureRole: {
+            fetchedAt: Date.now(),
+            cacheKey: buildTargetCacheKey(tokens, "azureRole"),
+            errors: [],
+            items: []
+          }
         }
       }
     };
@@ -475,10 +509,7 @@ describe("settings Access Setup page", () => {
           if (message.action === "getTokenStatus") {
             return {
               success: true,
-              data: {
-                graph: { hasToken: true, isExpired: false },
-                azureManagement: { hasToken: true, isExpired: false }
-              }
+              data: tokens
             };
           }
           return { success: true, data: true };
@@ -590,45 +621,23 @@ describe("settings Access Setup page", () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#access");
 
+    const tokens = {
+      graph: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 },
+      graphTargets: {
+        directoryRole: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 },
+        pimGroup: { hasToken: true, isExpired: false, tenantId: "tenant-1", principalId: "user-1", capturedAt: 1 }
+      },
+      azureManagement: { hasToken: false }
+    };
+    const directoryCacheKey = buildTargetCacheKey(tokens, "directoryRole");
+    const pimGroupCacheKey = buildTargetCacheKey(tokens, "pimGroup");
     const storageData: Record<string, unknown> = {
       [SETTINGS_KEY]: createDefaultSettings(),
       [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graphDirectory:",
-          errors: [],
-          items: [],
-          diagnostics: [
-            {
-              target: "directoryRole",
-              success: true,
-              checkedAt: "2026-06-12T10:00:00.000Z",
-              operation: "eligible",
-              endpointLabel: "Entra role eligibility"
-            }
-          ]
-        },
-        active: {
-          fetchedAt: Date.now(),
-          cacheKey: "graphPimGroup:",
-          errors: ["PermissionScopeNotGranted"],
-          items: [],
-          diagnostics: [
-            {
-              target: "pimGroup",
-              success: false,
-              checkedAt: "2026-06-12T10:01:00.000Z",
-              operation: "active",
-              endpointLabel: "PIM group active assignments",
-              failureKind: "missingCapability",
-              error: "PIM group access is limited."
-            }
-          ]
-        },
         eligibleByTarget: {
           directoryRole: {
             fetchedAt: Date.now(),
-            cacheKey: "graphDirectory:",
+            cacheKey: directoryCacheKey,
             errors: [],
             items: [],
             diagnostics: [
@@ -643,26 +652,39 @@ describe("settings Access Setup page", () => {
           },
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup:",
-            errors: ["PermissionScopeNotGranted"],
+            cacheKey: pimGroupCacheKey,
+            errors: [],
             items: [],
             diagnostics: [
               {
                 target: "pimGroup",
-                success: false,
-                checkedAt: "2026-06-12T10:01:00.000Z",
-                operation: "active",
-                endpointLabel: "PIM group active assignments",
-                failureKind: "missingCapability",
-                error: "PIM group access is limited."
+                success: true,
+                checkedAt: "2026-06-12T10:00:30.000Z",
+                operation: "eligible",
+                endpointLabel: "PIM group eligibility"
               }
             ]
           }
         },
         activeByTarget: {
+          directoryRole: {
+            fetchedAt: Date.now(),
+            cacheKey: directoryCacheKey,
+            errors: [],
+            items: [],
+            diagnostics: [
+              {
+                target: "directoryRole",
+                success: true,
+                checkedAt: "2026-06-12T10:00:10.000Z",
+                operation: "active",
+                endpointLabel: "Entra role active assignments"
+              }
+            ]
+          },
           pimGroup: {
             fetchedAt: Date.now(),
-            cacheKey: "graphPimGroup:",
+            cacheKey: pimGroupCacheKey,
             errors: ["PermissionScopeNotGranted"],
             items: [],
             diagnostics: [
@@ -687,10 +709,7 @@ describe("settings Access Setup page", () => {
           if (message.action === "getTokenStatus") {
             return {
               success: true,
-              data: {
-                graph: { hasToken: true, isExpired: false },
-                azureManagement: { hasToken: false }
-              }
+              data: tokens
             };
           }
           return { success: true, data: { items: [], errors: [] } };
@@ -719,8 +738,53 @@ describe("settings Access Setup page", () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#access");
 
+    const readyTokens = {
+      graph: { hasToken: true, capturedAt: 2, tenantId: "tenant-1", principalId: "user-1" },
+      graphTargets: {
+        directoryRole: {
+          hasToken: true,
+          capturedAt: 2,
+          tenantId: "tenant-1",
+          principalId: "user-1",
+          grantedScopes: ["RoleEligibilitySchedule.Read.Directory", "RoleAssignmentSchedule.ReadWrite.Directory"]
+        },
+        pimGroup: {
+          hasToken: true,
+          capturedAt: 2,
+          tenantId: "tenant-1",
+          principalId: "user-1",
+          grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup", "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
+        }
+      },
+      azureManagement: { hasToken: true, capturedAt: 2, tenantId: "tenant-1", principalId: "user-1" }
+    };
+    const readyEntry = (target: "directoryRole" | "pimGroup" | "azureRole", operation: "eligible" | "active") => ({
+      fetchedAt: Date.now(),
+      cacheKey: buildTargetCacheKey(readyTokens, target),
+      errors: [],
+      items: [],
+      diagnostics: [{
+        target,
+        success: true,
+        checkedAt: "2026-06-12T10:00:00.000Z",
+        operation,
+        endpointLabel: `${target} ${operation}`
+      }]
+    });
     const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: createDefaultSettings()
+      [SETTINGS_KEY]: createDefaultSettings(),
+      [DATA_CACHE_KEY]: {
+        eligibleByTarget: {
+          directoryRole: readyEntry("directoryRole", "eligible"),
+          pimGroup: readyEntry("pimGroup", "eligible"),
+          azureRole: readyEntry("azureRole", "eligible")
+        },
+        activeByTarget: {
+          directoryRole: readyEntry("directoryRole", "active"),
+          pimGroup: readyEntry("pimGroup", "active"),
+          azureRole: readyEntry("azureRole", "active")
+        }
+      }
     };
     let tokenRequests = 0;
     const chromeMock = {
@@ -737,22 +801,7 @@ describe("settings Access Setup page", () => {
                   graph: { hasToken: false },
                   azureManagement: { hasToken: false }
                 }
-                : {
-                  graph: { hasToken: true, capturedAt: 2 },
-                  graphTargets: {
-                    directoryRole: {
-                      hasToken: true,
-                      capturedAt: 2,
-                      grantedScopes: ["RoleEligibilitySchedule.Read.Directory", "RoleAssignmentSchedule.ReadWrite.Directory"]
-                    },
-                    pimGroup: {
-                      hasToken: true,
-                      capturedAt: 2,
-                      grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup", "PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
-                    }
-                  },
-                  azureManagement: { hasToken: true, capturedAt: 2 }
-                };
+                : readyTokens;
             return message.action === "refreshPortalTokens"
               ? { success: true, data: { tokenStatus: currentTokens, tabsFound: 1, tabsScanned: 1, captured: ["graph", "azureManagement"] } }
               : { success: true, data: currentTokens };
@@ -1557,6 +1606,8 @@ describe("settings Activity page", () => {
     expect(document.body.textContent).toContain("Security Group");
 
     clickButton("Clear history");
+    await waitFor(() => expect(document.body.textContent).toContain("Clear the local activation and deactivation history?"));
+    clickExactButton("Confirm");
     await waitFor(() =>
       expect(storageData[SETTINGS_KEY]).toMatchObject({
         activityHistory: []
@@ -2225,7 +2276,7 @@ describe("settings dark mode", () => {
     storageListeners[0]({ [SETTINGS_KEY]: { oldValue: current, newValue: external } }, "local");
 
     await waitFor(() => expect(textarea.value).toBe(localDraft));
-    await waitFor(() => expect(document.body.textContent).toContain("Saved settings changed elsewhere"));
+    await waitFor(() => expect(document.body.textContent).toContain("Saved data changed elsewhere"));
   });
 
   test("preserves and autosaves a preference draft when another settings section changes", async () => {

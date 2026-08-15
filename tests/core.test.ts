@@ -28,6 +28,8 @@ import {
   MAX_USER_JUSTIFICATION_LENGTH,
   formatJustificationForActivationRequest
 } from "../src/lib/justifications";
+import { getActivationItemTypeFromIdentity } from "../src/lib/activationIdentity";
+import { buildActivationItemLookup, normalizeActivationResponse } from "../src/lib/popupModel";
 import type { ActivationItem, QuickPimBundle, QuickPimSettings } from "../src/lib/types";
 
 const baseSettings: QuickPimSettings = {
@@ -47,7 +49,50 @@ const baseSettings: QuickPimSettings = {
   }
 };
 
+describe("popup response and identity safety", () => {
+  test("deduplicates activation results and treats conflicting duplicates as failures", () => {
+    const response = normalizeActivationResponse({
+      success: true,
+      results: [
+        { itemId: "directoryRole:reader:/", itemName: "Reader", success: true },
+        { itemId: "DIRECTORYROLE:READER:/", itemName: "Reader", success: false, error: "Rejected" }
+      ],
+      errors: []
+    });
+    expect(response.success).toBe(false);
+    expect(response.results).toHaveLength(1);
+    expect(response.errors).toEqual([expect.objectContaining({ success: false, error: "Rejected" })]);
+  });
+
+  test("drops ambiguous legacy lookup aliases instead of targeting the last item", () => {
+    const first: ActivationItem = {
+      id: "tenant:tenant-1:directoryRole:reader:/",
+      type: "directoryRole",
+      sourceName: "Reader",
+      displayName: "Reader",
+      principalId: "user-1",
+      roleDefinitionId: "reader",
+      directoryScopeId: "/",
+      scopeLabel: "Tenant",
+      status: "eligible",
+      tenantId: "tenant-1"
+    };
+    const second = { ...first, id: "tenant:tenant-2:directoryRole:reader:/", tenantId: "tenant-2" };
+    const lookup = buildActivationItemLookup([first, second]);
+    expect(lookup.get(first.id)).toBe(first);
+    expect(lookup.get(second.id)).toBe(second);
+    expect(lookup.has("directoryRole:reader:/")).toBe(false);
+  });
+});
+
 describe("PIM item normalization", () => {
+  test("infers item types from legacy and tenant-qualified identities", () => {
+    expect(getActivationItemTypeFromIdentity("directoryRole:reader:/")).toBe("directoryRole");
+    expect(getActivationItemTypeFromIdentity("tenant:TENANT-1:pimGroup:GROUP-1:member")).toBe("pimGroup");
+    expect(getActivationItemTypeFromIdentity("tenant:tenant-1:azureRole:reader:/subscriptions/sub-1")).toBe("azureRole");
+    expect(getActivationItemTypeFromIdentity("unknown:item")).toBeUndefined();
+  });
+
   test("normalizes Microsoft active assignment types without guessing", () => {
     expect(normalizeActiveAssignmentType("Activated")).toBe("activated");
     expect(normalizeActiveAssignmentType("assigned")).toBe("assigned");
@@ -283,6 +328,23 @@ describe("settings helpers", () => {
   test("manual aliases override API names", () => {
     expect(getDisplayName(items[0], baseSettings)).toBe("Tenant reader alias");
     expect(getDisplayName(items[1], baseSettings)).toBe("Break Glass Operators");
+  });
+
+  test("does not apply legacy role-specific settings across tenant-qualified items", () => {
+    const tenantOneItem = { ...items[0], tenantId: "tenant-one" };
+    const tenantTwoItem = { ...items[0], tenantId: "tenant-two" };
+    const tenantSettings: QuickPimSettings = {
+      ...baseSettings,
+      aliasesByItemId: {
+        ...baseSettings.aliasesByItemId,
+        "tenant:tenant-one:directoryRole:reader:/": "Tenant one reader"
+      },
+      favoriteItemIds: ["tenant:tenant-one:directoryRole:reader:/"]
+    };
+
+    expect(getDisplayName(tenantOneItem, tenantSettings)).toBe("Tenant one reader");
+    expect(getDisplayName(tenantTwoItem, tenantSettings)).toBe("Global Reader");
+    expect(sortItems([tenantTwoItem, tenantOneItem], tenantSettings, "name")[0]).toMatchObject({ tenantId: "tenant-one" });
   });
 
   test("sorts by name, last use, and activation count", () => {

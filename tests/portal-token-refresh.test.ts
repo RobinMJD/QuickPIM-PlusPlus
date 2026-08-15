@@ -1,7 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY,
   getPortalTokenRecoveryTargets,
+  loadPortalTokenScanDiagnostic,
+  recordPortalTokenScanDiagnostic,
   scanOpenEntraTabs,
+  sanitizePortalTokenScanDiagnostic,
   type ChromeTabsLike
 } from "../src/lib/portalTokenRefresh";
 import { buildTargetCacheKey } from "../src/lib/access";
@@ -28,7 +32,10 @@ describe("portal token background refresh", () => {
 
     await expect(scanOpenEntraTabs(tabs)).resolves.toEqual({
       tabsFound: 2,
+      tabsAttempted: 2,
       tabsScanned: 1,
+      failedTabs: 1,
+      failureSummary: "No receiving end",
       captured: ["graph", "azureManagement"]
     });
     expect(tabs.sendMessage).toHaveBeenCalledTimes(2);
@@ -49,10 +56,40 @@ describe("portal token background refresh", () => {
 
     await expect(scanOpenEntraTabs(tabs, { maxTabs: 3 })).resolves.toEqual({
       tabsFound: 10,
+      tabsAttempted: 3,
       tabsScanned: 3,
+      failedTabs: 0,
       captured: []
     });
     expect(sendMessage.mock.calls.map(([tabId]) => tabId)).toEqual([9, 10, 8]);
+  });
+
+  test("persists a bounded non-token portal scan diagnostic", async () => {
+    const values: Record<string, unknown> = {};
+    const storage = {
+      get: vi.fn(async (key: string) => ({ [key]: values[key] })),
+      set: vi.fn(async (value: Record<string, unknown>) => { Object.assign(values, value); })
+    };
+
+    await recordPortalTokenScanDiagnostic({
+      tabsFound: 20_000,
+      tabsAttempted: 16,
+      tabsScanned: 15,
+      failedTabs: 1,
+      captured: ["graph", "graph"],
+      failureSummary: "x".repeat(800)
+    }, storage, now);
+
+    await expect(loadPortalTokenScanDiagnostic(storage)).resolves.toMatchObject({
+      checkedAt: new Date(now).toISOString(),
+      tabsFound: 10_000,
+      tabsAttempted: 16,
+      tabsScanned: 15,
+      failedTabs: 1,
+      captured: ["graph"]
+    });
+    expect((values[PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY] as { failureSummary: string }).failureSummary).toHaveLength(500);
+    expect(sanitizePortalTokenScanDiagnostic({ checkedAt: "invalid" })).toBeUndefined();
   });
 
   test("recovers missing and near-expiry tokens without rescanning healthy targets", () => {
@@ -95,8 +132,26 @@ describe("portal token background refresh", () => {
       }]
     };
     const cache: QuickPimDataCache = {
-      eligibleByTarget: { pimGroup: limitedEntry },
-      activeByTarget: { pimGroup: limitedEntry }
+      eligibleByTarget: {
+        pimGroup: limitedEntry,
+        azureRole: {
+          items: [],
+          errors: [],
+          fetchedAt: now,
+          cacheKey: buildTargetCacheKey(tokenStatus, "azureRole"),
+          diagnostics: [{ target: "azureRole", success: true, checkedAt: new Date(now).toISOString(), operation: "eligible" }]
+        }
+      },
+      activeByTarget: {
+        pimGroup: limitedEntry,
+        azureRole: {
+          items: [],
+          errors: [],
+          fetchedAt: now,
+          cacheKey: buildTargetCacheKey(tokenStatus, "azureRole"),
+          diagnostics: [{ target: "azureRole", success: true, checkedAt: new Date(now).toISOString(), operation: "active" }]
+        }
+      }
     };
 
     expect(getPortalTokenRecoveryTargets({

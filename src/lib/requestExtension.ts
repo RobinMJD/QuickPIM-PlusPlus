@@ -81,8 +81,11 @@ export function buildTrackedRequestExtensionPlan(
     throw new Error("This role requires ticket details, but the original request details are unavailable.");
   }
 
-  const startDateTime = new Date(activeUntil + 1_000).toISOString();
-  const endDateTime = new Date(activeUntil + 1_000 + durationHours * 60 * 60 * 1_000).toISOString();
+  // Use the first complete UTC second after expiry. This remains non-overlapping
+  // if Microsoft rounds a millisecond-bearing source timestamp to whole seconds.
+  const continuationStart = Math.ceil(activeUntil / 1_000) * 1_000 + 1_000;
+  const startDateTime = new Date(continuationStart).toISOString();
+  const endDateTime = new Date(continuationStart + durationHours * 60 * 60 * 1_000).toISOString();
   return {
     item: trackedRequestToEligibleItem(request),
     durationHours,
@@ -101,6 +104,7 @@ function trackedRequestToEligibleItem(request: TrackedPimRequest): ActivationIte
     principalId: request.principalId,
     scopeLabel: request.scopeLabel || "Scope",
     status: "eligible" as const,
+    ...(request.tenantId ? { tenantId: request.tenantId } : {}),
     ...(request.activationRequirements ? { activationRequirements: request.activationRequirements } : {})
   };
 

@@ -1,14 +1,20 @@
 import { DEFAULT_SETTINGS, mergeImportedSettings, mergeSettings } from "./settings";
-import type { QuickPimSettings } from "./types";
+import { sanitizeTrackedRequestStore } from "./requestTracking";
+import type { QuickPimSettings, TrackedPimRequestStore } from "./types";
 
 export const MAX_SETTINGS_BACKUP_BYTES = 1024 * 1024;
 
 export interface SettingsBackupValidation {
   settings?: QuickPimSettings;
+  trackedRequests?: TrackedPimRequestStore;
   error?: string;
 }
 
-export function validateSettingsBackup(text: string, current: QuickPimSettings): SettingsBackupValidation {
+export function validateSettingsBackup(
+  text: string,
+  current: QuickPimSettings,
+  currentTrackedRequests: TrackedPimRequestStore = { version: 1, requests: [] }
+): SettingsBackupValidation {
   if (!text.trim()) {
     return { error: "Settings JSON cannot be empty." };
   }
@@ -20,7 +26,13 @@ export function validateSettingsBackup(text: string, current: QuickPimSettings):
     if (!isSettingsImportObject(parsed)) {
       return { error: "JSON must contain at least one recognized QuickPIM++ settings section." };
     }
-    return { settings: mergeImportedSettings(current, parsed) };
+    const parsedRecord = parsed as Record<string, unknown>;
+    return {
+      settings: mergeImportedSettings(current, parsedRecord),
+      trackedRequests: Object.hasOwn(parsedRecord, "trackedRequests")
+        ? sanitizeTrackedRequestStore(parsedRecord.trackedRequests)
+        : sanitizeTrackedRequestStore(currentTrackedRequests)
+    };
   } catch (parseError) {
     return { error: parseError instanceof Error ? `Invalid JSON: ${parseError.message}` : "Invalid JSON." };
   }
@@ -31,11 +43,20 @@ export function buildSettingsExportFileName(date: Date): string {
   return `quickpim-plusplus-settings_${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.json`;
 }
 
-export function stringifySettingsBackup(settings: QuickPimSettings): string {
-  return JSON.stringify(mergeSettings(settings), null, 2);
+export function stringifySettingsBackup(
+  settings: QuickPimSettings,
+  trackedRequests: TrackedPimRequestStore = { version: 1, requests: [] }
+): string {
+  return JSON.stringify({
+    ...mergeSettings(settings),
+    trackedRequests: sanitizeTrackedRequestStore(trackedRequests)
+  }, null, 2);
 }
 
-export function hasPortableSettingsData(settings: QuickPimSettings): boolean {
+export function hasPortableSettingsData(
+  settings: QuickPimSettings,
+  trackedRequests: TrackedPimRequestStore = { version: 1, requests: [] }
+): boolean {
   const normalized = mergeSettings(settings);
   const preferences = {
     ...normalized.preferences,
@@ -51,6 +72,7 @@ export function hasPortableSettingsData(settings: QuickPimSettings): boolean {
     || normalized.activityHistory.length
     || normalized.activationHistory.length
     || JSON.stringify(preferences) !== JSON.stringify(DEFAULT_SETTINGS.preferences)
+    || sanitizeTrackedRequestStore(trackedRequests).requests.length
   );
 }
 
@@ -67,6 +89,7 @@ function isSettingsImportObject(value: unknown): value is Partial<QuickPimSettin
     "bundles",
     "usageStatsByItemId",
     "activityHistory",
-    "preferences"
+    "preferences",
+    "trackedRequests"
   ].some((key) => keys.has(key));
 }

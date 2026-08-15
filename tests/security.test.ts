@@ -188,6 +188,19 @@ describe("runtime message validation", () => {
       action: "refreshTrackedRequests",
       requestIds: ["request-1", "request-2"]
     });
+    expect(validateQuickPimMessage({ action: "restoreTrackedRequests", store: { version: 1, requests: [] } })).toEqual({
+      action: "restoreTrackedRequests",
+      store: { version: 1, requests: [] }
+    });
+    expect(validateQuickPimMessage({
+      action: "restoreSettingsBackup",
+      settings: { version: 2 },
+      store: { version: 1, requests: [] }
+    })).toEqual({
+      action: "restoreSettingsBackup",
+      settings: { version: 2 },
+      store: { version: 1, requests: [] }
+    });
     expect(validateQuickPimMessage({ action: "extendTrackedRequest", requestId: " directoryRole:request-1 " })).toEqual({
       action: "extendTrackedRequest",
       requestId: "directoryRole:request-1"
@@ -215,6 +228,17 @@ describe("runtime message validation", () => {
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
     expect(() => validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: "request-1" })).toThrow(/identifiers/i);
+    expect(() => validateQuickPimMessage({ action: "restoreTrackedRequests", store: "invalid" })).toThrow(/backup/i);
+    expect(() => validateQuickPimMessage({ action: "restoreSettingsBackup", settings: "invalid", store: {} })).toThrow(/backup/i);
+    expect(() => validateQuickPimMessage({
+      action: "restoreSettingsBackup",
+      settings: { savedJustifications: ["x".repeat(1024 * 1024)] },
+      store: { version: 1, requests: [] }
+    })).toThrow(/too large/i);
+    expect(() => validateQuickPimMessage({
+      action: "restoreTrackedRequests",
+      store: { version: 1, requests: [{ justification: "x".repeat(1024 * 1024) }] }
+    })).toThrow(/too large/i);
     expect(() => validateQuickPimMessage({ action: "extendTrackedRequest", requestId: "" })).toThrow(/identifier/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: "not-array" })).toThrow(/items/i);
     expect(() => validateQuickPimMessage({ action: "activateItems", items: [], durationHours: 1 })).toThrow(/between 1 and 100/i);
@@ -222,6 +246,7 @@ describe("runtime message validation", () => {
       id: "directoryRole:reader:/",
       type: "directoryRole",
       principalId: "user",
+      tenantId: "tenant-1",
       status: "eligible",
       roleDefinitionId: "reader",
       directoryScopeId: "/"
@@ -257,6 +282,7 @@ describe("runtime message validation", () => {
       items: [{
         id: "directoryRole:reader:/",
         type: "directoryRole",
+        tenantId: "tenant-1",
         principalId: "user",
         status: "active",
         roleDefinitionId: "reader",

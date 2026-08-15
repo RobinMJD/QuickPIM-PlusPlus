@@ -15,14 +15,20 @@ import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrl
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./lib/apiErrors";
 import { mapWithConcurrency, mapWithConcurrencySettled } from "./lib/concurrency";
 import { collectPaginatedValues } from "./lib/pagination";
-import { withTimeout } from "./lib/async";
+import { withAbortableTimeout } from "./lib/async";
 import { runWithActivationItemLock } from "./lib/requestGate";
 import {
+  addRecentJustification,
+  compareAndSetSettings,
   getEnabledRoleFeatures,
   loadSettings,
+  loadSettingsSnapshot,
+  mergeSettings,
   mutateSettings,
   recordOperationActivity,
-  SETTINGS_KEY
+  runWithSettingsMutationLock,
+  SETTINGS_KEY,
+  SETTINGS_REVISION_KEY
 } from "./lib/settings";
 import {
   loadReferenceData,
@@ -36,6 +42,8 @@ import {
   updateCacheFromTargetResults
 } from "./lib/cache";
 import {
+  buildAccessCapabilityItems,
+  buildNameLookupDiagnostic,
   buildTargetCacheKeys,
   classifyAccessFailure,
   hasRequiredPortalToken
@@ -50,6 +58,8 @@ import {
   REQUEST_TRACKING_ALARM_NAME,
   REQUEST_TRACKING_AZURE_CONCURRENCY,
   REQUEST_TRACKING_GRAPH_CONCURRENCY,
+  EXPIRY_REMINDER_RETRY_DELAY_MS,
+  clearTrackedRequests,
   createTrackedPimRequest,
   getDueTrackedRequests,
   getActivationRequestItemStatus,
@@ -60,7 +70,11 @@ import {
   isTrackedRequestPending,
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
+  reconcileTrackedRequestWithActiveAssignments,
   mutateTrackedRequests,
+  runWithTrackedRequestMutationLock,
+  saveTrackedRequests,
+  sanitizeTrackedRequestStore,
   reconcileTrackedExtensionSources,
   trackedRequestMatchesValidatedToken,
   trackedRequestStatusLabel,
@@ -71,17 +85,18 @@ import {
 import {
   getPortalTokenRecoveryTargets,
   getStaleCacheTargets,
+  recordPortalTokenScanDiagnostic,
   scanOpenEntraTabs
 } from "./lib/portalTokenRefresh";
 import {
   PORTAL_RECOVERY_CLEANUP_ALARM_NAME,
   PORTAL_RECOVERY_SESSION_TTL_MS,
-  closeCompletedPortalRecoveryTabs,
   closeExpiredPortalRecoveryTabs,
   closePortalRecoveryTabsForTargets,
   focusPortalRecoveryTabs,
   getPortalRecoveryTokenSignature,
   getPortalRecoveryStatus,
+  isPortalRecoveryManagedTabId,
   openPortalRecoveryTabsAndReconcile,
   type PortalRecoveryApis
 } from "./lib/portalRecoveryTabs";
@@ -95,7 +110,11 @@ import {
   type GraphTokenTarget
 } from "./lib/graphTokenCapabilities";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
-import { resetExtensionData } from "./lib/extensionReset";
+import {
+  EXTENSION_RESET_PENDING_KEY,
+  resetExtensionData,
+  resumePendingExtensionReset
+} from "./lib/extensionReset";
 import { isPrivilegedAzureRoleDefinition } from "./lib/privilegedRoles";
 import {
   assertAllowedApiUrl,
@@ -110,12 +129,14 @@ import { selectBestStoredGraphTokenForTarget, selectPortalTokenCandidates } from
 import {
   beginRequestOperation,
   completeRequestOperation,
+  createRequestOperationItems,
   dismissRequestOperations,
   failRequestOperation,
   getRequestOperationFingerprint,
   loadRequestOperations,
   trackedRequestMatchesOperation,
-  touchRequestOperation
+  touchRequestOperation,
+  updateRequestOperationItem
 } from "./lib/requestOperations";
 import { normalizeActivationItemId } from "./lib/activationIdentity";
 import {
@@ -159,6 +180,7 @@ import {
   isBrowserSyncPayloadStorageKey,
   markBrowserSyncReminderShown,
   purgeBrowserSyncData,
+  queueBrowserSyncPurgeRetry,
   renameBrowserSyncDevice,
   setBrowserSyncEnabled,
   synchronizeBrowserData,
@@ -253,6 +275,7 @@ interface GraphBatchResponse<T> {
   responses?: Array<{
     id?: string;
     status?: number;
+    headers?: Record<string, string>;
     body?: T;
   }>;
 }
@@ -281,7 +304,6 @@ const bestEffortTasks = new Set<Promise<unknown>>();
 const requestOperationTasks = new Map<string, { fingerprint: string; task: Promise<ActivationResponse> }>();
 const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionResult>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
-const REQUEST_TRACKING_STORAGE_TIMEOUT_MS = 750;
 const BROWSER_SYNC_PERIOD_MINUTES = 30;
 const BROWSER_SYNC_TRANSIENT_RETRY_MINUTES = 5;
 
@@ -306,16 +328,16 @@ chrome.webRequest.onSendHeaders.addListener(
   REQUEST_HEADER_OPTIONS
 );
 
-runBestEffort(initializeEnabledBackgroundServices());
+runBestEffort(initializeBackgroundRuntime());
 
 chrome.runtime.onInstalled?.addListener(() => {
   distributionInfoPromise = undefined;
-  runBestEffort(initializeEnabledBackgroundServices(true));
+  runBestEffort(initializeBackgroundRuntime(true));
 });
 
 chrome.runtime.onStartup?.addListener(() => {
   distributionInfoPromise = undefined;
-  runBestEffort(initializeEnabledBackgroundServices(true));
+  runBestEffort(initializeBackgroundRuntime(true));
 });
 
 chrome.storage.onChanged?.addListener((changes, areaName) => {
@@ -367,7 +389,7 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
   } else if (alarm.name === REQUEST_TRACKING_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runTrackedRequestMaintenance));
   } else if (alarm.name === PORTAL_RECOVERY_CLEANUP_ALARM_NAME) {
-    runBestEffort(closeExpiredPortalRecoveryTabs(getPortalRecoveryApis()));
+    runBestEffort(maintainPortalRecoveryCleanup());
   } else if (alarm.name === BROWSER_SYNC_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runBrowserSync));
   }
@@ -377,22 +399,26 @@ chrome.notifications?.onClicked?.addListener((notificationId) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  runBestEffort(runIfExtensionEnabled(openTrackedRequestDetails));
-  chrome.notifications.clear(notificationId);
+  runBestEffort(runIfExtensionEnabled(async () => {
+    await openTrackedRequestDetails();
+    await clearNotification(notificationId);
+  }));
 });
 
 chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex) => {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
-  chrome.notifications.clear(notificationId);
   if (notificationId.endsWith(":expiry-extend") && buttonIndex === 0) {
     runBestEffort(runIfExtensionEnabled(() => runWithServiceWorkerKeepAlive(
       () => handleExtensionNotificationClick(notificationId)
     )));
     return;
   }
-  runBestEffort(runIfExtensionEnabled(openTrackedRequestDetails));
+  runBestEffort(runIfExtensionEnabled(async () => {
+    await openTrackedRequestDetails();
+    await clearNotification(notificationId);
+  }));
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -453,8 +479,32 @@ async function initializeEnabledBackgroundServices(runPreRefresh = false): Promi
     return;
   }
   await applyDistributionActionIcon(distribution);
-  await Promise.all([initializeBackgroundRefresh(), initializeRequestTracking(), initializeBrowserSync()]);
+  await Promise.all([
+    initializeBackgroundRefresh(),
+    initializeRequestTracking(),
+    initializeBrowserSync(),
+    reconcilePendingRequestOperations()
+  ]);
   if (runPreRefresh) await runBackgroundPreRefresh();
+}
+
+async function initializeBackgroundRuntime(runPreRefresh = false): Promise<void> {
+  if (extensionResetInProgress) return;
+  extensionResetInProgress = true;
+  let resumedReset = false;
+  try {
+    resumedReset = await resumePendingExtensionReset(chrome.storage.local, chrome.storage.session);
+  } finally {
+    extensionResetInProgress = false;
+  }
+  if (resumedReset) {
+    suppressBackgroundStorageEventsUntil = Date.now() + 2_000;
+    await Promise.allSettled([
+      chrome.alarms?.clearAll?.(),
+      chrome.action?.setBadgeText?.({ text: "" })
+    ]);
+  }
+  await initializeEnabledBackgroundServices(runPreRefresh);
 }
 
 function getBrowserSyncApis(distribution?: ExtensionDistributionInfo): BrowserSyncApis {
@@ -552,9 +602,16 @@ async function initializeBackgroundRefresh(): Promise<void> {
 
 function runBestEffort(operation: Promise<unknown>): void {
   bestEffortTasks.add(operation);
+  const releaseTimer = setTimeout(() => bestEffortTasks.delete(operation), 2 * 60_000);
   void operation.then(
-    () => bestEffortTasks.delete(operation),
-    () => bestEffortTasks.delete(operation)
+    () => {
+      clearTimeout(releaseTimer);
+      bestEffortTasks.delete(operation);
+    },
+    () => {
+      clearTimeout(releaseTimer);
+      bestEffortTasks.delete(operation);
+    }
   );
 }
 
@@ -695,7 +752,17 @@ async function pollDirectoryTrackedRequests(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
       token
     );
-    updateRequestsFromPayloadCollection(trackable, payloads, updates, now);
+    await updateRequestsFromPayloadCollection(
+      trackable,
+      payloads,
+      updates,
+      now,
+      (request) => fetchJson<Record<string, unknown>>(
+        graphApiUrl(`/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/${encodePathSegment(request.requestId)}`),
+        token
+      )
+    );
+    await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActiveDirectoryRoles(token));
   } catch (error) {
     for (const request of trackable) {
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
@@ -727,13 +794,23 @@ async function pollPimGroupTrackedRequests(
         graphApiUrl(`/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests?${filter.toString()}`),
         token
       );
-      updateRequestsFromPayloadCollection(principalRequests, payloads, updates, now);
+      await updateRequestsFromPayloadCollection(
+        principalRequests,
+        payloads,
+        updates,
+        now,
+        (request) => fetchJson<Record<string, unknown>>(
+          graphApiUrl(`/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/${encodePathSegment(request.requestId)}`),
+          token
+        )
+      );
     } catch (error) {
       for (const request of principalRequests) {
         updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
       }
     }
   });
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActivePimGroups(token));
 }
 
 async function pollAzureTrackedRequests(
@@ -759,6 +836,32 @@ async function pollAzureTrackedRequests(
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
     }
   });
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActiveAzureRoles(token));
+}
+
+async function reconcileRequestsWithActiveAssignments(
+  requests: TrackedPimRequest[],
+  updates: Map<string, TrackedPimRequest>,
+  now: number,
+  loadActiveItems: () => Promise<ActivationItem[]>
+): Promise<void> {
+  const candidates = requests
+    .map((request) => updates.get(request.id) || request)
+    .filter((request) => request.action === "activate"
+      && getEffectiveTrackedRequestStatus(request, now) === "active"
+      && !request.activeUntil);
+  if (!candidates.length) return;
+
+  try {
+    const activeItems = await loadActiveItems();
+    for (const request of candidates) {
+      updates.set(request.id, reconcileTrackedRequestWithActiveAssignments(request, activeItems, now));
+    }
+  } catch (error) {
+    for (const request of candidates) {
+      updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
+    }
+  }
 }
 
 function markRequestsWaitingForMatchingToken(
@@ -783,25 +886,40 @@ function markRequestsWaitingForMatchingToken(
   return trackable;
 }
 
-function updateRequestsFromPayloadCollection(
+async function updateRequestsFromPayloadCollection(
   requests: TrackedPimRequest[],
   payloads: Record<string, unknown>[],
   updates: Map<string, TrackedPimRequest>,
-  now: number
-): void {
+  now: number,
+  fetchMissing?: (request: TrackedPimRequest) => Promise<Record<string, unknown>>
+): Promise<void> {
   const byId = new Map(payloads.flatMap((payload) => {
     const id = getResponseIdentifier(payload);
     return id ? [[id.toLowerCase(), payload] as const] : [];
   }));
-  for (const request of requests) {
+  await mapWithConcurrency(requests, REQUEST_TRACKING_GRAPH_CONCURRENCY, async (request) => {
     const payload = byId.get(request.requestId.toLowerCase());
-    updates.set(
-      request.id,
-      payload
-        ? updateTrackedRequestFromPayload(request, payload, now)
-        : markTrackedRequestCheckFailure(request, "Microsoft has not exposed this request status yet.", now)
-    );
-  }
+    if (payload) {
+      updates.set(request.id, updateTrackedRequestFromPayload(request, payload, now));
+      return;
+    }
+    if (fetchMissing) {
+      try {
+        const directPayload = await fetchMissing(request);
+        updates.set(request.id, updateTrackedRequestFromPayload(request, directPayload, now));
+        return;
+      } catch {
+        // Eventual consistency is expected immediately after submission. Do not
+        // consume the long-running request's retry budget while it is invisible.
+      }
+    }
+    updates.set(request.id, markTrackedRequestCheckFailure(
+      request,
+      "Microsoft has not exposed this request status yet.",
+      now,
+      { waitingForVisibility: true }
+    ));
+  });
 }
 
 async function notifyTrackedRequestChanges(
@@ -817,19 +935,31 @@ async function notifyTrackedRequestChanges(
   const previousById = new Map(previousStore.requests.map((request) => [request.id, request]));
   const patches = new Map<string, Partial<TrackedPimRequest>>();
   const reminderMinutes = settings.preferences.expiryReminderMinutes;
-  for (const request of nextStore.requests) {
+  await mapWithConcurrency(nextStore.requests, 3, async (request) => {
     const previous = previousById.get(request.id);
     const status = getEffectiveTrackedRequestStatus(request, now);
-    if (previous && previous.status !== status && isNotifiableRequestStatus(status) && request.notifiedStatus !== status) {
-      const shown = await showTrackedRequestNotification(request, status);
-      if (shown) {
-        patches.set(request.id, { notifiedStatus: status });
-      }
+    const lastStatusAttempt = request.notificationLastAttemptAt
+      ? Date.parse(request.notificationLastAttemptAt)
+      : Number.NaN;
+    const statusRetryReady = !Number.isFinite(lastStatusAttempt)
+      || now >= lastStatusAttempt + EXPIRY_REMINDER_RETRY_DELAY_MS;
+    if (
+      previous
+      && previous.status !== status
+      && isNotifiableRequestStatus(status)
+      && request.notifiedStatus !== status
+      && statusRetryReady
+    ) {
+      const delivery = await showTrackedRequestNotification(request, status);
+      patches.set(request.id, {
+        notificationLastAttemptAt: new Date(now).toISOString(),
+        ...(delivery.shown ? { notifiedStatus: status, notificationLastError: undefined } : { notificationLastError: delivery.error })
+      });
     }
 
     const reminderDecision = getTrackedExpiryReminderDecision(request, reminderMinutes, now);
     if (reminderDecision) {
-      const shown = reminderDecision === "upcoming"
+      const delivery = reminderDecision === "upcoming"
         ? await showExpiryReminderNotification(
             request,
             reminderMinutes,
@@ -839,10 +969,13 @@ async function notifyTrackedRequestChanges(
       patches.set(request.id, {
         ...patches.get(request.id),
         expiryReminderAttemptedAt: new Date(now).toISOString(),
-        ...(shown ? { expiryReminderSentAt: new Date(now).toISOString() } : {})
+        notificationLastAttemptAt: new Date(now).toISOString(),
+        ...(delivery.shown
+          ? { expiryReminderSentAt: new Date(now).toISOString(), notificationLastError: undefined }
+          : { notificationLastError: delivery.error })
       });
     }
-  }
+  });
 
   if (!patches.size) {
     return nextStore;
@@ -853,7 +986,12 @@ async function notifyTrackedRequestChanges(
   }));
 }
 
-async function showMissedExpiryReminderNotification(request: TrackedPimRequest): Promise<boolean> {
+interface NotificationDeliveryResult {
+  shown: boolean;
+  error?: string;
+}
+
+async function showMissedExpiryReminderNotification(request: TrackedPimRequest): Promise<NotificationDeliveryResult> {
   return createRequestNotification(
     request,
     "PIM access expired",
@@ -867,7 +1005,7 @@ async function showMissedExpiryReminderNotification(request: TrackedPimRequest):
 async function showTrackedRequestNotification(
   request: TrackedPimRequest,
   status: TrackedPimRequestStatus
-): Promise<boolean> {
+): Promise<NotificationDeliveryResult> {
   const action = request.action === "activate" ? "activation" : "deactivation";
   const message = status === "active"
     ? `${request.itemName} is now active.`
@@ -881,7 +1019,7 @@ async function showExpiryReminderNotification(
   request: TrackedPimRequest,
   reminderMinutes: number,
   preferredExtensionDurationHours: number
-): Promise<boolean> {
+): Promise<NotificationDeliveryResult> {
   let extensionDurationHours: number | undefined;
   try {
     extensionDurationHours = buildTrackedRequestExtensionPlan(
@@ -913,10 +1051,10 @@ async function createRequestNotification(
   status: TrackedPimRequestStatus,
   suffix = "status",
   buttons?: chrome.notifications.ButtonOptions[]
-): Promise<boolean> {
+): Promise<NotificationDeliveryResult> {
   try {
     await chrome.notifications.create(
-      `${REQUEST_TRACKING_NOTIFICATION_PREFIX}${request.itemType}:${request.requestId.slice(0, 128)}:${status}:${suffix}`,
+      `${getTrackedNotificationPrefix(request)}${status}:${suffix}`,
       {
         type: "basic",
         iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
@@ -926,9 +1064,9 @@ async function createRequestNotification(
         ...(buttons?.length ? { buttons } : {})
       }
     );
-    return true;
-  } catch {
-    return false;
+    return { shown: true };
+  } catch (error) {
+    return { shown: false, error: sanitizeErrorMessage(error) };
   }
 }
 
@@ -939,9 +1077,7 @@ async function openTrackedRequestDetails(): Promise<void> {
 async function handleExtensionNotificationClick(notificationId: string): Promise<void> {
   const store = await loadTrackedRequests();
   const request = store.requests.find((candidate) =>
-    notificationId.startsWith(
-      `${REQUEST_TRACKING_NOTIFICATION_PREFIX}${candidate.itemType}:${candidate.requestId.slice(0, 128)}:`
-    )
+    notificationId.startsWith(getTrackedNotificationPrefix(candidate))
   );
   if (!request) {
     await createStandaloneRequestNotification(
@@ -956,6 +1092,24 @@ async function handleExtensionNotificationClick(notificationId: string): Promise
     result.success ? "PIM extension queued" : "PIM extension needs attention",
     result.message
   );
+  if (result.success) await clearNotification(notificationId);
+}
+
+function getTrackedNotificationPrefix(request: TrackedPimRequest): string {
+  return `${REQUEST_TRACKING_NOTIFICATION_PREFIX}${encodeURIComponent(request.id)}:${encodeURIComponent(request.requestId)}:`;
+}
+
+async function clearNotification(notificationId: string): Promise<void> {
+  if (!chrome.notifications?.clear) return;
+  await chrome.notifications.clear(notificationId);
+}
+
+async function clearTrackedRequestNotifications(): Promise<void> {
+  if (!chrome.notifications?.getAll) return;
+  const notifications = await new Promise<object>((resolve) => chrome.notifications.getAll(resolve));
+  await Promise.allSettled(Object.keys(notifications)
+    .filter((notificationId) => notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX))
+    .map((notificationId) => clearNotification(notificationId)));
 }
 
 async function createStandaloneRequestNotification(title: string, message: string): Promise<void> {
@@ -1126,12 +1280,17 @@ async function performBackgroundPreRefresh(): Promise<void> {
   await saveDataCache(nextCache);
   const referenceData = learnReferenceDataFromItems(await loadReferenceData(), [...snapshot.eligible.items, ...snapshot.active.items]);
   await saveReferenceData(referenceData);
+  await closeVerifiedRecoveryTabs(snapshotTokenStatus, nextCache);
 }
 
 async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender): Promise<unknown> {
   switch (message.action) {
     case "getTokenStatus":
       return getTokenStatus();
+    case "getSettingsSnapshot":
+      return loadSettingsSnapshot();
+    case "compareAndSetSettings":
+      return compareAndSetSettings(message.expectedRevision, message.settings);
     case "getBrowserSyncStatus":
       return getBrowserSyncStatus(getBrowserSyncApis(await getDistributionInfo()));
     case "getBrowserSyncPopupStatus": {
@@ -1200,6 +1359,38 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return enrichActivationPolicies(message.items);
     case "refreshTrackedRequests":
       return runTrackedRequestMaintenance(message.requestIds, true);
+    case "clearTrackedRequests":
+      await clearTrackedRequests();
+      await clearTrackedRequestNotifications();
+      await updateTrackedRequestBadge({ version: 1, requests: [] });
+      return true;
+    case "restoreTrackedRequests": {
+      const store = await saveTrackedRequests(message.store);
+      const settings = await loadSettings();
+      await Promise.all([
+        updateTrackedRequestBadge(store),
+        scheduleTrackedRequestMaintenance(store, settings)
+      ]);
+      return store;
+    }
+    case "restoreSettingsBackup": {
+      const restored = await runWithSettingsMutationLock(() => runWithTrackedRequestMutationLock(async () => {
+        const snapshot = await loadSettingsSnapshot();
+        const settings = mergeSettings(message.settings);
+        const store = sanitizeTrackedRequestStore(message.store);
+        await chrome.storage.local.set({
+          [SETTINGS_KEY]: settings,
+          [SETTINGS_REVISION_KEY]: snapshot.revision + 1,
+          [REQUEST_TRACKING_KEY]: store
+        });
+        return { settings, trackedRequests: store };
+      }));
+      await Promise.all([
+        updateTrackedRequestBadge(restored.trackedRequests),
+        scheduleTrackedRequestMaintenance(restored.trackedRequests, restored.settings)
+      ]);
+      return restored;
+    }
     case "extendTrackedRequest":
       return extendTrackedRequest(message.requestId);
     case "getRequestOperations":
@@ -1216,6 +1407,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           action: "activate",
           itemIds: message.items.map((item) => item.id),
           targets: uniqueAccessTargets(message.items.map((item) => item.type)),
+          tenantId: getSharedTenantId(message.items),
+          items: createRequestOperationItems(message.items),
           startedAt: Date.now(),
           durationHours: message.durationHours,
           justification: message.justification,
@@ -1239,6 +1432,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           action: "deactivate",
           itemIds: message.items.map((item) => item.id),
           targets: uniqueAccessTargets(message.items.map((item) => item.type)),
+          tenantId: getSharedTenantId(message.items),
+          items: createRequestOperationItems(message.items),
           startedAt: Date.now(),
           justification: message.justification,
           ticketInfo: message.ticketInfo
@@ -1291,6 +1486,10 @@ async function resetAllExtensionData(): Promise<void> {
         ? chrome.permissions.remove({ permissions: ["notifications"] })
         : Promise.resolve(false),
       purgeSyncedData: async () => purgeBrowserSyncData(getBrowserSyncApis(await getDistributionInfo())),
+      queueSyncedDataPurge: (error) => queueBrowserSyncPurgeRetry(chrome.storage.local, error),
+      prepareResetRecovery: () => chrome.storage.local.set({
+        [EXTENSION_RESET_PENDING_KEY]: { version: 1, startedAt: Date.now() }
+      }),
       clearLocalStorage: () => chrome.storage.local.clear(),
       clearSessionStorage: () => chrome.storage.session.clear(),
       clearAlarms: () => chrome.alarms?.clearAll ? chrome.alarms.clearAll() : Promise.resolve(false),
@@ -1314,19 +1513,21 @@ async function resetAllExtensionData(): Promise<void> {
 async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]> {
   const operations = await loadRequestOperations();
   const orphaned = operations.filter((operation) =>
-    operation.state === "running" && !requestOperationTasks.has(operation.id)
+    (operation.state === "running" || operation.state === "uncertain") && !requestOperationTasks.has(operation.id)
   );
   if (!orphaned.length) {
     return operations;
   }
 
-  await Promise.all(orphaned.map((operation) => reconcileOrphanedRequestOperation(operation)));
+  await Promise.allSettled(orphaned.map((operation) => reconcileOrphanedRequestOperation(operation)));
   return loadRequestOperations();
 }
 
 async function reconcileOrphanedRequestOperation(operation: RequestOperationRecord): Promise<void> {
+  await retryPendingTrackedRequests(operation);
+  const refreshedOperation = (await loadRequestOperations()).find((candidate) => candidate.id === operation.id) || operation;
   const store = await loadTrackedRequests().catch(() => undefined);
-  const matching = (store?.requests || []).filter((request) => trackedRequestMatchesOperation(request, operation));
+  const matching = (store?.requests || []).filter((request) => trackedRequestMatchesOperation(request, refreshedOperation));
   const byItemId = new Map<string, TrackedPimRequest>();
   for (const request of matching) {
     const itemId = normalizeActivationItemId(request.itemId);
@@ -1335,48 +1536,156 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
       byItemId.set(itemId, request);
     }
   }
-  const results: ActivationResult[] = operation.itemIds.map((itemId) => {
+  const operationItems = refreshedOperation.items?.length
+    ? refreshedOperation.items
+    : createRequestOperationItems(refreshedOperation.itemIds.map((itemId) => ({
+        id: itemId,
+        type: inferOperationItemType(itemId),
+        sourceName: itemId,
+        displayName: itemId,
+        principalId: "unknown",
+        scopeLabel: "Unknown scope",
+        status: refreshedOperation.action === "activate" ? "eligible" as const : "active" as const,
+        ...(refreshedOperation.tenantId ? { tenantId: refreshedOperation.tenantId } : {}),
+        ...(inferOperationItemType(itemId) === "directoryRole"
+          ? { roleDefinitionId: "unknown", directoryScopeId: "/" }
+          : inferOperationItemType(itemId) === "pimGroup"
+            ? { groupId: "unknown", accessId: "member" as const }
+            : { roleDefinitionId: "unknown", scope: "/" })
+      } as ActivationItem)), refreshedOperation.startedAt);
+  const results: ActivationResult[] = operationItems.map((operationItem) => {
+    const itemId = operationItem.itemId;
     const tracked = byItemId.get(normalizeActivationItemId(itemId));
-    return tracked
-      ? {
-          itemId,
-          itemName: tracked.itemName,
-          success: true,
-          requestId: tracked.requestId
-        }
-      : {
-          itemId,
-          itemName: itemId,
-          success: false,
-          error: "QuickPIM++ restarted before this item's Microsoft result could be recorded. Check Microsoft PIM before retrying.",
-          outcomeUnknown: true
-        };
+    if (tracked) return buildTrackedReconciliationResult(itemId, tracked);
+    if (operationItem.result) return operationItem.result;
+    if ((operationItem.state === "accepted" || operationItem.state === "tracking") && operationItem.requestId) {
+      return {
+        itemId,
+        itemName: operationItem.itemName,
+        success: true,
+        requestId: operationItem.requestId,
+        requestStatus: "submitted",
+        trackingUnavailable: true
+      };
+    }
+    const outcomeUnknown = operationItem.state === "sending" || operationItem.state === "uncertain";
+    return {
+      itemId,
+      itemName: operationItem.itemName,
+      success: false,
+      error: outcomeUnknown
+        ? "QuickPIM++ restarted while Microsoft may have been processing this item. Check Microsoft PIM before retrying to avoid a duplicate request."
+        : "QuickPIM++ restarted before this item was sent. It is safe to start a new request.",
+      ...(outcomeUnknown ? { outcomeUnknown: true } : {})
+    };
   });
-  if (matching.length) {
-    const errors = results.filter((result) => !result.success);
-    await completeRequestOperation(operation.id, {
-      success: errors.length === 0,
-      results,
-      errors,
-      ...(operation.sourceInstallationId ? { sourceInstallationId: operation.sourceInstallationId } : {}),
-      ...(operation.sourceDeviceName ? { sourceDeviceName: operation.sourceDeviceName } : {})
-    });
-    return;
-  }
-
-  await failRequestOperation(
-    operation.id,
-    "QuickPIM++ restarted while this request was running. Check Microsoft PIM before retrying to avoid a duplicate request."
-  );
+  const errors = results.filter((result) => !result.success);
+  await completeRequestOperation(refreshedOperation.id, {
+    success: errors.length === 0,
+    results,
+    errors,
+    ...(refreshedOperation.sourceInstallationId ? { sourceInstallationId: refreshedOperation.sourceInstallationId } : {}),
+    ...(refreshedOperation.sourceDeviceName ? { sourceDeviceName: refreshedOperation.sourceDeviceName } : {})
+  });
 }
 
-function runDurableRequestOperation(
+async function reconcilePendingRequestOperations(): Promise<void> {
+  const operations = await loadRequestOperations();
+  const orphaned = operations.filter((operation) =>
+    (operation.state === "running" || operation.state === "uncertain") && !requestOperationTasks.has(operation.id)
+  );
+  await Promise.allSettled(orphaned.map(async (operation) => {
+    try {
+      await reconcileOrphanedRequestOperation(operation);
+    } catch (error) {
+      await failRequestOperation(
+        operation.id,
+        `Request recovery could not finish: ${sanitizeErrorMessage(error)}`,
+        { uncertain: true }
+      ).catch(() => undefined);
+    }
+  }));
+}
+
+async function retryPendingTrackedRequests(operation: RequestOperationRecord): Promise<void> {
+  const pendingItems = (operation.items || []).filter((item) => item.pendingTrackedRequest);
+  if (!pendingItems.length) return;
+  const requests = pendingItems.flatMap((item) => item.pendingTrackedRequest ? [item.pendingTrackedRequest] : []);
+  if (!await persistTrackedSubmissionsBestEffort(requests)) return;
+  await Promise.allSettled(pendingItems.map((item) => updateRequestOperationItem(operation.id, item.itemId, {
+    state: "tracking",
+    itemName: item.itemName,
+    itemType: item.itemType,
+    ...(item.tenantId ? { tenantId: item.tenantId } : {}),
+    ...(item.requestId ? { requestId: item.requestId } : {}),
+    trackedRequestId: item.pendingTrackedRequest?.id,
+    pendingTrackedRequest: undefined
+  })));
+}
+
+function buildTrackedReconciliationResult(itemId: string, request: TrackedPimRequest): ActivationResult {
+  const requestStatus = getEffectiveTrackedRequestStatus(request);
+  if (requestStatus === "denied" || requestStatus === "failed" || requestStatus === "canceled" || requestStatus === "expired") {
+    return {
+      itemId,
+      itemName: request.itemName,
+      success: false,
+      requestId: request.requestId,
+      requestStatus,
+      error: request.lastError || `Microsoft marked this request as ${requestStatus}.`
+    };
+  }
+  if (requestStatus === "unknown" || requestStatus === "statusUnavailable") {
+    return {
+      itemId,
+      itemName: request.itemName,
+      success: false,
+      requestId: request.requestId,
+      requestStatus,
+      error: request.lastError || "Microsoft returned an unrecognized or unavailable request status.",
+      outcomeUnknown: true
+    };
+  }
+  return {
+    itemId,
+    itemName: request.itemName,
+    success: true,
+    requestId: request.requestId,
+    requestStatus
+  };
+}
+
+function inferOperationItemType(itemId: string): ActivationItem["type"] {
+  const normalized = normalizeActivationItemId(itemId).replace(/^tenant:[^:]+:/u, "");
+  if (normalized.startsWith("pimGroup:")) return "pimGroup";
+  if (normalized.startsWith("azureRole:")) return "azureRole";
+  return "directoryRole";
+}
+
+async function runDurableRequestOperation(
   operation: Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets" | "startedAt"> &
-    Partial<Pick<RequestOperationRecord, "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName">>,
+    Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "items" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName">>,
   execute: () => Promise<ActivationResponse>,
   activityItems: ActivationItem[]
 ): Promise<ActivationResponse> {
-  const fingerprint = getRequestOperationFingerprint(operation);
+  const source = await getBrowserSyncInstallationIdentity(
+    getBrowserSyncApis(await getDistributionInfo())
+  ).catch(() => undefined);
+  const operationTenantId = operation.tenantId
+    || getSharedTenantId(activityItems)
+    || await getTenantIdForOperationTargets(operation.targets);
+  const operationPrincipalId = operation.principalId || getSharedPrincipalId(activityItems);
+  const sourcedOperation = {
+    ...operation,
+    ...(operationTenantId ? { tenantId: operationTenantId } : {}),
+    ...(operationPrincipalId ? { principalId: operationPrincipalId } : {}),
+    ...(operation.items?.length ? {} : { items: createRequestOperationItems(activityItems) }),
+    ...(source ? {
+      sourceInstallationId: source.installationId,
+      sourceDeviceName: source.deviceName
+    } : {})
+  };
+  const fingerprint = getRequestOperationFingerprint(sourcedOperation);
   const existingOperation = requestOperationTasks.get(operation.id);
   if (existingOperation) {
     if (existingOperation.fingerprint !== fingerprint) {
@@ -1394,26 +1703,32 @@ function runDurableRequestOperation(
       return stored.response;
     }
     if (stored?.state === "error") {
-      throw new Error(stored.error || "The previous QuickPIM++ request failed.");
+      const definitelyUnsent = stored.items?.every((item) => item.state === "prepared") === true;
+      if (!definitelyUnsent) {
+        throw new Error(stored.error || "The previous QuickPIM++ request failed.");
+      }
+      await dismissRequestOperations([stored.id]);
     }
-    if (stored?.state === "running") {
+    if (stored?.state === "running" || stored?.state === "uncertain") {
       await reconcileOrphanedRequestOperation(stored);
       const reconciled = (await loadRequestOperations()).find((item) => item.id === operation.id);
       if (reconciled?.state === "complete" && reconciled.response) return reconciled.response;
+      if (reconciled?.response) return reconciled.response;
       throw new Error(reconciled?.error || "The previous QuickPIM++ request outcome is unknown. Check Microsoft PIM before retrying.");
     }
 
-    const source = await getBrowserSyncInstallationIdentity(
-      getBrowserSyncApis(await getDistributionInfo())
-    ).catch(() => undefined);
-    const sourcedOperation = source
-      ? {
-          ...operation,
-          sourceInstallationId: source.installationId,
-          sourceDeviceName: source.deviceName
-        }
-      : operation;
-    await beginRequestOperation(sourcedOperation);
+    const claimed = await beginRequestOperation(sourcedOperation);
+    if (!claimed) {
+      const claimedOperation = (await loadRequestOperations()).find((item) => item.id === operation.id);
+      if (claimedOperation?.state === "complete" && claimedOperation.response) return claimedOperation.response;
+      if (claimedOperation?.state === "error") throw new Error(claimedOperation.error || "The previous QuickPIM++ request failed.");
+      if (claimedOperation) {
+        await reconcileOrphanedRequestOperation(claimedOperation);
+        const reconciled = (await loadRequestOperations()).find((item) => item.id === operation.id);
+        if (reconciled?.response) return reconciled.response;
+      }
+      throw new Error("The existing QuickPIM++ request is still being reconciled. Check Microsoft PIM before retrying.");
+    }
     const heartbeat = setInterval(() => {
       void touchRequestOperation(operation.id).catch(() => undefined);
     }, 60_000);
@@ -1422,7 +1737,9 @@ function runDurableRequestOperation(
       result = await execute();
     } catch (error) {
       const detail = sanitizeErrorMessage(error);
-      await failRequestOperation(operation.id, detail).catch(() => undefined);
+      const latestOperation = (await loadRequestOperations()).find((item) => item.id === operation.id);
+      const outcomeUnknown = latestOperation?.state === "uncertain"
+        || latestOperation?.items?.some((item) => item.state === "uncertain") === true;
       const failedResults = activityItems.map((item) => ({
         itemId: item.id,
         itemName: item.displayName,
@@ -1436,18 +1753,22 @@ function runDurableRequestOperation(
         ...(source?.installationId ? { sourceInstallationId: source.installationId } : {}),
         ...(source?.deviceName ? { sourceDeviceName: source.deviceName } : {})
       };
-      await mutateSettings((settings) => recordOperationActivity(settings, {
-        operationId: operation.id,
-        action: operation.action,
-        items: activityItems,
-        response: failedResponse,
-        requestedAt: new Date(operation.startedAt).toISOString(),
-        completedAt: new Date().toISOString(),
-        durationHours: operation.durationHours,
-        justification: operation.justification,
-        bundleName: operation.bundleName,
-        source
-      })).catch(() => undefined);
+      await failRequestOperation(operation.id, detail, { uncertain: outcomeUnknown }).catch(() => undefined);
+      await mutateSettings((settings) => recordOperationActivity(
+        operation.justification?.trim() ? addRecentJustification(settings, operation.justification) : settings,
+        {
+          operationId: operation.id,
+          action: operation.action,
+          items: activityItems,
+          response: failedResponse,
+          requestedAt: new Date(operation.startedAt).toISOString(),
+          completedAt: new Date().toISOString(),
+          durationHours: operation.durationHours,
+          justification: operation.justification,
+          bundleName: operation.bundleName,
+          source
+        }
+      )).catch(() => undefined);
       throw error;
     } finally {
       clearInterval(heartbeat);
@@ -1459,8 +1780,10 @@ function runDurableRequestOperation(
       ...(source?.installationId ? { sourceInstallationId: source.installationId } : {}),
       ...(source?.deviceName ? { sourceDeviceName: source.deviceName } : {})
     };
-    await completeRequestOperation(operation.id, response).catch(() => undefined);
-    await mutateSettings((settings) => recordOperationActivity(settings, {
+    await completeRequestOperation(operation.id, response);
+    await mutateSettings((settings) => recordOperationActivity(
+      operation.justification?.trim() ? addRecentJustification(settings, operation.justification) : settings,
+      {
       operationId: operation.id,
       action: operation.action,
       items: activityItems,
@@ -1471,7 +1794,8 @@ function runDurableRequestOperation(
       justification: operation.justification,
       bundleName: operation.bundleName,
       source
-    })).catch(() => undefined);
+      }
+    )).catch(() => undefined);
     return response;
   });
 
@@ -1481,6 +1805,11 @@ function runDurableRequestOperation(
     () => requestOperationTasks.delete(operation.id)
   );
   return task;
+}
+
+function getSharedPrincipalId(items: ActivationItem[]): string | undefined {
+  const principalIds = [...new Set(items.map((item) => item.principalId.trim().toLowerCase()).filter(Boolean))];
+  return principalIds.length === 1 ? principalIds[0] : undefined;
 }
 
 async function annotateTrackedRequestSources(
@@ -1699,7 +2028,15 @@ async function executeWithPortalAccessRecovery(
     );
   }
 
-  return mergeRetriedActivationResponse(initialResponse, await execute(retryItems));
+  const retryResponse = await execute(retryItems);
+  const successfulTargets = recoveryTargets.filter((target) => retryItems.some((item) =>
+    item.type === target
+    && retryResponse.results.some((result) => result.success && result.itemId === item.id)
+  ));
+  if (successfulTargets.length) {
+    await closePortalRecoveryTabsForTargets(successfulTargets, getPortalRecoveryApis()).catch(() => undefined);
+  }
+  return mergeRetriedActivationResponse(initialResponse, retryResponse);
 }
 
 async function recoverPortalAccessForRequest(
@@ -1806,6 +2143,26 @@ function uniqueAccessTargets(targets: AccessSetupTarget[]): AccessSetupTarget[] 
     .filter((target) => requested.has(target));
 }
 
+function getSharedTenantId(items: ActivationItem[]): string | undefined {
+  const tenantIds = [...new Set(items
+    .map((item) => item.tenantId?.trim().toLowerCase())
+    .filter((tenantId): tenantId is string => Boolean(tenantId)))];
+  return tenantIds.length === 1 ? tenantIds[0] : undefined;
+}
+
+async function getTenantIdForOperationTargets(targets: AccessSetupTarget[]): Promise<string | undefined> {
+  const tokens = await getStoredTokens();
+  const tenantIds = new Set<string>();
+  for (const target of uniqueAccessTargets(targets)) {
+    const token = target === "azureRole"
+      ? tokens.azureManagementToken
+      : getGraphTokenForTarget(tokens, target);
+    const tenantId = token ? getTokenTenantId(token)?.trim().toLowerCase() : undefined;
+    if (tenantId) tenantIds.add(tenantId);
+  }
+  return tenantIds.size === 1 ? [...tenantIds][0] : undefined;
+}
+
 function accessTargetLabel(target: AccessSetupTarget): string {
   return target === "directoryRole" ? "Entra role" : target === "pimGroup" ? "PIM group" : "Azure role";
 }
@@ -1821,6 +2178,7 @@ function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
 
   const refresh = (async (): Promise<PortalTokenRefreshResult> => {
     const scanResult = await scanOpenEntraTabs(chrome.tabs);
+    await recordPortalTokenScanDiagnostic(scanResult).catch(() => undefined);
     const tokenStatus = await getTokenStatus();
     await closeCompletedRecoveryTabs(tokenStatus);
     return {
@@ -1857,7 +2215,8 @@ async function captureToken(details: chrome.webRequest.WebRequestHeadersDetails)
     return;
   }
 
-  const allowIdentityChange = await shouldAllowCapturedTokenIdentityChange(details.tabId, chrome.tabs);
+  const allowIdentityChange = await shouldAllowCapturedTokenIdentityChange(details.tabId, chrome.tabs)
+    || await isPortalRecoveryManagedTabId(details.tabId, getPortalRecoveryApis());
   const stored = await storeCapturedToken(
     tokenKind,
     token,
@@ -1879,12 +2238,9 @@ async function capturePortalTokens(
   if (!isAllowedPortalTokenSource(sourceUrl)) {
     throw new Error("Portal token capture is only allowed from Microsoft Entra pages.");
   }
-  if (sender.frameId !== undefined && sender.frameId !== 0) {
-    throw new Error("Portal token capture is only allowed from the top-level Microsoft Entra page.");
-  }
-
-  const storedTokens = await getStoredTokens();
+  const [storedTokens, settings] = await Promise.all([getStoredTokens(), loadSettings()]);
   const candidates = selectPortalTokenCandidates(tokens, {
+    requiredTargets: getEnabledRoleFeatures(settings),
     preferredIdentity: sender.tab?.active === true
       ? undefined
       : getFirstValidStoredTokenIdentity(storedTokens)
@@ -1929,7 +2285,9 @@ function getPortalRecoveryApis(): PortalRecoveryApis {
   return {
     tabs: chrome.tabs,
     tabGroups: chrome.tabGroups,
-    storage: chrome.storage.session,
+    // Recovery ownership is non-secret and must survive a browser restart.
+    // Access tokens themselves remain exclusively in storage.session.
+    storage: chrome.storage.local,
     windows: chrome.windows
   };
 }
@@ -1944,8 +2302,32 @@ async function openManagedPortalRecoveryTabs(targets: AccessSetupTarget[]) {
   return result;
 }
 
+async function maintainPortalRecoveryCleanup(): Promise<void> {
+  const apis = getPortalRecoveryApis();
+  await closeExpiredPortalRecoveryTabs(apis);
+  const status = await getPortalRecoveryStatus(apis);
+  if (status.state !== "idle") {
+    await chrome.alarms.create(PORTAL_RECOVERY_CLEANUP_ALARM_NAME, {
+      when: Date.now() + PORTAL_RECOVERY_SESSION_TTL_MS
+    });
+  }
+}
+
 async function closeCompletedRecoveryTabs(tokenStatus: TokenStatus): Promise<void> {
-  await closeCompletedPortalRecoveryTabs(tokenStatus, getPortalRecoveryApis());
+  await closeVerifiedRecoveryTabs(tokenStatus);
+}
+
+async function closeVerifiedRecoveryTabs(
+  tokenStatus: TokenStatus,
+  cache?: Awaited<ReturnType<typeof loadDataCache>>
+): Promise<void> {
+  const currentCache = cache || await loadDataCache();
+  const verifiedTargets = buildAccessCapabilityItems(tokenStatus, currentCache)
+    .filter((item) => item.status === "ready")
+    .map((item) => item.target);
+  if (verifiedTargets.length) {
+    await closePortalRecoveryTabsForTargets(verifiedTargets, getPortalRecoveryApis());
+  }
 }
 
 async function storeCapturedToken(
@@ -2078,24 +2460,23 @@ function shouldStoreTargetGraphToken(
     return true;
   }
 
+  const currentScore = getGraphTokenTargetScore(currentValidation.decoded, target);
+  const incomingScore = getGraphTokenTargetScore(incoming, target);
+  if (currentScore !== incomingScore) {
+    return incomingScore > currentScore;
+  }
+  const currentAuthScore = getGraphTokenAuthStrengthScore(currentValidation.decoded);
+  const incomingAuthScore = getGraphTokenAuthStrengthScore(incoming);
+  if (currentAuthScore !== incomingAuthScore) {
+    return incomingAuthScore > currentAuthScore;
+  }
   const lifetimePreference = shouldKeepCurrentForUsableLifetime(currentValidation.decoded, incoming, timestamp);
   if (lifetimePreference !== undefined) {
     return !lifetimePreference;
   }
-
-  const currentScore = getGraphTokenTargetScore(currentValidation.decoded, target);
-  const incomingScore = getGraphTokenTargetScore(incoming, target);
-  if (currentScore > incomingScore) {
-    return false;
-  }
-  const currentAuthScore = getGraphTokenAuthStrengthScore(currentValidation.decoded);
-  const incomingAuthScore = getGraphTokenAuthStrengthScore(incoming);
-  if (currentScore === incomingScore && currentAuthScore > incomingAuthScore) {
-    return false;
-  }
   const currentExpiry = Number(currentValidation.decoded.exp) || 0;
   const incomingExpiry = Number(incoming.exp) || 0;
-  return incomingScore > currentScore || incomingAuthScore > currentAuthScore || incomingExpiry >= currentExpiry;
+  return incomingExpiry >= currentExpiry;
 }
 
 function getGraphTokenStorageUpdate(
@@ -2124,28 +2505,25 @@ function shouldKeepCurrentToken(
   tokenKind: TokenKind,
   now = Date.now()
 ): boolean {
+  const currentScore = getTokenCaptureScore(current, tokenKind);
+  const incomingScore = getTokenCaptureScore(incoming, tokenKind);
+  if (currentScore !== incomingScore) {
+    return currentScore > incomingScore;
+  }
+  if (tokenKind === "graph") {
+    const currentAuthScore = getGraphTokenAuthStrengthScore(current);
+    const incomingAuthScore = getGraphTokenAuthStrengthScore(incoming);
+    if (currentAuthScore !== incomingAuthScore) {
+      return currentAuthScore > incomingAuthScore;
+    }
+  }
   const lifetimePreference = shouldKeepCurrentForUsableLifetime(current, incoming, now);
   if (lifetimePreference !== undefined) {
     return lifetimePreference;
   }
-  const currentScore = getTokenCaptureScore(current, tokenKind);
-  const incomingScore = getTokenCaptureScore(incoming, tokenKind);
-  if (currentScore > incomingScore) {
-    return true;
-  }
-  if (tokenKind === "graph" && currentScore === incomingScore) {
-    const currentAuthScore = getGraphTokenAuthStrengthScore(current);
-    const incomingAuthScore = getGraphTokenAuthStrengthScore(incoming);
-    if (currentAuthScore > incomingAuthScore) {
-      return true;
-    }
-    if (incomingAuthScore > currentAuthScore) {
-      return false;
-    }
-  }
   const currentExpiry = Number(current.exp) || 0;
   const incomingExpiry = Number(incoming.exp) || 0;
-  return currentScore === incomingScore && currentExpiry >= incomingExpiry;
+  return currentExpiry >= incomingExpiry;
 }
 
 function shouldKeepCurrentForUsableLifetime(
@@ -2298,7 +2676,15 @@ async function getActivationItems(targets: AccessSetupTarget[] = ["directoryRole
   return {
     items: dedupeItems(results.flatMap((result) => result.items)),
     errors: results.flatMap((result) => result.error ? [result.error] : []),
-    diagnostics: results.map((result) => result.diagnostic)
+    diagnostics: results.flatMap((result) => {
+      const nameDiagnostic = buildNameLookupDiagnostic(
+        result.diagnostic.target,
+        result.items,
+        "eligible",
+        result.diagnostic.checkedAt
+      );
+      return [result.diagnostic, ...(nameDiagnostic ? [nameDiagnostic] : [])];
+    })
   };
 }
 
@@ -2314,7 +2700,15 @@ async function getActiveItems(targets: AccessSetupTarget[] = ["directoryRole", "
   return {
     items: dedupeItems(results.flatMap((result) => result.items)),
     errors: results.flatMap((result) => result.error ? [result.error] : []),
-    diagnostics: results.map((result) => result.diagnostic)
+    diagnostics: results.flatMap((result) => {
+      const nameDiagnostic = buildNameLookupDiagnostic(
+        result.diagnostic.target,
+        result.items,
+        "active",
+        result.diagnostic.checkedAt
+      );
+      return [result.diagnostic, ...(nameDiagnostic ? [nameDiagnostic] : [])];
+    })
   };
 }
 
@@ -2335,39 +2729,42 @@ interface TargetSnapshotResult {
 
 async function getActivationSnapshot(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<ActivationSnapshot> {
   const tokens = await getStoredTokens();
-  const fetchers: Record<AccessSetupTarget, () => Promise<TargetSnapshotResult>> = {
-    directoryRole: () =>
+  const fetchers: Record<AccessSetupTarget, (signal: AbortSignal) => Promise<TargetSnapshotResult>> = {
+    directoryRole: (signal) =>
       fetchSnapshotGroup(
         "directoryRole",
         "graph",
         getGraphTokenForTarget(tokens, "directoryRole"),
         getDirectoryRoleSnapshot,
         getDirectoryRoles,
-        getActiveDirectoryRoles
+        getActiveDirectoryRoles,
+        signal
       ),
-    azureRole: () =>
+    azureRole: (signal) =>
       fetchSnapshotGroup(
         "azureRole",
         "azureManagement",
         tokens.azureManagementToken,
         getAzureRoleSnapshot,
         getAzureRoles,
-        getActiveAzureRoles
+        getActiveAzureRoles,
+        signal
       ),
-    pimGroup: () =>
+    pimGroup: (signal) =>
       fetchSnapshotGroup(
         "pimGroup",
         "graph",
         getGraphTokenForTarget(tokens, "pimGroup"),
         getPimGroupSnapshot,
         getPimGroups,
-        getActivePimGroups
+        getActivePimGroups,
+        signal
       )
   };
   const results = await Promise.all(targets.map(async (target) => {
     try {
-      return await withTimeout(
-        fetchers[target](),
+      return await withAbortableTimeout(
+        (signal) => fetchers[target](signal),
         TARGET_SNAPSHOT_TIMEOUT_MS,
         `${ENDPOINT_LABELS[target].eligible} refresh timed out. Cached data remains available.`
       );
@@ -2386,39 +2783,42 @@ async function getActivationSnapshot(targets: AccessSetupTarget[] = ["directoryR
 
 async function getActivationCoreSnapshot(targets: AccessSetupTarget[] = ["directoryRole", "azureRole", "pimGroup"]): Promise<ActivationSnapshot> {
   const tokens = await getStoredTokens();
-  const fetchers: Record<AccessSetupTarget, () => Promise<TargetSnapshotResult>> = {
-    directoryRole: () =>
+  const fetchers: Record<AccessSetupTarget, (signal: AbortSignal) => Promise<TargetSnapshotResult>> = {
+    directoryRole: (signal) =>
       fetchSnapshotGroup(
         "directoryRole",
         "graph",
         getGraphTokenForTarget(tokens, "directoryRole"),
         getDirectoryRoleCoreSnapshot,
         getDirectoryRoles,
-        getActiveDirectoryRoles
+        getActiveDirectoryRoles,
+        signal
       ),
-    azureRole: () =>
+    azureRole: (signal) =>
       fetchSnapshotGroup(
         "azureRole",
         "azureManagement",
         tokens.azureManagementToken,
         getAzureRoleCoreSnapshot,
         getAzureRoles,
-        getActiveAzureRoles
+        getActiveAzureRoles,
+        signal
       ),
-    pimGroup: () =>
+    pimGroup: (signal) =>
       fetchSnapshotGroup(
         "pimGroup",
         "graph",
         getGraphTokenForTarget(tokens, "pimGroup"),
         getPimGroupCoreSnapshot,
         getPimGroups,
-        getActivePimGroups
+        getActivePimGroups,
+        signal
       )
   };
   const results = await Promise.all(targets.map(async (target) => {
     try {
-      return await withTimeout(
-        fetchers[target](),
+      return await withAbortableTimeout(
+        (signal) => fetchers[target](signal),
         TARGET_SNAPSHOT_TIMEOUT_MS,
         `${ENDPOINT_LABELS[target].eligible} refresh timed out. Cached data remains available.`
       );
@@ -2495,9 +2895,10 @@ async function fetchSnapshotGroup(
   target: AccessSetupTarget,
   tokenKind: TokenKind,
   token: string | undefined,
-  fetcher: (token: string) => Promise<[ActivationItem[], ActivationItem[]] | ActivationSnapshotFetchResult>,
-  eligibleFallback: (token: string) => Promise<ActivationItem[]>,
-  activeFallback: (token: string) => Promise<ActivationItem[]>
+  fetcher: (token: string, signal?: AbortSignal) => Promise<[ActivationItem[], ActivationItem[]] | ActivationSnapshotFetchResult>,
+  eligibleFallback: (token: string, signal?: AbortSignal) => Promise<ActivationItem[]>,
+  activeFallback: (token: string, signal?: AbortSignal) => Promise<ActivationItem[]>,
+  signal?: AbortSignal
 ): Promise<TargetSnapshotResult> {
   if (!token) {
     const error = tokenKind === "graph" ? "Graph token is missing." : "Azure Management token is missing.";
@@ -2509,19 +2910,31 @@ async function fetchSnapshotGroup(
   }
 
   try {
-    const fetched = await fetcher(token);
+    const fetched = await fetcher(token, signal);
     const [eligibleItems, activeItems, eligibleError, activeError] = Array.isArray(fetched)
       ? [fetched[0], fetched[1], undefined, undefined]
       : [fetched.eligibleItems, fetched.activeItems, fetched.eligibleError, fetched.activeError];
+    const [eligibleRetry, activeRetry] = await Promise.all([
+      eligibleError && !eligibleItems.length
+        ? fetchItemGroup(target, tokenKind, token, eligibleFallback, "eligible", signal)
+        : undefined,
+      activeError && !activeItems.length
+        ? fetchItemGroup(target, tokenKind, token, activeFallback, "active", signal)
+        : undefined
+    ]);
     return {
       target,
-      eligible: makeSnapshotData(target, eligibleItems, eligibleError, "eligible"),
-      active: makeSnapshotData(target, activeItems, activeError, "active")
+      eligible: eligibleRetry
+        ? itemGroupToSnapshotData(eligibleRetry)
+        : makeSnapshotData(target, attachTenantIdentity(eligibleItems, token), eligibleError, "eligible"),
+      active: activeRetry
+        ? itemGroupToSnapshotData(activeRetry)
+        : makeSnapshotData(target, attachTenantIdentity(activeItems, token), activeError, "active")
     };
   } catch {
     const [eligible, active] = await Promise.all([
-      fetchItemGroup(target, tokenKind, token, eligibleFallback, "eligible"),
-      fetchItemGroup(target, tokenKind, token, activeFallback, "active")
+      fetchItemGroup(target, tokenKind, token, eligibleFallback, "eligible", signal),
+      fetchItemGroup(target, tokenKind, token, activeFallback, "active", signal)
     ]);
     return {
       target,
@@ -2532,11 +2945,22 @@ async function fetchSnapshotGroup(
 }
 
 function itemGroupToSnapshotData(result: { items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }): ActivationDataResult {
-  return { items: result.items, errors: result.error ? [result.error] : [], diagnostics: [result.diagnostic] };
+  const nameDiagnostic = buildNameLookupDiagnostic(
+    result.diagnostic.target,
+    result.items,
+    result.diagnostic.operation === "active" ? "active" : "eligible",
+    result.diagnostic.checkedAt
+  );
+  return {
+    items: result.items,
+    errors: result.error ? [result.error] : [],
+    diagnostics: [result.diagnostic, ...(nameDiagnostic ? [nameDiagnostic] : [])]
+  };
 }
 
 function makeSnapshotData(target: AccessSetupTarget, items: ActivationItem[], error?: string, operation: "eligible" | "active" = "eligible"): ActivationDataResult {
   const checkedAt = new Date().toISOString();
+  const nameDiagnostic = buildNameLookupDiagnostic(target, items, operation, checkedAt);
   return {
     items,
     errors: error ? [error] : [],
@@ -2547,7 +2971,7 @@ function makeSnapshotData(target: AccessSetupTarget, items: ActivationItem[], er
       operation,
       endpointLabel: ENDPOINT_LABELS[target][operation],
       ...(error ? { error, failureKind: classifyAccessFailure(error) } : {})
-    }]
+    }, ...(nameDiagnostic ? [nameDiagnostic] : [])]
   };
 }
 
@@ -2571,8 +2995,9 @@ async function fetchItemGroup(
   target: AccessSetupTarget,
   tokenKind: TokenKind,
   token: string | undefined,
-  fetcher: (token: string) => Promise<ActivationItem[]>,
-  operation: "eligible" | "active"
+  fetcher: (token: string, signal?: AbortSignal) => Promise<ActivationItem[]>,
+  operation: "eligible" | "active",
+  signal?: AbortSignal
 ): Promise<{ items: ActivationItem[]; error?: string; diagnostic: AccessDiagnostic }> {
   const checkedAt = new Date().toISOString();
   if (!token) {
@@ -2592,7 +3017,7 @@ async function fetchItemGroup(
   }
 
   try {
-    const items = await fetcher(token);
+    const items = attachTenantIdentity(await fetcher(token, signal), token);
     return {
       items,
       diagnostic: {
@@ -2622,16 +3047,22 @@ async function fetchItemGroup(
   }
 }
 
-async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> {
+function attachTenantIdentity(items: ActivationItem[], token: string): ActivationItem[] {
+  const tenantId = getTokenTenantId(token);
+  return tenantId ? items.map((item) => ({ ...item, tenantId })) : items;
+}
+
+async function getDirectoryRoles(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
   const roles = await fetchAllPages<DirectoryRoleApi>(
     graphApiUrl(`/v1.0/roleManagement/directory/roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')?${new URLSearchParams({ "$expand": "roleDefinition" }).toString()}`),
-    graphToken
+    graphToken,
+    signal
   );
   const [definitions, scopeNames, policyRequirements] = await Promise.all([
-    getDirectoryRoleDefinitionsBestEffort(graphToken),
-    getDirectoryScopeNamesBestEffort(graphToken, roles),
-    getDirectoryRolePolicyRequirementsBestEffort(graphToken)
+    getDirectoryRoleDefinitionsBestEffort(graphToken, signal),
+    getDirectoryScopeNamesBestEffort(graphToken, roles, signal),
+    getDirectoryRolePolicyRequirementsBestEffort(graphToken, signal)
   ]);
 
   return roles.map((role) => {
@@ -2646,26 +3077,35 @@ async function getDirectoryRoles(graphToken: string): Promise<ActivationItem[]> 
   });
 }
 
-async function getDirectoryRoleSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+async function getDirectoryRoleSnapshot(graphToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(graphToken, "graph");
-  const [eligibleRoles, assignmentInstances, assignmentRequests] = await Promise.all([
+  const [eligibleResult, instancesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl(`/v1.0/roleManagement/directory/roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')?${new URLSearchParams({ "$expand": "roleDefinition" }).toString()}`),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (eligibleResult.status === "rejected" && instancesResult.status === "rejected" && requestsResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligibleRoles = eligibleResult.status === "fulfilled" ? eligibleResult.value : [];
+  const assignmentInstances = instancesResult.status === "fulfilled" ? instancesResult.value : [];
+  const assignmentRequests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const [definitions, scopeNames, policyRequirements] = await Promise.all([
-    getDirectoryRoleDefinitionsBestEffort(graphToken),
-    getDirectoryScopeNamesBestEffort(graphToken, [...eligibleRoles, ...assignmentInstances, ...assignmentRequests]),
-    getDirectoryRolePolicyRequirementsBestEffort(graphToken)
+    getDirectoryRoleDefinitionsBestEffort(graphToken, signal),
+    getDirectoryScopeNamesBestEffort(graphToken, [...eligibleRoles, ...assignmentInstances, ...assignmentRequests], signal),
+    getDirectoryRolePolicyRequirementsBestEffort(graphToken, signal)
   ]);
   const eligible = eligibleRoles.map((role) => {
     const namedRole = withDirectoryRoleScopeName(withDirectoryRoleDefinitionName(role, definitions), scopeNames);
@@ -2679,28 +3119,42 @@ async function getDirectoryRoleSnapshot(graphToken: string): Promise<[Activation
   });
   const active = getDirectoryRoleActiveInstanceItems(assignmentInstances, definitions, scopeNames, policyRequirements);
   const pending = getDirectoryRolePendingRequestItems(assignmentRequests, definitions, scopeNames, policyRequirements);
-  return [eligible, [...pending, ...active]];
+  return {
+    eligibleItems: eligible,
+    activeItems: [...pending, ...active],
+    ...(eligibleResult.status === "rejected" ? { eligibleError: sanitizeErrorMessage(eligibleResult.reason) } : {}),
+    ...(instancesResult.status === "rejected" ? { activeError: sanitizeErrorMessage(instancesResult.reason) } : {})
+  };
 }
 
-async function getDirectoryRoleCoreSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+async function getDirectoryRoleCoreSnapshot(graphToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(graphToken, "graph");
-  const [eligibleRoles, assignmentInstances, assignmentRequests] = await Promise.all([
+  const [eligibleResult, instancesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl(`/v1.0/roleManagement/directory/roleEligibilityScheduleInstances/filterByCurrentUser(on='principal')?${new URLSearchParams({ "$expand": "roleDefinition" }).toString()}`),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (eligibleResult.status === "rejected" && instancesResult.status === "rejected" && requestsResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligibleRoles = eligibleResult.status === "fulfilled" ? eligibleResult.value : [];
+  const assignmentInstances = instancesResult.status === "fulfilled" ? instancesResult.value : [];
+  const assignmentRequests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const [definitions, scopeNames] = await Promise.all([
-    getDirectoryRoleDefinitionsBestEffort(graphToken),
-    getDirectoryScopeNamesBestEffort(graphToken, [...eligibleRoles, ...assignmentInstances, ...assignmentRequests])
+    getDirectoryRoleDefinitionsBestEffort(graphToken, signal),
+    getDirectoryScopeNamesBestEffort(graphToken, [...eligibleRoles, ...assignmentInstances, ...assignmentRequests], signal)
   ]);
   const eligible = eligibleRoles.map((role) => {
     const namedRole = withDirectoryRoleScopeName(withDirectoryRoleDefinitionName(role, definitions), scopeNames);
@@ -2708,7 +3162,12 @@ async function getDirectoryRoleCoreSnapshot(graphToken: string): Promise<[Activa
   });
   const active = getDirectoryRoleActiveInstanceItems(assignmentInstances, definitions, scopeNames).map(markActivationPolicyPending);
   const pending = getDirectoryRolePendingRequestItems(assignmentRequests, definitions, scopeNames).map(markActivationPolicyPending);
-  return [eligible, [...pending, ...active]];
+  return {
+    eligibleItems: eligible,
+    activeItems: [...pending, ...active],
+    ...(eligibleResult.status === "rejected" ? { eligibleError: sanitizeErrorMessage(eligibleResult.reason) } : {}),
+    ...(instancesResult.status === "rejected" ? { activeError: sanitizeErrorMessage(instancesResult.reason) } : {})
+  };
 }
 
 function getDirectoryRoleActiveInstanceItems(
@@ -2790,24 +3249,26 @@ interface DirectoryRoleDefinitionInfo {
   isPrivileged?: boolean;
 }
 
-async function getDirectoryRoleDefinitions(graphToken: string): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
+async function getDirectoryRoleDefinitions(graphToken: string, signal?: AbortSignal): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
   const roles = await fetchAllPages<DirectoryRoleDefinitionApi>(
     graphApiUrl("/v1.0/roleManagement/directory/roleDefinitions"),
-    graphToken
+    graphToken,
+    signal
   );
   return buildDirectoryRoleDefinitionInfoMap(roles);
 }
 
-async function getDirectoryRoleDefinitionsBestEffort(graphToken: string): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
+async function getDirectoryRoleDefinitionsBestEffort(graphToken: string, signal?: AbortSignal): Promise<Record<string, DirectoryRoleDefinitionInfo>> {
   try {
-    return await getDirectoryRoleDefinitions(graphToken);
+    return await getDirectoryRoleDefinitions(graphToken, signal);
   } catch {
     return {};
   }
 }
 
 async function getDirectoryRolePolicyRequirementsBestEffort(
-  graphToken: string
+  graphToken: string,
+  signal?: AbortSignal
 ): Promise<Record<string, Partial<ActivationRequirements>>> {
   const scopeTypes = ["DirectoryRole", "Directory"];
   const results = await Promise.allSettled(
@@ -2818,7 +3279,8 @@ async function getDirectoryRolePolicyRequirementsBestEffort(
       });
       return fetchAllPages<RoleManagementPolicyAssignmentApi>(
         graphApiUrl(`/beta/policies/roleManagementPolicyAssignments?${query.toString()}`),
-        graphToken
+        graphToken,
+        signal
       );
     })
   );
@@ -2836,10 +3298,10 @@ function buildDirectoryRoleDefinitionInfoMap(roles: DirectoryRoleDefinitionApi[]
       ...(typeof role.isPrivileged === "boolean" ? { isPrivileged: role.isPrivileged } : {})
     };
     if (role.id) {
-      result[role.id] = info;
+      result[role.id.toLowerCase()] = info;
     }
     if (role.templateId) {
-      result[role.templateId] = info;
+      result[role.templateId.toLowerCase()] = info;
     }
   }
   return result;
@@ -2848,9 +3310,9 @@ function buildDirectoryRoleDefinitionInfoMap(roles: DirectoryRoleDefinitionApi[]
 function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Record<string, DirectoryRoleDefinitionInfo>): DirectoryRoleApi {
   const roleDefinitionId = role.roleDefinitionId || role.roleDefinition?.id || role.roleDefinition?.templateId || role.id || "";
   const definition =
-    definitions[roleDefinitionId] ||
-    definitions[role.roleDefinition?.id || ""] ||
-    definitions[role.roleDefinition?.templateId || ""];
+    definitions[roleDefinitionId.toLowerCase()] ||
+    definitions[(role.roleDefinition?.id || "").toLowerCase()] ||
+    definitions[(role.roleDefinition?.templateId || "").toLowerCase()];
   return {
     ...role,
     roleName:
@@ -2863,7 +3325,8 @@ function withDirectoryRoleDefinitionName(role: DirectoryRoleApi, definitions: Re
 
 async function getDirectoryScopeNamesBestEffort(
   graphToken: string,
-  roles: Array<Pick<DirectoryRoleApi, "directoryScopeId">>
+  roles: Array<Pick<DirectoryRoleApi, "directoryScopeId">>,
+  signal?: AbortSignal
 ): Promise<Record<string, string>> {
   const scopeIds = [
     ...new Set(
@@ -2877,13 +3340,13 @@ async function getDirectoryScopeNamesBestEffort(
   }
 
   const entries = await mapWithConcurrency(scopeIds, 6, async (scopeId) => {
-    const displayName = await fetchDirectoryScopeDisplayName(graphToken, scopeId);
+    const displayName = await fetchDirectoryScopeDisplayName(graphToken, scopeId, signal);
     return displayName ? ([scopeId, displayName] as const) : undefined;
   });
   return Object.fromEntries(entries.filter((entry): entry is readonly [string, string] => Boolean(entry)));
 }
 
-async function fetchDirectoryScopeDisplayName(graphToken: string, directoryScopeId: string): Promise<string | undefined> {
+async function fetchDirectoryScopeDisplayName(graphToken: string, directoryScopeId: string, signal?: AbortSignal): Promise<string | undefined> {
   const objectId = extractDirectoryScopeObjectId(directoryScopeId);
   if (!objectId) {
     return undefined;
@@ -2891,7 +3354,7 @@ async function fetchDirectoryScopeDisplayName(graphToken: string, directoryScope
 
   for (const url of getDirectoryScopeLookupUrls(directoryScopeId, objectId)) {
     try {
-      const data = await fetchJson<{ displayName?: string; userPrincipalName?: string }>(url, graphToken);
+      const data = await fetchJson<{ displayName?: string; userPrincipalName?: string }>(url, graphToken, signal);
       const displayName = data.displayName || data.userPrincipalName;
       if (displayName) {
         return displayName;
@@ -2943,18 +3406,20 @@ function withDirectoryRoleScopeName(role: DirectoryRoleApi, scopeNames: Record<s
   return scopeName ? { ...role, directoryScopeDisplayName: scopeName } : role;
 }
 
-async function getPimGroups(graphToken: string): Promise<ActivationItem[]> {
+async function getPimGroups(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
   const schedules = await fetchAllPages<PimGroupApi>(
     graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances/filterByCurrentUser(on='principal')"),
-    graphToken
+    graphToken,
+    signal
   );
   const groupIds = [...new Set(schedules.map((schedule) => schedule.groupId).filter(Boolean) as string[])];
   const groupInfos = await getGroupInfos(
     graphToken,
-    groupIds
+    groupIds,
+    signal
   );
-  const policyRequirements = await getPimGroupPolicyRequirementsBestEffort(graphToken, groupIds);
+  const policyRequirements = await getPimGroupPolicyRequirementsBestEffort(graphToken, groupIds, signal);
 
   return schedules.map((schedule) => {
     const item = normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]);
@@ -2963,22 +3428,31 @@ async function getPimGroups(graphToken: string): Promise<ActivationItem[]> {
   });
 }
 
-async function getPimGroupSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+async function getPimGroupSnapshot(graphToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(graphToken, "graph");
-  const [eligibleSchedules, activeSchedules, assignmentRequests] = await Promise.all([
+  const [eligibleResult, instancesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (eligibleResult.status === "rejected" && instancesResult.status === "rejected" && requestsResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligibleSchedules = eligibleResult.status === "fulfilled" ? eligibleResult.value : [];
+  const activeSchedules = instancesResult.status === "fulfilled" ? instancesResult.value : [];
+  const assignmentRequests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const groupIds = [
     ...new Set(
       [...eligibleSchedules, ...activeSchedules, ...assignmentRequests]
@@ -2987,10 +3461,11 @@ async function getPimGroupSnapshot(graphToken: string): Promise<[ActivationItem[
     )
   ];
   const [groupInfos, policyRequirements] = await Promise.all([
-    getGroupInfos(graphToken, groupIds),
+    getGroupInfos(graphToken, groupIds, signal),
     getPimGroupPolicyRequirementsBestEffort(
       graphToken,
-      groupIds
+      groupIds,
+      signal
     )
   ]);
   const eligible = eligibleSchedules.map((schedule) => {
@@ -3000,25 +3475,39 @@ async function getPimGroupSnapshot(graphToken: string): Promise<[ActivationItem[
   });
   const active = getActivePimGroupInstanceItems(activeSchedules, groupInfos, policyRequirements);
   const pending = getPimGroupPendingRequestItems(assignmentRequests, groupInfos, policyRequirements);
-  return [eligible, [...pending, ...active]];
+  return {
+    eligibleItems: eligible,
+    activeItems: [...pending, ...active],
+    ...(eligibleResult.status === "rejected" ? { eligibleError: sanitizeErrorMessage(eligibleResult.reason) } : {}),
+    ...(instancesResult.status === "rejected" ? { activeError: sanitizeErrorMessage(instancesResult.reason) } : {})
+  };
 }
 
-async function getPimGroupCoreSnapshot(graphToken: string): Promise<[ActivationItem[], ActivationItem[]]> {
+async function getPimGroupCoreSnapshot(graphToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(graphToken, "graph");
-  const [eligibleSchedules, activeSchedules, assignmentRequests] = await Promise.all([
+  const [eligibleResult, instancesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (eligibleResult.status === "rejected" && instancesResult.status === "rejected" && requestsResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligibleSchedules = eligibleResult.status === "fulfilled" ? eligibleResult.value : [];
+  const activeSchedules = instancesResult.status === "fulfilled" ? instancesResult.value : [];
+  const assignmentRequests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const groupIds = [
     ...new Set(
       [...eligibleSchedules, ...activeSchedules, ...assignmentRequests]
@@ -3026,13 +3515,18 @@ async function getPimGroupCoreSnapshot(graphToken: string): Promise<[ActivationI
         .filter(Boolean) as string[]
     )
   ];
-  const groupInfos = await getGroupInfos(graphToken, groupIds);
+  const groupInfos = await getGroupInfos(graphToken, groupIds, signal);
   const eligible = eligibleSchedules.map((schedule) =>
     markActivationPolicyPending(normalizePimGroup(schedule, groupInfos[schedule.groupId || ""]))
   );
   const active = getActivePimGroupInstanceItems(activeSchedules, groupInfos, {}).map(markActivationPolicyPending);
   const pending = getPimGroupPendingRequestItems(assignmentRequests, groupInfos, {}).map(markActivationPolicyPending);
-  return [eligible, [...pending, ...active]];
+  return {
+    eligibleItems: eligible,
+    activeItems: [...pending, ...active],
+    ...(eligibleResult.status === "rejected" ? { eligibleError: sanitizeErrorMessage(eligibleResult.reason) } : {}),
+    ...(instancesResult.status === "rejected" ? { activeError: sanitizeErrorMessage(instancesResult.reason) } : {})
+  };
 }
 
 function getActivePimGroupInstanceItems(
@@ -3084,7 +3578,8 @@ function getPimGroupPendingRequestItems(
 
 async function getPimGroupPolicyRequirementsBestEffort(
   graphToken: string,
-  groupIds: string[]
+  groupIds: string[],
+  signal?: AbortSignal
 ): Promise<Record<string, Record<string, Partial<ActivationRequirements>>>> {
   const entries = await mapWithConcurrency(
     groupIds,
@@ -3097,17 +3592,26 @@ async function getPimGroupPolicyRequirementsBestEffort(
         });
         const assignments = await fetchAllPages<RoleManagementPolicyAssignmentApi>(
           graphApiUrl(`/beta/policies/roleManagementPolicyAssignments?${query.toString()}`),
-          graphToken
+          graphToken,
+          signal
         );
         const requirementsByRole = buildRolePolicyRequirementMap(assignments);
+        const byAccess: Record<string, Partial<ActivationRequirements>> = {};
+        for (const assignment of assignments) {
+          const accessId = getPimGroupPolicyAccessId(assignment);
+          if (!accessId) continue;
+          const requirements = getRoleDefinitionLookupKeys(assignment.roleDefinitionId)
+            .concat(getRoleDefinitionLookupKeys(assignment.properties?.roleDefinitionId))
+            .concat(getRoleDefinitionLookupKeys(assignment.id))
+            .map((key) => requirementsByRole[key])
+            .find(Boolean);
+          if (requirements) byAccess[accessId] = requirements;
+        }
         return [
           groupId,
-          Object.fromEntries(
-            Object.entries(requirementsByRole).map(([roleDefinitionId, requirements]) => [
-              roleDefinitionId.toLowerCase().includes("owner") ? "owner" : roleDefinitionId.toLowerCase().includes("member") ? "member" : "default",
-              requirements
-            ])
-          )
+          Object.keys(byAccess).length
+            ? byAccess
+            : Object.fromEntries(Object.entries(requirementsByRole).map(([, requirements]) => ["default", requirements]))
         ] as const;
       } catch {
         return [groupId, {}] as const;
@@ -3117,7 +3621,16 @@ async function getPimGroupPolicyRequirementsBestEffort(
   return Object.fromEntries(entries);
 }
 
-async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Record<string, GroupInfo>> {
+function getPimGroupPolicyAccessId(assignment: RoleManagementPolicyAssignmentApi): "member" | "owner" | undefined {
+  const candidates = [assignment.roleDefinitionId, assignment.properties?.roleDefinitionId, assignment.id]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+  if (candidates.some((parts) => parts.includes("owner"))) return "owner";
+  if (candidates.some((parts) => parts.includes("member"))) return "member";
+  return undefined;
+}
+
+async function getGroupInfos(graphToken: string, groupIds: string[], signal?: AbortSignal): Promise<Record<string, GroupInfo>> {
   const uniqueIds = [...new Set(groupIds.filter(Boolean))];
   const entries = await mapWithConcurrency(
     chunkItems(uniqueIds, GRAPH_BATCH_REQUEST_LIMIT),
@@ -3131,14 +3644,29 @@ async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Re
             method: "GET",
             url: `/groups/${encodePathSegment(groupId)}?$select=id,displayName,description,mail`
           })),
-          graphToken
+          graphToken,
+          signal
         );
         const responsesById = new Map((response.responses || []).map((item) => [item.id, item]));
-        return batchIds.map((groupId, index) => {
+        return await Promise.all(batchIds.map(async (groupId, index) => {
           const item = responsesById.get(String(index));
           const group = item?.status && item.status >= 200 && item.status < 300 ? item.body : undefined;
-          return [groupId, group?.id ? group : { id: groupId, displayName: groupId }] as const;
-        });
+          if (group?.id) return [groupId, group] as const;
+          if (item?.status === 429 || (item?.status !== undefined && item.status >= 500)) {
+            await delay(getGraphBatchRetryDelayMs(item.headers));
+            try {
+              const retried = await retryTransientMicrosoftRead(() => fetchJson<GroupInfo>(
+                graphApiUrl(`/v1.0/groups/${encodePathSegment(groupId)}?$select=id,displayName,description,mail`),
+                graphToken,
+                signal
+              ));
+              if (retried.id) return [groupId, retried] as const;
+            } catch {
+              // Keep the stable local ID fallback below.
+            }
+          }
+          return [groupId, { id: groupId, displayName: groupId }] as const;
+        }));
       } catch {
         return fallbackEntries;
       }
@@ -3147,47 +3675,74 @@ async function getGroupInfos(graphToken: string, groupIds: string[]): Promise<Re
   return Object.fromEntries(entries.flat());
 }
 
-async function getAzureRoles(azureManagementToken: string): Promise<ActivationItem[]> {
+function getGraphBatchRetryDelayMs(headers: Record<string, string> | undefined): number {
+  const raw = Object.entries(headers || {}).find(([key]) => key.toLowerCase() === "retry-after")?.[1];
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds >= 0
+    ? Math.min(5_000, Math.max(TRANSIENT_READ_RETRY_DELAY_MS, seconds * 1_000))
+    : TRANSIENT_READ_RETRY_DELAY_MS;
+}
+
+async function getAzureRoles(azureManagementToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const scopeResult = await getAzureRoleScopes(azureManagementToken);
-  const result = await getAzureRolesForScopes(azureManagementToken, scopeResult.scopes);
+  const scopeResult = await getAzureRoleScopes(azureManagementToken, signal);
+  const result = await getAzureRolesForScopes(azureManagementToken, scopeResult.scopes, true, signal);
   return returnOrThrowPartialAzureData(result, scopeResult.warnings, "eligible Azure roles");
 }
 
-async function getAzureRoleSnapshot(azureManagementToken: string): Promise<ActivationSnapshotFetchResult> {
+async function getAzureRoleSnapshot(azureManagementToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const scopeResult = await getAzureRoleScopes(azureManagementToken);
-  const [eligible, active] = await Promise.all([
-    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes),
-    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes)
+  const scopeResult = await getAzureRoleScopes(azureManagementToken, signal);
+  const [eligibleResult, activeResult] = await Promise.allSettled([
+    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes, true, signal),
+    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes, signal)
   ]);
+  if (eligibleResult.status === "rejected" && activeResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligible = eligibleResult.status === "fulfilled" ? eligibleResult.value : { items: [], warnings: [] };
+  const active = activeResult.status === "fulfilled" ? activeResult.value : { items: [], warnings: [] };
   return {
     eligibleItems: eligible.items,
     activeItems: active.items,
-    eligibleError: formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
-    activeError: formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
+    eligibleError: eligibleResult.status === "rejected"
+      ? sanitizeErrorMessage(eligibleResult.reason)
+      : formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
+    activeError: activeResult.status === "rejected"
+      ? sanitizeErrorMessage(activeResult.reason)
+      : formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
   };
 }
 
-async function getAzureRoleCoreSnapshot(azureManagementToken: string): Promise<ActivationSnapshotFetchResult> {
+async function getAzureRoleCoreSnapshot(azureManagementToken: string, signal?: AbortSignal): Promise<ActivationSnapshotFetchResult> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const scopeResult = await getAzureRoleScopes(azureManagementToken);
-  const [eligible, active] = await Promise.all([
-    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes, false),
-    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes)
+  const scopeResult = await getAzureRoleScopes(azureManagementToken, signal);
+  const [eligibleResult, activeResult] = await Promise.allSettled([
+    getAzureRolesForScopes(azureManagementToken, scopeResult.scopes, false, signal),
+    getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes, signal)
   ]);
+  if (eligibleResult.status === "rejected" && activeResult.status === "rejected") {
+    throw eligibleResult.reason;
+  }
+  const eligible = eligibleResult.status === "fulfilled" ? eligibleResult.value : { items: [], warnings: [] };
+  const active = activeResult.status === "fulfilled" ? activeResult.value : { items: [], warnings: [] };
   return {
     eligibleItems: eligible.items.map(markActivationPolicyPending),
     activeItems: active.items.map(markActivationPolicyPending),
-    eligibleError: formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
-    activeError: formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
+    eligibleError: eligibleResult.status === "rejected"
+      ? sanitizeErrorMessage(eligibleResult.reason)
+      : formatAzurePartialWarning([...scopeResult.warnings, ...eligible.warnings], "eligible Azure roles"),
+    activeError: activeResult.status === "rejected"
+      ? sanitizeErrorMessage(activeResult.reason)
+      : formatAzurePartialWarning([...scopeResult.warnings, ...active.warnings], "active Azure roles")
   };
 }
 
 async function getAzureRolesForScopes(
   azureManagementToken: string,
   scopes: AzureRoleScope[],
-  includePolicies = true
+  includePolicies = true,
+  signal?: AbortSignal
 ): Promise<AzureRoleLoadResult> {
   const roleGroups = await mapWithConcurrencySettled(
     scopes,
@@ -3198,7 +3753,8 @@ async function getAzureRolesForScopes(
           azureManagementUrl(
             `${scope.scope}/providers/Microsoft.Authorization/roleEligibilityScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
           ),
-          azureManagementToken
+          azureManagementToken,
+          signal
         )
       );
       return roles.map((role) => normalizeAzureRole(withAzureScopeContext(role, scope)));
@@ -3207,14 +3763,14 @@ async function getAzureRolesForScopes(
 
   assertAtLeastOneAzureScopeSucceeded(roleGroups, "eligible Azure roles");
   const items = dedupeItems(roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : [])));
-  const itemsWithPolicies = includePolicies ? await applyAzureRolePolicyRequirements(items, azureManagementToken) : items;
+  const itemsWithPolicies = includePolicies ? await applyAzureRolePolicyRequirements(items, azureManagementToken, signal) : items;
   return {
-    items: await applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken),
+    items: await applyAzureRoleDefinitionMetadata(itemsWithPolicies, azureManagementToken, signal),
     warnings: getAzureScopeWarnings(roleGroups, scopes)
   };
 }
 
-async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
+async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   const azureItems = items.filter((item): item is Extract<ActivationItem, { type: "azureRole" }> => item.type === "azureRole");
   const uniqueScopes = [...new Set(azureItems.map((item) => item.scope))];
   const policyEntries = await mapWithConcurrency(
@@ -3224,7 +3780,8 @@ async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: 
       try {
         const assignments = await fetchAllPages<RoleManagementPolicyAssignmentApi>(
           azureManagementUrl(`${scope}/providers/Microsoft.Authorization/roleManagementPolicyAssignments?api-version=2020-10-01`),
-          token
+          token,
+          signal
         );
         return [scope, buildRolePolicyRequirementMap(assignments)] as const;
       } catch {
@@ -3247,19 +3804,21 @@ async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: 
   });
 }
 
-async function getSubscriptions(token: string): Promise<Array<{ subscriptionId: string; displayName: string }>> {
+async function getSubscriptions(token: string, signal?: AbortSignal): Promise<Array<{ subscriptionId: string; displayName: string }>> {
   return fetchAllPages<Array<{ subscriptionId: string; displayName: string }>[number]>(
     azureManagementUrl("/subscriptions?api-version=2020-01-01"),
-    token
+    token,
+    signal
   );
 }
 
-async function getAzureRoleScopes(token: string): Promise<AzureRoleScopeResult> {
+async function getAzureRoleScopes(token: string, signal?: AbortSignal): Promise<AzureRoleScopeResult> {
   const [subscriptions, managementGroups] = await Promise.allSettled([
-    retryTransientMicrosoftRead(() => getSubscriptions(token)),
+    retryTransientMicrosoftRead(() => getSubscriptions(token, signal)),
     retryTransientMicrosoftRead(() => fetchAllPages<AzureManagementGroupApi>(
       azureManagementUrl("/providers/Microsoft.Management/managementGroups?api-version=2020-05-01"),
-      token
+      token,
+      signal
     ))
   ]);
   if (subscriptions.status === "rejected" && managementGroups.status === "rejected") {
@@ -3287,24 +3846,33 @@ async function getAzureRoleScopes(token: string): Promise<AzureRoleScopeResult> 
       ? [`Azure management groups could not be enumerated: ${sanitizeErrorMessage(managementGroups.reason)}`]
       : [])
   ];
-  return { scopes: dedupeAzureScopes(scopes), warnings };
+  const dedupedScopes = dedupeAzureScopes(scopes);
+  if (!dedupedScopes.length) {
+    throw new Error("Azure returned no accessible subscriptions or management groups for the captured portal token.");
+  }
+  return { scopes: dedupedScopes, warnings };
 }
 
-async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationItem[]> {
+async function getActiveDirectoryRoles(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
-  const [instances, requests] = await Promise.all([
+  const [instancesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (instancesResult.status === "rejected") throw instancesResult.reason;
+  const instances = instancesResult.value;
+  const requests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const [definitions, scopeNames] = await Promise.all([
-    getDirectoryRoleDefinitionsBestEffort(graphToken),
-    getDirectoryScopeNamesBestEffort(graphToken, [...instances, ...requests])
+    getDirectoryRoleDefinitionsBestEffort(graphToken, signal),
+    getDirectoryScopeNamesBestEffort(graphToken, [...instances, ...requests], signal)
   ]);
   return [
     ...getDirectoryRolePendingRequestItems(requests, definitions, scopeNames),
@@ -3312,16 +3880,17 @@ async function getActiveDirectoryRoles(graphToken: string): Promise<ActivationIt
   ];
 }
 
-async function getActiveAzureRoles(azureManagementToken: string): Promise<ActivationItem[]> {
+async function getActiveAzureRoles(azureManagementToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(azureManagementToken, "azureManagement");
-  const scopeResult = await getAzureRoleScopes(azureManagementToken);
-  const result = await getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes);
+  const scopeResult = await getAzureRoleScopes(azureManagementToken, signal);
+  const result = await getActiveAzureRolesForScopes(azureManagementToken, scopeResult.scopes, signal);
   return returnOrThrowPartialAzureData(result, scopeResult.warnings, "active Azure roles");
 }
 
 async function getActiveAzureRolesForScopes(
   azureManagementToken: string,
-  scopes: AzureRoleScope[]
+  scopes: AzureRoleScope[],
+  signal?: AbortSignal
 ): Promise<AzureRoleLoadResult> {
   const now = Date.now();
   const roleGroups = await mapWithConcurrencySettled(
@@ -3333,7 +3902,8 @@ async function getActiveAzureRolesForScopes(
           azureManagementUrl(
             `${scope.scope}/providers/Microsoft.Authorization/roleAssignmentScheduleInstances?api-version=2020-10-01&$filter=asTarget()`
           ),
-          azureManagementToken
+          azureManagementToken,
+          signal
         )
       );
       return roles
@@ -3362,7 +3932,8 @@ async function getActiveAzureRolesForScopes(
   return {
     items: await applyAzureRoleDefinitionMetadata(
       dedupeItems(roleGroups.flatMap((group) => (group.status === "fulfilled" ? group.value : []))),
-      azureManagementToken
+      azureManagementToken,
+      signal
     ),
     warnings: getAzureScopeWarnings(roleGroups, scopes)
   };
@@ -3433,7 +4004,7 @@ function retryTransientMicrosoftRead<T>(operation: () => Promise<T>): Promise<T>
   );
 }
 
-async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: string): Promise<ActivationItem[]> {
+async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   const azureItems = items.filter((item): item is Extract<ActivationItem, { type: "azureRole" }> => item.type === "azureRole");
   const definitionIds = [...new Set(azureItems.map((item) => item.roleDefinitionId))];
 
@@ -3449,7 +4020,8 @@ async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: 
         try {
           const definition = await fetchJson<AzureRoleDefinitionResponse>(
             azureManagementUrl(`${roleDefinitionId}?api-version=2022-04-01`),
-            token
+            token,
+            signal
           );
           return [
             roleDefinitionId,
@@ -3487,18 +4059,23 @@ async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: 
   });
 }
 
-async function getActivePimGroups(graphToken: string): Promise<ActivationItem[]> {
+async function getActivePimGroups(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
-  const [schedules, assignmentRequests] = await Promise.all([
+  const [schedulesResult, requestsResult] = await Promise.allSettled([
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     ),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on='principal')"),
-      graphToken
+      graphToken,
+      signal
     )
   ]);
+  if (schedulesResult.status === "rejected") throw schedulesResult.reason;
+  const schedules = schedulesResult.value;
+  const assignmentRequests = requestsResult.status === "fulfilled" ? requestsResult.value : [];
   const groupIds = [
     ...new Set(
       [...schedules, ...assignmentRequests]
@@ -3507,8 +4084,8 @@ async function getActivePimGroups(graphToken: string): Promise<ActivationItem[]>
     )
   ];
   const [groupInfos, policyRequirements] = await Promise.all([
-    getGroupInfos(graphToken, groupIds),
-    getPimGroupPolicyRequirementsBestEffort(graphToken, groupIds)
+    getGroupInfos(graphToken, groupIds, signal),
+    getPimGroupPolicyRequirementsBestEffort(graphToken, groupIds, signal)
   ]);
   const active = getActivePimGroupInstanceItems(schedules, groupInfos, policyRequirements);
   return [...getPimGroupPendingRequestItems(assignmentRequests, groupInfos, policyRequirements), ...active];
@@ -3540,8 +4117,18 @@ async function activateItems(
     items,
     4,
     async (item) => {
+      let microsoftAccepted = false;
+      let acceptedRequestId: string | undefined;
       try {
         return await runWithActivationItemLock(item, async () => {
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: "sending",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(item.tenantId ? { tenantId: item.tenantId } : {})
+            });
+          }
           const request = buildActivationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
@@ -3559,6 +4146,8 @@ async function activateItems(
 
           const data = await sendActivationRequest(request, token);
           const requestId = getResponseIdentifier(data.payload, request, data.location);
+          microsoftAccepted = true;
+          acceptedRequestId = requestId;
           const trackedRequest = requestId
             ? createTrackedPimRequest({
               item,
@@ -3576,9 +4165,37 @@ async function activateItems(
               tenantId: getTokenTenantId(token)
             })
             : undefined;
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: "accepted",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(getTokenTenantId(token) ? { tenantId: getTokenTenantId(token) } : {}),
+              ...(requestId ? { requestId } : {}),
+              ...(trackedRequest ? { pendingTrackedRequest: trackedRequest } : {}),
+              result: {
+                itemId: item.id,
+                itemName: item.displayName,
+                success: true,
+                ...(requestId ? { requestId } : {}),
+                requestStatus: "submitted"
+              }
+            });
+          }
           const trackingStored = trackedRequest
             ? await persistTrackedSubmissionsBestEffort([trackedRequest])
             : false;
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: trackingStored ? "tracking" : "accepted",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(getTokenTenantId(token) ? { tenantId: getTokenTenantId(token) } : {}),
+              ...(requestId ? { requestId } : {}),
+              ...(trackedRequest && trackingStored ? { trackedRequestId: trackedRequest.id } : {}),
+              pendingTrackedRequest: trackingStored ? undefined : trackedRequest
+            });
+          }
           return {
             result: {
               itemId: item.id,
@@ -3593,16 +4210,29 @@ async function activateItems(
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         const detail = sanitizeErrorMessage(error);
-        const outcomeUnknown = isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
-        return {
-          result: {
-            itemId: item.id,
+        const outcomeUnknown = microsoftAccepted || isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
+        const result: ActivationResult = {
+          itemId: item.id,
+          itemName: item.displayName,
+          success: false,
+          ...(acceptedRequestId ? { requestId: acceptedRequestId } : {}),
+          error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
+          ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
+          ...(outcomeUnknown ? { outcomeUnknown: true } : {})
+        };
+        if (options.operationId) {
+          await updateRequestOperationItem(options.operationId, item.id, {
+            state: outcomeUnknown ? "uncertain" : "terminal",
             itemName: item.displayName,
-            success: false,
-            error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
-            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
-            ...(outcomeUnknown ? { outcomeUnknown: true } : {})
-          },
+            itemType: item.type,
+            ...(item.tenantId ? { tenantId: item.tenantId } : {}),
+            ...(acceptedRequestId ? { requestId: acceptedRequestId } : {}),
+            result,
+            error: result.error
+          }).catch(() => undefined);
+        }
+        return {
+          result,
           trackedRequest: undefined
         };
       }
@@ -3628,8 +4258,7 @@ async function sendActivationRequest(request: ActivationRequest, token: string):
   }, MICROSOFT_API_WRITE_TIMEOUT_MS);
 
   if (!response.ok) {
-    const errorData = await safeJson(response);
-    throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
+    throw new Error(await getSafeApiErrorMessage(response));
   }
 
   return {
@@ -3654,8 +4283,18 @@ async function deactivateItems(
     items,
     4,
     async (item) => {
+      let microsoftAccepted = false;
+      let acceptedRequestId: string | undefined;
       try {
         return await runWithActivationItemLock(item, async () => {
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: "sending",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(item.tenantId ? { tenantId: item.tenantId } : {})
+            });
+          }
           const request = buildDeactivationRequest(item, justification.trim(), ticketInfo, startDateTime);
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
@@ -3666,6 +4305,8 @@ async function deactivateItems(
           assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
           const data = await sendActivationRequest(request, token);
           const requestId = getResponseIdentifier(data.payload, request, data.location);
+          microsoftAccepted = true;
+          acceptedRequestId = requestId;
           const trackedRequest = requestId
             ? createTrackedPimRequest({
               item,
@@ -3679,9 +4320,37 @@ async function deactivateItems(
               tenantId: getTokenTenantId(token)
             })
             : undefined;
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: "accepted",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(getTokenTenantId(token) ? { tenantId: getTokenTenantId(token) } : {}),
+              ...(requestId ? { requestId } : {}),
+              ...(trackedRequest ? { pendingTrackedRequest: trackedRequest } : {}),
+              result: {
+                itemId: item.id,
+                itemName: item.displayName,
+                success: true,
+                ...(requestId ? { requestId } : {}),
+                requestStatus: "submitted"
+              }
+            });
+          }
           const trackingStored = trackedRequest
             ? await persistTrackedSubmissionsBestEffort([trackedRequest])
             : false;
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: trackingStored ? "tracking" : "accepted",
+              itemName: item.displayName,
+              itemType: item.type,
+              ...(getTokenTenantId(token) ? { tenantId: getTokenTenantId(token) } : {}),
+              ...(requestId ? { requestId } : {}),
+              ...(trackedRequest && trackingStored ? { trackedRequestId: trackedRequest.id } : {}),
+              pendingTrackedRequest: trackingStored ? undefined : trackedRequest
+            });
+          }
           return {
             result: {
               itemId: item.id,
@@ -3696,16 +4365,29 @@ async function deactivateItems(
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         const detail = sanitizeErrorMessage(error);
-        const outcomeUnknown = isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
-        return {
-          result: {
-            itemId: item.id,
+        const outcomeUnknown = microsoftAccepted || isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
+        const result: ActivationResult = {
+          itemId: item.id,
+          itemName: item.displayName,
+          success: false,
+          ...(acceptedRequestId ? { requestId: acceptedRequestId } : {}),
+          error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
+          ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
+          ...(outcomeUnknown ? { outcomeUnknown: true } : {})
+        };
+        if (options.operationId) {
+          await updateRequestOperationItem(options.operationId, item.id, {
+            state: outcomeUnknown ? "uncertain" : "terminal",
             itemName: item.displayName,
-            success: false,
-            error: outcomeUnknown ? formatUnknownWriteOutcome(detail) : detail,
-            ...(accessRecoveryTarget ? { accessRecoveryTarget } : {}),
-            ...(outcomeUnknown ? { outcomeUnknown: true } : {})
-          },
+            itemType: item.type,
+            ...(item.tenantId ? { tenantId: item.tenantId } : {}),
+            ...(acceptedRequestId ? { requestId: acceptedRequestId } : {}),
+            result,
+            error: result.error
+          }).catch(() => undefined);
+        }
+        return {
+          result,
           trackedRequest: undefined
         };
       }
@@ -3808,29 +4490,28 @@ function getTokenForActivation(tokens: StoredTokens, item: ActivationItem, token
   return getGraphTokenForTarget(tokens, "directoryRole");
 }
 
-async function fetchAllPages<T>(url: string, token: string): Promise<T[]> {
+async function fetchAllPages<T>(url: string, token: string, signal?: AbortSignal): Promise<T[]> {
   const tokenKind = getAllowedTokenKindForUrl(url);
   if (!tokenKind) {
     throw new Error("API URL is not allowed.");
   }
   return collectPaginatedValues(url, async (nextUrl) => {
     assertAllowedApiUrl(nextUrl, tokenKind);
-    return fetchJson(nextUrl, token);
+    return fetchJson(nextUrl, token, signal);
   });
 }
 
-async function fetchJson<T>(url: string, token: string): Promise<T> {
+async function fetchJson<T>(url: string, token: string, signal?: AbortSignal): Promise<T> {
   assertAllowedApiUrl(url);
   const response = await fetchMicrosoftApi(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     }
-  }, MICROSOFT_API_READ_TIMEOUT_MS);
+  }, MICROSOFT_API_READ_TIMEOUT_MS, signal);
 
   if (!response.ok) {
-    const errorData = await safeJson(response);
-    throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
+    throw new Error(await getSafeApiErrorMessage(response));
   }
 
   return (await response.json()) as T;
@@ -3838,7 +4519,8 @@ async function fetchJson<T>(url: string, token: string): Promise<T> {
 
 async function fetchGraphBatch<T>(
   requests: Array<{ id: string; method: "GET"; url: string }>,
-  token: string
+  token: string,
+  signal?: AbortSignal
 ): Promise<GraphBatchResponse<T>> {
   if (!requests.length || requests.length > GRAPH_BATCH_REQUEST_LIMIT) {
     throw new Error("Microsoft Graph batch size is invalid.");
@@ -3852,10 +4534,9 @@ async function fetchGraphBatch<T>(
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ requests })
-  }, MICROSOFT_API_READ_TIMEOUT_MS);
+  }, MICROSOFT_API_READ_TIMEOUT_MS, signal);
   if (!response.ok) {
-    const errorData = await safeJson(response);
-    throw new Error(sanitizeErrorMessage(getApiErrorMessage(errorData, response) || `${response.status} ${response.statusText}`));
+    throw new Error(await getSafeApiErrorMessage(response));
   }
   return (await response.json()) as GraphBatchResponse<T>;
 }
@@ -3869,10 +4550,20 @@ function chunkItems<T>(items: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
-async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: number, parentSignal?: AbortSignal): Promise<Response> {
   assertAllowedApiUrl(url);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let requestTimedOut = false;
+  const timeout = setTimeout(() => {
+    requestTimedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const cancelFromParent = () => controller.abort();
+  if (parentSignal?.aborted) {
+    controller.abort();
+  } else {
+    parentSignal?.addEventListener("abort", cancelFromParent, { once: true });
+  }
   try {
     return await fetch(url, {
       ...init,
@@ -3883,11 +4574,14 @@ async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: numb
     });
   } catch (error) {
     if (controller.signal.aborted) {
-      throw new Error(`Microsoft API request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`);
+      throw new Error(requestTimedOut
+        ? `Microsoft API request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`
+        : "Microsoft API request was canceled because the refresh deadline expired.");
     }
     throw error;
   } finally {
     clearTimeout(timeout);
+    parentSignal?.removeEventListener("abort", cancelFromParent);
   }
 }
 
@@ -3899,8 +4593,28 @@ async function safeJson(response: Response): Promise<unknown> {
   }
 }
 
+async function getSafeApiErrorMessage(response: Response): Promise<string> {
+  const fallback = `Microsoft API returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}.`;
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  let payload: unknown;
+  let text = "";
+  try {
+    text = (await response.text()).slice(0, 8_192);
+    payload = text ? JSON.parse(text) : undefined;
+  } catch {
+    payload = undefined;
+  }
+  const apiMessage = getApiErrorMessage(payload, response);
+  if (apiMessage) return sanitizeErrorMessage(apiMessage);
+  if (contentType.includes("text/html") || /<\s*!doctype|<\s*html/i.test(text)) {
+    return sanitizeErrorMessage(`${fallback} The Microsoft gateway returned an HTML error page; retry after the portal session is ready.`);
+  }
+  const plainText = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return sanitizeErrorMessage(plainText || fallback);
+}
+
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
-  return [...new Map(items.map((item) => [item.id, item])).values()];
+  return [...new Map(items.map((item) => [normalizeActivationItemId(item.id), item])).values()];
 }
 
 function getApiErrorMessage(payload: unknown, response?: Response): string | undefined {
@@ -3927,29 +4641,32 @@ async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]
   if (!requests.length) {
     return true;
   }
-  try {
-    await withTimeout((async () => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
       const store = await mutateTrackedRequests((current) => upsertTrackedRequests(current, requests));
       const settings = await loadSettings();
       await Promise.all([
         updateTrackedRequestBadge(store),
         scheduleTrackedRequestMaintenance(store, settings)
       ]);
-    })(), REQUEST_TRACKING_STORAGE_TIMEOUT_MS, "Request tracking storage timed out.");
-    return true;
-  } catch {
-    // Microsoft already accepted the request. Tracking must not alter that result.
-    try {
-      const requestIds = new Set(requests.map((request) => request.requestId));
-      const stored = await withTimeout(
-        loadTrackedRequests(),
-        REQUEST_TRACKING_STORAGE_TIMEOUT_MS,
-        "Request tracking verification timed out."
-      );
-      return requests.length > 0 && stored.requests.filter((request) => requestIds.has(request.requestId)).length === requestIds.size;
+      return true;
     } catch {
-      return false;
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+      }
     }
+  }
+
+  // Microsoft already accepted the request. The durable operation item keeps
+  // the complete non-secret tracking record so startup reconciliation can
+  // retry this write without ever resubmitting the Microsoft request.
+  try {
+    const requestIds = new Set(requests.map((request) => request.id));
+    const stored = await loadTrackedRequests();
+    return requests.every((request) => requestIds.has(request.id)
+      && stored.requests.some((candidate) => candidate.id === request.id));
+  } catch {
+    return false;
   }
 }
 

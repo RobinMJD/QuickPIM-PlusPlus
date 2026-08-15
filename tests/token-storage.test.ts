@@ -33,11 +33,12 @@ describe("session token storage", () => {
     const sessionData: Record<string, unknown> = {};
     const local = makeStorageArea(localData);
     const session = makeStorageArea(sessionData);
+    const expectedTokens = { ...localData };
 
     const migrated = await migrateLegacyLocalTokensToSession({ local, session, now });
 
     expect(migrated).toBe(true);
-    expect(sessionData).toMatchObject(localData);
+    expect(sessionData).toMatchObject(expectedTokens);
     expect(local.remove).toHaveBeenCalledWith(TOKEN_STORAGE_KEYS);
     for (const key of TOKEN_STORAGE_KEYS) {
       expect(localData).not.toHaveProperty(key);

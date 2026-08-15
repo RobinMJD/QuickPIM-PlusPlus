@@ -26,7 +26,7 @@ import {
   getScopeLabel,
   loadSettings,
   mergeSettings,
-  mutateSettings
+  mutateSettingsViaBackground
 } from "../lib/settings";
 import {
   clearReferenceData,
@@ -39,6 +39,11 @@ import { APP_BUILD_TIMESTAMP, APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import { isOperationTimeoutError } from "../lib/async";
 import { refreshTokenStatusFreshness } from "../lib/token";
+import {
+  getActivationItemIdentity,
+  getActivationItemIdentityCandidates,
+  normalizeActivationItemId
+} from "../lib/activationIdentity";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { savePopupDraft } from "../lib/popupDraft";
 import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
@@ -61,7 +66,12 @@ import {
   type BrowserSyncDevice,
   type BrowserSyncStatus
 } from "../lib/browserSync";
-import { MAX_SETTINGS_BACKUP_BYTES, buildSettingsExportFileName, validateSettingsBackup } from "../lib/settingsBackup";
+import { MAX_SETTINGS_BACKUP_BYTES, buildSettingsExportFileName, stringifySettingsBackup, validateSettingsBackup } from "../lib/settingsBackup";
+import {
+  PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY,
+  loadPortalTokenScanDiagnostic,
+  type PortalTokenScanDiagnostic
+} from "../lib/portalTokenRefresh";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
   advanceOperationProgress,
@@ -73,7 +83,6 @@ import {
 } from "../lib/progress";
 import {
   REQUEST_TRACKING_KEY,
-  clearTrackedRequests,
   getEffectiveTrackedRequestStatus,
   getNextTrackedExpiryReminderTime,
   getPendingTrackedRequestCount,
@@ -85,6 +94,7 @@ import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAct
 
 type SettingsTab = "home" | "role-access" | "appearance" | "aliases" | "activation" | "justifications" | "bundles" | "activity" | "sync" | "diagnostics" | "backup" | "reset" | "about";
 type PreferencePage = "appearance" | "activation";
+type SettingsMutator = (current: QuickPimSettings) => QuickPimSettings;
 
 const CONCEPT_CREATOR = "Daniel Bradley";
 const INSPIRATION_REPOSITORY_URL = "https://github.com/DanielBradley1/QuickPIM";
@@ -176,6 +186,8 @@ function SettingsApp() {
   const eligibleProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const accessProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
+  const settingsRef = useRef(settings);
+  const trackedRequestsRef = useRef(trackedRequests);
 
   if (!initialSettingsHydration.current) {
     initialSettingsHydration.current = new Promise<void>((resolve) => {
@@ -184,6 +196,8 @@ function SettingsApp() {
   }
 
   tokenStatusRef.current = tokenStatus;
+  settingsRef.current = settings;
+  trackedRequestsRef.current = trackedRequests;
 
   function publishTokenStatus(nextStatus: TokenStatus): void {
     tokenStatusRef.current = nextStatus;
@@ -235,15 +249,20 @@ function SettingsApp() {
       if (areaName !== "local") {
         return;
       }
-      if (changes[REQUEST_TRACKING_KEY]) {
-        setTrackedRequests(sanitizeTrackedRequestStore(changes[REQUEST_TRACKING_KEY].newValue));
-      }
-      if (!changes[SETTINGS_KEY]) {
+      if (!changes[REQUEST_TRACKING_KEY] && !changes[SETTINGS_KEY]) {
         return;
       }
-      const merged = mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined);
-      setSettings(merged);
-      const serialized = JSON.stringify(merged, null, 2);
+      const nextTrackedRequests = changes[REQUEST_TRACKING_KEY]
+        ? sanitizeTrackedRequestStore(changes[REQUEST_TRACKING_KEY].newValue)
+        : trackedRequestsRef.current;
+      const nextSettings = changes[SETTINGS_KEY]
+        ? mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined)
+        : settingsRef.current;
+      trackedRequestsRef.current = nextTrackedRequests;
+      settingsRef.current = nextSettings;
+      if (changes[REQUEST_TRACKING_KEY]) setTrackedRequests(nextTrackedRequests);
+      if (changes[SETTINGS_KEY]) setSettings(nextSettings);
+      const serialized = stringifySettingsBackup(nextSettings, nextTrackedRequests);
       if (!exportTextDirty.current) {
         replaceExportText(serialized);
       } else {
@@ -327,19 +346,23 @@ function SettingsApp() {
     }
     setError("");
     try {
-      const loadedSettings = await loadSettings();
-      setSettings(loadedSettings);
-      if (!exportTextDirty.current) {
-        replaceExportText(JSON.stringify(loadedSettings, null, 2));
-      }
-      setIsSettingsReady(true);
-      const [loadedTokens, loadedCache, loadedReferenceData, loadedTrackedRequests] = await Promise.all([
-        readTokenStatusWithRetry(tokenStatusRef.current),
-        loadDataCache(),
-        loadReferenceData(),
+      const [loadedSettings, loadedTrackedRequests] = await Promise.all([
+        loadSettings(),
         loadTrackedRequests()
       ]);
+      setSettings(loadedSettings);
       setTrackedRequests(loadedTrackedRequests);
+      settingsRef.current = loadedSettings;
+      trackedRequestsRef.current = loadedTrackedRequests;
+      if (!exportTextDirty.current) {
+        replaceExportText(stringifySettingsBackup(loadedSettings, loadedTrackedRequests));
+      }
+      setIsSettingsReady(true);
+      const [loadedTokens, loadedCache, loadedReferenceData] = await Promise.all([
+        readTokenStatusWithRetry(tokenStatusRef.current),
+        loadDataCache(),
+        loadReferenceData()
+      ]);
       const tokenCacheKey = buildTokenCacheKey(loadedTokens);
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
       let effectiveTokenStatus = loadedTokens;
@@ -652,28 +675,18 @@ function SettingsApp() {
     }
   }
 
-  async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
+  async function persistMutation(mutator: SettingsMutator, successMessage = "Settings saved.") {
     if (!isSettingsReady) {
       setError("Wait for saved settings to finish loading before making changes.");
       return false;
     }
-    const changedSections = [
-      "aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles",
-      "usageStatsByItemId", "activityHistory", "activationHistory", "preferences"
-    ] as const;
-    const sectionsToSave = changedSections.filter((key) => JSON.stringify(next[key]) !== JSON.stringify(settings[key]));
     const operation = settingsMutationQueue.current.then(async () => {
       try {
-        const merged = await mutateSettings((latest) => {
-          const mergedInput: QuickPimSettings = { ...latest };
-          for (const key of sectionsToSave) {
-            (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
-          }
-          return mergedInput;
-        });
+        const merged = await mutateSettingsViaBackground(mutator);
         setSettings(merged);
+        settingsRef.current = merged;
         if (!exportTextDirty.current) {
-          replaceExportText(JSON.stringify(merged, null, 2));
+          replaceExportText(stringifySettingsBackup(merged, trackedRequestsRef.current));
         }
         setError("");
         setMessage(successMessage);
@@ -686,6 +699,31 @@ function SettingsApp() {
     });
     settingsMutationQueue.current = operation.then(() => undefined, () => undefined);
     return operation;
+  }
+
+  async function persist(next: QuickPimSettings, successMessage = "Settings saved.") {
+    const baseline = settings;
+    const changedSections = [
+      "aliasesByItemId", "favoriteItemIds", "savedJustifications", "recentJustifications", "bundles",
+      "usageStatsByItemId", "activityHistory", "activationHistory", "preferences"
+    ] as const;
+    const sectionsToSave = changedSections.filter((key) => JSON.stringify(next[key]) !== JSON.stringify(baseline[key]));
+    const preferencePatch = Object.fromEntries(
+      Object.entries(next.preferences).filter(([key, value]) => (
+        JSON.stringify(value) !== JSON.stringify(baseline.preferences[key as keyof QuickPimSettings["preferences"]])
+      ))
+    ) as Partial<QuickPimSettings["preferences"]>;
+    return persistMutation((latest) => {
+      const mergedInput: QuickPimSettings = { ...latest };
+      for (const key of sectionsToSave) {
+        if (key === "preferences") {
+          mergedInput.preferences = { ...latest.preferences, ...preferencePatch };
+        } else {
+          (mergedInput as unknown as Record<string, unknown>)[key] = next[key];
+        }
+      }
+      return mergedInput;
+    }, successMessage);
   }
 
   async function clearCapturedTokens() {
@@ -702,6 +740,44 @@ function SettingsApp() {
       setMessage("");
       setError(clearError instanceof Error ? clearError.message : String(clearError));
     }
+  }
+
+  async function restoreSettingsBackup(
+    candidate: QuickPimSettings,
+    store: TrackedPimRequestStore
+  ): Promise<boolean> {
+    if (!isSettingsReady) {
+      setError("Wait for saved settings to finish loading before restoring a backup.");
+      return false;
+    }
+    const operation = settingsMutationQueue.current.then(async () => {
+      try {
+        const restored = await sendMessage<{
+          settings: QuickPimSettings;
+          trackedRequests: TrackedPimRequestStore;
+        }>({
+          action: "restoreSettingsBackup",
+          settings: candidate,
+          store
+        });
+        const restoredSettings = mergeSettings(restored.settings);
+        const restoredRequests = sanitizeTrackedRequestStore(restored.trackedRequests);
+        setSettings(restoredSettings);
+        settingsRef.current = restoredSettings;
+        trackedRequestsRef.current = restoredRequests;
+        setTrackedRequests(restoredRequests);
+        replaceExportText(stringifySettingsBackup(restoredSettings, restoredRequests));
+        setError("");
+        setMessage("Settings and request history restored from JSON.");
+        return true;
+      } catch (restoreError) {
+        setMessage("");
+        setError(restoreError instanceof Error ? restoreError.message : String(restoreError));
+        return false;
+      }
+    });
+    settingsMutationQueue.current = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   async function clearLearnedReferences() {
@@ -736,7 +812,9 @@ function SettingsApp() {
       setDataCache({});
       setReferenceData(undefined);
       setTrackedRequests({ version: 1, requests: [] });
-      replaceExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2));
+      settingsRef.current = DEFAULT_SETTINGS;
+      trackedRequestsRef.current = { version: 1, requests: [] };
+      replaceExportText(stringifySettingsBackup(DEFAULT_SETTINGS));
       setError("");
       setMessage("All QuickPIM++ data was cleared.");
       if (!isTestRuntime()) {
@@ -868,7 +946,7 @@ function SettingsApp() {
                 referenceData={referenceData}
                 trackedRequests={trackedRequests}
                 onTrackedRequestsChange={setTrackedRequests}
-                onSave={persist}
+                onMutate={persistMutation}
               />
             ) : null}
             {tab === "aliases" ? (
@@ -876,12 +954,12 @@ function SettingsApp() {
                 settings={settings}
                 items={items}
                 referenceData={referenceData}
-                onSave={persist}
+                onMutate={persistMutation}
                 onClearReferenceData={clearLearnedReferences}
               />
             ) : null}
-            {tab === "justifications" ? <JustificationsPanel settings={settings} onSave={persist} /> : null}
-            {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onSave={persist} /> : null}
+            {tab === "justifications" ? <JustificationsPanel settings={settings} onMutate={persistMutation} /> : null}
+            {tab === "bundles" ? <BundlesPanel settings={settings} items={items} referenceData={referenceData} onMutate={persistMutation} /> : null}
             {tab === "activation" ? (
               <PreferencesPanel page="activation" settings={settings} onSave={persist} navigationFlushRef={pendingTabFlushRef} />
             ) : null}
@@ -891,11 +969,13 @@ function SettingsApp() {
             {tab === "backup" && isSettingsReady ? (
               <DataPanel
                 settings={settings}
+                trackedRequests={trackedRequests}
                 exportText={exportText}
                 exportBaselineText={exportBaselineText}
                 externalChange={exportExternalChange}
                 setExportText={replaceExportText}
-                onSave={persist}
+                onRestoreBackup={restoreSettingsBackup}
+                onResetSettings={() => persistMutation(() => DEFAULT_SETTINGS, "Settings reset to defaults.")}
                 onClearMessage={() => setMessage("")}
                 onError={setError}
               />
@@ -1589,14 +1669,14 @@ function ActivityPanel({
   referenceData,
   trackedRequests,
   onTrackedRequestsChange,
-  onSave
+  onMutate
 }: {
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
   trackedRequests: TrackedPimRequestStore;
   onTrackedRequestsChange: (store: TrackedPimRequestStore) => void;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
 }) {
   const [view, setView] = useState<"requests" | "history" | "usage">("requests");
   const [requestSearch, setRequestSearch] = useState("");
@@ -1612,7 +1692,8 @@ function ActivityPanel({
   const [typeFilter, setTypeFilter] = useState<ActivationItem["type"] | "all">("all");
   const [historyLimit, setHistoryLimit] = useState(settings.preferences.activityHistoryLimit);
   const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
-  const now = Date.now();
+  const [now, setNow] = useState(() => Date.now());
+  const [confirmingClear, setConfirmingClear] = useState<"requests" | "history" | "usage" | undefined>();
   const selectedRequest = trackedRequests.requests.find((request) => request.id === selectedRequestId);
   const filteredRequests = useMemo(() => {
     const term = requestSearch.trim().toLowerCase();
@@ -1639,19 +1720,29 @@ function ActivityPanel({
     });
   }, [actionFilter, browserSyncStatus, resultFilter, search, settings.activityHistory, typeFilter]);
   const usageEntries = useMemo(() => {
-    const itemsById = new Map(items.map((item) => [item.id, item]));
-    const historyNamesById = new Map<string, string>();
-    for (const entry of settings.activityHistory) {
-      if (!historyNamesById.has(entry.itemId) && entry.itemName.trim()) {
-        historyNamesById.set(entry.itemId, entry.itemName);
+    const itemsById = new Map<string, ActivationItem>();
+    for (const item of items) {
+      for (const identity of getActivationItemIdentityCandidates(item)) {
+        itemsById.set(normalizeActivationItemId(identity), item);
       }
     }
+    const historyNamesById = new Map<string, string>();
+    for (const entry of settings.activityHistory) {
+      const normalizedId = normalizeActivationItemId(entry.itemId);
+      if (!historyNamesById.has(normalizedId) && entry.itemName.trim()) {
+        historyNamesById.set(normalizedId, entry.itemName);
+      }
+    }
+    const aliasesById = new Map(
+      Object.entries(settings.aliasesByItemId).map(([id, value]) => [normalizeActivationItemId(id), value] as const)
+    );
     return Object.entries(settings.usageStatsByItemId)
       .map(([id, stats]) => {
-        const item = itemsById.get(id);
+        const normalizedId = normalizeActivationItemId(id);
+        const item = itemsById.get(normalizedId);
         const name = item
           ? getDisplayName(item, settings, referenceData)
-          : settings.aliasesByItemId[id] || historyNamesById.get(id) || id;
+          : aliasesById.get(normalizedId) || historyNamesById.get(normalizedId) || id;
         return { id, name, stats };
       })
       .sort((left, right) => left.name.localeCompare(right.name));
@@ -1660,6 +1751,11 @@ function ActivityPanel({
   useEffect(() => {
     setHistoryLimit(settings.preferences.activityHistoryLimit);
   }, [settings.preferences.activityHistoryLimit]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1707,26 +1803,28 @@ function ActivityPanel({
   }
 
   async function clearRequests() {
-    await clearTrackedRequests();
+    await sendMessage({ action: "clearTrackedRequests" });
     onTrackedRequestsChange({ version: 1, requests: [] });
     setSelectedRequestId(undefined);
     setRequestError("");
     setRequestMessage("Tracked requests cleared.");
+    setConfirmingClear(undefined);
   }
 
   async function saveHistoryLimit() {
     if (!Number.isInteger(historyLimit) || historyLimit < 10 || historyLimit > 200 || historyLimit === settings.preferences.activityHistoryLimit) {
       return;
     }
-    await onSave({
-      ...settings,
-      preferences: { ...settings.preferences, activityHistoryLimit: historyLimit },
-      activityHistory: settings.activityHistory.slice(0, historyLimit)
-    }, "");
+    await onMutate((latest) => ({
+      ...latest,
+      preferences: { ...latest.preferences, activityHistoryLimit: historyLimit }
+    }), "");
   }
 
   async function resetUsageCounters() {
-    await onSave({ ...settings, usageStatsByItemId: {}, activationHistory: [] }, "Usage counters reset.");
+    if (await onMutate((latest) => ({ ...latest, usageStatsByItemId: {}, activationHistory: [] }), "Usage counters reset.")) {
+      setConfirmingClear(undefined);
+    }
   }
 
   async function prepareRequestInPopup(request: TrackedPimRequest, requestMode: "activate" | "deactivate") {
@@ -1789,19 +1887,45 @@ function ActivityPanel({
           <p className="muted">Follow submitted requests, review local history, and inspect role usage counters.</p>
         </div>
         {view === "requests" ? (
-          <button className="btn danger" disabled={!trackedRequests.requests.length} onClick={() => void clearRequests()}>
+          <button className="btn danger" disabled={!trackedRequests.requests.length} onClick={() => setConfirmingClear("requests")}>
             Clear requests
           </button>
         ) : view === "history" ? (
-          <button className="btn danger" disabled={!settings.activityHistory.length} onClick={() => void onSave({ ...settings, activityHistory: [] }, "Activity history cleared.")}>
+          <button className="btn danger" disabled={!settings.activityHistory.length} onClick={() => setConfirmingClear("history")}>
             Clear history
           </button>
         ) : (
-          <button className="btn danger" disabled={!usageEntries.length} onClick={() => void resetUsageCounters()}>
+          <button className="btn danger" disabled={!usageEntries.length} onClick={() => setConfirmingClear("usage")}>
             Reset counters
           </button>
         )}
       </div>
+      {confirmingClear ? (
+        <div className="settings-confirmation danger" role="alertdialog" aria-label={`Confirm ${confirmingClear} clear`}>
+          <span>
+            {confirmingClear === "requests"
+              ? "Remove all locally tracked request details? Microsoft requests are not canceled."
+              : confirmingClear === "history"
+                ? "Clear the local activation and deactivation history?"
+                : "Reset all local activation counters?"}
+          </span>
+          <div className="button-row nowrap">
+            <button
+              className="btn danger"
+              onClick={() => void (confirmingClear === "requests"
+                ? clearRequests()
+                : confirmingClear === "history"
+                  ? onMutate((latest) => ({ ...latest, activityHistory: [] }), "Activity history cleared.").then((saved) => {
+                      if (saved) setConfirmingClear(undefined);
+                    })
+                  : resetUsageCounters())}
+            >
+              Confirm
+            </button>
+            <button className="btn" onClick={() => setConfirmingClear(undefined)}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
       <div className="segmented-control activity-view-switch" role="tablist" aria-label="Activity view">
         <button className={view === "requests" ? "active" : ""} role="tab" aria-selected={view === "requests"} onClick={() => setView("requests")}>
           Requests
@@ -2393,8 +2517,11 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
   }
 
   async function purgeSyncedData() {
-    await runAction({ action: "purgeBrowserSyncData" }, "Synced settings and history were deleted. Sync is now off on this installation.");
-    if (isMounted.current) setConfirmingPurge(false);
+    const deleted = await runAction(
+      { action: "purgeBrowserSyncData" },
+      "Synced settings and history were deleted. Sync is now off on this installation."
+    );
+    if (deleted && isMounted.current) setConfirmingPurge(false);
   }
 
   const otherDevices = status?.devices.filter((device) => device.installationId !== status.installationId) || [];
@@ -2601,10 +2728,11 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
             <h3>What syncs</h3>
             <div className="sync-scope-grid">
               <div><strong>Included</strong><p>Popup and activation preferences, enabled tabs, aliases, favorites, saved and recent justifications, bundles, usage counters, and recent activity history.</p></div>
-              <div><strong>Always local</strong><p>Microsoft tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission.</p></div>
+              <div><strong>Always local</strong><p>Microsoft tokens, API caches, learned names, popup drafts, in-progress requests, tracked request reminders, and notification permission.</p></div>
             </div>
             <p className="muted">Chrome Sync and Microsoft Edge Sync are separate services. Use Backup &amp; Restore when moving data between Chrome and Edge.</p>
             <p className="muted">Activity events and counters from installations used at the same time are merged without double-counting. Microsoft remains authoritative if two installations submit the same role request simultaneously.</p>
+            <p className="muted">The installation that submitted a request remains responsible for status checks and expiry reminders. Backup &amp; Restore can deliberately move that request journal to another installation without duplicating live notifications through browser sync.</p>
           </div>
 
           <div className="settings-danger-zone sync-purge-zone">
@@ -2721,6 +2849,7 @@ function DiagnosticsPanel({
   const [distributionInfo, setDistributionInfo] = useState<ExtensionDistributionInfo | null>(null);
   const [browserSyncStatus, setBrowserSyncStatus] = useState<BrowserSyncStatus | null>(null);
   const [notificationPermissionGranted, setNotificationPermissionGranted] = useState<boolean | null>(null);
+  const [portalScanDiagnostic, setPortalScanDiagnostic] = useState<PortalTokenScanDiagnostic | null>(null);
   const identity = getIdentityContext(tokenStatus);
   useEffect(() => {
     void getExtensionDistributionInfo().then(setDistributionInfo).catch(() => setDistributionInfo(null));
@@ -2728,6 +2857,15 @@ function DiagnosticsPanel({
       { action: "getBrowserSyncStatus" },
       { timeoutMs: 4_000, timeoutMessage: "Browser sync status check timed out." }
     ).then((value) => setBrowserSyncStatus(sanitizeBrowserSyncStatus(value))).catch(() => setBrowserSyncStatus(null));
+    const refreshPortalScanDiagnostic = () => {
+      void loadPortalTokenScanDiagnostic()
+        .then((value) => setPortalScanDiagnostic(value || null))
+        .catch(() => setPortalScanDiagnostic(null));
+    };
+    const handleStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+      if (areaName === "local" && changes[PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY]) refreshPortalScanDiagnostic();
+    };
+    refreshPortalScanDiagnostic();
     const refreshNotificationPermission = () => {
       if (!chrome.notifications || !chrome.permissions?.contains) {
         setNotificationPermissionGranted(false);
@@ -2743,9 +2881,11 @@ function DiagnosticsPanel({
     refreshNotificationPermission();
     chrome.permissions?.onAdded?.addListener(handlePermissionChange);
     chrome.permissions?.onRemoved?.addListener(handlePermissionChange);
+    chrome.storage.onChanged?.addListener(handleStorageChange);
     return () => {
       chrome.permissions?.onAdded?.removeListener(handlePermissionChange);
       chrome.permissions?.onRemoved?.removeListener(handlePermissionChange);
+      chrome.storage.onChanged?.removeListener(handleStorageChange);
     };
   }, []);
   const diagnostics = useMemo(() => {
@@ -2771,6 +2911,10 @@ function DiagnosticsPanel({
     }
     return [...uniqueDiagnostics.values()];
   }, [dataCache]);
+  const latestNotificationFailure = useMemo(() => trackedRequests.requests
+    .filter((request) => request.notificationLastError)
+    .sort((left, right) => (right.notificationLastAttemptAt || right.updatedAt)
+      .localeCompare(left.notificationLastAttemptAt || left.updatedAt))[0], [trackedRequests]);
 
   function createReport(): string {
     return stringifySupportReport({
@@ -2884,6 +3028,22 @@ function DiagnosticsPanel({
           {settings.preferences.requestNotificationsEnabled && notificationPermissionGranted === false ? (
             <p className="diagnostic-warning">The saved setting is enabled, but the optional browser permission is missing.</p>
           ) : null}
+          {latestNotificationFailure ? (
+            <p className="diagnostic-warning" title={latestNotificationFailure.notificationLastError}>
+              Last delivery failed {formatLocalDateTime(latestNotificationFailure.notificationLastAttemptAt || latestNotificationFailure.updatedAt)}.
+            </p>
+          ) : null}
+        </div>
+        <div>
+          <strong>Microsoft portal tab scan</strong>
+          <p>{portalScanDiagnostic
+            ? `${portalScanDiagnostic.tabsScanned}/${portalScanDiagnostic.tabsAttempted} page${portalScanDiagnostic.tabsAttempted === 1 ? "" : "s"} replied at ${formatLocalDateTime(portalScanDiagnostic.checkedAt)}`
+            : "No scan recorded yet"}</p>
+          {portalScanDiagnostic?.failureSummary ? (
+            <p className="diagnostic-warning" title={portalScanDiagnostic.failureSummary}>
+              {portalScanDiagnostic.failedTabs || 1} page scan failed. Details are included in the sanitized support state.
+            </p>
+          ) : null}
         </div>
       </div>
       <div className="activity-list">
@@ -2912,13 +3072,13 @@ function AliasesPanel({
   settings,
   items,
   referenceData,
-  onSave,
+  onMutate,
   onClearReferenceData
 }: {
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
   onClearReferenceData: () => Promise<void>;
 }) {
   const [itemId, setItemId] = useState("");
@@ -2944,20 +3104,25 @@ function AliasesPanel({
 
   async function saveAlias() {
     if (!selectedItem || !alias.trim()) return;
-    await onSave({
-      ...settings,
+    const itemIdentity = selectedItem.id;
+    const nextAlias = alias.trim();
+    if (await onMutate((latest) => ({
+      ...latest,
       aliasesByItemId: {
-        ...settings.aliasesByItemId,
-        [selectedItem.id]: alias.trim()
+        ...latest.aliasesByItemId,
+        [itemIdentity]: nextAlias
       }
-    });
-    setAlias("");
+    }))) {
+      setAlias("");
+    }
   }
 
   async function removeAlias(id: string) {
-    const aliasesByItemId = { ...settings.aliasesByItemId };
-    delete aliasesByItemId[id];
-    await onSave({ ...settings, aliasesByItemId });
+    await onMutate((latest) => {
+      const aliasesByItemId = { ...latest.aliasesByItemId };
+      delete aliasesByItemId[id];
+      return { ...latest, aliasesByItemId };
+    });
   }
 
   return (
@@ -3038,10 +3203,10 @@ function AliasesPanel({
 
 function JustificationsPanel({
   settings,
-  onSave
+  onMutate
 }: {
   settings: QuickPimSettings;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
 }) {
   const [value, setValue] = useState("");
   const [validationWarning, setValidationWarning] = useState("");
@@ -3056,20 +3221,20 @@ function JustificationsPanel({
     if (!Number.isInteger(recentLimit) || recentLimit < 1 || recentLimit > 20 || recentLimit === settings.preferences.recentJustificationLimit) {
       return;
     }
-    await onSave({
-      ...settings,
-      preferences: { ...settings.preferences, recentJustificationLimit: recentLimit }
-    }, "");
+    await onMutate((latest) => ({
+      ...latest,
+      preferences: { ...latest.preferences, recentJustificationLimit: recentLimit }
+    }), "");
   }
 
   async function restoreRecentLimit() {
     setConfirmRestore(false);
     const defaultLimit = DEFAULT_SETTINGS.preferences.recentJustificationLimit;
     setRecentLimit(defaultLimit);
-    await onSave({
-      ...settings,
-      preferences: { ...settings.preferences, recentJustificationLimit: defaultLimit }
-    }, "Justification picker default restored.");
+    await onMutate((latest) => ({
+      ...latest,
+      preferences: { ...latest.preferences, recentJustificationLimit: defaultLimit }
+    }), "Justification picker default restored.");
   }
 
   async function add() {
@@ -3081,31 +3246,35 @@ function JustificationsPanel({
       return;
     }
     setValidationWarning("");
-    const exists = settings.savedJustifications.some((item) => item.toLowerCase() === trimmed.toLowerCase());
-    await onSave({
-      ...settings,
-      savedJustifications: exists ? settings.savedJustifications : [trimmed, ...settings.savedJustifications]
-    });
-    setValue("");
+    if (await onMutate((latest) => {
+      const exists = latest.savedJustifications.some((item) => item.toLowerCase() === trimmed.toLowerCase());
+      return {
+        ...latest,
+        savedJustifications: exists ? latest.savedJustifications : [trimmed, ...latest.savedJustifications]
+      };
+    })) {
+      setValue("");
+    }
   }
 
   async function removeSaved(target: string) {
-    await onSave({
-      ...settings,
-      savedJustifications: settings.savedJustifications.filter((item) => item !== target)
-    });
+    await onMutate((latest) => ({
+      ...latest,
+      savedJustifications: latest.savedJustifications.filter((item) => item !== target)
+    }));
   }
 
   async function moveSaved(index: number, direction: -1 | 1) {
-    const targetIndex = index + direction;
-    if (targetIndex < 0 || targetIndex >= settings.savedJustifications.length) return;
-
-    const savedJustifications = [...settings.savedJustifications];
-    const [item] = savedJustifications.splice(index, 1);
-    savedJustifications.splice(targetIndex, 0, item);
-    await onSave({
-      ...settings,
-      savedJustifications
+    const target = settings.savedJustifications[index];
+    if (!target) return;
+    await onMutate((latest) => {
+      const currentIndex = latest.savedJustifications.indexOf(target);
+      const targetIndex = currentIndex + direction;
+      if (currentIndex < 0 || targetIndex < 0 || targetIndex >= latest.savedJustifications.length) return latest;
+      const savedJustifications = [...latest.savedJustifications];
+      const [item] = savedJustifications.splice(currentIndex, 1);
+      savedJustifications.splice(targetIndex, 0, item);
+      return { ...latest, savedJustifications };
     }, "Saved justifications reordered.");
   }
 
@@ -3213,7 +3382,7 @@ function JustificationsPanel({
               <CopyTextButton text={item} label="recent justification" />
             </div>
           ))}
-          <button className="btn danger" onClick={() => void onSave({ ...settings, recentJustifications: [] }, "Recent history cleared.")}>
+          <button className="btn danger" onClick={() => void onMutate((latest) => ({ ...latest, recentJustifications: [] }), "Recent history cleared.")}>
             Clear recent
           </button>
         </div>
@@ -3239,12 +3408,12 @@ function BundlesPanel({
   settings,
   items,
   referenceData,
-  onSave
+  onMutate
 }: {
   settings: QuickPimSettings;
   items: ActivationItem[];
   referenceData?: ReferenceDataCache;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
 }) {
   const [name, setName] = useState("");
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
@@ -3258,8 +3427,19 @@ function BundlesPanel({
     () => [...items].sort((a, b) => getDisplayName(a, settings, referenceData).localeCompare(getDisplayName(b, settings, referenceData))),
     [items, referenceData, settings]
   );
+  const canonicalBundleItemIds = useMemo(() => {
+    const result = new Map<string, string>();
+    for (const item of items) {
+      const canonical = getActivationItemIdentity(item);
+      result.set(normalizeActivationItemId(item.id), canonical);
+      for (const candidate of getActivationItemIdentityCandidates(item)) {
+        result.set(normalizeActivationItemId(candidate), canonical);
+      }
+    }
+    return result;
+  }, [items]);
   const selectedItems = useMemo(
-    () => items.filter((item) => selectedItemIds.has(item.id)),
+    () => items.filter((item) => selectedItemIds.has(getActivationItemIdentity(item))),
     [items, selectedItemIds]
   );
   const durationOptions = useMemo(() => getDurationOptions(selectedItems), [selectedItems]);
@@ -3286,16 +3466,22 @@ function BundlesPanel({
       defaultDurationHours: effectiveDuration,
       defaultJustification: justification.trim() || undefined
     };
-    const bundles = editingBundleId
-      ? settings.bundles.map((item) => (item.id === editingBundleId ? bundle : item))
-      : [bundle, ...settings.bundles.filter((item) => item.id !== bundle.id)];
-    await onSave({ ...settings, bundles });
-    resetDraft();
+    if (await onMutate((latest) => ({
+      ...latest,
+      bundles: editingBundleId
+        ? latest.bundles.map((item) => (item.id === editingBundleId ? bundle : item))
+        : [bundle, ...latest.bundles.filter((item) => item.id !== bundle.id)]
+    }))) {
+      resetDraft();
+    }
   }
 
   async function removeBundle(bundleId: string) {
-    await onSave({ ...settings, bundles: settings.bundles.filter((bundle) => bundle.id !== bundleId) });
-    if (editingBundleId === bundleId) {
+    const saved = await onMutate((latest) => ({
+      ...latest,
+      bundles: latest.bundles.filter((bundle) => bundle.id !== bundleId)
+    }));
+    if (saved && editingBundleId === bundleId) {
       resetDraft();
     }
   }
@@ -3325,7 +3511,9 @@ function BundlesPanel({
 
   function loadBundleDraft(bundle: QuickPimBundle, nextName: string) {
     setName(nextName);
-    setSelectedItemIds(new Set(bundle.itemIds));
+    setSelectedItemIds(new Set(bundle.itemIds.map((itemId) => (
+      canonicalBundleItemIds.get(normalizeActivationItemId(itemId)) || itemId
+    ))));
     setDurationHours(bundle.defaultDurationHours || settings.preferences.defaultDurationHours);
     setJustification(bundle.defaultJustification || "");
   }
@@ -3390,16 +3578,19 @@ function BundlesPanel({
       </div>
       {validationWarning ? <p className="message error settings-inline-message">{validationWarning}</p> : null}
       <div className="checkbox-grid settings-section-gap">
-        {sortedItems.map((item) => (
-          <label className="checkbox-option" key={item.id}>
-            <input type="checkbox" checked={selectedItemIds.has(item.id)} onChange={() => toggle(item.id)} />
+        {sortedItems.map((item) => {
+          const itemIdentity = getActivationItemIdentity(item);
+          return (
+          <label className="checkbox-option" key={itemIdentity}>
+            <input type="checkbox" checked={selectedItemIds.has(itemIdentity)} onChange={() => toggle(itemIdentity)} />
             <span>
               <strong>{getDisplayName(item, settings, referenceData)}</strong>
               <br />
               <span className="muted">{getScopeLabel(item, referenceData)}</span>
             </span>
           </label>
-        ))}
+          );
+        })}
       </div>
       <div className="button-row settings-form-actions">
         <button className="btn primary" onClick={() => void saveBundle()} disabled={!name.trim() || !selectedItemIds.size}>
@@ -4175,20 +4366,24 @@ function PreferencesPanel({
 
 function DataPanel({
   settings,
+  trackedRequests,
   exportText,
   exportBaselineText,
   externalChange,
   setExportText,
-  onSave,
+  onRestoreBackup,
+  onResetSettings,
   onClearMessage,
   onError
 }: {
   settings: QuickPimSettings;
+  trackedRequests: TrackedPimRequestStore;
   exportText: string;
   exportBaselineText: string;
   externalChange: boolean;
   setExportText: (value: string, dirty?: boolean) => void;
-  onSave: (settings: QuickPimSettings, message?: string) => Promise<boolean>;
+  onRestoreBackup: (settings: QuickPimSettings, store: TrackedPimRequestStore) => Promise<boolean>;
+  onResetSettings: () => Promise<boolean>;
   onClearMessage: () => void;
   onError: (message: string) => void;
 }) {
@@ -4196,7 +4391,10 @@ function DataPanel({
   const [actionMessage, setActionMessage] = useState("");
   const [stagedFileName, setStagedFileName] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
-  const validation = useMemo(() => validateSettingsBackup(exportText, settings), [exportText, settings]);
+  const validation = useMemo(
+    () => validateSettingsBackup(exportText, settings, trackedRequests),
+    [exportText, settings, trackedRequests]
+  );
   const isDirty = exportText !== exportBaselineText;
 
   async function saveEditor() {
@@ -4207,8 +4405,12 @@ function DataPanel({
       onError(validation.error || "The JSON cannot be saved.");
       return;
     }
-    if (await onSave(validation.settings, "Settings restored from JSON.")) {
-      setExportText(JSON.stringify(validation.settings, null, 2), false);
+    if (externalChange) {
+      onError("Saved data changed after this editor was opened. Reload saved data before applying this backup.");
+      return;
+    }
+    if (await onRestoreBackup(validation.settings, validation.trackedRequests || trackedRequests)) {
+      setExportText(stringifySettingsBackup(validation.settings, validation.trackedRequests || trackedRequests), false);
       setStagedFileName("");
     }
   }
@@ -4255,7 +4457,7 @@ function DataPanel({
         throw new Error("The settings file is larger than 1 MiB.");
       }
       const text = await file.text();
-      const nextValidation = validateSettingsBackup(text, settings);
+      const nextValidation = validateSettingsBackup(text, settings, trackedRequests);
       if (!nextValidation.settings) {
         throw new Error(nextValidation.error || "The selected file is not a valid QuickPIM++ settings backup.");
       }
@@ -4279,8 +4481,8 @@ function DataPanel({
 
   async function resetAllSettings() {
     setConfirmReset(false);
-    if (await onSave(DEFAULT_SETTINGS, "Settings reset to defaults.")) {
-      setExportText(JSON.stringify(DEFAULT_SETTINGS, null, 2), false);
+    if (await onResetSettings()) {
+      setExportText(stringifySettingsBackup(DEFAULT_SETTINGS, trackedRequests), false);
       setActionMessage("");
       setStagedFileName("");
     }
@@ -4291,7 +4493,7 @@ function DataPanel({
       <div className="panel-title-row">
         <div>
           <h2>Backup & Restore</h2>
-          <p className="muted">Copy, download, review, or restore portable QuickPIM++ data. Backups include preferences, aliases, favorites, bundles, justifications, counters, and activity history. Access tokens and temporary caches are intentionally excluded.</p>
+          <p className="muted">Copy, download, review, or restore portable QuickPIM++ data. Backups include preferences, aliases, favorites, bundles, justifications, counters, activity history, and the sanitized request follow-up journal. Access tokens and temporary caches are intentionally excluded.</p>
         </div>
         <span className={`backup-dirty-state ${isDirty ? "dirty" : "saved"}`}>{isDirty ? "Unsaved JSON changes" : "Matches saved settings"}</span>
       </div>
@@ -4320,13 +4522,13 @@ function DataPanel({
       {stagedFileName && isDirty && validation.settings ? (
         <div className="settings-confirmation warning backup-staged-confirmation" role="status">
           <span><strong>{stagedFileName}</strong> is loaded but has not been restored yet.</span>
-          <button className="btn primary" onClick={() => void saveEditor()}>
+          <button className="btn primary" disabled={externalChange} onClick={() => void saveEditor()}>
             <SaveIcon />
             <span>Apply loaded backup</span>
           </button>
         </div>
       ) : null}
-      {externalChange && isDirty ? <p className="message warning settings-inline-message">Saved settings changed elsewhere. Reload to use the latest saved version, or save this editor to replace it.</p> : null}
+      {externalChange && isDirty ? <p className="message warning settings-inline-message">Saved data changed elsewhere. Reload saved data before applying this editor so newer changes are not overwritten.</p> : null}
       {validation.error ? <p className="message error settings-inline-message" role="alert">{validation.error}</p> : null}
       {actionMessage ? <p className="message success settings-inline-message" role="status">{actionMessage}</p> : null}
       <div className="field settings-section-gap">
@@ -4344,7 +4546,7 @@ function DataPanel({
         <p className="muted">Loading a file does not change this installation until you apply it. Manual editor changes are also not autosaved.</p>
       </div>
       <div className="button-row settings-form-actions backup-editor-actions">
-        <button className="btn primary" disabled={!isDirty || !validation.settings} onClick={() => void saveEditor()}>
+        <button className="btn primary" disabled={!isDirty || !validation.settings || externalChange} onClick={() => void saveEditor()}>
           <SaveIcon />
           <span>Save changes</span>
         </button>

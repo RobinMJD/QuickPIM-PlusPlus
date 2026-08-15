@@ -9,7 +9,11 @@ export function isAmbiguousMicrosoftWriteFailure(
 }
 
 export function isTransientMicrosoftFailure(message: string): boolean {
-  return /timed out|network|failed to fetch|load failed|aborted|gateway|service unavailable|internal server|temporar|too many requests|throttl|\b429\b|\b5\d\d\b/i.test(message);
+  const normalized = message.trim().toLowerCase();
+  if (/timed out|network(?: error| failure)|failed to fetch|load failed|request (?:was )?aborted|bad gateway|gateway timeout|service unavailable|internal server error|temporar(?:y|ily)|too many requests|throttl/u.test(normalized)) {
+    return true;
+  }
+  return /(?:^|\b)(?:http(?: status)?|status(?: code)?|response)\s*[:=]?\s*(?:408|425|429|5\d\d)(?:\b|$)/u.test(normalized);
 }
 
 export function formatUnknownWriteOutcome(error: string): string {

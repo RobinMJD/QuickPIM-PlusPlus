@@ -7,6 +7,7 @@ import {
   validateSettingsBackup
 } from "../src/lib/settingsBackup";
 import { DEFAULT_SETTINGS } from "../src/lib/settings";
+import type { TrackedPimRequestStore } from "../src/lib/types";
 
 describe("settings backup", () => {
   test("uses the exact local timestamped export filename", () => {
@@ -115,5 +116,43 @@ describe("settings backup", () => {
     expect(restored.error).toBeUndefined();
     expect(restored.settings).toEqual(configured);
     expect(restored.settings?.preferences.enabledFeatures).not.toContain("azureRole");
+  });
+
+  test("round-trips the sanitized request follow-up journal without tokens", () => {
+    const trackedRequests: TrackedPimRequestStore = {
+      version: 1,
+      requests: [{
+        id: "tenant:tenant-a:directoryRole:request-1",
+        requestId: "request-1",
+        action: "activate",
+        itemId: "directoryRole:reader:/",
+        itemName: "Reader",
+        itemType: "directoryRole",
+        principalId: "principal-1",
+        tenantId: "tenant-a",
+        roleDefinitionId: "reader",
+        directoryScopeId: "/",
+        status: "submitted",
+        requestedAt: "2026-08-10T10:00:00.000Z",
+        updatedAt: "2026-08-10T10:00:00.000Z",
+        nextCheckAt: "2026-08-10T10:01:00.000Z",
+        checkCount: 0
+      }]
+    };
+
+    const text = stringifySettingsBackup(DEFAULT_SETTINGS, trackedRequests);
+    const restored = validateSettingsBackup(text, DEFAULT_SETTINGS);
+
+    expect(restored.trackedRequests?.requests).toHaveLength(1);
+    expect(restored.trackedRequests?.requests[0]).toMatchObject({
+      requestId: "request-1",
+      itemId: "directoryRole:reader:/",
+      itemName: "Reader",
+      tenantId: "tenant-a",
+      status: "submitted",
+      nextCheckAt: "2026-08-10T10:01:00.000Z"
+    });
+    expect(text).not.toMatch(/access[_-]?token|refresh[_-]?token/i);
+    expect(hasPortableSettingsData(DEFAULT_SETTINGS, trackedRequests)).toBe(true);
   });
 });

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
+import { fetchWithPolicy } from "./http-request.mjs";
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const WEBSTORE_API_BASE = "https://chromewebstore.googleapis.com";
@@ -109,7 +110,7 @@ async function refreshAccessToken(tokenUrl, config) {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body
-  });
+  }, { attempts: 3, retryNetwork: true });
   if (!payload.access_token || typeof payload.access_token !== "string") {
     throw new Error(`Chrome Web Store token response did not include an access token: ${sanitizeChromeWebStoreMessage(JSON.stringify(payload))}`);
   }
@@ -125,7 +126,7 @@ async function uploadPackage(uploadUrl, zipPath, accessToken) {
       "Content-Type": "application/zip"
     },
     body: readFileSync(zipPath)
-  });
+  }, { attempts: 2 });
 }
 
 async function pollUploadStatus(fetchStatusUrl, accessToken, attempts, intervalMs) {
@@ -134,7 +135,7 @@ async function pollUploadStatus(fetchStatusUrl, accessToken, attempts, intervalM
     const payload = await fetchJson(fetchStatusUrl, {
       method: "GET",
       headers: { Authorization: `Bearer ${accessToken}` }
-    });
+    }, { attempts: 3, retryNetwork: true });
     if (!isUploadInProgress(payload)) {
       return payload;
     }
@@ -159,11 +160,11 @@ async function publishItem(publishUrl, accessToken) {
   return fetchJson(publishUrl, {
     method: "POST",
     headers: { Authorization: `Bearer ${accessToken}` }
-  });
+  }, { attempts: 1, retryStatuses: false });
 }
 
-async function fetchJson(url, init) {
-  const response = await fetch(url, init);
+async function fetchJson(url, init, policy) {
+  const response = await fetchWithPolicy(url, init, policy);
   const text = await response.text();
   const payload = text ? safeJson(text) : {};
   if (!response.ok) {

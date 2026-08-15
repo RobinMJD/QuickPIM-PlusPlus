@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.17.6.
+Reviewed for v2.18.0.
+
+## v2.18.0 Lifecycle And Concurrency Review
+
+The request lifecycle, tenant boundaries, portal recovery, cache semantics, browser sync, backup/reset, tracking, notifications, and bounded-retention paths were re-audited against service-worker interruption, browser restart, partial API failure, concurrent extension contexts, and clock-skewed installations. Privileged writes now use a durable per-item local journal, ambiguous outcomes are reconciled rather than resent, role and request identities carry tenant boundaries, cross-context settings mutations use background compare-and-set semantics, target refresh deadlines cancel underlying Microsoft reads, and policy/name lookup gaps remain visible as sanitized diagnostics without hiding usable cached role data.
+
+Browser sync now commits remote generations before their corresponding local baseline, preserves bounded per-installation provenance, and keeps purge/resume markers monotonic. A local reset can complete while cloud sync is unavailable; a durable tombstone blocks stale restoration and retries cloud cleanup later. Tracked requests are included in explicit JSON backup and restore, while live in-progress operations and notification reminder state remain local.
 
 ## v2.17.6 Notification Reliability Review
 
@@ -36,7 +42,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Expired or invalid stored tokens are cleared when detected.
 - Errors are redacted before being displayed or returned from the background worker.
 - The diagnostics support report contains aggregate counts and sanitized capability state only. It excludes tokens, authorization headers, account names, role names, full object IDs, tickets, and justification text.
-- Activation and deactivation operations are journaled in session storage without bearer tokens. The background worker owns the Microsoft request, so closing the popup does not cancel it; reopening the popup reconnects to its progress and result.
+- Activation and deactivation operations are journaled in bounded local storage without bearer tokens. The background worker owns the Microsoft request, so closing the popup does not cancel it; reopening the popup reconnects to its progress and result. Accepted and uncertain items are checkpointed independently so a browser restart can reconcile them without blindly resending a privileged write.
 - Automatic portal recovery retries only failures identified before an activation or deactivation write was sent. Ambiguous network timeouts and server responses are never replayed automatically, preventing duplicate privileged-access requests.
 - Follow-on activation requests are submitted once with a future start time and linked to their source request. Their submission state is persisted before the Microsoft write; an ambiguous result is marked unknown and cannot be retried until the user verifies Microsoft PIM.
 - A Microsoft claims or MFA challenge requires a newly captured portal token before retry. QuickPIM++ discards the matching managed recovery tab, opens a fresh inactive portal page, focuses it only when Microsoft requires interaction, and retries after the token signature changes.
@@ -64,7 +70,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - Captured tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission remain local to the installation.
 - Official Chrome and Edge Store editions can synchronize a bounded, sanitized subset of preferences, aliases, favorites, justifications, bundles, usage, and recent activity through the browser account's extension sync service. Chrome Sync and Microsoft Edge Sync remain separate ecosystems. Random per-installation IDs and user-defined device labels attribute activity without requesting a hostname.
 - Browser sync is enabled by default but controlled per installation. Synced data can be purged with independent monotonic purge and resume markers that cannot overwrite each other at the storage-item level. Active purge markers pause other installations before payload keys are removed, reject stale snapshot epochs, and retire stale installation heartbeats on reconciliation.
-- A full extension reset requires that browser-sync data is purged first. If the cloud purge cannot be confirmed, local data is left intact and the reset reports an error instead of claiming completion.
+- A full extension reset always clears the confirmed local scope after user confirmation. If browser-sync purge cannot be confirmed, a durable deletion tombstone prevents stale cloud data from being restored and retries remote cleanup later.
 - Sync payloads use category timestamps, deferred three-way baselines, deterministic sanitization, bounded chunks, real JSON storage-byte accounting, quota headroom for atomic-generation replacement, per-installation device records, event-union activity merging, and per-installation monotonic usage counters. Clock revisions that cannot be ordered safely keep the local edit pending. Corrupt, partially delivered, stale-epoch, or unsupported generations and control records are rejected without replacing local settings. Tokens and Microsoft request identifiers are never included.
 - Tracked request records keep only bounded request identifiers, item metadata, lifecycle state, local justification and ticket text, continuation links, and sanitized diagnostics. Tokens and raw Microsoft API payloads are never persisted in request history.
 - Request records are matched to the captured tenant and principal before status calls are made. Microsoft API URLs remain constrained to the existing Graph and Azure Management allowlists.

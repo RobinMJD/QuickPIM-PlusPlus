@@ -15,6 +15,7 @@ import type {
   UsageStats
 } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
+import { sendRuntimeMessage } from "./runtimeMessaging";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { getReferenceDisplayName, getReferenceScopeLabel } from "./referenceData";
 import {
@@ -23,9 +24,16 @@ import {
 } from "./justifications";
 import { isSafeRecordKey, sanitizeErrorMessage } from "./security";
 import { DEFAULT_EXTENSION_DURATION_HOURS, sanitizeExtensionDurationHours } from "./requestExtension";
-import { getActivationItemIdentity, normalizeActivationItemId } from "./activationIdentity";
+import {
+  getActivationItemIdentity,
+  getActivationItemIdentityCandidates,
+  getLegacyActivationItemIdentity,
+  normalizeActivationItemId
+} from "./activationIdentity";
 
 export const SETTINGS_KEY = "quickPimSettings.v1";
+export const SETTINGS_REVISION_KEY = "quickPimSettingsRevision.v1";
+const MAX_SETTINGS_MUTATION_ATTEMPTS = 8;
 const MAX_HISTORY_ENTRIES = 50;
 const MAX_ACTIVITY_HISTORY_ENTRIES = 200;
 const MAX_ALIASES = 300;
@@ -42,9 +50,23 @@ export const ROLE_FEATURES: Array<ActivationItem["type"]> = ["directoryRole", "p
 export const ALL_FEATURES: QuickPimFeature[] = [...ROLE_FEATURES, "bundles"];
 const withSettingsMutationLock = createStorageMutationLock("quickPimSettingsMutation");
 
+export function runWithSettingsMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  return withSettingsMutationLock(operation);
+}
+
 export interface SettingsStorageAreaLike {
   get(key: string): Promise<Record<string, unknown>>;
   set(items: Record<string, unknown>): Promise<void>;
+}
+
+export interface SettingsSnapshot {
+  settings: QuickPimSettings;
+  revision: number;
+  needsNormalization?: boolean;
+}
+
+export interface SettingsCompareAndSetResult extends SettingsSnapshot {
+  applied: boolean;
 }
 
 export const DEFAULT_SETTINGS: QuickPimSettings = {
@@ -81,14 +103,15 @@ export const DEFAULT_SETTINGS: QuickPimSettings = {
 
 export function mergeSettings(input: Partial<QuickPimSettings> | undefined): QuickPimSettings {
   const source = isRecord(input) ? input : {};
+  const preferences = sanitizePreferences(source.preferences);
   return {
     ...DEFAULT_SETTINGS,
     aliasesByItemId: sanitizeAliases(source.aliasesByItemId),
     favoriteItemIds: sanitizeFavoriteItemIds(source.favoriteItemIds),
     usageStatsByItemId: sanitizeUsageStats(source.usageStatsByItemId),
-    preferences: sanitizePreferences(source.preferences),
+    preferences,
     savedJustifications: sanitizeJustificationList(source.savedJustifications, MAX_SAVED_JUSTIFICATIONS),
-    recentJustifications: sanitizeJustificationList(source.recentJustifications, 20),
+    recentJustifications: sanitizeJustificationList(source.recentJustifications, preferences.recentJustificationLimit),
     bundles: sanitizeBundles(source.bundles),
     activityHistory: sanitizeActivityHistory(source.activityHistory, source.activationHistory, source.preferences),
     activationHistory: sanitizeActivationHistory(source.activationHistory),
@@ -107,6 +130,16 @@ export async function loadSettings(): Promise<QuickPimSettings> {
   return loadSettingsFromStorage(chrome.storage.local);
 }
 
+export async function loadSettingsSnapshot(): Promise<SettingsSnapshot> {
+  return loadSettingsSnapshotFromStorage(chrome.storage.local);
+}
+
+export async function loadSettingsSnapshotInStorage(
+  storage: SettingsStorageAreaLike
+): Promise<SettingsSnapshot> {
+  return loadSettingsSnapshotFromStorage(storage);
+}
+
 export async function mutateSettings(
   mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
 ): Promise<QuickPimSettings> {
@@ -118,13 +151,99 @@ export async function mutateSettingsInStorage(
   mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
 ): Promise<QuickPimSettings> {
   return withSettingsMutationLock(async () => {
-    const current = await loadSettingsFromStorage(storage);
-    const next = mergeSettings(await mutator(current));
-    if (JSON.stringify(current) !== JSON.stringify(next)) {
-      await storage.set({ [SETTINGS_KEY]: next });
+    const snapshot = await loadSettingsSnapshotFromStorage(storage);
+    const next = mergeSettings(await mutator(snapshot.settings));
+    if (snapshot.needsNormalization || JSON.stringify(snapshot.settings) !== JSON.stringify(next)) {
+      await storage.set({
+        [SETTINGS_KEY]: next,
+        [SETTINGS_REVISION_KEY]: snapshot.revision + 1
+      });
     }
     return next;
   });
+}
+
+export async function compareAndSetSettings(
+  expectedRevision: number,
+  candidate: QuickPimSettings
+): Promise<SettingsCompareAndSetResult> {
+  return compareAndSetSettingsInStorage(chrome.storage.local, expectedRevision, candidate);
+}
+
+export async function compareAndSetSettingsInStorage(
+  storage: SettingsStorageAreaLike,
+  expectedRevision: number,
+  candidate: QuickPimSettings
+): Promise<SettingsCompareAndSetResult> {
+  return withSettingsMutationLock(async () => {
+    const snapshot = await loadSettingsSnapshotFromStorage(storage);
+    if (snapshot.revision !== expectedRevision) {
+      return { ...snapshot, applied: false };
+    }
+    const next = mergeSettings(candidate);
+    if (!snapshot.needsNormalization && JSON.stringify(snapshot.settings) === JSON.stringify(next)) {
+      return { settings: snapshot.settings, revision: snapshot.revision, applied: true };
+    }
+    const revision = snapshot.revision + 1;
+    await storage.set({
+      [SETTINGS_KEY]: next,
+      [SETTINGS_REVISION_KEY]: revision
+    });
+    return { settings: next, revision, applied: true };
+  });
+}
+
+export async function mutateSettingsViaBackground(
+  mutator: (current: QuickPimSettings) => QuickPimSettings | Promise<QuickPimSettings>
+): Promise<QuickPimSettings> {
+  let snapshot = await sendRuntimeMessage<SettingsSnapshot>({ action: "getSettingsSnapshot" });
+  if (!isSettingsSnapshot(snapshot)) {
+    // Unit/component harnesses intentionally expose only a partial Chrome
+    // runtime. A real extension context always provides getURL and must fail
+    // closed rather than bypassing the authoritative background mutation path.
+    if (
+      typeof chrome.runtime?.getURL !== "function"
+      || typeof chrome.runtime?.getManifest !== "function"
+      || (typeof navigator !== "undefined" && /jsdom/i.test(navigator.userAgent))
+    ) {
+      return mutateSettings(mutator);
+    }
+    throw new Error("QuickPIM++ could not read the current settings revision. Reload the extension and retry.");
+  }
+  for (let attempt = 0; attempt < MAX_SETTINGS_MUTATION_ATTEMPTS; attempt += 1) {
+    const candidate = mergeSettings(await mutator(snapshot.settings));
+    if (JSON.stringify(candidate) === JSON.stringify(snapshot.settings)) {
+      return snapshot.settings;
+    }
+    const result = await sendRuntimeMessage<SettingsCompareAndSetResult>({
+      action: "compareAndSetSettings",
+      expectedRevision: snapshot.revision,
+      settings: candidate
+    });
+    if (!isSettingsCompareAndSetResult(result)) {
+      throw new Error("QuickPIM++ received an invalid settings update response. Reload the extension and retry.");
+    }
+    if (result.applied) {
+      return result.settings;
+    }
+    snapshot = result;
+  }
+  throw new Error("Settings changed repeatedly in another QuickPIM++ window. Please retry your change.");
+}
+
+function isSettingsSnapshot(value: unknown): value is SettingsSnapshot {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && Number.isSafeInteger((value as SettingsSnapshot).revision)
+    && (value as SettingsSnapshot).revision >= 0
+    && (value as SettingsSnapshot).settings
+    && typeof (value as SettingsSnapshot).settings === "object"
+  );
+}
+
+function isSettingsCompareAndSetResult(value: unknown): value is SettingsCompareAndSetResult {
+  return isSettingsSnapshot(value) && typeof (value as SettingsCompareAndSetResult).applied === "boolean";
 }
 
 async function loadSettingsFromStorage(storage: SettingsStorageAreaLike): Promise<QuickPimSettings> {
@@ -132,12 +251,30 @@ async function loadSettingsFromStorage(storage: SettingsStorageAreaLike): Promis
   return mergeSettings(result[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined);
 }
 
+async function loadSettingsSnapshotFromStorage(storage: SettingsStorageAreaLike): Promise<SettingsSnapshot> {
+  const [settingsResult, revisionResult] = await Promise.all([
+    storage.get(SETTINGS_KEY),
+    storage.get(SETTINGS_REVISION_KEY)
+  ]);
+  const rawRevision = revisionResult[SETTINGS_REVISION_KEY];
+  const revision = Number.isSafeInteger(rawRevision) && Number(rawRevision) >= 0 ? Number(rawRevision) : 0;
+  const rawSettings = settingsResult[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined;
+  const settings = mergeSettings(rawSettings);
+  return {
+    settings,
+    revision,
+    needsNormalization: JSON.stringify(rawSettings) !== JSON.stringify(settings)
+  };
+}
+
 export function getDisplayName(
   item: ActivationItem,
   settings: QuickPimSettings,
   referenceData?: ReferenceDataCache
 ): string {
-  const alias = settings.aliasesByItemId[getActivationItemIdentity(item)]?.trim();
+  const alias = getActivationItemIdentityCandidates(item)
+    .map((identity) => settings.aliasesByItemId[identity]?.trim())
+    .find(Boolean);
   return alias || getReferenceDisplayName(item, referenceData) || item.displayName || item.sourceName || "Unknown";
 }
 
@@ -146,7 +283,9 @@ export function getScopeLabel(item: ActivationItem, referenceData?: ReferenceDat
 }
 
 export function getUsage(item: ActivationItem, settings: QuickPimSettings) {
-  return settings.usageStatsByItemId[getActivationItemIdentity(item)] || { activationCount: 0 };
+  return getActivationItemIdentityCandidates(item)
+    .map((identity) => settings.usageStatsByItemId[identity])
+    .find(Boolean) || { activationCount: 0 };
 }
 
 export function sortItems(
@@ -158,8 +297,10 @@ export function sortItems(
 ): ActivationItem[] {
   const sortable = [...items];
   const favoriteItemIds = new Set((settings.favoriteItemIds || []).map(normalizeActivationItemId));
+  const isFavorite = (item: ActivationItem) => getActivationItemIdentityCandidates(item)
+    .some((identity) => favoriteItemIds.has(normalizeActivationItemId(identity)));
   return sortable.sort((a, b) => {
-    const favoriteDiff = Number(favoriteItemIds.has(getActivationItemIdentity(b))) - Number(favoriteItemIds.has(getActivationItemIdentity(a)));
+    const favoriteDiff = Number(isFavorite(b)) - Number(isFavorite(a));
     if (favoriteDiff) {
       return favoriteDiff;
     }
@@ -228,7 +369,9 @@ export function recordActivations(
   for (const item of items) {
     const itemId = getActivationItemIdentity(item);
     if (!isSafeRecordKey(itemId)) continue;
-    const current = usageStatsByItemId[itemId] || { activationCount: 0 };
+    const current = usageStatsByItemId[itemId]
+      || (!item.tenantId ? usageStatsByItemId[getLegacyActivationItemIdentity(item)] : undefined)
+      || { activationCount: 0 };
     if (source?.installationId && isSafeRecordKey(source.installationId)) {
       const byInstallationId = { ...current.byInstallationId };
       const currentSource = byInstallationId[source.installationId] || { activationCount: 0 };
@@ -292,6 +435,7 @@ export function recordActivityResults(
       itemId: result.itemId,
       itemName: item?.displayName || result.itemName,
       itemType: item?.type || inferItemType(result.itemId),
+      ...(item?.tenantId ? { tenantId: item.tenantId } : {}),
       scopeLabel: item?.scopeLabel,
       requestedAt: input.requestedAt,
       completedAt: input.completedAt,
@@ -311,7 +455,11 @@ export function recordActivityResults(
     activityHistory: [
       ...entries,
       ...settings.activityHistory.filter((entry) => !entryIds.has(entry.id))
-    ].slice(0, settings.preferences.activityHistoryLimit || DEFAULT_SETTINGS.preferences.activityHistoryLimit)
+    ]
+      .sort((left, right) => (
+        right.completedAt || right.requestedAt
+      ).localeCompare(left.completedAt || left.requestedAt))
+      .slice(0, settings.preferences.activityHistoryLimit || DEFAULT_SETTINGS.preferences.activityHistoryLimit)
   };
 }
 
@@ -381,6 +529,7 @@ export function createActivationHistoryEntries(
     itemId: item.id,
     itemName: item.displayName,
     itemType: item.type,
+    ...(item.tenantId ? { tenantId: item.tenantId } : {}),
     bundleName,
     activatedAt
   }));
@@ -404,7 +553,13 @@ function stableTextHash(value: string): string {
 }
 
 export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): BundleExpansion {
-  const itemsById = new Map(items.map((item) => [getActivationItemIdentity(item), item]));
+  const itemsById = new Map<string, ActivationItem>();
+  for (const item of items) {
+    for (const identity of getActivationItemIdentityCandidates(item)) {
+      itemsById.set(normalizeActivationItemId(identity), item);
+    }
+    itemsById.set(normalizeActivationItemId(item.id), item);
+  }
   const bundleItems = bundle.itemIds
     .map((itemId) => itemsById.get(normalizeActivationItemId(itemId)))
     .filter((item): item is ActivationItem => Boolean(item && item.status === "eligible"));
@@ -673,11 +828,13 @@ function sanitizeActivationHistory(value: unknown): ActivationHistoryEntry[] {
       itemName,
       itemType,
       activatedAt,
+      ...(sanitizeString(entry.tenantId, MAX_ITEM_ID_LENGTH) ? { tenantId: sanitizeString(entry.tenantId, MAX_ITEM_ID_LENGTH) } : {}),
       bundleName: sanitizeString(entry.bundleName, MAX_BUNDLE_NAME_LENGTH)
     });
-    if (result.length >= MAX_HISTORY_ENTRIES) break;
   }
-  return result;
+  return result
+    .sort((left, right) => right.activatedAt.localeCompare(left.activatedAt))
+    .slice(0, MAX_HISTORY_ENTRIES);
 }
 
 function sanitizeActivityHistory(
@@ -717,6 +874,7 @@ function sanitizeActivityHistory(
       itemName,
       itemType,
       requestedAt,
+      ...(sanitizeString(entry.tenantId, MAX_ITEM_ID_LENGTH) ? { tenantId: sanitizeString(entry.tenantId, MAX_ITEM_ID_LENGTH) } : {}),
       ...(sanitizeIsoTimestamp(entry.completedAt) ? { completedAt: sanitizeIsoTimestamp(entry.completedAt) } : {}),
       ...(sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) ? { scopeLabel: sanitizeString(entry.scopeLabel, MAX_ALIAS_LENGTH) } : {}),
       ...(durationHours ? { durationHours } : {}),
@@ -726,9 +884,19 @@ function sanitizeActivityHistory(
       ...(sanitizeString(entry.sourceInstallationId, 80) ? { sourceInstallationId: sanitizeString(entry.sourceInstallationId, 80) } : {}),
       ...(sanitizeString(entry.sourceDeviceName, 60) ? { sourceDeviceName: sanitizeString(entry.sourceDeviceName, 60) } : {})
     });
-    if (resultEntries.length >= limit) break;
   }
-  return resultEntries;
+  const byId = new Map<string, ActivityHistoryEntry>();
+  for (const entry of resultEntries) {
+    const current = byId.get(entry.id);
+    if (!current || (entry.completedAt || entry.requestedAt) > (current.completedAt || current.requestedAt)) {
+      byId.set(entry.id, entry);
+    }
+  }
+  return [...byId.values()]
+    .sort((left, right) => (
+      right.completedAt || right.requestedAt
+    ).localeCompare(left.completedAt || left.requestedAt))
+    .slice(0, limit);
 }
 
 function latestIsoTimestamp(left: string | undefined, right: string | undefined): string | undefined {
@@ -747,6 +915,7 @@ function migrateActivationHistoryToActivity(value: unknown): ActivityHistoryEntr
     itemId: entry.itemId,
     itemName: entry.itemName,
     itemType: entry.itemType,
+    ...(entry.tenantId ? { tenantId: entry.tenantId } : {}),
     requestedAt: entry.activatedAt,
     completedAt: entry.activatedAt,
     ...(entry.bundleName ? { bundleName: entry.bundleName } : {})

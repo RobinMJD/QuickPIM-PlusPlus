@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { pathToFileURL } from "node:url";
+import { fetchWithPolicy } from "./http-request.mjs";
 
 const EDGE_ADDONS_API_BASE = "https://api.addons.microsoftedge.microsoft.com/v1";
 const REQUIRED_ENV = ["EDGE_ADDONS_CLIENT_ID", "EDGE_ADDONS_API_KEY", "EDGE_ADDONS_PRODUCT_ID", "EDGE_ADDONS_ZIP"];
@@ -99,7 +100,8 @@ async function main() {
 }
 
 async function startOperation(url, init) {
-  const response = await fetch(url, init);
+  // Starting a Store operation is not safely repeatable after an ambiguous network failure.
+  const response = await fetchWithPolicy(url, init, { attempts: 1, retryStatuses: false });
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`Microsoft Edge Add-ons API request failed (${response.status}): ${sanitizeEdgeAddonsMessage(text)}`);
@@ -114,7 +116,11 @@ async function startOperation(url, init) {
 async function pollOperation(url, headers, attempts, intervalMs, label) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     if (attempt > 1) await delay(intervalMs);
-    const response = await fetch(url, { method: "GET", headers });
+    const response = await fetchWithPolicy(
+      url,
+      { method: "GET", headers },
+      { attempts: 3, retryNetwork: true }
+    );
     const text = await response.text();
     if (!response.ok) {
       throw new Error(`Microsoft Edge Add-ons ${label} status failed (${response.status}): ${sanitizeEdgeAddonsMessage(text)}`);

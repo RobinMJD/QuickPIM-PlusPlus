@@ -41,6 +41,7 @@ export interface TicketInfo {
 export interface BaseActivationItem {
   id: string;
   type: ActivationItemType;
+  tenantId?: string;
   sourceName: string;
   displayName: string;
   principalId: string;
@@ -99,6 +100,7 @@ export interface ActivationHistoryEntry {
   itemId: string;
   itemName: string;
   itemType: ActivationItemType;
+  tenantId?: string;
   bundleName?: string;
   activatedAt: string;
 }
@@ -116,6 +118,7 @@ export type TrackedPimRequestStatus =
   | "failed"
   | "canceled"
   | "expired"
+  | "unknown"
   | "statusUnavailable";
 
 export interface ActivityHistoryEntry {
@@ -125,6 +128,7 @@ export interface ActivityHistoryEntry {
   itemId: string;
   itemName: string;
   itemType: ActivationItemType;
+  tenantId?: string;
   scopeLabel?: string;
   requestedAt: string;
   completedAt?: string;
@@ -173,6 +177,7 @@ export interface TrackedPimRequest {
   extensionLastError?: string;
   approvalId?: string;
   targetScheduleId?: string;
+  activeAssignmentMissingSince?: string;
   lastCheckedAt?: string;
   nextCheckAt?: string;
   checkCount: number;
@@ -180,6 +185,8 @@ export interface TrackedPimRequest {
   notifiedStatus?: TrackedPimRequestStatus;
   expiryReminderAttemptedAt?: string;
   expiryReminderSentAt?: string;
+  notificationLastAttemptAt?: string;
+  notificationLastError?: string;
   sourceInstallationId?: string;
   sourceDeviceName?: string;
 }
@@ -219,11 +226,14 @@ export interface CachedActivationEntry {
   refreshStartedAt?: number;
   cacheKey?: string;
   diagnostics?: AccessDiagnostic[];
+  truncated?: boolean;
+  totalItems?: number;
 }
 
 export type TargetActivationCache = Partial<Record<AccessSetupTarget, CachedActivationEntry>>;
 
 export interface QuickPimDataCache {
+  version?: 2;
   eligible?: CachedActivationEntry;
   active?: CachedActivationEntry;
   eligibleByTarget?: TargetActivationCache;
@@ -292,8 +302,11 @@ export interface TokenStatus {
 export interface PortalTokenRefreshResult {
   tokenStatus: TokenStatus;
   tabsFound: number;
+  tabsAttempted?: number;
   tabsScanned: number;
+  failedTabs?: number;
   captured: TokenKind[];
+  failureSummary?: string;
 }
 
 export interface PortalRecoveryOpenResult {
@@ -343,6 +356,7 @@ export interface ActivationResult {
   itemName: string;
   success: boolean;
   requestId?: string;
+  requestStatus?: TrackedPimRequestStatus;
   error?: string;
   accessRecoveryTarget?: AccessSetupTarget;
   outcomeUnknown?: boolean;
@@ -368,22 +382,51 @@ export interface TrackedRequestExtensionResult {
 }
 
 export type RequestOperationAction = "activate" | "deactivate";
-export type RequestOperationState = "running" | "complete" | "error";
+export type RequestOperationState = "running" | "complete" | "error" | "uncertain";
+export type RequestOperationItemState =
+  | "prepared"
+  | "sending"
+  | "accepted"
+  | "tracking"
+  | "terminal"
+  | "uncertain";
+
+export interface RequestOperationItemRecord {
+  itemId: string;
+  itemName: string;
+  itemType: ActivationItemType;
+  tenantId?: string;
+  principalId?: string;
+  scopeLabel?: string;
+  state: RequestOperationItemState;
+  updatedAt: number;
+  requestId?: string;
+  trackedRequestId?: string;
+  pendingTrackedRequest?: TrackedPimRequest;
+  result?: ActivationResult;
+  error?: string;
+}
 
 export interface RequestOperationRecord {
   id: string;
   action: RequestOperationAction;
   itemIds: string[];
   targets: AccessSetupTarget[];
+  tenantId?: string;
+  principalId?: string;
+  items?: RequestOperationItemRecord[];
   state: RequestOperationState;
   startedAt: number;
   updatedAt: number;
+  terminalAt?: number;
+  nextActionAt?: number;
   durationHours?: number;
   justification?: string;
   ticketInfo?: TicketInfo;
   bundleName?: string;
   sourceInstallationId?: string;
   sourceDeviceName?: string;
+  revision?: number;
   response?: ActivationResponse;
   error?: string;
 }

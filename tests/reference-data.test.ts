@@ -82,7 +82,7 @@ describe("reference data cache", () => {
     expect(imported.pimGroups).toHaveProperty("group-300");
   });
 
-  test("rejects reference maps that exceed the raw processing budget", () => {
+  test("retains a bounded subset when a reference map exceeds the raw processing budget", () => {
     const imported = mergeReferenceData({
       pimGroups: Object.fromEntries(Array.from({ length: 1_201 }, (_, index) => [
         `group-${index}`,
@@ -90,7 +90,8 @@ describe("reference data cache", () => {
       ]))
     });
 
-    expect(imported.pimGroups).toEqual({});
+    expect(Object.keys(imported.pimGroups)).toHaveLength(300);
+    expect(imported.pimGroups["group-0"]).toMatchObject({ name: "Group 0" });
   });
 
   test("drops prototype-sensitive reference keys", () => {
