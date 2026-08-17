@@ -141,10 +141,13 @@ import {
 import { normalizeActivationItemId } from "./lib/activationIdentity";
 import {
   getAccessRecoveryTargets,
+  getClaimsChallengeRecoveryTargets,
+  getPortalRecoveryFailureMessage,
   getFreshAccessRecoveryTargets,
   isFreshPortalTokenRequired,
   mergeRetriedActivationResponse,
-  replaceAccessRecoveryErrors
+  replaceAccessRecoveryErrors,
+  shouldFocusPortalRecovery
 } from "./lib/requestRecovery";
 import {
   buildTrackedRequestExtensionPlan,
@@ -297,6 +300,8 @@ let forceAllTrackedRequestMaintenance = false;
 let backgroundPreRefreshInFlight: Promise<void> | undefined;
 let browserSyncInFlight: Promise<BrowserSyncStatus> | undefined;
 let browserSyncFollowUp: Promise<BrowserSyncStatus> | undefined;
+let browserSyncChangeTimer: ReturnType<typeof setTimeout> | undefined;
+let browserSyncChangeDueAt = 0;
 let distributionInfoPromise: Promise<ExtensionDistributionInfo> | undefined;
 let extensionResetInProgress = false;
 let suppressBackgroundStorageEventsUntil = 0;
@@ -306,6 +311,11 @@ const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionRes
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
 const BROWSER_SYNC_PERIOD_MINUTES = 30;
 const BROWSER_SYNC_TRANSIENT_RETRY_MINUTES = 5;
+// A changed snapshot needs two ordered cloud writes (chunks, then manifest).
+// Waiting for a short quiet period keeps sustained edits below the browser's
+// hourly write budget while remote delivery can still be consumed promptly.
+const BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS = 5_000;
+const BROWSER_SYNC_REMOTE_CHANGE_DEBOUNCE_MS = 500;
 
 const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
   directoryRole: {
@@ -344,8 +354,9 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
   if (extensionResetInProgress || Date.now() < suppressBackgroundStorageEventsUntil) return;
   if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
     runBestEffort(runIfExtensionEnabled(async () => {
-      await Promise.all([initializeBackgroundRefresh(), initializeRequestTracking(), runBrowserSync(true)]);
+      await Promise.all([initializeBackgroundRefresh(), initializeRequestTracking()]);
     }));
+    scheduleBrowserSyncAfterStorageChange(BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS);
   }
   if (areaName === "local" && changes[REQUEST_TRACKING_KEY]) {
     runBestEffort(runIfExtensionEnabled(initializeRequestTracking));
@@ -356,7 +367,7 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
     // Browser sync can deliver a manifest before its chunks. Queue one
     // follow-up pass even when a sync is already running so the completed
     // generation is consumed as soon as the remaining change events arrive.
-    runBestEffort(runIfExtensionEnabled(() => runBrowserSync(true)));
+    scheduleBrowserSyncAfterStorageChange(BROWSER_SYNC_REMOTE_CHANGE_DEBOUNCE_MS);
   }
 });
 
@@ -540,10 +551,13 @@ async function updateBrowserSyncAlarm(status: BrowserSyncStatus): Promise<void> 
   if (status.supported && status.enabled) {
     const existing = await chrome.alarms.get(BROWSER_SYNC_ALARM_NAME);
     const retrySoon = isTransientBrowserSyncError(status.lastError);
-    const retryDeadline = Date.now() + BROWSER_SYNC_TRANSIENT_RETRY_MINUTES * 60_000;
+    const retryDeadline = status.writeRetryAt && status.writeRetryAt > Date.now()
+      ? status.writeRetryAt
+      : Date.now() + BROWSER_SYNC_TRANSIENT_RETRY_MINUTES * 60_000;
+    const retryDelayMinutes = Math.max(0.5, (retryDeadline - Date.now()) / 60_000);
     if (!existing || (retrySoon && (!existing.scheduledTime || existing.scheduledTime > retryDeadline + 5_000))) {
       chrome.alarms.create(BROWSER_SYNC_ALARM_NAME, {
-        delayInMinutes: retrySoon ? BROWSER_SYNC_TRANSIENT_RETRY_MINUTES : 1,
+        delayInMinutes: retrySoon ? retryDelayMinutes : 1,
         periodInMinutes: BROWSER_SYNC_PERIOD_MINUTES
       });
     }
@@ -556,7 +570,22 @@ function isTransientBrowserSyncError(error: string | undefined): boolean {
   return Boolean(error && /still arriving|temporar|unavailable|network|timed? out|rate limit|write operations/i.test(error));
 }
 
+function scheduleBrowserSyncAfterStorageChange(delayMs: number): void {
+  browserSyncChangeDueAt = Math.max(browserSyncChangeDueAt, Date.now() + delayMs);
+  if (browserSyncChangeTimer) clearTimeout(browserSyncChangeTimer);
+  browserSyncChangeTimer = setTimeout(() => {
+    browserSyncChangeTimer = undefined;
+    browserSyncChangeDueAt = 0;
+    runBestEffort(runIfExtensionEnabled(() => runBrowserSync(true)));
+  }, Math.max(0, browserSyncChangeDueAt - Date.now()));
+}
+
 async function runBrowserSync(queueFollowUpIfBusy = false): Promise<BrowserSyncStatus> {
+  if (browserSyncChangeTimer) {
+    clearTimeout(browserSyncChangeTimer);
+    browserSyncChangeTimer = undefined;
+    browserSyncChangeDueAt = 0;
+  }
   if (browserSyncInFlight) {
     if (!queueFollowUpIfBusy) return browserSyncInFlight;
     if (!browserSyncFollowUp) {
@@ -2019,7 +2048,8 @@ async function executeWithPortalAccessRecovery(
 
   const recovery = await recoverPortalAccessForRequest(
     recoveryTargets,
-    getFreshAccessRecoveryTargets(initialResponse)
+    getFreshAccessRecoveryTargets(initialResponse),
+    getClaimsChallengeRecoveryTargets(initialResponse)
   );
   if (!recovery.ready) {
     return replaceAccessRecoveryErrors(
@@ -2041,7 +2071,8 @@ async function executeWithPortalAccessRecovery(
 
 async function recoverPortalAccessForRequest(
   targets: AccessSetupTarget[],
-  freshTokenTargets: AccessSetupTarget[] = []
+  freshTokenTargets: AccessSetupTarget[] = [],
+  claimsChallengeTargets: AccessSetupTarget[] = []
 ): Promise<{ ready: boolean; error?: string }> {
   const initialTokenStatus = await getTokenStatus();
   const freshTokenBaselines = Object.fromEntries(
@@ -2077,8 +2108,9 @@ async function recoverPortalAccessForRequest(
   }
 
   const deadline = Date.now() + REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS;
+  const recoveryStartedAt = Date.now();
   let passiveScanAt = 0;
-  let interactionWasFocused = false;
+  let focusAttempts = 0;
   while (Date.now() < deadline) {
     await delay(REQUEST_PORTAL_RECOVERY_POLL_INTERVAL_MS);
     if (Date.now() - passiveScanAt >= 3_000) {
@@ -2096,11 +2128,17 @@ async function recoverPortalAccessForRequest(
       await closeCompletedRecoveryTabs(tokenStatus);
       return { ready: true };
     }
-    if (!interactionWasFocused) {
-      const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), tokenStatus);
-      if (recoveryStatus.state === "interactionRequired") {
-        interactionWasFocused = true;
-        await focusPortalRecoveryTabs(getPortalRecoveryApis(), Date.now(), tokenStatus);
+    const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), tokenStatus);
+    if (shouldFocusPortalRecovery({
+      elapsedMs: Date.now() - recoveryStartedAt,
+      interactionRequired: recoveryStatus.state === "interactionRequired",
+      requiresFreshToken: remainingTargets.some((target) => claimsChallengeTargets.includes(target)),
+      focusAttempts
+    })) {
+      focusAttempts += 1;
+      const focusResult = await focusPortalRecoveryTabs(getPortalRecoveryApis(), Date.now(), tokenStatus);
+      if (focusResult.focused) {
+        focusAttempts = 2;
       }
     }
   }
@@ -2109,9 +2147,12 @@ async function recoverPortalAccessForRequest(
   const interactionRequired = recoveryStatus.state === "interactionRequired";
   return {
     ready: false,
-    error: interactionRequired
-      ? "Microsoft sign-in or another portal prompt must be completed before this request can continue. Your selection and inputs remain saved."
-      : `QuickPIM++ could not capture ${remainingTargets.map(accessTargetLabel).join(" and ")} request access in time. Your selection and inputs remain saved.`
+    error: getPortalRecoveryFailureMessage({
+      remainingTargets,
+      claimsChallengeTargets,
+      interactionRequired,
+      targetLabel: accessTargetLabel
+    })
   };
 }
 
@@ -3030,7 +3071,9 @@ async function fetchItemGroup(
     };
   } catch (error) {
     const sanitized = sanitizeErrorMessage(error);
-    const partialItems = error instanceof PartialActivationDataError ? error.items : [];
+    const partialItems = error instanceof PartialActivationDataError
+      ? attachTenantIdentity(error.items, token)
+      : [];
     return {
       items: partialItems,
       error: sanitized,
@@ -4439,6 +4482,10 @@ function assertRequestTokenReady(
   const principalId = validation.decoded.oid;
   if (typeof principalId !== "string" || principalId.toLowerCase() !== item.principalId.toLowerCase()) {
     throw new Error("The selected role belongs to another signed-in account. Refresh role data before retrying.");
+  }
+  const tenantId = validation.decoded.tid;
+  if (!item.tenantId || typeof tenantId !== "string" || tenantId.toLowerCase() !== item.tenantId.toLowerCase()) {
+    throw new Error("The selected role belongs to another Microsoft tenant. Refresh role data before retrying.");
   }
 }
 

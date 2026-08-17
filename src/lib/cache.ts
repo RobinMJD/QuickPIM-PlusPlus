@@ -532,11 +532,12 @@ function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | 
   if (!isRecord(value) || !Array.isArray(value.items)) return undefined;
   const fetchedAt = getFiniteTimestamp(typeof value.fetchedAt === "number" ? value.fetchedAt : undefined);
   if (fetchedAt === undefined || fetchedAt > now + MAX_FUTURE_CLOCK_SKEW_MS) return undefined;
+  const cacheKey = sanitizeIdentityString(value.cacheKey, MAX_CACHE_KEY_LENGTH);
 
   const seen = new Set<string>();
   const inputItems = value.items.slice(0, MAX_CACHE_INPUT_ITEMS);
   const items = inputItems.flatMap((candidate) => {
-    const item = sanitizeCachedActivationItem(candidate);
+    const item = sanitizeCachedActivationItem(candidate, cacheKey);
     if (!item || (expectedTarget && item.type !== expectedTarget)) return [];
     const key = item.id.toLowerCase();
     if (seen.has(key)) return [];
@@ -553,7 +554,6 @@ function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | 
   const refreshStartedAt = rawRefreshStartedAt !== undefined && rawRefreshStartedAt <= now + MAX_FUTURE_CLOCK_SKEW_MS
     ? rawRefreshStartedAt
     : undefined;
-  const cacheKey = sanitizeIdentityString(value.cacheKey, MAX_CACHE_KEY_LENGTH);
   const sourceTotalItems = Number(value.totalItems);
   const totalItems = Number.isSafeInteger(sourceTotalItems) && sourceTotalItems >= items.length
     ? sourceTotalItems
@@ -573,7 +573,7 @@ function sanitizeCacheEntry(value: unknown, expectedTarget: AccessSetupTarget | 
   };
 }
 
-function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefined {
+function sanitizeCachedActivationItem(value: unknown, cacheKey?: string): ActivationItem | undefined {
   if (!isRecord(value) || !ITEM_STATUSES.has(String(value.status))) return undefined;
   const id = sanitizeIdentityString(value.id);
   const sourceName = sanitizeRequiredString(value.sourceName);
@@ -584,6 +584,8 @@ function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefine
   const activationPolicyState = value.activationPolicyState === "pending" || value.activationPolicyState === "ready"
     ? value.activationPolicyState as "pending" | "ready"
     : undefined;
+  const tenantId = sanitizeTenantId(value.tenantId)
+    || getCachedTenantId(cacheKey, value.type as ActivationItem["type"], principalId);
 
   const common = {
     id,
@@ -592,6 +594,7 @@ function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefine
     principalId,
     scopeLabel,
     status: value.status as ActivationItem["status"],
+    ...(tenantId ? { tenantId } : {}),
     ...(sanitizeOptionalString(value.sourceScopeLabel) ? { sourceScopeLabel: sanitizeOptionalString(value.sourceScopeLabel) } : {}),
     ...(ASSIGNMENT_TYPES.has(String(value.activeAssignmentType)) ? { activeAssignmentType: value.activeAssignmentType as ActivationItem["activeAssignmentType"] } : {}),
     ...(sanitizeTimestamp(value.activeUntil) ? { activeUntil: sanitizeTimestamp(value.activeUntil) } : {}),
@@ -633,6 +636,37 @@ function sanitizeCachedActivationItem(value: unknown): ActivationItem | undefine
     };
   }
   return undefined;
+}
+
+function getCachedTenantId(
+  cacheKey: string | undefined,
+  itemType: ActivationItem["type"],
+  principalId: string
+): string | undefined {
+  if (!cacheKey) return undefined;
+  const preferredLabels = itemType === "azureRole"
+    ? ["azure"]
+    : itemType === "directoryRole"
+      ? ["graphDirectory", "graph"]
+      : ["graphPimGroup", "graph"];
+  const parts = cacheKey.split("|");
+  for (const label of preferredLabels) {
+    const matchingPart = parts.find((part) => part.startsWith(`${label}:`));
+    if (!matchingPart) continue;
+    const segments = matchingPart.split(":");
+    // Valid identity-bound keys contain label, tenant, principal, then token
+    // capability metadata. Sentinels such as `graph:missing` and tokens with
+    // no known identity must never be interpreted as a tenant.
+    if (segments.length < 4 || segments[2].toLowerCase() !== principalId.toLowerCase()) continue;
+    const tenantId = sanitizeTenantId(segments[1]);
+    if (tenantId) return tenantId;
+  }
+  return undefined;
+}
+
+function sanitizeTenantId(value: unknown): string | undefined {
+  const tenantId = sanitizeIdentityString(value, 128);
+  return tenantId && /^[a-zA-Z0-9-]+$/.test(tenantId) ? tenantId : undefined;
 }
 
 function sanitizeActivationRequirements(value: unknown): ActivationItem["activationRequirements"] | undefined {

@@ -353,8 +353,11 @@ function assertUniqueActivationItems(items: ActivationItem[]): void {
 
 function assertSingleTenant(items: ActivationItem[]): void {
   const tenantIds = items.map((item) => item.tenantId?.trim().toLowerCase()).filter(Boolean) as string[];
-  if (tenantIds.length !== items.length || new Set(tenantIds).size !== 1) {
-    throw new Error("Every activation item must belong to the same known Microsoft tenant.");
+  if (tenantIds.length !== items.length) {
+    throw new Error("Role tenant context is unavailable. Refresh role data before retrying.");
+  }
+  if (new Set(tenantIds).size !== 1) {
+    throw new Error("Selected activation items belong to different Microsoft tenants.");
   }
 }
 

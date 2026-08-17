@@ -1,9 +1,12 @@
 import { describe, expect, test } from "vitest";
 import {
   getAccessRecoveryTargets,
+  getClaimsChallengeRecoveryTargets,
   getFreshAccessRecoveryTargets,
+  getPortalRecoveryFailureMessage,
   mergeRetriedActivationResponse,
-  replaceAccessRecoveryErrors
+  replaceAccessRecoveryErrors,
+  shouldFocusPortalRecovery
 } from "../src/lib/requestRecovery";
 import { CLAIMS_CHALLENGE_MESSAGE } from "../src/lib/apiErrors";
 import type { ActivationResponse } from "../src/lib/types";
@@ -41,7 +44,7 @@ describe("activation portal access recovery", () => {
     })).toEqual([]);
   });
 
-  test("requires a newly captured token for Microsoft claims challenges", () => {
+  test("requires a newly captured token for every explicit access recovery", () => {
     const response: ActivationResponse = {
       success: false,
       results: [
@@ -64,7 +67,8 @@ describe("activation portal access recovery", () => {
     };
     response.errors = response.results;
 
-    expect(getFreshAccessRecoveryTargets(response)).toEqual(["directoryRole"]);
+    expect(getFreshAccessRecoveryTargets(response)).toEqual(["directoryRole", "pimGroup"]);
+    expect(getClaimsChallengeRecoveryTargets(response)).toEqual(["directoryRole"]);
   });
 
   test("replaces only retried item outcomes and preserves earlier successes", () => {
@@ -93,5 +97,47 @@ describe("activation portal access recovery", () => {
     expect(replaced.errors).toHaveLength(2);
     expect(replaced.errors.every((result) => result.error === "Finish Microsoft sign-in and retry.")).toBe(true);
     expect(replaced.errors.map((result) => result.accessRecoveryTarget)).toEqual(["pimGroup", "azureRole"]);
+  });
+
+  test("foregrounds unresolved recovery only after a short silent grace period", () => {
+    expect(shouldFocusPortalRecovery({
+      elapsedMs: 11_999,
+      interactionRequired: false,
+      requiresFreshToken: false,
+      focusAttempts: 0
+    })).toBe(false);
+    expect(shouldFocusPortalRecovery({
+      elapsedMs: 12_000,
+      interactionRequired: false,
+      requiresFreshToken: false,
+      focusAttempts: 0
+    })).toBe(true);
+    expect(shouldFocusPortalRecovery({
+      elapsedMs: 500,
+      interactionRequired: true,
+      requiresFreshToken: false,
+      focusAttempts: 0
+    })).toBe(true);
+    expect(shouldFocusPortalRecovery({
+      elapsedMs: 60_000,
+      interactionRequired: true,
+      requiresFreshToken: true,
+      focusAttempts: 2
+    })).toBe(false);
+  });
+
+  test("preserves the Microsoft claims action instead of replacing it with a generic timeout", () => {
+    expect(getPortalRecoveryFailureMessage({
+      remainingTargets: ["directoryRole"],
+      claimsChallengeTargets: ["directoryRole"],
+      interactionRequired: false,
+      targetLabel: () => "Entra role"
+    })).toBe(CLAIMS_CHALLENGE_MESSAGE);
+    expect(getPortalRecoveryFailureMessage({
+      remainingTargets: ["directoryRole"],
+      claimsChallengeTargets: [],
+      interactionRequired: false,
+      targetLabel: () => "Entra role"
+    })).toContain("could not capture Entra role request access in time");
   });
 });

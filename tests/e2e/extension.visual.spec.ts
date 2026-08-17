@@ -452,7 +452,7 @@ async function seedPopupRole(worker: Worker): Promise<void> {
         bundles: [{
           id: "bundle:visual",
           name: "Visual privileged bundle",
-          itemIds: ["directoryRole:visual-test-1:/"],
+          itemIds: ["tenant:tenant-visual:directoryRole:visual-test-1:/"],
           defaultDurationHours: 2,
           defaultJustification: "Validate the visual regression environment"
         }],

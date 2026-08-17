@@ -2655,7 +2655,14 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
             {status.crossDeviceState === "verified" && receivedActivityCount === 0 ? (
               <p className="message settings-inline-message">Another installation is visible, but no activity from it is stored here yet. Use Send &amp; receive now on that computer after its QuickPIM++ activity is recorded.</p>
             ) : null}
-            {status.lastError ? <p className="message error settings-inline-message">{status.lastError}</p> : null}
+            {status.lastError ? (
+              <p className="message error settings-inline-message">
+                {status.lastError}
+                {status.writeRetryAt && status.writeRetryAt > Date.now()
+                  ? ` Next automatic retry: ${formatSyncTimestamp(status.writeRetryAt)}.`
+                  : ""}
+              </p>
+            ) : null}
             {status.omittedCategories.length ? (
               <p className="message settings-inline-message">
                 Browser quota limits the synchronized copy of {formatLimitedSyncCategories(status.omittedCategories)}. Complete local data is preserved; use Backup &amp; Restore when the full dataset is required on another installation.
@@ -2677,7 +2684,7 @@ function BrowserSyncPanel({ settings }: { settings: QuickPimSettings }) {
                     className="input"
                     value={deviceName}
                     maxLength={60}
-                    disabled={isBusy}
+                    aria-busy={isBusy && lastRequestedDeviceName.current !== ""}
                     onChange={(event) => {
                       lastFailedDeviceName.current = "";
                       setDeviceName(event.target.value);

@@ -25,6 +25,7 @@ import {
 import { filterLoadErrorsForAccessState } from "../lib/accessMessages";
 import {
   coerceDurationForItems,
+  attachKnownTenantIdentities,
   buildActivationItemLookup,
   filterAssignedActiveItems,
   formatLoadMessages,
@@ -1977,8 +1978,9 @@ function PopupApp() {
         isActivationReviewOpen: true,
         requestMode: "activate"
       }).catch(() => undefined);
+      const requestItems = attachKnownTenantIdentities(activatableItems, tokenStatus);
       const response = normalizeActivationResponse(await sendActivationOperation(
-        activatableItems,
+        requestItems,
         "The activation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
       ));
       requestProgress = advanceOperationProgress(requestProgress, 2);
@@ -2121,8 +2123,9 @@ function PopupApp() {
         isActivationReviewOpen: true,
         requestMode: "deactivate"
       }).catch(() => undefined);
+      const requestItems = attachKnownTenantIdentities(deactivatableItems, tokenStatus);
       const response = normalizeActivationResponse(await sendDeactivationOperation(
-        deactivatableItems,
+        requestItems,
         "The deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
       ));
       requestProgress = advanceOperationProgress(requestProgress, 2);

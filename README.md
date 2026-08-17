@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.18.0**
+Current version: **v2.18.2**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -89,7 +89,7 @@ QuickPIM++ does not run a developer-controlled service and does not ask you to c
 
 - Validated Microsoft portal tokens stay in browser session storage and are cleared when the browser session ends.
 - Tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission stay local to the installation.
-- Useful preferences and bounded convenience data can use the browser account's extension sync service. Sync is enabled by default, can be disabled per installation, and can be purged from Settings. Complete generations are validated before use, concurrent writers are reconciled on a following pass, and quota-limited cloud snapshots never replace a complete local history with a truncated copy.
+- Useful preferences and bounded convenience data can use the browser account's extension sync service. Sync is enabled by default, can be disabled per installation, and can be purged from Settings. Complete generations are validated before use, concurrent writers are reconciled on a following pass, and quota-limited cloud snapshots never replace a complete local history with a truncated copy. Cloud writes are coalesced and batched; if the browser temporarily rejects a write at its rate limit, QuickPIM++ keeps the local copy and retries after a cooldown.
 - Chrome Sync and Microsoft Edge Sync are separate services; Backup & Restore moves data between browser families.
 - Microsoft PIM operations go directly to Microsoft Graph or Azure Management.
 - The public GitHub API is used only to display project release information in Settings.

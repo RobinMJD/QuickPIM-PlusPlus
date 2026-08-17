@@ -152,6 +152,26 @@ function getTargetTokenStatus(
   return tokenStatus?.graphTargets?.[target] || tokenStatus?.graph;
 }
 
+export function attachKnownTenantIdentities(
+  items: ActivationItem[],
+  tokenStatus: TokenStatus | null | undefined
+): ActivationItem[] {
+  return items.map((item) => {
+    if (item.tenantId) return item;
+    const token = getTargetTokenStatus(item.type, tokenStatus);
+    if (
+      !token?.hasToken
+      || token.isExpired
+      || !token.tenantId
+      || !token.principalId
+      || token.principalId.toLowerCase() !== item.principalId.toLowerCase()
+    ) {
+      return item;
+    }
+    return { ...item, tenantId: token.tenantId };
+  });
+}
+
 export function formatLoadMessages(messages: string[]): string[] {
   const seen = new Set<string>();
   return messages

@@ -33,7 +33,12 @@ const BROWSER_SYNC_ATOMIC_GENERATION_MARKER = "a1";
 // small enough for the previous and next generations to coexist atomically.
 const BROWSER_SYNC_CHUNK_QUOTA_BYTES = 8_000;
 const BROWSER_SYNC_ORPHAN_GRACE_MS = 48 * 60 * 60_000;
-const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 2 * 60_000;
+// Browser sync has a much tighter write budget than local storage. A device
+// record only needs to prove that the installation is still participating; it
+// does not need to mirror every local settings write.
+const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 30 * 60_000;
+const BROWSER_SYNC_MINUTE_QUOTA_RETRY_MS = 75_000;
+const BROWSER_SYNC_HOUR_QUOTA_RETRY_MS = 10 * 60_000;
 const BROWSER_SYNC_READ_RETRY_DELAYS_MS = [100, 500, 1_500] as const;
 const MAX_SYNC_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
 const SYNC_VERIFICATION_FUTURE_TOLERANCE_MS = 5 * 60_000;
@@ -162,6 +167,7 @@ export interface BrowserSyncLocalState {
   lastSyncAt?: number;
   lastSuccessAt?: number;
   lastError?: string;
+  writeRetryAt?: number;
   lastRemoteGeneration?: string;
   lastAppliedPurgeAt?: number;
   categoryHashes: Partial<Record<SyncCategoryName, string>>;
@@ -191,6 +197,7 @@ export interface BrowserSyncStatus {
   lastSyncAt?: number;
   lastSuccessAt?: number;
   lastError?: string;
+  writeRetryAt?: number;
   reminderMode: BrowserSyncReminderMode;
   reminderDue: boolean;
   suspendedByPurge: boolean;
@@ -364,6 +371,7 @@ async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<Brow
     lastSyncAt: state.lastSyncAt,
     lastSuccessAt: state.lastSuccessAt,
     lastError: state.lastError || statusReadError,
+    writeRetryAt: state.writeRetryAt,
     reminderMode: state.reminderMode,
     reminderDue: !capability.supported
       && state.reminderMode !== "never"
@@ -492,6 +500,17 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       throw new Error("Local settings changed while browser sync was running. QuickPIM++ kept the newer local edit and will merge it on the next sync.");
     }
 
+    if (state.writeRetryAt && state.writeRetryAt > now) {
+      state = {
+        ...state,
+        lastSyncAt: now,
+        lastError: browserSyncWriteQuotaMessage(),
+        writeRetryAt: state.writeRetryAt
+      };
+      await saveLocalState(apis.local, state);
+      return getBrowserSyncStatusUnlocked(apis);
+    }
+
     let generation = remote?.manifest.generation;
     let wroteRemoteSnapshot = false;
     if (fittedHash !== remoteHash || omissionMetadataChanged) {
@@ -531,6 +550,7 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       lastSyncAt: now,
       lastSuccessAt: now,
       lastError: undefined,
+      writeRetryAt: undefined,
       lastRemoteGeneration: generation,
       categoryHashes: mergedHashes,
       categoryUpdatedAt: mergedCategoryUpdatedAt,
@@ -548,10 +568,12 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
     state = completedState;
     await saveLocalState(apis.local, state);
   } catch (error) {
+    const quotaRetryDelay = browserSyncWriteQuotaRetryDelay(error);
     state = {
       ...state,
       lastSyncAt: now,
-      lastError: sanitizeSyncError(error)
+      lastError: sanitizeSyncError(error),
+      writeRetryAt: quotaRetryDelay ? now + quotaRetryDelay : undefined
     };
     await saveLocalState(apis.local, state);
   }
@@ -631,16 +653,18 @@ async function setBrowserSyncEnabledUnlocked(apis: BrowserSyncApis, enabled: boo
         // Resume and purge use independent keys so concurrent operations
         // cannot replace one another at the storage-item level. The legacy
         // control record remains readable for safe upgrades from older builds.
-        await apis.sync.set({
+        await performBrowserSyncWrite(() => apis.sync!.set({
           [BROWSER_SYNC_EPOCH_KEY]: { version: 1, epochAt } satisfies BrowserSyncEpochMarker
-        });
+        }));
         state = { ...state, lastAppliedPurgeAt: control.purgedAt };
         await saveLocalState(apis.local, state);
       }
     } catch (error) {
+      const quotaRetryDelay = browserSyncWriteQuotaRetryDelay(error);
       state = {
         ...state,
-        lastError: `Browser sync is enabled locally, but cloud state could not be checked: ${sanitizeSyncError(error)}`
+        lastError: `Browser sync is enabled locally, but cloud state could not be checked: ${sanitizeSyncError(error)}`,
+        writeRetryAt: quotaRetryDelay ? now + quotaRetryDelay : undefined
       };
       await saveLocalState(apis.local, state);
       return getBrowserSyncStatusUnlocked(apis);
@@ -650,9 +674,11 @@ async function setBrowserSyncEnabledUnlocked(apis: BrowserSyncApis, enabled: boo
   try {
     await updateDeviceRegistry(apis.sync, state, capability.browserLabel, normalizePlatform(apis.platform || detectPlatform()), now, false);
   } catch (error) {
+    const quotaRetryDelay = browserSyncWriteQuotaRetryDelay(error);
     state = {
       ...state,
-      lastError: `Browser sync is off locally, but the cloud installation status could not be updated: ${sanitizeSyncError(error)}`
+      lastError: `Browser sync is off locally, but the cloud installation status could not be updated: ${sanitizeSyncError(error)}`,
+      writeRetryAt: quotaRetryDelay ? now + quotaRetryDelay : undefined
     };
     await saveLocalState(apis.local, state);
   }
@@ -671,10 +697,14 @@ async function updateBrowserSyncDeviceNameUnlocked(apis: BrowserSyncApis, name: 
   let remoteDevice: BrowserSyncDevice | undefined;
   let deliveryError: string | undefined;
   if (apis.sync && state.enabled && capability.supported) {
-    try {
-      remoteDevice = await loadDeviceRecord(apis.sync, state.installationId, now);
-    } catch (error) {
-      deliveryError = sanitizeSyncError(error);
+    if (state.writeRetryAt && state.writeRetryAt > now) {
+      deliveryError = browserSyncWriteQuotaMessage();
+    } else {
+      try {
+        remoteDevice = await loadDeviceRecord(apis.sync, state.installationId, now);
+      } catch (error) {
+        deliveryError = sanitizeSyncError(error);
+      }
     }
   }
   const nextState = {
@@ -683,7 +713,8 @@ async function updateBrowserSyncDeviceNameUnlocked(apis: BrowserSyncApis, name: 
     deviceNameUpdatedAt: nextSyncRevision(now, state.deviceNameUpdatedAt, remoteDevice?.nameUpdatedAt || 0),
     lastError: deliveryError
       ? `The installation name is saved locally, but could not be sent yet: ${deliveryError}`
-      : undefined
+      : undefined,
+    writeRetryAt: deliveryError ? state.writeRetryAt : undefined
   };
   await saveLocalState(apis.local, nextState);
   if (apis.sync && state.enabled && capability.supported && !deliveryError) {
@@ -697,9 +728,11 @@ async function updateBrowserSyncDeviceNameUnlocked(apis: BrowserSyncApis, name: 
         state.enabled
       );
     } catch (error) {
+      const quotaRetryDelay = browserSyncWriteQuotaRetryDelay(error);
       await saveLocalState(apis.local, {
         ...nextState,
-        lastError: `The installation name is saved locally, but could not be sent yet: ${sanitizeSyncError(error)}`
+        lastError: `The installation name is saved locally, but could not be sent yet: ${sanitizeSyncError(error)}`,
+        writeRetryAt: quotaRetryDelay ? now + quotaRetryDelay : undefined
       });
     }
   }
@@ -738,7 +771,7 @@ async function renameBrowserSyncDeviceUnlocked(
     name: deviceName,
     nameUpdatedAt: nextSyncRevision(now, device.nameUpdatedAt)
   };
-  await apis.sync.set({ [deviceKey(safeId)]: renamed });
+  await performBrowserSyncWrite(() => apis.sync!.set({ [deviceKey(safeId)]: renamed }));
 
   if (state.installationId === safeId) {
     await saveLocalState(apis.local, {
@@ -799,10 +832,10 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
   if (purgedAt <= Math.max(currentControl.purgedAt || 0, currentControl.epochAt || 0)) {
     throw new Error("Browser clocks are too far apart to purge synced data safely. Correct the system clock, then retry.");
   }
-  await apis.sync.set({
+  await performBrowserSyncWrite(() => apis.sync!.set({
     [BROWSER_SYNC_CONTROL_KEY]: { version: 1, purgedAt, epochAt: 0 } satisfies BrowserSyncControl,
     [BROWSER_SYNC_PURGE_KEY]: { version: 1, purgedAt } satisfies BrowserSyncPurgeMarker
-  });
+  }));
   const all = await apis.sync.get(null);
   const coordinationKeys = new Set([
     BROWSER_SYNC_CONTROL_KEY,
@@ -815,7 +848,9 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
   if (keys.length) {
     const latest = await apis.sync.get(keys);
     const unchangedKeys = keys.filter((key) => valuesEqual(latest[key], all[key]));
-    if (unchangedKeys.length) await apis.sync.remove(unchangedKeys);
+    if (unchangedKeys.length) {
+      await performBrowserSyncWrite(() => apis.sync!.remove(unchangedKeys));
+    }
   }
   const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   await saveLocalState(apis.local, {
@@ -826,6 +861,7 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
     lastSuccessAt: undefined,
     lastRemoteGeneration: undefined,
     lastError: undefined,
+    writeRetryAt: undefined,
     categoryHashes: {},
     categoryUpdatedAt: {},
     categoryBaselines: getSyncCategoryValues(DEFAULT_SETTINGS),
@@ -864,7 +900,8 @@ export function sanitizeBrowserSyncStatus(value: unknown): BrowserSyncStatus | n
     platform: sanitizeText(value.platform, 80) || "Unknown platform",
     lastSyncAt: sanitizeTimestamp(value.lastSyncAt, now),
     lastSuccessAt: sanitizeTimestamp(value.lastSuccessAt, now),
-    lastError: sanitizeText(value.lastError, 300) || undefined,
+    lastError: value.lastError ? sanitizeSyncError(value.lastError) : undefined,
+    writeRetryAt: sanitizeTimestamp(value.writeRetryAt, now),
     reminderMode: value.reminderMode === "never" ? "never" : "daily",
     reminderDue: value.reminderDue === true,
     suspendedByPurge: value.suspendedByPurge === true,
@@ -1556,14 +1593,16 @@ async function writeRemoteSnapshot(
   };
   const writtenKeys: string[] = [];
   try {
-    // Individual writes stay below both the per-item and per-call sync quotas.
-    // The manifest is committed last, so readers never treat a partial upload
-    // as the current generation.
+    // A bulk set still enforces the 8 KiB limit independently for each chunk,
+    // but consumes only one browser write operation. The manifest is committed
+    // separately and last, so readers never accept a partial generation.
+    const chunkItems: Record<string, string> = {};
     for (let index = 0; index < chunks.length; index += 1) {
       const key = chunkKey(generation, index);
-      await sync.set({ [key]: chunks[index] });
+      chunkItems[key] = chunks[index]!;
       writtenKeys.push(key);
     }
+    await performBrowserSyncWrite(() => sync.set(chunkItems));
 
     const latestManifestValue = (await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY];
     const latestManifest = latestManifestValue === undefined || latestManifestValue === null
@@ -1580,7 +1619,7 @@ async function writeRemoteSnapshot(
       throw new Error("Another installation updated browser sync at the same time. QuickPIM++ will merge that generation on the next run.");
     }
 
-    await sync.set({ [BROWSER_SYNC_MANIFEST_KEY]: manifest });
+    await performBrowserSyncWrite(() => sync.set({ [BROWSER_SYNC_MANIFEST_KEY]: manifest }));
     const committed = sanitizeManifest((await sync.get(BROWSER_SYNC_MANIFEST_KEY))[BROWSER_SYNC_MANIFEST_KEY], now);
     if (committed?.generation !== generation || committed.hash !== manifest.hash) {
       throw new Error("Another installation completed browser sync at the same time. QuickPIM++ will reconcile both changes on the next run.");
@@ -1589,7 +1628,14 @@ async function writeRemoteSnapshot(
     if (writtenKeys.length) {
       const latest = await sync.get(writtenKeys);
       const ownedKeys = writtenKeys.filter((key, index) => latest[key] === chunks[index]);
-      if (ownedKeys.length) await sync.remove(ownedKeys);
+      if (ownedKeys.length) {
+        try {
+          await performBrowserSyncWrite(() => sync.remove(ownedKeys));
+        } catch {
+          // Uncommitted chunks are ignored because the manifest was not moved.
+          // The orphan cleanup pass removes them after its grace period.
+        }
+      }
     }
     throw error;
   }
@@ -1622,7 +1668,9 @@ async function removeStaleOrphanedChunks(
   if (staleKeys.length) {
     const latest = await sync.get(staleKeys);
     const unchangedKeys = staleKeys.filter((key) => valuesEqual(latest[key], all[key]));
-    if (unchangedKeys.length) await sync.remove(unchangedKeys);
+    if (unchangedKeys.length) {
+      await performBrowserSyncWrite(() => sync.remove(unchangedKeys));
+    }
   }
 }
 
@@ -1649,7 +1697,8 @@ async function loadBrowserSyncLocalState(
     lastReminderAt: sanitizeTimestamp(source.lastReminderAt, now),
     lastSyncAt: sanitizeTimestamp(source.lastSyncAt, now),
     lastSuccessAt: sanitizeTimestamp(source.lastSuccessAt, now),
-    lastError: sanitizeText(source.lastError, 300) || undefined,
+    lastError: source.lastError ? sanitizeSyncError(source.lastError) : undefined,
+    writeRetryAt: sanitizeTimestamp(source.writeRetryAt, now),
     lastRemoteGeneration: sanitizeText(source.lastRemoteGeneration, 120) || undefined,
     lastAppliedPurgeAt: sanitizeTimestamp(source.lastAppliedPurgeAt, now),
     categoryHashes: sanitizeCategoryNumberMap(source.categoryHashes, false),
@@ -1753,7 +1802,7 @@ async function pauseBrowserSyncAfterPurge(
   };
   await saveLocalState(local, next);
   try {
-    await sync.remove(deviceKey(state.installationId));
+    await performBrowserSyncWrite(() => sync.remove(deviceKey(state.installationId)));
   } catch {
     // The tombstone still protects synced settings. A later reconciliation can
     // retry removal of this non-sensitive installation heartbeat.
@@ -1825,7 +1874,7 @@ async function updateDeviceRegistry(
   const heartbeatDue = !existing
     || now - existing.lastSyncAt >= BROWSER_SYNC_DEVICE_HEARTBEAT_MS;
   if (recordChanged || heartbeatDue) {
-    await sync.set({ [deviceKey(state.installationId)]: current });
+    await performBrowserSyncWrite(() => sync.set({ [deviceKey(state.installationId)]: current }));
   }
   const all = await sync.get(null);
   const latestRegistry = buildDeviceRegistry(all, now);
@@ -1833,7 +1882,9 @@ async function updateDeviceRegistry(
     const key = deviceKey(device.installationId);
     return Object.hasOwn(all, key) ? [] : [[key, device] as const];
   }));
-  if (Object.keys(legacyMigrations).length) await sync.set(legacyMigrations);
+  if (Object.keys(legacyMigrations).length) {
+    await performBrowserSyncWrite(() => sync.set(legacyMigrations));
+  }
   const retainedDevices = latestRegistry.devices.some((device) => device.installationId === state.installationId)
     ? latestRegistry.devices
     : [...latestRegistry.devices.slice(0, MAX_SYNC_DEVICES - 1), current];
@@ -1848,7 +1899,9 @@ async function updateDeviceRegistry(
     const unchangedKeys = staleDeviceKeys.filter((key) =>
       valuesEqual(latestCandidates[key], all[key])
     );
-    if (unchangedKeys.length) await sync.remove(unchangedKeys);
+    if (unchangedKeys.length) {
+      await performBrowserSyncWrite(() => sync.remove(unchangedKeys));
+    }
   }
 }
 
@@ -2052,7 +2105,41 @@ function isRecentlyActiveSyncDevice(device: BrowserSyncDevice, now: number): boo
     && now - device.lastSyncAt <= BROWSER_SYNC_VERIFICATION_FRESHNESS_MS;
 }
 
+class BrowserSyncWriteQuotaError extends Error {
+  constructor(readonly retryDelayMs: number) {
+    super(browserSyncWriteQuotaMessage());
+    this.name = "BrowserSyncWriteQuotaError";
+  }
+}
+
+function browserSyncWriteQuotaMessage(): string {
+  return "Browser Sync is temporarily delaying uploads to stay within the browser's write limit. Local data is safe, and QuickPIM++ will retry automatically.";
+}
+
+function browserSyncWriteQuotaRetryDelay(error: unknown): number | undefined {
+  if (error instanceof BrowserSyncWriteQuotaError) return error.retryDelayMs;
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/MAX_WRITE_OPERATIONS_PER_HOUR|write operations per hour/i.test(message)) {
+    return BROWSER_SYNC_HOUR_QUOTA_RETRY_MS;
+  }
+  if (/MAX_(?:SUSTAINED_)?WRITE_OPERATIONS_PER_MINUTE|write operations per minute/i.test(message)) {
+    return BROWSER_SYNC_MINUTE_QUOTA_RETRY_MS;
+  }
+  return undefined;
+}
+
+async function performBrowserSyncWrite(operation: () => Promise<void>): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    const retryDelay = browserSyncWriteQuotaRetryDelay(error);
+    if (retryDelay) throw new BrowserSyncWriteQuotaError(retryDelay);
+    throw error;
+  }
+}
+
 function sanitizeSyncError(error: unknown): string {
+  if (browserSyncWriteQuotaRetryDelay(error)) return browserSyncWriteQuotaMessage();
   const message = error instanceof Error ? error.message : String(error || "Browser sync failed.");
   return sanitizeText(message, 300) || "Browser sync failed.";
 }

@@ -251,6 +251,20 @@ describe("runtime message validation", () => {
       roleDefinitionId: "reader",
       directoryScopeId: "/"
     };
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [{ ...duplicateRole, tenantId: undefined }],
+      durationHours: 1,
+      justification: "Investigate production issue",
+      operationId
+    })).toThrow(/tenant context is unavailable/i);
+    expect(() => validateQuickPimMessage({
+      action: "activateItems",
+      items: [duplicateRole, { ...duplicateRole, id: "directoryRole:admin:/", roleDefinitionId: "admin", tenantId: "tenant-2" }],
+      durationHours: 1,
+      justification: "Investigate production issue",
+      operationId
+    })).toThrow(/different Microsoft tenants/i);
     expect(validateQuickPimMessage({ action: "enrichActivationPolicies", items: [duplicateRole] })).toEqual({
       action: "enrichActivationPolicies",
       items: [duplicateRole]

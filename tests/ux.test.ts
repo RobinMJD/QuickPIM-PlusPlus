@@ -32,6 +32,7 @@ import {
   getPopupAccessStatusSummary,
   isHighPrivilegeItem,
   mergeEligibleWithActive,
+  attachKnownTenantIdentities,
   tokenStatusText
 } from "../src/lib/popupModel";
 import { buildDirectoryRoleDefinitionNameMap, normalizeDirectoryRole, normalizePimGroup } from "../src/lib/pim";
@@ -176,6 +177,58 @@ describe("popup cache helpers", () => {
     expect(cache.eligibleByTarget?.directoryRole?.fetchedAt).toBe(now - 60_000);
     expect(cache.eligibleByTarget?.directoryRole?.refreshStartedAt).toBe(now);
     expect(isCacheEntryFresh(cache.eligibleByTarget?.directoryRole, DEFAULT_ELIGIBLE_CACHE_TTL_MS, now, "tenant-a")).toBe(false);
+  });
+
+  test("restores missing tenant identity from a target cache key without overwriting known identity", () => {
+    const now = Date.parse("2026-05-18T12:10:00.000Z");
+    const cache = sanitizeDataCache({
+      eligibleByTarget: {
+        directoryRole: {
+          items: [directoryRole, { ...directoryRole, id: "directoryRole:admin:/", tenantId: "tenant-known" }],
+          errors: [],
+          fetchedAt: now,
+          cacheKey: "graphDirectory:tenant-cached:user-1:scope-signature"
+        }
+      }
+    }, now);
+
+    expect(cache.eligibleByTarget?.directoryRole?.items).toEqual([
+      expect.objectContaining({ id: directoryRole.id, tenantId: "tenant-cached" }),
+      expect.objectContaining({ id: "directoryRole:admin:/", tenantId: "tenant-known" })
+    ]);
+
+    const missingIdentityCache = sanitizeDataCache({
+      eligible: {
+        items: [directoryRole],
+        errors: [],
+        fetchedAt: now,
+        cacheKey: "graph:missing|azure:missing"
+      }
+    }, now);
+    expect(missingIdentityCache.eligible?.items[0].tenantId).toBeUndefined();
+
+    const mismatchedPrincipalCache = sanitizeDataCache({
+      eligible: {
+        items: [directoryRole],
+        errors: [],
+        fetchedAt: now,
+        cacheKey: "graphDirectory:tenant-cached:other-user:scope-signature"
+      }
+    }, now);
+    expect(mismatchedPrincipalCache.eligible?.items[0].tenantId).toBeUndefined();
+  });
+
+  test("attaches only a matching target token tenant to request items", () => {
+    const items = attachKnownTenantIdentities([directoryRole, { ...directoryRole, id: "directoryRole:other:/", principalId: "other-user" }], {
+      graph: { hasToken: true, tenantId: "tenant-generic", principalId: "user-1" },
+      graphTargets: {
+        directoryRole: { hasToken: true, tenantId: "tenant-directory", principalId: "user-1" }
+      },
+      azureManagement: { hasToken: false }
+    });
+
+    expect(items[0]).toMatchObject({ tenantId: "tenant-directory" });
+    expect(items[1].tenantId).toBeUndefined();
   });
 
   test("preserves disjoint target refreshes when cache writers save different feature areas", () => {

@@ -1,6 +1,6 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.0.
+Reviewed for v2.18.2.
 
 ## v2.18.0 Lifecycle And Concurrency Review
 
@@ -95,6 +95,6 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 - QuickPIM++ intentionally relies on captured portal tokens. Session-only storage reduces persistence, but a compromised live browser profile or extension context could still expose current-session tokens.
 - QuickPIM++ does not download Microsoft signing keys or perform local JWT signature verification. Captured candidates remain provisional until Microsoft Graph or Azure Management accepts them; a forged storage value cannot gain Microsoft privileges, but could temporarily disrupt local token selection until it is rejected or replaced.
 - Browser extension sync storage is provided by the signed-in browser account and is not treated as encrypted secret storage. Synced data deliberately excludes tokens and live request state, but saved justifications and activity metadata may still be visible to that browser account's sync infrastructure.
-- Browser sync is eventually consistent and subject to the provider's transport, policy, and quota limits. Chrome Sync and Microsoft Edge Sync do not exchange extension data with each other; the extension preserves complete local data and exposes Backup & Restore when a bounded cloud category cannot be transported in full.
+- Browser sync is eventually consistent and subject to the provider's transport, policy, and quota limits. Cloud snapshot chunks are batched, local change bursts are coalesced, heartbeat writes are bounded, and a provider write-rate rejection enters a persisted cooldown before an automatic retry. Chrome Sync and Microsoft Edge Sync do not exchange extension data with each other; the extension preserves complete local data and exposes Backup & Restore when a bounded cloud category cannot be transported in full.
 - Azure RBAC authorization is enforced server-side by Azure; QuickPIM++ can detect captured Azure Management tokens but cannot prove every target scope has sufficient RBAC until an API call is made.
 - Authentication-context-protected activations may still require interactive portal steps outside the extension.

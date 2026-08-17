@@ -3519,6 +3519,59 @@ describe("settings Browser Sync page", () => {
     }));
   });
 
+  test("keeps the installation-name field focused while autosave is in flight", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#sync");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    const status = createBrowserSyncUiStatus({ enabled: false });
+    let finishFirstSave: (() => void) | undefined;
+    let renameCalls = 0;
+    const runtime = chromeMock.runtime as { sendMessage: ReturnType<typeof vi.fn> };
+    runtime.sendMessage = vi.fn(async (message: { action: string; name?: string }) => {
+      if (message.action === "getBrowserSyncStatus") return { success: true, data: status };
+      if (message.action === "updateBrowserSyncDeviceName") {
+        renameCalls += 1;
+        if (renameCalls === 1) {
+          await new Promise<void>((resolve) => {
+            finishFirstSave = resolve;
+          });
+        }
+        return {
+          success: true,
+          data: { ...status, deviceName: message.name || status.deviceName }
+        };
+      }
+      if (message.action === "getTokenStatus") {
+        return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+      }
+      if (message.action === "getActivationSnapshot") {
+        return { success: true, data: { eligible: { items: [], errors: [] }, active: { items: [], errors: [] } } };
+      }
+      return { success: true, data: true };
+    });
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector<HTMLInputElement>("#sync-device-name")?.value).toBe("Admin Mac"));
+    const field = document.querySelector<HTMLInputElement>("#sync-device-name")!;
+    field.focus();
+    setFieldValue(field, "Operations laptop");
+
+    await waitFor(() => expect(renameCalls).toBe(1), 1_500);
+    expect(field.disabled).toBe(false);
+    expect(document.activeElement).toBe(field);
+
+    setFieldValue(field, "Operations laptop two");
+    expect(document.activeElement).toBe(field);
+    finishFirstSave?.();
+
+    await waitFor(() => expect(renameCalls).toBe(2), 1_500);
+    await waitFor(() => expect(field.value).toBe("Operations laptop two"));
+    expect(document.activeElement).toBe(field);
+  });
+
   test("prevents duplicate Browser Sync actions before React disables the control", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#sync");
