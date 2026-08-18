@@ -29,6 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -53,6 +54,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
+
+      - name: Require successful main CI for tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/require-successful-main-ci.mjs "$RELEASE_TAG"
 
       - name: Pin npm
         run: npm install --global npm@11.6.2
@@ -162,6 +168,7 @@ jobs:
           CHROME_WEBSTORE_PUBLISHER_ID: ${{ secrets.CHROME_WEBSTORE_PUBLISHER_ID }}
           CHROME_WEBSTORE_EXTENSION_ID: ${{ secrets.CHROME_WEBSTORE_EXTENSION_ID }}
           CHROME_WEBSTORE_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip
+          CHROME_WEBSTORE_REPLACE_ACTIVE_SUBMISSION: "true"
 
   microsoft-edge-add-ons:
     needs: [verify-package, github-release]

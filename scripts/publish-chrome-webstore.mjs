@@ -27,8 +27,11 @@ export function readChromeWebStoreConfig(env = process.env) {
     publisherId: String(env.CHROME_WEBSTORE_PUBLISHER_ID || "").trim(),
     extensionId: String(env.CHROME_WEBSTORE_EXTENSION_ID || "").trim(),
     zipPath: String(env.CHROME_WEBSTORE_ZIP || "").trim(),
+    replaceActiveSubmission: readBoolean(env.CHROME_WEBSTORE_REPLACE_ACTIVE_SUBMISSION, false),
     pollAttempts: readPositiveInteger(env.CHROME_WEBSTORE_UPLOAD_POLL_ATTEMPTS, 20),
-    pollIntervalMs: readPositiveInteger(env.CHROME_WEBSTORE_UPLOAD_POLL_INTERVAL_MS, 15_000)
+    pollIntervalMs: readPositiveInteger(env.CHROME_WEBSTORE_UPLOAD_POLL_INTERVAL_MS, 15_000),
+    cancellationPollAttempts: readPositiveInteger(env.CHROME_WEBSTORE_CANCEL_POLL_ATTEMPTS, 20),
+    cancellationPollIntervalMs: readPositiveInteger(env.CHROME_WEBSTORE_CANCEL_POLL_INTERVAL_MS, 5_000)
   };
 }
 
@@ -39,8 +42,33 @@ export function buildChromeWebStoreEndpoints({ publisherId, extensionId }) {
     tokenUrl: TOKEN_URL,
     uploadUrl: `${WEBSTORE_API_BASE}/upload/v2/publishers/${encodedPublisher}/items/${encodedExtension}:upload`,
     fetchStatusUrl: `${WEBSTORE_API_BASE}/v2/publishers/${encodedPublisher}/items/${encodedExtension}:fetchStatus`,
+    cancelSubmissionUrl: `${WEBSTORE_API_BASE}/v2/publishers/${encodedPublisher}/items/${encodedExtension}:cancelSubmission`,
     publishUrl: `${WEBSTORE_API_BASE}/v2/publishers/${encodedPublisher}/items/${encodedExtension}:publish`
   };
+}
+
+export function getSubmittedRevisionState(payload) {
+  const state = payload?.submittedItemRevisionStatus?.state;
+  return typeof state === "string" ? state.toUpperCase() : "";
+}
+
+export function getSubmittedRevisionVersions(payload) {
+  const channels = payload?.submittedItemRevisionStatus?.distributionChannels;
+  if (!Array.isArray(channels)) return [];
+  return [...new Set(channels.map((channel) => String(channel?.crxVersion || "").trim()).filter(Boolean))];
+}
+
+export function hasActiveSubmission(payload) {
+  return ["PENDING_REVIEW", "STAGED"].includes(getSubmittedRevisionState(payload));
+}
+
+export function getPackageVersion(zipPath) {
+  return basename(String(zipPath || "")).match(/-v(\d+\.\d+\.\d+)-chromium-stores\.zip$/)?.[1] || "";
+}
+
+export function getSubmissionPreparation(payload, packageVersion) {
+  if (!hasActiveSubmission(payload)) return "upload";
+  return packageVersion && getSubmittedRevisionVersions(payload).includes(packageVersion) ? "already-submitted" : "replace";
 }
 
 export function getUploadState(payload) {
@@ -88,6 +116,10 @@ async function main() {
 
   const endpoints = buildChromeWebStoreEndpoints(config);
   const accessToken = await refreshAccessToken(endpoints.tokenUrl, config);
+  if (config.replaceActiveSubmission) {
+    const preparation = await prepareSubmission(endpoints, config, accessToken);
+    if (preparation === "already-submitted") return;
+  }
   const uploadPayload = await uploadPackage(endpoints.uploadUrl, config.zipPath, accessToken);
   const finalUploadPayload = isUploadInProgress(uploadPayload)
     ? await pollUploadStatus(endpoints.fetchStatusUrl, accessToken, config.pollAttempts, config.pollIntervalMs)
@@ -97,6 +129,28 @@ async function main() {
   const publishPayload = await publishItem(endpoints.publishUrl, accessToken);
   console.log(`Chrome Web Store publish submitted for ${basename(config.zipPath)}.`);
   console.log(sanitizeChromeWebStoreMessage(JSON.stringify(publishPayload)));
+}
+
+async function prepareSubmission(endpoints, config, accessToken) {
+  const status = await fetchItemStatus(endpoints.fetchStatusUrl, accessToken);
+  const packageVersion = getPackageVersion(config.zipPath);
+  const preparation = getSubmissionPreparation(status, packageVersion);
+  if (preparation === "upload") return preparation;
+  if (preparation === "already-submitted") {
+    console.log(`Chrome Web Store already has v${packageVersion} under review; no replacement is needed.`);
+    return preparation;
+  }
+
+  const previousVersions = getSubmittedRevisionVersions(status);
+  console.log(`Cancelling superseded Chrome Web Store submission${previousVersions.length ? ` (${previousVersions.join(", ")})` : ""} before uploading v${packageVersion || "next"}...`);
+  await cancelSubmission(endpoints.cancelSubmissionUrl, accessToken);
+  await pollSubmissionCancelled(
+    endpoints.fetchStatusUrl,
+    accessToken,
+    config.cancellationPollAttempts,
+    config.cancellationPollIntervalMs
+  );
+  return preparation;
 }
 
 async function refreshAccessToken(tokenUrl, config) {
@@ -144,6 +198,34 @@ async function pollUploadStatus(fetchStatusUrl, accessToken, attempts, intervalM
   throw new Error("Chrome Web Store upload did not finish processing before the polling timeout.");
 }
 
+async function fetchItemStatus(fetchStatusUrl, accessToken) {
+  return fetchJson(fetchStatusUrl, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  }, { attempts: 3, retryNetwork: true });
+}
+
+async function cancelSubmission(cancelSubmissionUrl, accessToken) {
+  await fetchJson(cancelSubmissionUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}` }
+  }, { attempts: 1, retryStatuses: false });
+}
+
+async function pollSubmissionCancelled(fetchStatusUrl, accessToken, attempts, intervalMs) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const status = await fetchItemStatus(fetchStatusUrl, accessToken);
+    if (!hasActiveSubmission(status)) {
+      console.log("Superseded Chrome Web Store submission cancelled.");
+      return;
+    }
+    if (attempt === attempts) break;
+    console.log(`Waiting for Chrome Web Store cancellation (${attempt}/${attempts})...`);
+    await delay(intervalMs);
+  }
+  throw new Error("Chrome Web Store submission remained active after the cancellation polling timeout; refusing to upload over it.");
+}
+
 function assertUploadReady(payload) {
   if (isUploadSuccess(payload)) {
     return;
@@ -184,6 +266,11 @@ function safeJson(text) {
 function readPositiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : fallback;
+}
+
+function readBoolean(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
 }
 
 function delay(ms) {

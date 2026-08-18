@@ -2,8 +2,13 @@ import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import {
   buildChromeWebStoreEndpoints,
+  getPackageVersion,
   getMissingChromeWebStoreConfig,
+  getSubmissionPreparation,
+  getSubmittedRevisionState,
+  getSubmittedRevisionVersions,
   getUploadState,
+  hasActiveSubmission,
   isUploadFailure,
   isUploadInProgress,
   isUploadSuccess,
@@ -24,7 +29,7 @@ describe("Chrome Web Store publish script", () => {
     expect(missing).toEqual(["CHROME_WEBSTORE_CLIENT_SECRET", "CHROME_WEBSTORE_EXTENSION_ID"]);
   });
 
-  test("builds encoded v2 upload, status, and publish endpoints", () => {
+  test("builds encoded v2 upload, status, cancellation, and publish endpoints", () => {
     const endpoints = buildChromeWebStoreEndpoints({
       publisherId: "publisher/with space",
       extensionId: "item/with space"
@@ -36,9 +41,28 @@ describe("Chrome Web Store publish script", () => {
     expect(endpoints.fetchStatusUrl).toBe(
       "https://chromewebstore.googleapis.com/v2/publishers/publisher%2Fwith%20space/items/item%2Fwith%20space:fetchStatus"
     );
+    expect(endpoints.cancelSubmissionUrl).toBe(
+      "https://chromewebstore.googleapis.com/v2/publishers/publisher%2Fwith%20space/items/item%2Fwith%20space:cancelSubmission"
+    );
     expect(endpoints.publishUrl).toBe(
       "https://chromewebstore.googleapis.com/v2/publishers/publisher%2Fwith%20space/items/item%2Fwith%20space:publish"
     );
+  });
+
+  test("replaces only a superseded active submission and treats a same-version retry as complete", () => {
+    const pending = {
+      submittedItemRevisionStatus: {
+        state: "PENDING_REVIEW",
+        distributionChannels: [{ crxVersion: "2.18.8" }]
+      }
+    };
+    expect(getSubmittedRevisionState(pending)).toBe("PENDING_REVIEW");
+    expect(getSubmittedRevisionVersions(pending)).toEqual(["2.18.8"]);
+    expect(hasActiveSubmission(pending)).toBe(true);
+    expect(getSubmissionPreparation(pending, "2.18.9")).toBe("replace");
+    expect(getSubmissionPreparation(pending, "2.18.8")).toBe("already-submitted");
+    expect(getSubmissionPreparation({ submittedItemRevisionStatus: { state: "CANCELLED" } }, "2.18.9")).toBe("upload");
+    expect(getPackageVersion("release/quickpim-plusplus-v2.18.9-chromium-stores.zip")).toBe("2.18.9");
   });
 
   test("classifies upload states from top-level and nested API payloads", () => {
@@ -65,6 +89,7 @@ describe("release workflow Chrome Web Store publishing", () => {
     expect(workflow).toContain("CHROME_WEBSTORE_CLIENT_ID");
     expect(workflow).toContain("CHROME_WEBSTORE_REFRESH_TOKEN");
     expect(workflow).toContain("scripts/publish-chrome-webstore.mjs");
+    expect(workflow).toContain('CHROME_WEBSTORE_REPLACE_ACTIVE_SUBMISSION: "true"');
     expect(workflow).toContain("browser-store-package-${{ env.RELEASE_TAG }}");
     expect(workflow).toContain("quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip");
     expect(workflow).toContain("npm test");

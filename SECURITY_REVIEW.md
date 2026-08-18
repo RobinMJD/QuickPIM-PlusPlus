@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.9.
+Reviewed for v2.18.10.
+
+## v2.18.10 Release Pipeline Safety Review
+
+Release packaging and publication now require a successful `CI` workflow for the exact tagged commit. The gate polls by immutable commit SHA and fails closed for failed, cancelled, timed-out, skipped, neutral, or missing CI outcomes, so GitHub and Store publication jobs cannot race ahead of the repository's primary validation workflow.
+
+Chrome Web Store publication detects an older active submission, cancels it through the official API, waits until the Store confirms that the review is no longer active, and only then uploads the newer verified package. A retry for the same version is idempotent and does not cancel or duplicate its own review. Microsoft Edge Add-ons does not expose a documented cancellation API, so superseded Edge reviews must be cancelled in Partner Center before the verified replacement is submitted.
 
 ## v2.18.9 Access Recovery Consistency Review
 
@@ -94,7 +100,7 @@ QuickPIM++ is a local MV3 browser extension that captures Microsoft Graph and Az
 
 - Build tooling is kept in `devDependencies`.
 - `npm audit --audit-level=low` is part of CI and the exact-tag release gate.
-- Release workflows pin third-party actions to immutable commit SHAs, rerun tests and audit, and refuse to overwrite a different existing release asset.
+- Release workflows pin third-party actions to immutable commit SHAs, require successful main CI for the exact tagged commit, rerun tests and audit, and refuse to overwrite a different existing release asset.
 - Chrome Web Store OAuth credentials and Microsoft Edge Add-ons API credentials are read only from protected GitHub environment secrets. They are never embedded in the extension package, repository, release assets, or listing metadata.
 - Chrome and Edge packages are generated from the same verified `dist/` payload, checked for a root manifest, matching version, path traversal, and unwanted metadata before publication.
 - CI loads the built MV3 extension in Chromium and checks popup keyboard behavior, fixed-width layout, footer alignment, and responsive Settings diagnostics before packaging.
