@@ -1339,11 +1339,12 @@ function AccessSetupPanel({
         return;
       }
       const latestSettings = await onFlushPreferences();
+      const currentDataCache = await loadDataCache();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
-      const initialTargets = getAccessSetupTargets(buildAccessCapabilityItems(tokenStatus, dataCache, currentFeatures));
+      const initialTargets = getAccessSetupTargets(buildAccessCapabilityItems(tokenStatus, currentDataCache, currentFeatures));
       const scannedTokens = await onScanPortalTabsForTokens();
       const remainingTargets = getAccessSetupTargets(
-        buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures)
+        buildAccessCapabilityItems(scannedTokens, currentDataCache, currentFeatures)
       ).filter((target) => initialTargets.includes(target));
       if (remainingTargets.length) {
         const recovery = await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
@@ -1410,6 +1411,7 @@ function AccessSetupPanel({
     setPortalRecoveryError("");
     try {
       const latestSettings = await onFlushPreferences();
+      const currentDataCache = await loadDataCache();
       const currentFeatures = getEnabledRoleFeatures(latestSettings);
       const scannedTokens = await onScanPortalTabsForTokens();
       const recoveryStatus = await readPortalRecoveryStatus(portalRecoveryStatusRef.current);
@@ -1417,7 +1419,7 @@ function AccessSetupPanel({
       if (recoveryStatus.state === "interactionRequired") {
         return;
       }
-      const currentTargets = getAccessSetupTargets(buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures));
+      const currentTargets = getAccessSetupTargets(buildAccessCapabilityItems(scannedTokens, currentDataCache, currentFeatures));
       await onRefreshAccessData(scannedTokens, currentTargets.length ? currentTargets : currentFeatures);
     } catch (recheckError) {
       setPortalRecoveryError(recheckError instanceof Error ? recheckError.message : String(recheckError));

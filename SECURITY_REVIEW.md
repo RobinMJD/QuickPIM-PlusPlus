@@ -1,6 +1,10 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.8.
+Reviewed for v2.18.9.
+
+## v2.18.9 Access Recovery Consistency Review
+
+Access Setup now reloads the persisted capability cache after pending Settings hydration and autosave work completes. Portal rescans, recovery-page selection, and manual access rechecks therefore use one current cache snapshot instead of a render-time snapshot that could briefly be empty and open unnecessary Microsoft portal tabs.
 
 ## v2.18.8 Tenant Identity Compatibility Review
 
