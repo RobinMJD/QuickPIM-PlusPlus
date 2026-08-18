@@ -1,5 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 import {
+  PORTAL_TAB_QUERY_TIMEOUT_MS,
+  PORTAL_TAB_SCAN_CONCURRENCY,
+  PORTAL_TAB_SCAN_MAX_TABS,
+  PORTAL_TAB_SCAN_TIMEOUT_MS,
   PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY,
   getPortalTokenRecoveryTargets,
   loadPortalTokenScanDiagnostic,
@@ -62,6 +66,30 @@ describe("portal token background refresh", () => {
       captured: []
     });
     expect(sendMessage.mock.calls.map(([tabId]) => tabId)).toEqual([9, 10, 8]);
+  });
+
+  test("keeps the default scan within the popup refresh timeout budget", async () => {
+    expect(PORTAL_TAB_SCAN_MAX_TABS).toBe(8);
+    expect(
+      PORTAL_TAB_SCAN_TIMEOUT_MS * Math.ceil(PORTAL_TAB_SCAN_MAX_TABS / PORTAL_TAB_SCAN_CONCURRENCY)
+      + PORTAL_TAB_QUERY_TIMEOUT_MS
+    ).toBeLessThan(17_000);
+
+    const portalTabs = Array.from({ length: 20 }, (_, index) => ({
+      id: index + 1,
+      url: index === 19
+        ? "https://entra.microsoft.com/?quickpimRecovery=pimGroup.1000#view/Microsoft_Azure_PIMCommon/ActivationMenuBlade/~/aadgroup"
+        : "https://entra.microsoft.com/"
+    })) as chrome.tabs.Tab[];
+    const sendMessage = vi.fn(async () => ({ success: true, data: { captured: [] } }));
+
+    await scanOpenEntraTabs({
+      query: vi.fn(async () => portalTabs),
+      sendMessage
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(PORTAL_TAB_SCAN_MAX_TABS);
+    expect(sendMessage).toHaveBeenNthCalledWith(1, 20, { action: "quickPimScanPortalTokens" });
   });
 
   test("persists a bounded non-token portal scan diagnostic", async () => {

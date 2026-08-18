@@ -118,6 +118,54 @@ describe("Microsoft PIM API contracts", () => {
     expect(settings).not.toContain("setInterval(() => void updateStatus()");
   });
 
+  test("accepts background API verification as portal recovery completion without requiring new token bytes", () => {
+    expect(popup).toContain("recoveryStatusObserved && recoveryStatus.state === \"idle\"");
+    expect(popup).toContain("if (!recovered.recoveryCompleted)");
+    expect(popup).not.toContain("recovered.changedTargets.length !== portalTokenRecoveryTargets.length");
+  });
+
+  test("keeps portal recovery owned by the service worker until current-generation API verification", () => {
+    expect(background).toContain("initializePortalRecoveryLifecycle()");
+    expect(background).toContain("PORTAL_RECOVERY_VERIFY_ALARM_NAME");
+    expect(background).toContain("getApiVerifiedPortalRecoveryTargets");
+    expect(background).toContain("expectedJourneyCreatedAt");
+    expect(background).toContain("schedulePortalRecoveryVerification()");
+    expect(background).toContain("schedulePortalRecoveryVerificationTimer");
+    expect(background).toContain("closeOrphanedPortalRecoveryTabs(apis)");
+    expect(background).not.toContain("closeCompletedRecoveryTabs");
+    expect(background).not.toContain("closeCompletedPortalRecoveryTabs");
+    expect(background).not.toMatch(/if \(stored\) \{\s*await closePortalRecoveryTabsForTargets/);
+  });
+
+  test("generation-guards cleanup requested by popup and Settings refreshes", () => {
+    expect(popup).toContain("expectedJourneyCreatedAt: portalRecoveryJourneyCreatedAt");
+    expect(settings).toContain("expectedJourneyCreatedAt: options.expectedPortalRecoveryJourneyCreatedAt");
+    expect(background).toContain("message.expectedJourneyCreatedAt");
+    expect(popup).not.toContain('{ action: "closePortalRecoveryTabs", targets: completedRecoveryTargets }');
+    expect(settings).not.toContain('{ action: "closePortalRecoveryTabs", targets: completedRecoveryTargets }');
+  });
+
+  test("schedules recovery cleanup even when opening or grouping throws", () => {
+    expect(background).toContain("async function openManagedPortalRecoveryTabs");
+    expect(background).toContain("return await openPortalRecoveryTabsAndReconcile");
+    expect(background).toContain("} finally {");
+    expect(background).toContain("Schedule unconditionally");
+    expect(background).toContain("schedulePortalRecoveryCleanup()");
+    expect(background).toContain("schedulePortalRecoveryVerification()");
+  });
+
+  test("re-arms one-shot recovery cleanup after transient browser API failures", () => {
+    expect(background).toContain("const PORTAL_RECOVERY_CLEANUP_RETRY_MS = 60_000");
+    expect(background).toContain("schedulePortalRecoveryCleanup(PORTAL_RECOVERY_CLEANUP_RETRY_MS)");
+    expect(background).toContain("schedulePortalRecoveryVerification(PORTAL_RECOVERY_VERIFY_RETRY_MS)");
+  });
+
+  test("releases the manual refresh lock even when a newer refresh supersedes its run", () => {
+    expect(popup).toContain("manualRefreshRunId.current = runId");
+    expect(popup).toContain("if (manualRefreshRunId.current === runId)");
+    expect(popup).not.toContain("manualRefreshInFlight");
+  });
+
   test("retries token-state reads within the existing timeout budget before using verified in-memory state", () => {
     expect(popup).toContain("readTokenStatusWithRetry(tokenStatusRef.current)");
     expect(settings).toContain("readTokenStatusWithRetry(tokenStatusRef.current)");
@@ -126,7 +174,8 @@ describe("Microsoft PIM API contracts", () => {
   });
 
   test("queues notification extensions in the service worker without replaying ambiguous writes", () => {
-    expect(background).toContain("chrome.notifications?.onButtonClicked");
+    expect(background).toContain("registerNotificationListeners();");
+    expect(background).toContain("chrome.notifications.onButtonClicked?.addListener(trackedNotificationButtonClicked)");
     expect(background).toContain("buildTrackedRequestExtensionPlan");
     expect(background).toContain("continuationOfRequestId: source.requestId");
     expect(background).toContain('extensionAttemptState: "uncertain"');
@@ -136,10 +185,22 @@ describe("Microsoft PIM API contracts", () => {
   test("reconciles optional notification permission changes and catches up missed expiry reminders", () => {
     expect(background).toContain("chrome.permissions?.onAdded?.addListener(notificationPermissionAdded)");
     expect(background).toContain("chrome.permissions?.onRemoved?.addListener(notificationPermissionRemoved)");
+    expect(background).toContain("registerNotificationListeners();");
     expect(background).toContain("expiryReminderAttemptedAt: undefined");
     expect(background).toContain("getTrackedExpiryReminderDecision(request, reminderMinutes, now)");
     expect(background).toContain("showMissedExpiryReminderNotification(request)");
     expect(settings).toContain("Enable on this browser");
     expect(settings).toContain("Send test notification");
+    expect(settings).toContain("NOTIFICATION_TEST_BUTTON_TITLES.map");
+    expect(settings).toContain('sendRuntimeMessage({ action: "initializeNotificationDelivery" })');
+    expect(settings).toContain("buttonEvent.addListener(handleTestButtonClick)");
+    expect(background).toContain("notificationId === NOTIFICATION_TEST_ID");
+    expect(background).toContain("getNotificationTestButtonResult(buttonIndex)");
+  });
+
+  test("coalesces automatic Browser Sync writes and recognizes Edge byte-capacity quotas", () => {
+    expect(background).toContain("const BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS = 30_000");
+    expect(background).toContain("const BROWSER_SYNC_REMOTE_CHANGE_DEBOUNCE_MS = 2_000");
+    expect(background).toContain("write quota|storage capacity");
   });
 });

@@ -959,7 +959,7 @@ describe("popup compact controls", () => {
         recoveryOpened = true;
         return {
           success: true,
-          data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true }
+          data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true, journeyCreatedAt: 1000 }
         };
       }
       return { success: true, data: true };
@@ -994,7 +994,11 @@ describe("popup compact controls", () => {
       targets: ["pimGroup"],
       detail: "core"
     }), 2500);
-    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({ action: "closePortalRecoveryTabs", targets: ["pimGroup"] }), 2500);
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith({
+      action: "closePortalRecoveryTabs",
+      targets: ["pimGroup"],
+      expectedJourneyCreatedAt: 1000
+    }), 2500);
   });
 
   test("automatically starts recovery for both enabled Graph features when only cached Azure data is visible", async () => {
@@ -1100,7 +1104,7 @@ describe("popup compact controls", () => {
         recoveryOpened = true;
         return {
           success: true,
-          data: { requestedCount: 2, openedCount: 2, reusedCount: 0, managedCount: 2, grouped: true }
+          data: { requestedCount: 2, openedCount: 2, reusedCount: 0, managedCount: 2, grouped: true, journeyCreatedAt: 1000 }
         };
       }
       if (message.action === "getActivationSnapshot") {
@@ -1293,7 +1297,7 @@ describe("popup compact controls", () => {
           grouped: true,
           interactionReason: "signIn"
         };
-        return { success: true, data: { requestedCount: 3, openedCount: 3, reusedCount: 0, managedCount: 3, grouped: true } };
+        return { success: true, data: { requestedCount: 3, openedCount: 3, reusedCount: 0, managedCount: 3, grouped: true, journeyCreatedAt: 1000 } };
       }
       if (message.action === "focusPortalRecoveryTabs") {
         return { success: true, data: { focused: true, status: recoveryStatus } };
@@ -1667,7 +1671,7 @@ describe("popup compact controls", () => {
     };
     const recoveryOpen = deferred<{
       success: true;
-      data: { requestedCount: number; openedCount: number; reusedCount: number; managedCount: number; grouped: boolean };
+      data: { requestedCount: number; openedCount: number; reusedCount: number; managedCount: number; grouped: boolean; journeyCreatedAt?: number };
     }>();
     let recoveryStarted = false;
     const sendMessage = vi.fn((message: { action: string; targets?: string[] }) => {
@@ -1717,7 +1721,7 @@ describe("popup compact controls", () => {
 
     recoveryOpen.resolve({
       success: true,
-      data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true }
+      data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true, journeyCreatedAt: 1000 }
     });
     await waitFor(() => expect(document.body.textContent).toContain("Refreshing one role source in the background."));
     expect(document.body.textContent).toContain("Available roles remain usable.");
@@ -4020,6 +4024,88 @@ describe("popup compact controls", () => {
     expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remove Zebra Role from favorites"]')).toBeTruthy();
   });
 
+  test("migrates an existing legacy favorite before sorting tenant-scoped rows", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const items: ActivationItem[] = [
+      {
+        id: "directoryRole:alpha:/",
+        type: "directoryRole",
+        sourceName: "Alpha Role",
+        displayName: "Alpha Role",
+        principalId: "principal-1",
+        tenantId: "tenant-one",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "alpha",
+        directoryScopeId: "/"
+      },
+      {
+        id: "directoryRole:zebra:/",
+        type: "directoryRole",
+        sourceName: "Zebra Role",
+        displayName: "Zebra Role",
+        principalId: "principal-1",
+        tenantId: "tenant-one",
+        scopeLabel: "Tenant",
+        status: "eligible",
+        roleDefinitionId: "zebra",
+        directoryScopeId: "/"
+      }
+    ];
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        favoriteItemIds: ["directoryRole:zebra:/"]
+      },
+      [DATA_CACHE_KEY]: {
+        eligible: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items
+        },
+        active: {
+          fetchedAt: Date.now(),
+          cacheKey: "graph:missing|azure:missing",
+          errors: [],
+          items: []
+        }
+      }
+    };
+
+    vi.stubGlobal("chrome", {
+      runtime: {
+        sendMessage: vi.fn(async (message: { action: string }) => message.action === "getTokenStatus"
+          ? {
+              success: true,
+              data: {
+                graph: { hasToken: false },
+                azureManagement: { hasToken: false }
+              }
+            }
+          : { success: true, data: { items: [], errors: [] } })
+      },
+      storage: {
+        local: {
+          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
+          remove: vi.fn(async () => undefined)
+        }
+      },
+      tabs: { create: vi.fn() }
+    });
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => {
+      expect([...document.querySelectorAll(".role-title")].map((item) => item.textContent)).toEqual(["Zebra Role", "Alpha Role"]);
+    });
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remove Zebra Role from favorites"]')).toBeTruthy();
+    await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({
+      favoriteItemIds: ["tenant:tenant-one:directoryRole:zebra:/"]
+    }));
+  });
+
   test("shows a crown icon after high privilege role names only", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const items: ActivationItem[] = [
@@ -4335,6 +4421,32 @@ describe("popup draft persistence", () => {
     };
   }
 
+  test("migrates and displays a legacy PIM group alias for the current tenant", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: {
+        ...DEFAULT_SETTINGS,
+        aliasesByItemId: {
+          [pimGroupItem.id]: "Global Administrator"
+        },
+        preferences: {
+          ...DEFAULT_SETTINGS.preferences,
+          enabledFeatures: ["pimGroup", "bundles"],
+          autoEnabledFeaturesInitialized: true
+        }
+      }
+    };
+    vi.stubGlobal("chrome", popupChromeMock(storageData));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("Global Administrator"));
+    expect(document.body.textContent).not.toContain("Privileged Group");
+    await waitFor(() => expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).aliasesByItemId).toEqual({
+      "tenant:tenant-1:pimGroup:group-1:member": "Global Administrator"
+    }));
+  });
+
   test("uses one compact Active switch and reverses the selected useful sorter", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const storageData: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS };
@@ -4562,6 +4674,39 @@ describe("popup draft persistence", () => {
     const inputs = [...document.querySelectorAll<HTMLInputElement>(".activation-grid .input")];
     expect(inputs.map((input) => input.value)).toEqual(["ServiceNow", "INC-123"]);
     expect(document.querySelector<HTMLSelectElement>(".activation-bar .select")?.value).toBe("2");
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({
+      tenantId: "tenant-1",
+      principalId: "principal-1"
+    }));
+  });
+
+  test("clears a restored selection that belongs to another tenant", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = {
+      [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [POPUP_DRAFT_KEY]: {
+        updatedAt: Date.now(),
+        tab: "pimGroup",
+        search: "Privileged",
+        sortMode: "name",
+        selectedIds: [pimGroupItem.id],
+        durationHours: 2,
+        justification: "Needed for group maintenance",
+        ticketSystem: "ServiceNow",
+        ticketNumber: "INC-123",
+        isActivationReviewOpen: true,
+        tenantId: "tenant-2",
+        principalId: "principal-2"
+      }
+    };
+
+    vi.stubGlobal("chrome", popupChromeMock(storageData));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("another or an unknown Microsoft account context"));
+    expect(document.body.textContent).not.toContain("Activate 1 selected");
+    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({ selectedIds: [] }));
   });
 
   test("keeps restored selected ids until activation data loads, then prunes invalid ids", async () => {

@@ -42,7 +42,6 @@ import {
   updateCacheFromTargetResults
 } from "./lib/cache";
 import {
-  buildAccessCapabilityItems,
   buildNameLookupDiagnostic,
   buildTargetCacheKeys,
   classifyAccessFailure,
@@ -91,15 +90,19 @@ import {
 import {
   PORTAL_RECOVERY_CLEANUP_ALARM_NAME,
   PORTAL_RECOVERY_SESSION_TTL_MS,
+  PORTAL_RECOVERY_VERIFY_ALARM_NAME,
   closeExpiredPortalRecoveryTabs,
+  closeOrphanedPortalRecoveryTabs,
   closePortalRecoveryTabsForTargets,
   focusPortalRecoveryTabs,
+  getPortalRecoveryJourneyCreatedAt,
   getPortalRecoveryTokenSignature,
   getPortalRecoveryStatus,
   isPortalRecoveryManagedTabId,
   openPortalRecoveryTabsAndReconcile,
   type PortalRecoveryApis
 } from "./lib/portalRecoveryTabs";
+import { getApiVerifiedPortalRecoveryTargets } from "./lib/portalRecoveryVerification";
 import {
   getRequiredGraphActivationScopes,
   getGraphTokenAuthStrengthScore,
@@ -138,7 +141,16 @@ import {
   touchRequestOperation,
   updateRequestOperationItem
 } from "./lib/requestOperations";
-import { normalizeActivationItemId } from "./lib/activationIdentity";
+import {
+  activationItemIdentitiesMatch,
+  getActivationItemIdentity,
+  normalizeActivationItemId
+} from "./lib/activationIdentity";
+import {
+  NOTIFICATION_TEST_ID,
+  NOTIFICATION_TEST_RESULT_ID,
+  getNotificationTestButtonResult
+} from "./lib/notificationTest";
 import {
   getAccessRecoveryTargets,
   getClaimsChallengeRecoveryTargets,
@@ -298,6 +310,10 @@ let requestTrackingMaintenanceFollowUp: Promise<TrackedPimRequestStore> | undefi
 const pendingForcedTrackedRequestIds = new Set<string>();
 let forceAllTrackedRequestMaintenance = false;
 let backgroundPreRefreshInFlight: Promise<void> | undefined;
+let portalRecoveryVerificationInFlight: Promise<void> | undefined;
+let portalRecoveryVerificationFollowUpRequested = false;
+let portalRecoveryVerificationTimer: ReturnType<typeof setTimeout> | undefined;
+let portalRecoveryVerificationDueAt = 0;
 let browserSyncInFlight: Promise<BrowserSyncStatus> | undefined;
 let browserSyncFollowUp: Promise<BrowserSyncStatus> | undefined;
 let browserSyncChangeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -314,8 +330,11 @@ const BROWSER_SYNC_TRANSIENT_RETRY_MINUTES = 5;
 // A changed snapshot needs two ordered cloud writes (chunks, then manifest).
 // Waiting for a short quiet period keeps sustained edits below the browser's
 // hourly write budget while remote delivery can still be consumed promptly.
-const BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS = 5_000;
-const BROWSER_SYNC_REMOTE_CHANGE_DEBOUNCE_MS = 500;
+const BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS = 30_000;
+const BROWSER_SYNC_REMOTE_CHANGE_DEBOUNCE_MS = 2_000;
+const PORTAL_RECOVERY_VERIFY_DELAY_MS = 1_500;
+const PORTAL_RECOVERY_VERIFY_RETRY_MS = 30_000;
+const PORTAL_RECOVERY_CLEANUP_RETRY_MS = 60_000;
 
 const ENDPOINT_LABELS: Record<AccessSetupTarget, { eligible: string; active: string }> = {
   directoryRole: {
@@ -354,7 +373,11 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
   if (extensionResetInProgress || Date.now() < suppressBackgroundStorageEventsUntil) return;
   if (areaName === "local" && changes[SETTINGS_KEY]?.newValue) {
     runBestEffort(runIfExtensionEnabled(async () => {
-      await Promise.all([initializeBackgroundRefresh(), initializeRequestTracking()]);
+      await Promise.all([
+        initializeBackgroundRefresh(),
+        initializeRequestTracking(),
+        initializePortalRecoveryLifecycle()
+      ]);
     }));
     scheduleBrowserSyncAfterStorageChange(BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS);
   }
@@ -379,6 +402,7 @@ function notificationPermissionRemoved(permissions: chrome.permissions.Permissio
 
 function notificationPermissionAdded(permissions: chrome.permissions.Permissions): void {
   if (!permissions.permissions?.includes("notifications")) return;
+  registerNotificationListeners();
   runBestEffort(runIfExtensionEnabled(async () => {
     await mutateTrackedRequests((current) => ({
       version: 1,
@@ -401,12 +425,16 @@ chrome.alarms?.onAlarm?.addListener((alarm) => {
     runBestEffort(runIfExtensionEnabled(runTrackedRequestMaintenance));
   } else if (alarm.name === PORTAL_RECOVERY_CLEANUP_ALARM_NAME) {
     runBestEffort(maintainPortalRecoveryCleanup());
+  } else if (alarm.name === PORTAL_RECOVERY_VERIFY_ALARM_NAME) {
+    runBestEffort(runIfExtensionEnabled(runPortalRecoveryVerification));
   } else if (alarm.name === BROWSER_SYNC_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runBrowserSync));
   }
 });
 
-chrome.notifications?.onClicked?.addListener((notificationId) => {
+let notificationListenersRegistered = false;
+
+function trackedNotificationClicked(notificationId: string): void {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
@@ -414,9 +442,23 @@ chrome.notifications?.onClicked?.addListener((notificationId) => {
     await openTrackedRequestDetails();
     await clearNotification(notificationId);
   }));
-});
+}
 
-chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex) => {
+function trackedNotificationButtonClicked(notificationId: string, buttonIndex: number): void {
+  if (notificationId === NOTIFICATION_TEST_ID) {
+    const result = getNotificationTestButtonResult(buttonIndex);
+    if (!result) return;
+    runBestEffort(runIfExtensionEnabled(async () => {
+      await clearNotification(notificationId);
+      await chrome.notifications.create(NOTIFICATION_TEST_RESULT_ID, {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
+        title: result.title,
+        message: result.message
+      });
+    }));
+    return;
+  }
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
@@ -430,7 +472,16 @@ chrome.notifications?.onButtonClicked?.addListener((notificationId, buttonIndex)
     await openTrackedRequestDetails();
     await clearNotification(notificationId);
   }));
-});
+}
+
+function registerNotificationListeners(): void {
+  if (notificationListenersRegistered || !chrome.notifications) return;
+  chrome.notifications.onClicked?.addListener(trackedNotificationClicked);
+  chrome.notifications.onButtonClicked?.addListener(trackedNotificationButtonClicked);
+  notificationListenersRegistered = true;
+}
+
+registerNotificationListeners();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isTrustedRuntimeSender(sender)) {
@@ -480,12 +531,17 @@ async function runIfExtensionEnabled<T>(operation: () => T | Promise<T>, rejectW
 async function initializeEnabledBackgroundServices(runPreRefresh = false): Promise<void> {
   const distribution = await getDistributionInfo();
   if (distribution.blockedInEdge) {
-    await Promise.all([
+    const recoveryApis = getPortalRecoveryApis();
+    await Promise.allSettled([
       chrome.alarms?.clear?.(PRE_REFRESH_ALARM_NAME),
       chrome.alarms?.clear?.(REQUEST_TRACKING_ALARM_NAME),
       chrome.alarms?.clear?.(BROWSER_SYNC_ALARM_NAME),
-      chrome.action?.setBadgeText?.({ text: "" })
+      chrome.alarms?.clear?.(PORTAL_RECOVERY_CLEANUP_ALARM_NAME),
+      chrome.alarms?.clear?.(PORTAL_RECOVERY_VERIFY_ALARM_NAME),
+      chrome.action?.setBadgeText?.({ text: "" }),
+      closePortalRecoveryTabsForTargets(["directoryRole", "pimGroup", "azureRole"], recoveryApis)
     ]);
+    await closeOrphanedPortalRecoveryTabs(recoveryApis).catch(() => undefined);
     await applyDistributionActionIcon(distribution);
     return;
   }
@@ -494,7 +550,8 @@ async function initializeEnabledBackgroundServices(runPreRefresh = false): Promi
     initializeBackgroundRefresh(),
     initializeRequestTracking(),
     initializeBrowserSync(),
-    reconcilePendingRequestOperations()
+    reconcilePendingRequestOperations(),
+    initializePortalRecoveryLifecycle()
   ]);
   if (runPreRefresh) await runBackgroundPreRefresh();
 }
@@ -567,7 +624,7 @@ async function updateBrowserSyncAlarm(status: BrowserSyncStatus): Promise<void> 
 }
 
 function isTransientBrowserSyncError(error: string | undefined): boolean {
-  return Boolean(error && /still arriving|temporar|unavailable|network|timed? out|rate limit|write operations/i.test(error));
+  return Boolean(error && /still arriving|temporar|unavailable|network|timed? out|rate limit|write operations|write quota|storage capacity/i.test(error));
 }
 
 function scheduleBrowserSyncAfterStorageChange(delayMs: number): void {
@@ -1248,6 +1305,7 @@ async function runBackgroundPreRefresh(): Promise<void> {
 
 async function performBackgroundPreRefresh(): Promise<void> {
   const refreshStartedAt = Date.now();
+  const recoveryJourneyCreatedAt = await getPortalRecoveryJourneyCreatedAt(getPortalRecoveryApis());
   const settings = await loadSettings();
   if (!settings.preferences.backgroundPreRefreshEnabled) {
     await syncPreRefreshAlarm(chrome.alarms, false);
@@ -1309,7 +1367,14 @@ async function performBackgroundPreRefresh(): Promise<void> {
   await saveDataCache(nextCache);
   const referenceData = learnReferenceDataFromItems(await loadReferenceData(), [...snapshot.eligible.items, ...snapshot.active.items]);
   await saveReferenceData(referenceData);
-  await closeVerifiedRecoveryTabs(snapshotTokenStatus, nextCache);
+  if (recoveryJourneyCreatedAt !== undefined) {
+    await closeVerifiedRecoveryTabs(
+      await getTokenStatus(),
+      await loadDataCache(),
+      targets,
+      recoveryJourneyCreatedAt
+    );
+  }
 }
 
 async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender): Promise<unknown> {
@@ -1318,6 +1383,16 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return getTokenStatus();
     case "getSettingsSnapshot":
       return loadSettingsSnapshot();
+    case "initializeNotificationDelivery":
+      // Optional permissions can become available after an MV3 worker has
+      // already started. Re-run registration from an explicit page handshake;
+      // the top-level registration still handles later worker restarts.
+      registerNotificationListeners();
+      await initializeRequestTracking();
+      return {
+        apiAvailable: Boolean(chrome.notifications),
+        listenersRegistered: notificationListenersRegistered
+      };
     case "compareAndSetSettings":
       return compareAndSetSettings(message.expectedRevision, message.settings);
     case "getBrowserSyncStatus":
@@ -1371,7 +1446,12 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
     case "openPortalRecoveryTabs":
       return openManagedPortalRecoveryTabs(message.targets);
     case "closePortalRecoveryTabs":
-      return closePortalRecoveryTabsForTargets(message.targets, getPortalRecoveryApis());
+      return closeVerifiedRecoveryTabs(
+        await getTokenStatus(),
+        undefined,
+        message.targets,
+        message.expectedJourneyCreatedAt
+      );
     case "clearToken":
       await clearTokens();
       return true;
@@ -1497,6 +1577,7 @@ async function resetAllExtensionData(): Promise<void> {
         || requestTrackingMaintenanceInFlight
         || requestTrackingMaintenanceFollowUp
         || backgroundPreRefreshInFlight
+        || portalRecoveryVerificationInFlight
         || browserSyncInFlight
         || browserSyncFollowUp
       ),
@@ -1557,14 +1638,6 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
   const refreshedOperation = (await loadRequestOperations()).find((candidate) => candidate.id === operation.id) || operation;
   const store = await loadTrackedRequests().catch(() => undefined);
   const matching = (store?.requests || []).filter((request) => trackedRequestMatchesOperation(request, refreshedOperation));
-  const byItemId = new Map<string, TrackedPimRequest>();
-  for (const request of matching) {
-    const itemId = normalizeActivationItemId(request.itemId);
-    const current = byItemId.get(itemId);
-    if (!current || request.requestedAt > current.requestedAt) {
-      byItemId.set(itemId, request);
-    }
-  }
   const operationItems = refreshedOperation.items?.length
     ? refreshedOperation.items
     : createRequestOperationItems(refreshedOperation.itemIds.map((itemId) => ({
@@ -1584,7 +1657,9 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
       } as ActivationItem)), refreshedOperation.startedAt);
   const results: ActivationResult[] = operationItems.map((operationItem) => {
     const itemId = operationItem.itemId;
-    const tracked = byItemId.get(normalizeActivationItemId(itemId));
+    const tracked = matching
+      .filter((request) => activationItemIdentitiesMatch(itemId, request.itemId))
+      .sort((left, right) => right.requestedAt.localeCompare(left.requestedAt))[0];
     if (tracked) return buildTrackedReconciliationResult(itemId, tracked);
     if (operationItem.result) return operationItem.result;
     if ((operationItem.state === "accepted" || operationItem.state === "tracking") && operationItem.requestId) {
@@ -2041,7 +2116,8 @@ async function executeWithPortalAccessRecovery(
       .filter((result) => result.accessRecoveryTarget)
       .map((result) => result.itemId)
   );
-  const retryItems = items.filter((item) => retryIds.has(item.id));
+  const retryItems = items.filter((item) => [...retryIds]
+    .some((itemId) => activationItemIdentitiesMatch(itemId, getActivationItemIdentity(item))));
   if (!retryItems.length) {
     return initialResponse;
   }
@@ -2061,10 +2137,15 @@ async function executeWithPortalAccessRecovery(
   const retryResponse = await execute(retryItems);
   const successfulTargets = recoveryTargets.filter((target) => retryItems.some((item) =>
     item.type === target
-    && retryResponse.results.some((result) => result.success && result.itemId === item.id)
+    && retryResponse.results.some((result) => result.success
+      && activationItemIdentitiesMatch(result.itemId, getActivationItemIdentity(item)))
   ));
-  if (successfulTargets.length) {
-    await closePortalRecoveryTabsForTargets(successfulTargets, getPortalRecoveryApis()).catch(() => undefined);
+  if (successfulTargets.length && recovery.journeyCreatedAt !== undefined) {
+    await closePortalRecoveryTabsForTargets(
+      successfulTargets,
+      getPortalRecoveryApis(),
+      recovery.journeyCreatedAt
+    ).catch(() => undefined);
   }
   return mergeRetriedActivationResponse(initialResponse, retryResponse);
 }
@@ -2073,7 +2154,7 @@ async function recoverPortalAccessForRequest(
   targets: AccessSetupTarget[],
   freshTokenTargets: AccessSetupTarget[] = [],
   claimsChallengeTargets: AccessSetupTarget[] = []
-): Promise<{ ready: boolean; error?: string }> {
+): Promise<{ ready: boolean; error?: string; journeyCreatedAt?: number }> {
   const initialTokenStatus = await getTokenStatus();
   const freshTokenBaselines = Object.fromEntries(
     freshTokenTargets.map((target) => [target, getPortalRecoveryTokenSignature(initialTokenStatus, target)])
@@ -2088,13 +2169,23 @@ async function recoverPortalAccessForRequest(
   let tokenStatus = await getTokenStatus();
   let remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus, freshTokenBaselines);
   if (!remainingTargets.length) {
-    return { ready: true };
+    return {
+      ready: true,
+      journeyCreatedAt: await getPortalRecoveryJourneyCreatedAt(getPortalRecoveryApis())
+    };
   }
 
   const managedFreshTargets = remainingTargets.filter((target) => freshTokenTargets.includes(target));
   if (managedFreshTargets.length) {
     try {
-      await closePortalRecoveryTabsForTargets(managedFreshTargets, getPortalRecoveryApis());
+      const existingJourneyCreatedAt = await getPortalRecoveryJourneyCreatedAt(getPortalRecoveryApis());
+      if (existingJourneyCreatedAt !== undefined) {
+        await closePortalRecoveryTabsForTargets(
+          managedFreshTargets,
+          getPortalRecoveryApis(),
+          existingJourneyCreatedAt
+        );
+      }
     } catch {
       // A stale managed-tab record must not block opening a fresh recovery page.
     }
@@ -2106,6 +2197,7 @@ async function recoverPortalAccessForRequest(
       error: "QuickPIM++ could not open the Microsoft portal page needed for this request. Your selection and inputs remain saved."
     };
   }
+  const journeyCreatedAt = await getPortalRecoveryJourneyCreatedAt(getPortalRecoveryApis());
 
   const deadline = Date.now() + REQUEST_PORTAL_RECOVERY_WAIT_TIMEOUT_MS;
   const recoveryStartedAt = Date.now();
@@ -2125,8 +2217,7 @@ async function recoverPortalAccessForRequest(
     }
     remainingTargets = getRequestMissingAccessTargets(targets, tokenStatus, freshTokenBaselines);
     if (!remainingTargets.length) {
-      await closeCompletedRecoveryTabs(tokenStatus);
-      return { ready: true };
+      return { ready: true, journeyCreatedAt };
     }
     const recoveryStatus = await getPortalRecoveryStatus(getPortalRecoveryApis(), Date.now(), tokenStatus);
     if (shouldFocusPortalRecovery({
@@ -2212,7 +2303,9 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
+function refreshPortalTokensFromOpenTabs(
+  options: { scheduleVerification?: boolean } = {}
+): Promise<PortalTokenRefreshResult> {
   if (portalTokenRefreshInFlight) {
     return portalTokenRefreshInFlight;
   }
@@ -2221,7 +2314,12 @@ function refreshPortalTokensFromOpenTabs(): Promise<PortalTokenRefreshResult> {
     const scanResult = await scanOpenEntraTabs(chrome.tabs);
     await recordPortalTokenScanDiagnostic(scanResult).catch(() => undefined);
     const tokenStatus = await getTokenStatus();
-    await closeCompletedRecoveryTabs(tokenStatus);
+    if (options.scheduleVerification !== false) {
+      const journeyCreatedAt = await getPortalRecoveryJourneyCreatedAt(getPortalRecoveryApis());
+      if (journeyCreatedAt !== undefined) {
+        await schedulePortalRecoveryVerification();
+      }
+    }
     return {
       tokenStatus,
       ...scanResult
@@ -2266,7 +2364,7 @@ async function captureToken(details: chrome.webRequest.WebRequestHeadersDetails)
     { allowIdentityChange }
   );
   if (stored) {
-    await closeCompletedRecoveryTabs(await getTokenStatus());
+    await schedulePortalRecoveryVerification();
   }
 }
 
@@ -2300,7 +2398,7 @@ async function capturePortalTokens(
     }
   }
   if (captured.size) {
-    await closeCompletedRecoveryTabs(await getTokenStatus());
+    await schedulePortalRecoveryVerification();
   }
   return { captured: [...captured] };
 }
@@ -2334,41 +2432,295 @@ function getPortalRecoveryApis(): PortalRecoveryApis {
 }
 
 async function openManagedPortalRecoveryTabs(targets: AccessSetupTarget[]) {
-  const result = await openPortalRecoveryTabsAndReconcile(targets, getTokenStatus, getPortalRecoveryApis());
-  if (result.managedCount) {
-    await chrome.alarms.create(PORTAL_RECOVERY_CLEANUP_ALARM_NAME, {
-      when: Date.now() + PORTAL_RECOVERY_SESSION_TTL_MS
-    });
+  const apis = getPortalRecoveryApis();
+  try {
+    return await openPortalRecoveryTabsAndReconcile(targets, getTokenStatus, apis);
+  } finally {
+    // The manager persists each created tab before grouping. Schedule the
+    // durable lifecycle from a finally block so a grouping/storage failure or
+    // popup closure cannot strand a partially opened recovery journey.
+    // Schedule unconditionally. If storage failed after a tab was created, the
+    // verifier can still find its exact URL marker and close it as an orphan.
+    // With no recovery journey these one-shot alarms simply reconcile to idle.
+    await Promise.allSettled([
+      schedulePortalRecoveryCleanup(),
+      schedulePortalRecoveryVerification()
+    ]);
   }
-  return result;
 }
 
 async function maintainPortalRecoveryCleanup(): Promise<void> {
   const apis = getPortalRecoveryApis();
-  await closeExpiredPortalRecoveryTabs(apis);
-  const status = await getPortalRecoveryStatus(apis);
-  if (status.state !== "idle") {
-    await chrome.alarms.create(PORTAL_RECOVERY_CLEANUP_ALARM_NAME, {
-      when: Date.now() + PORTAL_RECOVERY_SESSION_TTL_MS
-    });
+  try {
+    await Promise.all([
+      closeExpiredPortalRecoveryTabs(apis),
+      closeOrphanedPortalRecoveryTabs(apis)
+    ]);
+    const status = await getPortalRecoveryStatus(apis, Date.now(), await getTokenStatus());
+    if (status.state === "idle") {
+      await clearPortalRecoveryAlarms();
+      return;
+    }
+    await schedulePortalRecoveryCleanup();
+    if (status.state === "waiting") {
+      await schedulePortalRecoveryVerification();
+    }
+  } catch {
+    // A one-shot alarm is consumed before this handler runs. Leave another
+    // durable attempt behind when tabs/storage are temporarily unavailable.
+    await Promise.allSettled([
+      schedulePortalRecoveryCleanup(PORTAL_RECOVERY_CLEANUP_RETRY_MS),
+      schedulePortalRecoveryVerification(PORTAL_RECOVERY_VERIFY_RETRY_MS)
+    ]);
   }
 }
 
-async function closeCompletedRecoveryTabs(tokenStatus: TokenStatus): Promise<void> {
-  await closeVerifiedRecoveryTabs(tokenStatus);
+async function initializePortalRecoveryLifecycle(): Promise<void> {
+  const apis = getPortalRecoveryApis();
+  try {
+    await closeExpiredPortalRecoveryTabs(apis);
+    await closeOrphanedPortalRecoveryTabs(apis);
+
+    const [settings, tokenStatus] = await Promise.all([loadSettings(), getTokenStatus()]);
+    let status = await getPortalRecoveryStatus(apis, Date.now(), tokenStatus);
+    if (status.state === "idle") {
+      await clearPortalRecoveryAlarms();
+      return;
+    }
+
+    const journeyCreatedAt = await getPortalRecoveryJourneyCreatedAt(apis);
+    const enabledTargets = new Set(getEnabledRoleFeatures(settings));
+    const disabledTargets = status.managedTargets.filter((target) => !enabledTargets.has(target));
+    if (disabledTargets.length && journeyCreatedAt !== undefined) {
+      await closePortalRecoveryTabsForTargets(disabledTargets, apis, journeyCreatedAt);
+      status = await getPortalRecoveryStatus(apis, Date.now(), tokenStatus);
+    }
+
+    if (status.state === "idle") {
+      await clearPortalRecoveryAlarms();
+      return;
+    }
+    await Promise.all([
+      schedulePortalRecoveryCleanup(),
+      schedulePortalRecoveryVerification()
+    ]);
+  } catch {
+    // Startup may race browser session restoration. Retry instead of letting a
+    // transient tabs/storage failure strand a restored QuickPIM++ group.
+    await Promise.allSettled([
+      schedulePortalRecoveryCleanup(PORTAL_RECOVERY_CLEANUP_RETRY_MS),
+      schedulePortalRecoveryVerification(PORTAL_RECOVERY_VERIFY_RETRY_MS)
+    ]);
+  }
 }
 
 async function closeVerifiedRecoveryTabs(
   tokenStatus: TokenStatus,
-  cache?: Awaited<ReturnType<typeof loadDataCache>>
-): Promise<void> {
+  cache?: Awaited<ReturnType<typeof loadDataCache>>,
+  requestedTargets?: AccessSetupTarget[],
+  expectedJourneyCreatedAt?: number
+): Promise<AccessSetupTarget[]> {
+  const apis = getPortalRecoveryApis();
+  const journeyCreatedAt = expectedJourneyCreatedAt
+    ?? await getPortalRecoveryJourneyCreatedAt(apis);
+  if (journeyCreatedAt === undefined) return [];
+
   const currentCache = cache || await loadDataCache();
-  const verifiedTargets = buildAccessCapabilityItems(tokenStatus, currentCache)
-    .filter((item) => item.status === "ready")
-    .map((item) => item.target);
-  if (verifiedTargets.length) {
-    await closePortalRecoveryTabsForTargets(verifiedTargets, getPortalRecoveryApis());
+  const targets = requestedTargets || (await getPortalRecoveryStatus(apis, Date.now(), tokenStatus)).managedTargets;
+  const verifiedTargets = getApiVerifiedPortalRecoveryTargets({
+    tokenStatus,
+    cache: currentCache,
+    targets,
+    journeyCreatedAt
+  });
+  if (!verifiedTargets.length) return [];
+  return closePortalRecoveryTabsForTargets(verifiedTargets, apis, journeyCreatedAt);
+}
+
+async function runPortalRecoveryVerification(): Promise<void> {
+  if (portalRecoveryVerificationInFlight) {
+    portalRecoveryVerificationFollowUpRequested = true;
+    return portalRecoveryVerificationInFlight;
   }
+
+  clearPortalRecoveryVerificationTimer();
+
+  const verification = (async () => {
+    // Leave a durable retry behind before network work starts. If MV3 suspends
+    // the worker mid-check, the recovery journey resumes without the popup.
+    await schedulePortalRecoveryAlarm(
+      PORTAL_RECOVERY_VERIFY_ALARM_NAME,
+      PORTAL_RECOVERY_VERIFY_RETRY_MS
+    );
+    schedulePortalRecoveryVerificationTimer(PORTAL_RECOVERY_VERIFY_RETRY_MS);
+    await performPortalRecoveryVerification();
+  })();
+  const trackedVerification = verification.finally(async () => {
+    portalRecoveryVerificationInFlight = undefined;
+    if (portalRecoveryVerificationFollowUpRequested) {
+      portalRecoveryVerificationFollowUpRequested = false;
+      await schedulePortalRecoveryVerification();
+    }
+  });
+  portalRecoveryVerificationInFlight = trackedVerification;
+  return trackedVerification;
+}
+
+async function performPortalRecoveryVerification(): Promise<void> {
+  const apis = getPortalRecoveryApis();
+  let journeyCreatedAt = await getPortalRecoveryJourneyCreatedAt(apis);
+  if (journeyCreatedAt === undefined) {
+    await closeOrphanedPortalRecoveryTabs(apis);
+    await clearPortalRecoveryAlarms();
+    return;
+  }
+
+  const scannedTokens = (await refreshPortalTokensFromOpenTabs({ scheduleVerification: false })).tokenStatus;
+  let status = await getPortalRecoveryStatus(apis, Date.now(), scannedTokens);
+  const currentJourneyCreatedAt = await getPortalRecoveryJourneyCreatedAt(apis);
+  if (currentJourneyCreatedAt !== journeyCreatedAt) {
+    if (currentJourneyCreatedAt !== undefined) await schedulePortalRecoveryVerification();
+    return;
+  }
+
+  const settings = await loadSettings();
+  const enabledTargets = new Set(getEnabledRoleFeatures(settings));
+  const disabledTargets = status.managedTargets.filter((target) => !enabledTargets.has(target));
+  if (disabledTargets.length) {
+    await closePortalRecoveryTabsForTargets(disabledTargets, apis, journeyCreatedAt);
+    status = await getPortalRecoveryStatus(apis, Date.now(), scannedTokens);
+  }
+  if (status.state === "idle") {
+    await closeOrphanedPortalRecoveryTabs(apis);
+    await clearPortalRecoveryAlarms();
+    return;
+  }
+
+  journeyCreatedAt = await getPortalRecoveryJourneyCreatedAt(apis);
+  if (journeyCreatedAt === undefined) {
+    await clearPortalRecoveryAlarms();
+    return;
+  }
+  const verificationTargets = status.managedTargets.filter((target) =>
+    enabledTargets.has(target) && hasRequiredPortalToken(target, scannedTokens)
+  );
+  if (verificationTargets.length) {
+    const refreshStartedAt = Date.now();
+    const [dataCache, referenceData, snapshot] = await Promise.all([
+      loadDataCache(),
+      loadReferenceData(),
+      getActivationCoreSnapshot(verificationTargets)
+    ]);
+    const fetchedAt = Date.now();
+    const snapshotTokenStatus = snapshot.tokenStatus || scannedTokens;
+    const cacheKeys = buildTargetCacheKeys(snapshotTokenStatus, verificationTargets);
+    let nextCache = updateCacheFromTargetResults(
+      dataCache,
+      "eligible",
+      verificationTargets,
+      snapshot.eligibleByTarget || splitActivationResultByTarget(snapshot.eligible, verificationTargets),
+      fetchedAt,
+      cacheKeys,
+      refreshStartedAt
+    );
+    nextCache = updateCacheFromTargetResults(
+      nextCache,
+      "active",
+      verificationTargets,
+      snapshot.activeByTarget || splitActivationResultByTarget(snapshot.active, verificationTargets),
+      fetchedAt,
+      cacheKeys,
+      refreshStartedAt
+    );
+    await Promise.all([
+      saveDataCache(nextCache),
+      saveReferenceData(learnReferenceDataFromItems(
+        referenceData,
+        [...snapshot.eligible.items, ...snapshot.active.items]
+      ))
+    ]);
+    await closeVerifiedRecoveryTabs(
+      await getTokenStatus(),
+      await loadDataCache(),
+      verificationTargets,
+      journeyCreatedAt
+    );
+  }
+
+  status = await getPortalRecoveryStatus(apis, Date.now(), await getTokenStatus());
+  if (status.state === "idle") {
+    await closeOrphanedPortalRecoveryTabs(apis);
+    await clearPortalRecoveryAlarms();
+    return;
+  }
+  await schedulePortalRecoveryCleanup();
+  if (status.state === "waiting") {
+    await schedulePortalRecoveryAlarm(
+      PORTAL_RECOVERY_VERIFY_ALARM_NAME,
+      PORTAL_RECOVERY_VERIFY_RETRY_MS
+    );
+    schedulePortalRecoveryVerificationTimer(PORTAL_RECOVERY_VERIFY_RETRY_MS);
+  }
+}
+
+async function schedulePortalRecoveryVerification(delayMs = PORTAL_RECOVERY_VERIFY_DELAY_MS): Promise<void> {
+  if (portalRecoveryVerificationInFlight) {
+    portalRecoveryVerificationFollowUpRequested = true;
+    return;
+  }
+  schedulePortalRecoveryVerificationTimer(delayMs);
+  await schedulePortalRecoveryAlarm(PORTAL_RECOVERY_VERIFY_ALARM_NAME, delayMs);
+}
+
+function schedulePortalRecoveryVerificationTimer(delayMs: number): void {
+  const dueAt = Date.now() + Math.max(0, delayMs);
+  if (portalRecoveryVerificationTimer && portalRecoveryVerificationDueAt <= dueAt + 50) {
+    return;
+  }
+  clearPortalRecoveryVerificationTimer();
+  portalRecoveryVerificationDueAt = dueAt;
+  portalRecoveryVerificationTimer = setTimeout(() => {
+    portalRecoveryVerificationTimer = undefined;
+    portalRecoveryVerificationDueAt = 0;
+    runBestEffort(runIfExtensionEnabled(runPortalRecoveryVerification));
+  }, Math.max(0, dueAt - Date.now()));
+}
+
+function clearPortalRecoveryVerificationTimer(): void {
+  if (portalRecoveryVerificationTimer) {
+    clearTimeout(portalRecoveryVerificationTimer);
+    portalRecoveryVerificationTimer = undefined;
+  }
+  portalRecoveryVerificationDueAt = 0;
+}
+
+async function schedulePortalRecoveryCleanup(delayMs = PORTAL_RECOVERY_SESSION_TTL_MS): Promise<void> {
+  await schedulePortalRecoveryAlarm(
+    PORTAL_RECOVERY_CLEANUP_ALARM_NAME,
+    delayMs
+  );
+}
+
+async function schedulePortalRecoveryAlarm(name: string, delayMs: number): Promise<void> {
+  const when = Date.now() + Math.max(0, delayMs);
+  let existing: chrome.alarms.Alarm | undefined;
+  try {
+    existing = chrome.alarms?.get ? await chrome.alarms.get(name) : undefined;
+  } catch {
+    existing = undefined;
+  }
+  // Never postpone an earlier reconciliation. Repeated token headers and
+  // popup openings therefore coalesce into one bounded verification pass.
+  if (existing && existing.scheduledTime <= when + 250) return;
+  await chrome.alarms.create(name, { when });
+}
+
+async function clearPortalRecoveryAlarms(): Promise<void> {
+  clearPortalRecoveryVerificationTimer();
+  await Promise.allSettled([
+    chrome.alarms?.clear?.(PORTAL_RECOVERY_CLEANUP_ALARM_NAME),
+    chrome.alarms?.clear?.(PORTAL_RECOVERY_VERIFY_ALARM_NAME)
+  ]);
 }
 
 async function storeCapturedToken(
@@ -4661,7 +5013,7 @@ async function getSafeApiErrorMessage(response: Response): Promise<string> {
 }
 
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
-  return [...new Map(items.map((item) => [normalizeActivationItemId(item.id), item])).values()];
+  return [...new Map(items.map((item) => [normalizeActivationItemId(getActivationItemIdentity(item)), item])).values()];
 }
 
 function getApiErrorMessage(payload: unknown, response?: Response): string | undefined {

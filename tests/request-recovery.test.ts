@@ -90,6 +90,38 @@ describe("activation portal access recovery", () => {
     expect(merged.errors).toEqual([]);
   });
 
+  test("replaces a legacy recovery result with its tenant-scoped retry outcome", () => {
+    const initial: ActivationResponse = {
+      success: false,
+      results: [{
+        itemId: "tenant:tenant-one:pimGroup:group-1:member",
+        itemName: "Intune operators",
+        success: false,
+        error: "Refresh required",
+        accessRecoveryTarget: "pimGroup"
+      }],
+      errors: []
+    };
+    initial.errors = initial.results;
+
+    const merged = mergeRetriedActivationResponse(initial, {
+      success: true,
+      results: [{
+        itemId: "pimGroup:group-1:member",
+        itemName: "Intune operators",
+        success: true,
+        requestId: "request-after-refresh"
+      }],
+      errors: []
+    });
+
+    expect(merged).toMatchObject({
+      success: true,
+      results: [{ success: true, requestId: "request-after-refresh" }],
+      errors: []
+    });
+  });
+
   test("keeps recovery metadata when user interaction is still required", () => {
     const replaced = replaceAccessRecoveryErrors(initialResponse, "Finish Microsoft sign-in and retry.");
 

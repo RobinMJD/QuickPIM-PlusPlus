@@ -8,6 +8,11 @@ import {
   getDisplayName,
   mergeImportedSettings,
   mergeSettings,
+  migrateLegacyAliasesByItemId,
+  migrateLegacyFavoriteItemIds,
+  migrateLegacyItemSettingsForItems,
+  migrateLegacyUsageStatsByItemId,
+  recordActivityResults,
   recordActivations,
   sortItems
 } from "../src/lib/settings";
@@ -28,7 +33,11 @@ import {
   MAX_USER_JUSTIFICATION_LENGTH,
   formatJustificationForActivationRequest
 } from "../src/lib/justifications";
-import { getActivationItemTypeFromIdentity } from "../src/lib/activationIdentity";
+import {
+  activationItemIdentitiesMatch,
+  getActivationItemIdentity,
+  getActivationItemTypeFromIdentity
+} from "../src/lib/activationIdentity";
 import { buildActivationItemLookup, normalizeActivationResponse } from "../src/lib/popupModel";
 import type { ActivationItem, QuickPimBundle, QuickPimSettings } from "../src/lib/types";
 
@@ -50,6 +59,17 @@ const baseSettings: QuickPimSettings = {
 };
 
 describe("popup response and identity safety", () => {
+  test("matches a legacy identity to one tenant-scoped identity without crossing known tenants", () => {
+    expect(activationItemIdentitiesMatch(
+      "directoryRole:reader:/",
+      "tenant:tenant-one:directoryRole:reader:/"
+    )).toBe(true);
+    expect(activationItemIdentitiesMatch(
+      "tenant:tenant-one:directoryRole:reader:/",
+      "tenant:tenant-two:directoryRole:reader:/"
+    )).toBe(false);
+  });
+
   test("deduplicates activation results and treats conflicting duplicates as failures", () => {
     const response = normalizeActivationResponse({
       success: true,
@@ -345,6 +365,154 @@ describe("settings helpers", () => {
     expect(getDisplayName(tenantOneItem, tenantSettings)).toBe("Tenant one reader");
     expect(getDisplayName(tenantTwoItem, tenantSettings)).toBe("Global Reader");
     expect(sortItems([tenantTwoItem, tenantOneItem], tenantSettings, "name")[0]).toMatchObject({ tenantId: "tenant-one" });
+  });
+
+  test("migrates a unique legacy alias to the tenant-scoped item identity", () => {
+    const tenantGroup = { ...items[1], tenantId: "tenant-one" };
+    const migrated = migrateLegacyAliasesByItemId(
+      { "pimGroup:group-1:member": "Daily privileged group" },
+      [tenantGroup]
+    );
+
+    expect(migrated).toEqual({
+      "tenant:tenant-one:pimGroup:group-1:member": "Daily privileged group"
+    });
+    expect(getDisplayName(tenantGroup, { ...baseSettings, aliasesByItemId: migrated })).toBe("Daily privileged group");
+  });
+
+  test("migrates a unique legacy favorite and keeps it pinned for the current tenant", () => {
+    const tenantReader = { ...items[0], tenantId: "tenant-one" };
+    const tenantGroup = { ...items[1], tenantId: "tenant-one" };
+    const migrated = migrateLegacyItemSettingsForItems(
+      {
+        ...baseSettings,
+        favoriteItemIds: ["directoryRole:reader:/"]
+      },
+      [tenantGroup, tenantReader]
+    );
+
+    expect(migrated.favoriteItemIds).toEqual(["tenant:tenant-one:directoryRole:reader:/"]);
+    expect(sortItems([tenantGroup, tenantReader], migrated, "name")[0]).toEqual(tenantReader);
+  });
+
+  test("does not migrate an ambiguous legacy favorite across tenants", () => {
+    const legacyFavorites = ["directoryRole:reader:/"];
+    const migrated = migrateLegacyFavoriteItemIds(legacyFavorites, [
+      { ...items[0], tenantId: "tenant-one" },
+      { ...items[0], tenantId: "tenant-two" }
+    ]);
+
+    expect(migrated).toBe(legacyFavorites);
+  });
+
+  test("does not migrate an ambiguous legacy alias across tenants", () => {
+    const tenantOneGroup = { ...items[1], tenantId: "tenant-one" };
+    const tenantTwoGroup = { ...items[1], tenantId: "tenant-two" };
+    const aliases = { "pimGroup:group-1:member": "Ambiguous group" };
+
+    expect(migrateLegacyAliasesByItemId(aliases, [tenantOneGroup, tenantTwoGroup])).toBe(aliases);
+  });
+
+  test("migrates legacy usage to a unique tenant identity without losing per-device counts", () => {
+    const tenantReader = { ...items[0], tenantId: "tenant-one" };
+    const migrated = migrateLegacyUsageStatsByItemId({
+      "directoryRole:reader:/": {
+        activationCount: 3,
+        lastUsedAt: "2026-05-17T10:00:00.000Z"
+      },
+      "tenant:tenant-one:directoryRole:reader:/": {
+        activationCount: 1,
+        lastUsedAt: "2026-05-18T10:00:00.000Z",
+        byInstallationId: {
+          "device-one": { activationCount: 1, lastUsedAt: "2026-05-18T10:00:00.000Z" }
+        }
+      }
+    }, [tenantReader]);
+
+    expect(migrated).toEqual({
+      "tenant:tenant-one:directoryRole:reader:/": {
+        activationCount: 4,
+        legacyActivationCount: 3,
+        lastUsedAt: "2026-05-18T10:00:00.000Z",
+        byInstallationId: {
+          "device-one": { activationCount: 1, lastUsedAt: "2026-05-18T10:00:00.000Z" }
+        }
+      }
+    });
+  });
+
+  test("does not migrate ambiguous legacy usage across tenants", () => {
+    const usage = { "directoryRole:reader:/": { activationCount: 3 } };
+    expect(migrateLegacyUsageStatsByItemId(usage, [
+      { ...items[0], tenantId: "tenant-one" },
+      { ...items[0], tenantId: "tenant-two" }
+    ])).toBe(usage);
+  });
+
+  test("migrates bundle and history item IDs only when the tenant target is unambiguous", () => {
+    const tenantReader = { ...items[0], tenantId: "tenant-one" };
+    const settings = {
+      ...baseSettings,
+      bundles: [{ id: "bundle-tenant", name: "Tenant work", itemIds: [items[0].id] }],
+      activityHistory: [{
+        id: "activity-tenant",
+        action: "activate" as const,
+        result: "success" as const,
+        itemId: items[0].id,
+        itemName: items[0].displayName,
+        itemType: items[0].type,
+        tenantId: "tenant-one",
+        requestedAt: "2026-05-18T12:00:00.000Z"
+      }],
+      activationHistory: [{
+        id: "activation-tenant",
+        itemId: items[0].id,
+        itemName: items[0].displayName,
+        itemType: items[0].type,
+        tenantId: "tenant-one",
+        activatedAt: "2026-05-18T12:00:00.000Z"
+      }]
+    };
+
+    const migrated = migrateLegacyItemSettingsForItems(settings, [tenantReader]);
+    const canonical = getActivationItemIdentity(tenantReader);
+    expect(migrated.bundles[0].itemIds).toEqual([canonical]);
+    expect(migrated.activityHistory[0].itemId).toBe(canonical);
+    expect(migrated.activationHistory[0].itemId).toBe(canonical);
+
+    const ambiguous = migrateLegacyItemSettingsForItems(settings, [
+      tenantReader,
+      { ...tenantReader, tenantId: "tenant-two" }
+    ]);
+    expect(ambiguous.bundles[0].itemIds).toEqual([items[0].id]);
+    expect(ambiguous.activityHistory[0].itemId).toBe(canonical);
+  });
+
+  test("records new tenant activity with the tenant-scoped item identity", () => {
+    const tenantReader = { ...items[0], tenantId: "tenant-one" };
+    const updated = recordActivityResults(baseSettings, {
+      action: "activate",
+      items: [tenantReader],
+      response: {
+        success: true,
+        results: [{ itemId: items[0].id, itemName: items[0].displayName, success: true }],
+        errors: []
+      },
+      requestedAt: "2026-05-18T12:00:00.000Z",
+      completedAt: "2026-05-18T12:00:01.000Z"
+    });
+
+    expect(updated.activityHistory[0].itemId).toBe(getActivationItemIdentity(tenantReader));
+  });
+
+  test("preserves an existing tenant-scoped alias while removing its redundant legacy key", () => {
+    const tenantGroup = { ...items[1], tenantId: "tenant-one" };
+    expect(migrateLegacyAliasesByItemId({
+      "pimGroup:group-1:member": "Legacy alias",
+      "tenant:tenant-one:pimGroup:group-1:member": "Tenant alias"
+    }, [tenantGroup])).toEqual({
+      "tenant:tenant-one:pimGroup:group-1:member": "Tenant alias"
+    });
   });
 
   test("sorts by name, last use, and activation count", () => {

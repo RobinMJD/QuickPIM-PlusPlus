@@ -26,7 +26,9 @@ describe("popup draft storage", () => {
         ticketSystem: " ServiceNow ",
         ticketNumber: " INC-123 ",
         isActivationReviewOpen: true,
-        requestMode: "deactivate"
+        requestMode: "deactivate",
+        tenantId: " Tenant-One ",
+        principalId: " Principal-One "
       },
       now
     );
@@ -43,8 +45,29 @@ describe("popup draft storage", () => {
       ticketSystem: "ServiceNow",
       ticketNumber: "INC-123",
       isActivationReviewOpen: true,
-      requestMode: "deactivate"
+      requestMode: "deactivate",
+      tenantId: "Tenant-One",
+      principalId: "Principal-One"
     });
+  });
+
+  test("does not retain account identity when no request selection is stored", () => {
+    expect(sanitizePopupDraft({
+      updatedAt: now,
+      tab: "pimGroup",
+      search: "operators",
+      selectedIds: [],
+      tenantId: "tenant-one",
+      principalId: "principal-one"
+    }, now)).not.toHaveProperty("tenantId");
+    expect(sanitizePopupDraft({
+      updatedAt: now,
+      tab: "pimGroup",
+      search: "operators",
+      selectedIds: [],
+      tenantId: "tenant-one",
+      principalId: "principal-one"
+    }, now)).not.toHaveProperty("principalId");
   });
 
   test("drops expired or empty drafts", () => {

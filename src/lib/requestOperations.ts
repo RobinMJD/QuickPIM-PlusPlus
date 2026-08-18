@@ -13,7 +13,13 @@ import type {
   TrackedPimRequestStatus
 } from "./types";
 import { createStorageMutationLock } from "./storageMutation";
-import { normalizeActivationItemId } from "./activationIdentity";
+import {
+  activationItemIdentitiesMatch,
+  getActivationItemIdentity,
+  getTenantIdFromActivationItemIdentity,
+  getUnscopedActivationItemIdentity,
+  normalizeActivationItemId
+} from "./activationIdentity";
 import { sanitizeTrackedRequestStore } from "./requestTracking";
 
 export const REQUEST_OPERATIONS_LOCAL_KEY = "quickPimRequestOperations.v2";
@@ -86,6 +92,13 @@ export async function beginRequestOperation(
 ): Promise<boolean> {
   const storage = options.storage || chrome.storage.local;
   const now = options.now ?? Date.now();
+  const normalizedTenantId = normalizeOptionalText(operation.tenantId).toLowerCase();
+  const embeddedTenantIds = new Set(operation.itemIds
+    .map(getTenantIdFromActivationItemIdentity)
+    .filter((tenantId): tenantId is string => Boolean(tenantId)));
+  if (embeddedTenantIds.size > 1 || (normalizedTenantId && embeddedTenantIds.size && !embeddedTenantIds.has(normalizedTenantId))) {
+    throw new Error("Every request operation item must belong to the same Microsoft tenant.");
+  }
   const items = operation.items?.length
     ? operation.items
     : operation.itemIds.flatMap((itemId) => createPreparedOperationItem(itemId, now, operation.tenantId, operation.principalId) || []);
@@ -102,12 +115,12 @@ export async function beginRequestOperation(
       return current;
     }
 
-    const normalizedItemIds = new Set(operation.itemIds.map(normalizeActivationItemId));
     const conflicting = current.find((candidate) =>
       (candidate.state === "running" || candidate.state === "uncertain")
       && tenantBoundariesMatch(candidate.tenantId, operation.tenantId)
       && tenantBoundariesMatch(candidate.principalId, operation.principalId)
-      && candidate.itemIds.some((itemId) => normalizedItemIds.has(normalizeActivationItemId(itemId)))
+      && candidate.itemIds.some((itemId) =>
+        operation.itemIds.some((requestedItemId) => activationItemIdentitiesMatch(itemId, requestedItemId)))
     );
     if (conflicting) {
       throw new Error("A QuickPIM++ request for one or more selected items is already in progress.");
@@ -131,7 +144,7 @@ export async function beginRequestOperation(
 export function createRequestOperationItems(items: ActivationItem[], now = Date.now()): RequestOperationItemRecord[] {
   const unique = new Map<string, RequestOperationItemRecord>();
   for (const item of items) {
-    const itemId = normalizeActivationItemId(item.id);
+    const itemId = normalizeActivationItemId(getActivationItemIdentity(item));
     if (unique.has(itemId)) continue;
     unique.set(itemId, {
       itemId,
@@ -155,7 +168,8 @@ export function getRequestOperationFingerprint(operation: RequestOperationIdenti
     tenantId: normalizeOptionalText(operation.tenantId).toLowerCase() || null,
     principalId: normalizeOptionalText(operation.principalId).toLowerCase() || null,
     sourceInstallationId: normalizeOptionalText(operation.sourceInstallationId).toLowerCase() || null,
-    itemIds: [...new Set(operation.itemIds.map(normalizeActivationItemId))].sort(),
+    itemIds: [...new Set(operation.itemIds.map((itemId) =>
+      normalizeOperationItemIdentity(itemId, operation.tenantId)))].sort(),
     targets: [...new Set(operation.targets)].sort(),
     durationHours: operation.durationHours ?? null,
     justification: normalizeFingerprintText(operation.justification) || null,
@@ -170,7 +184,7 @@ export function trackedRequestMatchesOperation(
 ): boolean {
   if (
     request.action !== operation.action
-    || !operation.itemIds.map(normalizeActivationItemId).includes(normalizeActivationItemId(request.itemId))
+    || !operation.itemIds.some((itemId) => activationItemIdentitiesMatch(itemId, request.itemId))
     || !tenantBoundariesMatch(request.tenantId, operation.tenantId)
     || !tenantBoundariesMatch(request.principalId, operation.principalId)
   ) {
@@ -206,7 +220,6 @@ export async function updateRequestOperationItem(
 ): Promise<void> {
   const storage = options.storage || chrome.storage.local;
   const now = options.now ?? Date.now();
-  const normalizedItemId = normalizeActivationItemId(itemId);
   let operationFound = false;
   let itemFound = false;
   await mutateOperations(storage, now, (current) => current.map((operation) => {
@@ -216,7 +229,7 @@ export async function updateRequestOperationItem(
       ? operation.items
       : operation.itemIds.flatMap((candidate) => createPreparedOperationItem(candidate, operation.startedAt, operation.tenantId, operation.principalId) || []);
     const items = existingItems.map((item) => {
-      if (normalizeActivationItemId(item.itemId) !== normalizedItemId) return item;
+      if (!activationItemIdentitiesMatch(item.itemId, itemId)) return item;
       itemFound = true;
       return { ...item, ...update, updatedAt: now };
     });
@@ -241,16 +254,12 @@ export async function completeRequestOperation(
   const now = options.now ?? Date.now();
   await mutateOperations(storage, now, (current) => current.map((operation) => {
     if (operation.id !== id) return operation;
-    const resultsById = new Map<string, ActivationResult[]>();
-    for (const result of response.results) {
-      const itemId = normalizeActivationItemId(result.itemId);
-      resultsById.set(itemId, [...(resultsById.get(itemId) || []), result]);
-    }
     const items = (operation.items?.length
       ? operation.items
       : operation.itemIds.flatMap((itemId) => createPreparedOperationItem(itemId, operation.startedAt, operation.tenantId, operation.principalId) || []))
       .map((item) => {
-        const matches = resultsById.get(normalizeActivationItemId(item.itemId)) || [];
+        const matches = response.results.filter((result) =>
+          activationItemIdentitiesMatch(item.itemId, result.itemId));
         const result = matches[0];
         if (!result || matches.length !== 1) {
           const error = !result
@@ -343,9 +352,11 @@ export function sanitizeRequestOperations(value: unknown, now = Date.now()): Req
 
 export function selectNextRequestOperation(
   operations: RequestOperationRecord[],
-  excludedIds: ReadonlySet<string> = new Set()
+  excludedIds: ReadonlySet<string> = new Set(),
+  identity: { tenantId?: string; principalId?: string } = {}
 ): RequestOperationRecord | undefined {
-  const available = operations.filter((operation) => !excludedIds.has(operation.id));
+  const available = operations.filter((operation) =>
+    !excludedIds.has(operation.id) && requestOperationMatchesIdentity(operation, identity));
   const terminal = available
     .filter((operation) => operation.state === "complete" || operation.state === "error")
     .sort(compareOperationAge)[0];
@@ -418,10 +429,16 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     || (terminalAt !== undefined && (terminalAt < startedAt || terminalAt > now + MAX_FUTURE_CLOCK_SKEW_MS))
     || (nextActionAt !== undefined && (nextActionAt < startedAt || nextActionAt > now + REQUEST_OPERATION_TTL_MS))
   ) return undefined;
-  const itemIds = [...new Set(sanitizeStrings(value.itemIds, 100, 512).map(normalizeActivationItemId))];
+  const rawItemIds = sanitizeStrings(value.itemIds, 100, 512).map(normalizeActivationItemId);
   const targets = sanitizeTargets(value.targets);
-  if (!itemIds.length || !targets.length) return undefined;
-  const tenantId = sanitizeOptionalId(value.tenantId);
+  if (!rawItemIds.length || !targets.length) return undefined;
+  const embeddedTenantIds = new Set(rawItemIds
+    .map(getTenantIdFromActivationItemIdentity)
+    .filter((tenantId): tenantId is string => Boolean(tenantId)));
+  if (embeddedTenantIds.size > 1) return undefined;
+  const tenantId = sanitizeOptionalId(value.tenantId) || [...embeddedTenantIds][0];
+  if (tenantId && embeddedTenantIds.size && !embeddedTenantIds.has(tenantId.toLowerCase())) return undefined;
+  const itemIds = [...new Set(rawItemIds.map((itemId) => normalizeOperationItemIdentity(itemId, tenantId)))];
   const principalId = sanitizeOptionalId(value.principalId);
   const response = sanitizeActivationResponse(value.response);
   const items = sanitizeRequestOperationItems(value.items, itemIds, startedAt, tenantId, principalId, response, now);
@@ -470,8 +487,9 @@ function sanitizeRequestOperationItems(
   const byId = new Map<string, RequestOperationItemRecord>();
   for (const candidate of values.slice(0, 100)) {
     if (!isRecord(candidate) || typeof candidate.itemId !== "string") continue;
-    const itemId = normalizeActivationItemId(candidate.itemId.slice(0, 512));
-    if (!itemIds.includes(itemId) || !isOperationItemState(candidate.state)) continue;
+    const itemId = normalizeOperationItemIdentity(candidate.itemId.slice(0, 512), operationTenantId);
+    if (!itemIds.some((operationItemId) => activationItemIdentitiesMatch(operationItemId, itemId))
+      || !isOperationItemState(candidate.state)) continue;
     const updatedAt = sanitizeEpochMilliseconds(candidate.updatedAt);
     if (updatedAt === undefined || updatedAt > now + MAX_FUTURE_CLOCK_SKEW_MS || updatedAt < startedAt) continue;
     const itemType = sanitizeActivationItemType(candidate.itemType) || inferActivationItemType(itemId);
@@ -496,16 +514,19 @@ function sanitizeRequestOperationItems(
       ...(typeof candidate.error === "string" ? { error: candidate.error.slice(0, 1_000) } : {})
     });
   }
-  const responseById = new Map((response?.results || []).map((result) => [normalizeActivationItemId(result.itemId), result]));
   return itemIds.flatMap((itemId) => {
     const existing = byId.get(itemId);
     if (existing) return [existing];
     const prepared = createPreparedOperationItem(itemId, startedAt, operationTenantId, operationPrincipalId);
     if (!prepared) return [];
-    const result = responseById.get(itemId);
+    const matchingResults = (response?.results || []).filter((candidate) =>
+      activationItemIdentitiesMatch(itemId, candidate.itemId));
+    const result = matchingResults.length === 1 ? matchingResults[0] : undefined;
     if (!result) {
       if (!response) return [prepared];
-      const error = "The stored background response omitted this requested item. Check Microsoft PIM before retrying.";
+      const error = matchingResults.length > 1
+        ? "The stored background response contained duplicate results for this item. Check Microsoft PIM before retrying."
+        : "The stored background response omitted this requested item. Check Microsoft PIM before retrying.";
       return [{
         ...prepared,
         state: "uncertain",
@@ -664,6 +685,21 @@ function tenantBoundariesMatch(left: string | undefined, right: string | undefin
   if (!left && !right) return true;
   if (!left || !right) return false;
   return left.toLowerCase() === right.toLowerCase();
+}
+
+function requestOperationMatchesIdentity(
+  operation: RequestOperationRecord,
+  identity: { tenantId?: string; principalId?: string }
+): boolean {
+  if (identity.tenantId && !tenantBoundariesMatch(operation.tenantId, identity.tenantId)) return false;
+  if (identity.principalId && !tenantBoundariesMatch(operation.principalId, identity.principalId)) return false;
+  return true;
+}
+
+function normalizeOperationItemIdentity(itemId: string, tenantId?: string): string {
+  const normalized = normalizeActivationItemId(itemId);
+  if (!tenantId || getTenantIdFromActivationItemIdentity(normalized)) return normalized;
+  return `tenant:${tenantId.trim().toLowerCase()}:${getUnscopedActivationItemIdentity(normalized)}`;
 }
 
 function compareOperationAge(left: RequestOperationRecord, right: RequestOperationRecord): number {

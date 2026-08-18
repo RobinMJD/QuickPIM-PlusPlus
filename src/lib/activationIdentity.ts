@@ -51,6 +51,29 @@ export function normalizeActivationItemId(value: string): string {
   return `${type}:${trimmed.slice(separator + 1).toLowerCase()}`;
 }
 
+export function getTenantIdFromActivationItemIdentity(value: string): string | undefined {
+  const tenantMatch = /^tenant:([^:]+):(.+)$/u.exec(normalizeActivationItemId(value));
+  return tenantMatch?.[1];
+}
+
+export function getUnscopedActivationItemIdentity(value: string): string {
+  const normalized = normalizeActivationItemId(value);
+  const tenantMatch = /^tenant:[^:]+:(.+)$/u.exec(normalized);
+  return tenantMatch?.[1] || normalized;
+}
+
+export function activationItemIdentitiesMatch(left: string, right: string): boolean {
+  const normalizedLeft = normalizeActivationItemId(left);
+  const normalizedRight = normalizeActivationItemId(right);
+  const leftTenantId = getTenantIdFromActivationItemIdentity(normalizedLeft);
+  const rightTenantId = getTenantIdFromActivationItemIdentity(normalizedRight);
+
+  if (leftTenantId && rightTenantId) {
+    return normalizedLeft === normalizedRight;
+  }
+  return getUnscopedActivationItemIdentity(normalizedLeft) === getUnscopedActivationItemIdentity(normalizedRight);
+}
+
 export function getActivationItemTypeFromIdentity(value: string): AccessSetupTarget | undefined {
   const normalized = normalizeActivationItemId(value);
   const withoutTenant = normalized.startsWith("tenant:")

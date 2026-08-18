@@ -19,7 +19,7 @@ export type QuickPimMessage =
   | { action: "getPortalRecoveryStatus" }
   | { action: "focusPortalRecoveryTabs" }
   | { action: "openPortalRecoveryTabs"; targets: AccessSetupTarget[] }
-  | { action: "closePortalRecoveryTabs"; targets: AccessSetupTarget[] }
+  | { action: "closePortalRecoveryTabs"; targets: AccessSetupTarget[]; expectedJourneyCreatedAt: number }
   | { action: "clearToken" }
   | { action: "resetExtensionData" }
   | { action: "getActivationItems"; targets?: AccessSetupTarget[] }
@@ -32,6 +32,7 @@ export type QuickPimMessage =
   | { action: "restoreSettingsBackup"; settings: QuickPimSettings; store: TrackedPimRequestStore }
   | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
+  | { action: "initializeNotificationDelivery" }
   | { action: "dismissRequestOperations"; operationIds: string[] }
   | { action: "capturePortalTokens"; tokens: string[]; source?: string }
   | {
@@ -64,6 +65,7 @@ const SIMPLE_ACTIONS = new Set([
   "clearToken",
   "resetExtensionData",
   "getRequestOperations",
+  "initializeNotificationDelivery",
   "clearTrackedRequests"
 ]);
 const TARGETED_FETCH_ACTIONS = new Set(["getActivationItems", "getActiveItems", "getActivationSnapshot"]);
@@ -158,12 +160,27 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
     return { action: "dismissBrowserSyncReminder", mode: message.mode };
   }
 
-  if (message.action === "openPortalRecoveryTabs" || message.action === "closePortalRecoveryTabs") {
+  if (message.action === "openPortalRecoveryTabs") {
     const targets = sanitizeTargets(message.targets);
     if (!targets?.length) {
       throw new Error("Portal recovery targets must not be empty.");
     }
-    return { action: message.action, targets };
+    return { action: "openPortalRecoveryTabs", targets };
+  }
+
+  if (message.action === "closePortalRecoveryTabs") {
+    const targets = sanitizeTargets(message.targets);
+    if (!targets?.length) {
+      throw new Error("Portal recovery targets must not be empty.");
+    }
+    if (!Number.isSafeInteger(message.expectedJourneyCreatedAt) || Number(message.expectedJourneyCreatedAt) <= 0) {
+      throw new Error("Portal recovery close requests require a valid journey identifier.");
+    }
+    return {
+      action: "closePortalRecoveryTabs",
+      targets,
+      expectedJourneyCreatedAt: Number(message.expectedJourneyCreatedAt)
+    };
   }
 
   if (message.action === "capturePortalTokens") {

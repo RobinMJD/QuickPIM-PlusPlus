@@ -169,9 +169,10 @@ describe("runtime message validation", () => {
       action: "openPortalRecoveryTabs",
       targets: ["pimGroup", "azureRole"]
     });
-    expect(validateQuickPimMessage({ action: "closePortalRecoveryTabs", targets: ["directoryRole"] })).toEqual({
+    expect(validateQuickPimMessage({ action: "closePortalRecoveryTabs", targets: ["directoryRole"], expectedJourneyCreatedAt: 1234 })).toEqual({
       action: "closePortalRecoveryTabs",
-      targets: ["directoryRole"]
+      targets: ["directoryRole"],
+      expectedJourneyCreatedAt: 1234
     });
     expect(validateQuickPimMessage({ action: "getPortalRecoveryStatus" })).toEqual({ action: "getPortalRecoveryStatus" });
     expect(validateQuickPimMessage({ action: "focusPortalRecoveryTabs" })).toEqual({ action: "focusPortalRecoveryTabs" });
@@ -225,6 +226,8 @@ describe("runtime message validation", () => {
     expect(() => validateQuickPimMessage({ action: "renameBrowserSyncDevice", installationId: "abcd1234", name: "" })).toThrow(/between 1 and 60/i);
     expect(() => validateQuickPimMessage({ action: "dismissBrowserSyncReminder", mode: "later" })).toThrow(/invalid/i);
     expect(() => validateQuickPimMessage({ action: "openPortalRecoveryTabs", targets: [] })).toThrow(/must not be empty/i);
+    expect(() => validateQuickPimMessage({ action: "closePortalRecoveryTabs", targets: ["pimGroup"] })).toThrow(/journey identifier/i);
+    expect(() => validateQuickPimMessage({ action: "closePortalRecoveryTabs", targets: ["pimGroup"], expectedJourneyCreatedAt: -1 })).toThrow(/journey identifier/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: "abc" })).toThrow(/tokens/i);
     expect(() => validateQuickPimMessage({ action: "capturePortalTokens", tokens: ["x".repeat(9000)] })).toThrow(/token/i);
     expect(() => validateQuickPimMessage({ action: "refreshTrackedRequests", requestIds: "request-1" })).toThrow(/identifiers/i);

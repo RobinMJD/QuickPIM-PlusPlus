@@ -315,6 +315,7 @@ export interface PortalRecoveryOpenResult {
   reusedCount: number;
   managedCount: number;
   grouped: boolean;
+  journeyCreatedAt?: number;
 }
 
 export interface PortalRecoveryStatus {

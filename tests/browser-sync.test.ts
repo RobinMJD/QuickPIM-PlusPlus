@@ -100,6 +100,19 @@ class OneShotMinuteWriteQuotaStorage extends WriteCountingStorage {
   }
 }
 
+class OneShotCapacityQuotaStorage extends WriteCountingStorage {
+  rejectNextWrite = true;
+
+  override async set(items: Record<string, unknown>): Promise<void> {
+    this.writes += 1;
+    if (this.rejectNextWrite) {
+      this.rejectNextWrite = false;
+      throw new Error("Resource::kQuotaBytes quota exceeded.");
+    }
+    await MemoryStorage.prototype.set.call(this, items);
+  }
+}
+
 class QuotaStorage extends MemoryStorage {
   maxBytesInUse = 0;
 
@@ -430,6 +443,36 @@ describe("native browser sync", () => {
     }
   });
 
+  test("keeps only the current committed snapshot generation after repeated changes", async () => {
+    const sync = new QuotaStorage();
+    const local = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
+
+    for (let index = 0; index < 6; index += 1) {
+      await mutateSettingsInStorage(local, (current) => ({
+        ...current,
+        aliasesByItemId: {
+          ...current.aliasesByItemId,
+          [`directoryRole:${index}:/`]: `Role ${index}`
+        }
+      }));
+      const status = await synchronizeBrowserData({
+        local,
+        sync,
+        distribution: edgeStore,
+        now: 1_000 + index,
+        platform: "Windows"
+      });
+      expect(status.lastError).toBeUndefined();
+    }
+
+    const currentGeneration = (sync.data[BROWSER_SYNC_MANIFEST_KEY] as { generation: string }).generation;
+    const generations = new Set(Object.keys(sync.data)
+      .filter((key) => key.startsWith("quickPimSync.chunk.v1."))
+      .map((key) => key.slice("quickPimSync.chunk.v1.".length, key.lastIndexOf("."))));
+    expect([...generations]).toEqual([currentGeneration]);
+    expect(sync.maxBytesInUse).toBeLessThanOrEqual(102_400);
+  });
+
   test("batches a multi-chunk snapshot into a bounded number of browser writes", async () => {
     const sync = new WriteCountingStorage();
     const settings = structuredClone(DEFAULT_SETTINGS);
@@ -481,6 +524,26 @@ describe("native browser sync", () => {
     expect(recovered.writeRetryAt).toBeUndefined();
   });
 
+  test("turns the Edge byte-capacity quota into a safe automatic recovery cooldown", async () => {
+    const sync = new OneShotCapacityQuotaStorage();
+    const local = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
+
+    const rejected = await synchronizeBrowserData({ local, sync, distribution: edgeStore, now: 1_000, platform: "Windows" });
+    const attemptsAfterRejection = sync.writes;
+
+    expect(rejected.lastError).toMatch(/cleaning superseded cloud snapshots.*storage capacity/i);
+    expect(rejected.lastError).not.toMatch(/Resource::kQuotaBytes/i);
+    expect(rejected.writeRetryAt).toBe(601_000);
+
+    const deferred = await synchronizeBrowserData({ local, sync, distribution: edgeStore, now: 2_000, platform: "Windows" });
+    expect(sync.writes).toBe(attemptsAfterRejection);
+    expect(deferred.lastError).toMatch(/retry automatically/i);
+
+    const recovered = await synchronizeBrowserData({ local, sync, distribution: edgeStore, now: 601_000, platform: "Windows" });
+    expect(recovered.lastError).toBeUndefined();
+    expect(recovered.writeRetryAt).toBeUndefined();
+  });
+
   test("replaces a previously persisted raw write-quota error with user-facing recovery text", async () => {
     const local = new MemoryStorage({
       [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS),
@@ -500,6 +563,27 @@ describe("native browser sync", () => {
 
     expect(status.lastError).toMatch(/temporarily delaying uploads/i);
     expect(status.lastError).not.toMatch(/MAX_WRITE_OPERATIONS/i);
+  });
+
+  test("replaces a persisted raw Edge capacity-quota error with recovery guidance", async () => {
+    const local = new MemoryStorage({
+      [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS),
+      [BROWSER_SYNC_LOCAL_STATE_KEY]: {
+        version: 1,
+        enabled: true,
+        installationId: "existing-installation",
+        deviceName: "Admin workstation",
+        reminderMode: "daily",
+        categoryHashes: {},
+        categoryUpdatedAt: {},
+        lastError: "Resource::kQuotaBytes quota exceeded."
+      }
+    });
+
+    const status = await getBrowserSyncStatus({ local, sync: new MemoryStorage(), distribution: edgeStore, now: 1_000, platform: "Windows" });
+
+    expect(status.lastError).toMatch(/cleaning superseded cloud snapshots.*storage capacity/i);
+    expect(status.lastError).not.toMatch(/Resource::kQuotaBytes/i);
   });
 
   test("removes only aged superseded generations before a reconciliation write", async () => {
@@ -1013,7 +1097,7 @@ describe("native browser sync", () => {
     expect(merged.activityHistory.map((entry) => entry.id)).toEqual(["new-event"]);
   });
 
-  test("retains recent prior chunks and preserves a concurrent upload until the cleanup grace period", async () => {
+  test("removes the committed predecessor while preserving an unrelated concurrent upload", async () => {
     const sync = new MemoryStorage();
     const local = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
     await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: 1_000, platform: "Windows" });
@@ -1026,7 +1110,7 @@ describe("native browser sync", () => {
     await local.set({ [SETTINGS_KEY]: edited });
     await synchronizeBrowserData({ local, sync, distribution: chromeStore, now: 2_000, platform: "Windows" });
 
-    expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${firstGeneration}.`))).toBe(true);
+    expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${firstGeneration}.`))).toBe(false);
     expect(sync.data[concurrentChunkKey]).toBe("pending");
     const currentGeneration = (sync.data[BROWSER_SYNC_MANIFEST_KEY] as { generation: string }).generation;
     expect(Object.keys(sync.data).some((key) => key.startsWith(`quickPimSync.chunk.v1.${currentGeneration}.`))).toBe(true);

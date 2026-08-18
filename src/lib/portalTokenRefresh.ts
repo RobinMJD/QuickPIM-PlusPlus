@@ -17,10 +17,12 @@ import type {
 
 export const ENTRA_PORTAL_TAB_PATTERN = "https://entra.microsoft.com/*";
 export const PORTAL_TOKEN_RECOVERY_WINDOW_MINUTES = 10;
-export const PORTAL_TAB_SCAN_TIMEOUT_MS = 8_000;
+// Keep the worst-case scan inside the popup's 17-second runtime-message budget:
+// two batches of four tabs at five seconds each, plus the bounded tab query.
+export const PORTAL_TAB_SCAN_TIMEOUT_MS = 5_000;
 export const PORTAL_TAB_SCAN_CONCURRENCY = 4;
 export const PORTAL_TAB_QUERY_TIMEOUT_MS = 2_000;
-export const PORTAL_TAB_SCAN_MAX_TABS = 64;
+export const PORTAL_TAB_SCAN_MAX_TABS = 8;
 export const PORTAL_TOKEN_SCAN_DIAGNOSTIC_KEY = "quickPimPortalTokenScanDiagnostic.v1";
 
 export interface ChromeTabsLike {

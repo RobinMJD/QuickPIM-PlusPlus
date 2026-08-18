@@ -62,6 +62,7 @@ import {
   getDefaultSortDirection,
   getScopeLabel,
   loadSettings,
+  migrateLegacyItemSettingsForItems,
   mutateSettingsViaBackground,
   sortItems
 } from "../lib/settings";
@@ -82,7 +83,7 @@ import { refreshTokenStatusFreshness } from "../lib/token";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { sanitizeErrorMessage } from "../lib/security";
 import {
-  activationItemMatchesIdentity,
+  activationItemIdentitiesMatch,
   getActivationItemIdentity,
   getActivationItemTypeFromIdentity,
   normalizeActivationItemId
@@ -264,13 +265,19 @@ async function waitForManagedPortalRecovery(
   targets: AccessSetupTarget[],
   baselineTokens: TokenStatus,
   isCurrentRun: () => boolean
-): Promise<{ tokens: TokenStatus; changedTargets: AccessSetupTarget[]; recoveryStatus: PortalRecoveryStatus }> {
+): Promise<{
+  tokens: TokenStatus;
+  changedTargets: AccessSetupTarget[];
+  recoveryStatus: PortalRecoveryStatus;
+  recoveryCompleted: boolean;
+}> {
   const baselineSignatures = Object.fromEntries(
     targets.map((target) => [target, getPortalRecoveryTokenSignature(baselineTokens, target)])
   ) as Partial<Record<AccessSetupTarget, string>>;
   let latestTokens = baselineTokens;
   let changedTargets: AccessSetupTarget[] = [];
   let recoveryStatus = emptyPortalRecoveryStatus();
+  let recoveryStatusObserved = false;
   const deadline = Date.now() + PORTAL_RECOVERY_WAIT_TIMEOUT_MS;
 
   while (isCurrentRun() && Date.now() < deadline) {
@@ -285,13 +292,17 @@ async function waitForManagedPortalRecovery(
       ]);
       latestTokens = nextTokens;
       recoveryStatus = nextRecoveryStatus;
+      recoveryStatusObserved = true;
     } catch {
       continue;
     }
     changedTargets = targets.filter((target) =>
       hasPortalRecoveryTokenChanged(target, baselineSignatures[target], latestTokens)
     );
-    if (changedTargets.length === targets.length) {
+    if (
+      changedTargets.length === targets.length
+      || (recoveryStatusObserved && recoveryStatus.state === "idle")
+    ) {
       break;
     }
     if (recoveryStatus.state === "interactionRequired") {
@@ -300,22 +311,29 @@ async function waitForManagedPortalRecovery(
   }
 
   if (changedTargets.length !== targets.length && recoveryStatus.state !== "interactionRequired") {
-    recoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
+    const finalRecoveryStatus = await readPortalRecoveryStatus(recoveryStatus);
+    recoveryStatusObserved ||= finalRecoveryStatus !== recoveryStatus;
+    recoveryStatus = finalRecoveryStatus;
   }
-  return { tokens: latestTokens, changedTargets, recoveryStatus };
+  return {
+    tokens: latestTokens,
+    changedTargets,
+    recoveryStatus,
+    recoveryCompleted: changedTargets.length === targets.length
+      || (recoveryStatusObserved && recoveryStatus.state === "idle")
+  };
 }
 
 function buildActivationFailureNotice(
   errors: ActivationResponse["errors"],
   activatableItems: Array<Pick<ActivationItem, "id" | "type">>
 ): ActivationFailureNotice {
-  const itemsById = new Map(activatableItems.map((item) => [item.id, item.type]));
   const recoveryTargets = new Set<RoleTab>();
   const formattedErrors = errors.map((errorItem) => {
     const rawError = errorItem.error || "";
     const formatted = formatActivationError(errorItem);
     const target = errorItem.accessRecoveryTarget
-      || itemsById.get(errorItem.itemId)
+      || findUniqueItemByIdentity(activatableItems, errorItem.itemId)?.type
       || inferRoleTabFromItemId(errorItem.itemId);
     if (
       target
@@ -379,6 +397,7 @@ function PopupApp() {
   const [dismissedIdentityMismatchDetail, setDismissedIdentityMismatchDetail] = useState<string | undefined>();
   const [isActivating, setIsActivating] = useState(false);
   const [requestMode, setRequestMode] = useState<PopupRequestMode | undefined>();
+  const [selectionIdentity, setSelectionIdentity] = useState<{ tenantId?: string; principalId?: string }>({});
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
@@ -392,11 +411,13 @@ function PopupApp() {
   const requestProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshRunId = useRef(0);
   const activeRefreshRunId = useRef<number | undefined>(undefined);
-  const manualRefreshInFlight = useRef(false);
+  const manualRefreshRunId = useRef<number | undefined>(undefined);
   const requestProgressRunId = useRef(0);
   const activationRequestInFlight = useRef(false);
   const selectedIdsRef = useRef(selectedIds);
   const requestModeRef = useRef(requestMode);
+  const selectionIdentityRef = useRef(selectionIdentity);
+  const restoredDraftSelectionNeedsValidation = useRef(false);
   const backgroundOperationIdRef = useRef<string | undefined>(undefined);
   const operationPollFailureCount = useRef(0);
   const ownedRequestOperationIds = useRef(new Set<string>());
@@ -406,11 +427,13 @@ function PopupApp() {
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
   const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
   const resolvedActivationIdentityKey = useRef<string | undefined>(undefined);
+  const itemSettingsMigrationFingerprint = useRef("");
 
   tokenStatusRef.current = tokenStatus;
   portalRecoveryStatusRef.current = portalRecoveryStatus;
   selectedIdsRef.current = selectedIds;
   requestModeRef.current = requestMode;
+  selectionIdentityRef.current = selectionIdentity;
 
   function publishPortalRecoveryStatus(nextStatus: PortalRecoveryStatus): void {
     portalRecoveryStatusRef.current = nextStatus;
@@ -624,6 +647,8 @@ function PopupApp() {
         }
         setRequestMode(undefined);
         setIsActivationReviewOpen(false);
+        selectionIdentityRef.current = {};
+        setSelectionIdentity({});
       }
       if (next.size && !requestMode && mode) {
         setRequestMode(mode);
@@ -631,6 +656,86 @@ function PopupApp() {
       return setsEqual(current, next) ? current : next;
     });
   }, [hasActivationDataLoaded, itemsById, requestMode, resolvedActivationTargets]);
+
+  useEffect(() => {
+    if (!hasActivationDataLoaded || !selectedIds.size || (!identityContext.tenantId && !identityContext.principalId)) {
+      return;
+    }
+    const storedIdentity = selectionIdentityRef.current;
+    const legacyDraftWithoutIdentity = restoredDraftSelectionNeedsValidation.current
+      && !storedIdentity.tenantId
+      && !storedIdentity.principalId;
+    const legacySelectionItems = legacyDraftWithoutIdentity
+      ? [...selectedIds].map((id) => getItemByPersistedId(itemsById, id))
+      : [];
+    const canBindLegacyDraftToCurrentIdentity = legacyDraftWithoutIdentity
+      && legacySelectionItems.length === selectedIds.size
+      && legacySelectionItems.every((item) => {
+        if (!item) {
+          return false;
+        }
+        const hasTenantEvidence = Boolean(item.tenantId && identityContext.tenantId);
+        const hasPrincipalEvidence = Boolean(item.principalId && identityContext.principalId);
+        const tenantMatches = !hasTenantEvidence
+          || item.tenantId!.toLowerCase() === identityContext.tenantId!.toLowerCase();
+        const principalMatches = !hasPrincipalEvidence
+          || item.principalId!.toLowerCase() === identityContext.principalId!.toLowerCase();
+        return (hasTenantEvidence || hasPrincipalEvidence) && tenantMatches && principalMatches;
+      });
+    const tenantMismatch = Boolean(
+      storedIdentity.tenantId
+      && identityContext.tenantId
+      && storedIdentity.tenantId.toLowerCase() !== identityContext.tenantId.toLowerCase()
+    );
+    const principalMismatch = Boolean(
+      storedIdentity.principalId
+      && identityContext.principalId
+      && storedIdentity.principalId.toLowerCase() !== identityContext.principalId.toLowerCase()
+    );
+    restoredDraftSelectionNeedsValidation.current = false;
+    if (canBindLegacyDraftToCurrentIdentity) {
+      const reboundIdentity = {
+        tenantId: identityContext.tenantId,
+        principalId: identityContext.principalId
+      };
+      selectionIdentityRef.current = reboundIdentity;
+      setSelectionIdentity(reboundIdentity);
+      return;
+    }
+    if (!legacyDraftWithoutIdentity && !tenantMismatch && !principalMismatch) {
+      return;
+    }
+
+    selectedIdsRef.current = new Set();
+    requestModeRef.current = undefined;
+    selectionIdentityRef.current = {};
+    setSelectedIds(new Set());
+    setRequestMode(undefined);
+    setSelectionIdentity({});
+    setIsActivationReviewOpen(false);
+    setJustification("");
+    setTicketSystem("");
+    setTicketNumber("");
+    setActivationFailureNotice(null);
+    setMessage("A saved request selection was cleared because it belonged to another or an unknown Microsoft account context.");
+    void flushPopupDraft({
+      selectedIds: [],
+      isActivationReviewOpen: false,
+      requestMode: undefined,
+      tenantId: undefined,
+      principalId: undefined,
+      justification: "",
+      ticketSystem: "",
+      ticketNumber: ""
+    });
+  }, [
+    hasActivationDataLoaded,
+    identityContext.principalId,
+    identityContext.tenantId,
+    itemsById,
+    selectedIds,
+    selectedIds.size
+  ]);
 
   useEffect(() => {
     if (visibleTabs.length && !visibleTabs.includes(tab)) {
@@ -675,6 +780,7 @@ function PopupApp() {
     justification,
     quickFilters,
     search,
+    selectionIdentity,
     selectedIds,
     sortDirection,
     sortMode,
@@ -735,7 +841,10 @@ function PopupApp() {
           ...ownedRequestOperationIds.current,
           ...reconciledRequestOperationIds.current
         ]);
-        const operation = selectNextRequestOperation(operations, excludedOperationIds);
+        const operation = selectNextRequestOperation(operations, excludedOperationIds, {
+          tenantId: identityContext.tenantId,
+          principalId: identityContext.principalId
+        });
         if (!operation) {
           return;
         }
@@ -747,6 +856,9 @@ function PopupApp() {
           setIsActivating(true);
           setRequestMode(operation.action);
           setIsActivationReviewOpen(true);
+          const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
+          selectionIdentityRef.current = operationIdentity;
+          setSelectionIdentity(operationIdentity);
           if (operation.durationHours !== undefined) {
             setDurationHours(operation.durationHours);
           }
@@ -802,7 +914,13 @@ function PopupApp() {
         window.clearTimeout(timer);
       }
     };
-  }, [hasActivationDataLoaded, isPopupDraftReady, itemsById]);
+  }, [
+    hasActivationDataLoaded,
+    identityContext.principalId,
+    identityContext.tenantId,
+    isPopupDraftReady,
+    itemsById
+  ]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -862,6 +980,10 @@ function PopupApp() {
         setTicketNumber(draft.ticketNumber);
         setIsActivationReviewOpen(draft.isActivationReviewOpen);
         setRequestMode(draft.requestMode);
+        const restoredIdentity = { tenantId: draft.tenantId, principalId: draft.principalId };
+        selectionIdentityRef.current = restoredIdentity;
+        setSelectionIdentity(restoredIdentity);
+        restoredDraftSelectionNeedsValidation.current = Boolean(draft.selectedIds.length);
         setHasRestoredPopupDraft(true);
       }
     } finally {
@@ -923,6 +1045,8 @@ function PopupApp() {
       ticketNumber,
       isActivationReviewOpen,
       requestMode,
+      tenantId: selectedIds.size ? selectionIdentity.tenantId : undefined,
+      principalId: selectedIds.size ? selectionIdentity.principalId : undefined,
       ...overrides
     };
   }
@@ -953,6 +1077,9 @@ function PopupApp() {
     setTicketSystem("");
     setTicketNumber("");
     setRequestMode(undefined);
+    selectionIdentityRef.current = {};
+    setSelectionIdentity({});
+    restoredDraftSelectionNeedsValidation.current = false;
     setActivationProgress(null);
     setActivationFailureNotice(null);
     setError("");
@@ -973,8 +1100,12 @@ function PopupApp() {
     const refreshStartedAt = Date.now();
     const runId = ++refreshRunId.current;
     activeRefreshRunId.current = runId;
+    if (manualRefreshRunId.current !== undefined) {
+      manualRefreshRunId.current = undefined;
+      setIsManualRefreshing(false);
+    }
     if (options.userInitiated) {
-      manualRefreshInFlight.current = true;
+      manualRefreshRunId.current = runId;
       setIsManualRefreshing(true);
     }
     const isCurrentRun = () => refreshRunId.current === runId;
@@ -988,6 +1119,7 @@ function PopupApp() {
     let surfaceRefreshErrors = !preferQuietCachedRefresh && !options.suppressMessage;
     let cacheDecisionMade = false;
     let canShowCachedData = false;
+    let portalRecoveryJourneyCreatedAt: number | undefined;
 
     if (!options.suppressMessage && !isActivationReviewOpen) {
       setError("");
@@ -1160,6 +1292,7 @@ function PopupApp() {
           `Opening Microsoft portal access for ${portalTokenRecoveryTargets.map(tabLabel).join(", ")}`
         );
         const recovery = await openPortalPagesForTargets(portalTokenRecoveryTargets);
+        portalRecoveryJourneyCreatedAt = recovery.journeyCreatedAt;
         if (!isCurrentRun()) {
           return;
         }
@@ -1189,7 +1322,7 @@ function PopupApp() {
           setMessage("");
           return;
         }
-        if (recovered.changedTargets.length !== portalTokenRecoveryTargets.length) {
+        if (!recovered.recoveryCompleted) {
           setHasActivationDataLoaded(true);
           showProgressError(
             `Microsoft portal access was not captured in time${recovery.grouped ? " from the QuickPIM++ access refresh group" : ""}. Expand it only if Microsoft requires sign-in or another prompt.`,
@@ -1206,7 +1339,7 @@ function PopupApp() {
             || !currentCacheView.eligibleCache[target]?.isFresh
             || !currentCacheView.activeCache[target]?.isFresh
         );
-        managedPortalRecoveryCompleted = true;
+        managedPortalRecoveryCompleted = recovered.recoveryCompleted;
       }
 
       if (
@@ -1226,6 +1359,7 @@ function PopupApp() {
           );
           try {
             const recovery = await startPortalRecoveryInBackground(targetsToStart);
+            portalRecoveryJourneyCreatedAt = recovery.journeyCreatedAt;
             if (!isCurrentRun()) {
               return;
             }
@@ -1566,9 +1700,13 @@ function PopupApp() {
       ]);
       const nextAccessCapabilities = buildAccessCapabilityItems(progressiveTokens, progressiveCache, finalEnabledRoleFeatures);
       const completedRecoveryTargets = portalTokenRecoveryTargets.filter((target) => successfulRefreshTargets.has(target));
-      if (completedRecoveryTargets.length) {
+      if (completedRecoveryTargets.length && portalRecoveryJourneyCreatedAt !== undefined) {
         try {
-          await sendMessage<AccessSetupTarget[]>({ action: "closePortalRecoveryTabs", targets: completedRecoveryTargets });
+          await sendMessage<AccessSetupTarget[]>({
+            action: "closePortalRecoveryTabs",
+            targets: completedRecoveryTargets,
+            expectedJourneyCreatedAt: portalRecoveryJourneyCreatedAt
+          });
         } catch {
           // Role data is ready even if the browser rejects optional temporary-tab cleanup.
         }
@@ -1618,13 +1756,13 @@ function PopupApp() {
       if (activeRefreshRunId.current === runId) {
         activeRefreshRunId.current = undefined;
       }
+      if (manualRefreshRunId.current === runId) {
+        manualRefreshRunId.current = undefined;
+        setIsManualRefreshing(false);
+      }
       if (isCurrentRun()) {
         setIsLoading(false);
         setIsRefreshing(false);
-        if (options.userInitiated) {
-          manualRefreshInFlight.current = false;
-          setIsManualRefreshing(false);
-        }
         if (progressVisible && refreshCompleted) {
           refreshProgressClearTimer.current = setTimeout(() => {
             if (refreshRunId.current === runId) {
@@ -1647,12 +1785,40 @@ function PopupApp() {
     eligible: { items: ActivationItem[]; errors: string[] },
     active: { items: ActivationItem[]; errors: string[] }
   ) {
-    setSettings(nextSettings);
+    const identifiedEligibleItems = attachKnownTenantIdentities(eligible.items, nextTokens);
+    const identifiedActiveItems = attachKnownTenantIdentities(active.items, nextTokens);
+    const identifiedItems = [...identifiedEligibleItems, ...identifiedActiveItems];
+    const displaySettings = migrateLegacyItemSettingsForItems(nextSettings, identifiedItems);
+    if (displaySettings !== nextSettings) {
+      const fingerprint = JSON.stringify([
+        displaySettings.aliasesByItemId,
+        displaySettings.favoriteItemIds,
+        displaySettings.usageStatsByItemId,
+        displaySettings.bundles,
+        displaySettings.activityHistory,
+        displaySettings.activationHistory
+      ]);
+      if (itemSettingsMigrationFingerprint.current !== fingerprint) {
+        itemSettingsMigrationFingerprint.current = fingerprint;
+        void mutateSettingsViaBackground((latest) => migrateLegacyItemSettingsForItems(latest, identifiedItems))
+          .then((saved) => {
+            if (itemSettingsMigrationFingerprint.current === fingerprint) {
+              setSettings(saved);
+            }
+          })
+          .catch(() => {
+            if (itemSettingsMigrationFingerprint.current === fingerprint) {
+              itemSettingsMigrationFingerprint.current = "";
+            }
+          });
+      }
+    }
+    setSettings(displaySettings);
     publishTokenStatus(nextTokens);
     setReferenceData(nextReferenceData);
-    setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(nextSettings)));
-    setEligibleItems(applyDisplayData(eligible.items, nextSettings, nextReferenceData));
-    setActiveItems(applyDisplayData(active.items, nextSettings, nextReferenceData));
+    setAccessCapabilities(buildAccessCapabilityItems(nextTokens, nextCache, getEnabledRoleFeatures(displaySettings)));
+    setEligibleItems(applyDisplayData(identifiedEligibleItems, displaySettings, nextReferenceData));
+    setActiveItems(applyDisplayData(identifiedActiveItems, displaySettings, nextReferenceData));
   }
 
   function toggleSelected(itemId: string) {
@@ -1665,10 +1831,34 @@ function PopupApp() {
     const currentMode = requestModeRef.current;
     if (!item || !itemMode || (currentMode && currentMode !== itemMode)) return;
     const next = new Set(selectedIdsRef.current);
-    const selectedItemId = [...next].find((id) => normalizeActivationItemId(id) === normalizeActivationItemId(item.id));
+    const selectedItemId = [...next].find((id) => activationItemIdentitiesMatch(id, item.id));
     if (selectedItemId) next.delete(selectedItemId);
-    else next.add(item.id);
+    else {
+      const itemIdentity = {
+        tenantId: item.tenantId || identityContext.tenantId,
+        principalId: item.principalId || identityContext.principalId
+      };
+      const currentIdentity = selectionIdentityRef.current;
+      if (
+        (currentIdentity.tenantId && itemIdentity.tenantId
+          && currentIdentity.tenantId.toLowerCase() !== itemIdentity.tenantId.toLowerCase())
+        || (currentIdentity.principalId && itemIdentity.principalId
+          && currentIdentity.principalId.toLowerCase() !== itemIdentity.principalId.toLowerCase())
+      ) {
+        setError("Selected roles must belong to the same Microsoft account and tenant.");
+        return;
+      }
+      next.add(item.id);
+      if (!selectedIdsRef.current.size) {
+        selectionIdentityRef.current = itemIdentity;
+        setSelectionIdentity(itemIdentity);
+      }
+    }
     const nextMode = next.size ? currentMode || itemMode : undefined;
+    if (!next.size) {
+      selectionIdentityRef.current = {};
+      setSelectionIdentity({});
+    }
     selectedIdsRef.current = next;
     requestModeRef.current = nextMode;
     setSelectedIds(next);
@@ -1725,13 +1915,17 @@ function PopupApp() {
         setError(detail);
         setSelectedIds(new Set(restorableIds));
         setRequestMode(operation.action);
+        const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
+        selectionIdentityRef.current = operationIdentity;
+        setSelectionIdentity(operationIdentity);
         setIsActivationReviewOpen(true);
         await flushPopupDraft({
           selectedIds: restorableIds,
           durationHours: operation.durationHours ?? durationHours,
           justification: operation.justification ?? justification,
           isActivationReviewOpen: true,
-          requestMode: operation.action
+          requestMode: operation.action,
+          ...operationIdentity
         });
         requestProgress = failOperationProgress(
           requestProgress,
@@ -1755,12 +1949,13 @@ function PopupApp() {
                 ? [{ id, type: inferredType }]
                 : [];
           });
-      const successfulIds = new Set(response.results
+      const successfulIds = response.results
         .filter((result) => result.success)
-        .map((result) => normalizeActivationItemId(result.itemId)));
-      const failedIds = new Set(response.errors.map((result) => normalizeActivationItemId(result.itemId)));
-      const failedSelectionIds = operation.itemIds.filter((id) => failedIds.has(normalizeActivationItemId(id)));
-      const successCount = successfulIds.size;
+        .map((result) => result.itemId);
+      const failedIds = response.errors.map((result) => result.itemId);
+      const failedSelectionIds = operation.itemIds.filter((id) =>
+        failedIds.some((failedId) => activationItemIdentitiesMatch(id, failedId)));
+      const successCount = successfulIds.length;
       const failureNotice = response.errors.length
         ? buildActivationFailureNotice(response.errors, operationItems)
         : null;
@@ -1769,7 +1964,8 @@ function PopupApp() {
       setActivationFailureNotice(failureNotice);
       setSelectedIds((current) => {
         const next = new Set(
-          [...current].filter((id) => !successfulIds.has(normalizeActivationItemId(id)))
+          [...current].filter((id) =>
+            !successfulIds.some((successfulId) => activationItemIdentitiesMatch(id, successfulId)))
         );
         failedSelectionIds.forEach((id) => next.add(id));
         return next;
@@ -1785,16 +1981,22 @@ function PopupApp() {
 
       if (failedSelectionIds.length) {
         setRequestMode(operation.action);
+        const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
+        selectionIdentityRef.current = operationIdentity;
+        setSelectionIdentity(operationIdentity);
         setIsActivationReviewOpen(true);
         await flushPopupDraft({
           selectedIds: failedSelectionIds,
           durationHours: operation.durationHours ?? durationHours,
           justification: operation.justification ?? justification,
           isActivationReviewOpen: true,
-          requestMode: operation.action
+          requestMode: operation.action,
+          ...operationIdentity
         });
       } else {
         setRequestMode(undefined);
+        selectionIdentityRef.current = {};
+        setSelectionIdentity({});
         setIsActivationReviewOpen(false);
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
@@ -1987,7 +2189,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => activatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
+        .map((result) => findUniqueItemByIdentity(activatableItems, result.itemId))
         .filter((item): item is ActivationItem => Boolean(item));
 
       setSettings((current) => addRecentJustification(current, effectiveJustification));
@@ -2021,6 +2223,8 @@ function PopupApp() {
         await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "activate" });
       } else {
         setRequestMode(undefined);
+        selectionIdentityRef.current = {};
+        setSelectionIdentity({});
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
@@ -2132,7 +2336,7 @@ function PopupApp() {
       setActivationProgress(requestProgress);
       const successItems = response.results
         .filter((result) => result.success)
-        .map((result) => deactivatableItems.find((item) => normalizeActivationItemId(item.id) === normalizeActivationItemId(result.itemId)))
+        .map((result) => findUniqueItemByIdentity(deactivatableItems, result.itemId))
         .filter((item): item is ActivationItem => Boolean(item));
 
       if (justification.trim()) {
@@ -2169,6 +2373,8 @@ function PopupApp() {
         await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "deactivate" });
       } else {
         setRequestMode(undefined);
+        selectionIdentityRef.current = {};
+        setSelectionIdentity({});
         latestPopupDraft.current = undefined;
         await clearPopupDraft();
       }
@@ -2226,7 +2432,15 @@ function PopupApp() {
     const expansion = expandBundle(bundle, displayItems);
     if (!expansion.items.length) return;
     setRequestMode(expansion.items.length ? "activate" : undefined);
-    setSelectedIds(new Set(expansion.items.map((item) => item.id)));
+    const bundleSelection = new Set(expansion.items.map((item) => item.id));
+    selectedIdsRef.current = bundleSelection;
+    setSelectedIds(bundleSelection);
+    const bundleIdentity = {
+      tenantId: expansion.items[0].tenantId || identityContext.tenantId,
+      principalId: expansion.items[0].principalId || identityContext.principalId
+    };
+    selectionIdentityRef.current = bundleIdentity;
+    setSelectionIdentity(bundleIdentity);
     if (expansion.durationHours) setDurationHours(expansion.durationHours);
     if (expansion.justification) setJustification(expansion.justification);
     setTicketSystem("");
@@ -2413,7 +2627,7 @@ function PopupApp() {
           <button
             className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
             onClick={() => {
-              if (manualRefreshInFlight.current) {
+              if (manualRefreshRunId.current !== undefined) {
                 return;
               }
               if (isPortalInteractionRequired) {
@@ -2672,9 +2886,7 @@ function PopupApp() {
               settings.bundles.map((bundle) => {
                 const expansion = expandBundle(bundle, displayItems);
                 const preflight = getBundlePreflight(bundle, displayItems, "");
-                const configuredItems = bundle.itemIds.map((itemId) => (
-                  displayItems.find((item) => activationItemMatchesIdentity(item, itemId))
-                ));
+                const configuredItems = bundle.itemIds.map((itemId) => getItemByPersistedId(itemsById, itemId));
                 const itemSummary = configuredItems.map((item, index) => item
                   ? getDisplayName(item, settings, referenceData)
                   : settings.aliasesByItemId[bundle.itemIds[index]] || "Unavailable item"
@@ -3606,6 +3818,11 @@ function getItemByPersistedId(
   itemId: string
 ): ActivationItem | undefined {
   return itemsById.get(itemId) || itemsById.get(normalizeActivationItemId(itemId));
+}
+
+function findUniqueItemByIdentity<T extends { id: string }>(items: T[], itemId: string): T | undefined {
+  const matches = items.filter((item) => activationItemIdentitiesMatch(item.id, itemId));
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 function setsEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {

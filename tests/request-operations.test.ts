@@ -292,6 +292,120 @@ describe("background request operation journal", () => {
     });
   });
 
+  test("migrates legacy operation item IDs into their explicit tenant boundary", () => {
+    const [operation] = sanitizeRequestOperations([{
+      id: "request_operation_tenant_migration",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      tenantId: "Tenant-One",
+      principalId: "Principal-One",
+      state: "running",
+      startedAt: NOW,
+      updatedAt: NOW
+    }], NOW);
+
+    expect(operation).toMatchObject({
+      tenantId: "Tenant-One",
+      principalId: "Principal-One",
+      itemIds: ["tenant:tenant-one:directoryRole:reader:/"]
+    });
+    expect(operation.items?.[0].itemId).toBe("tenant:tenant-one:directoryRole:reader:/");
+  });
+
+  test("rejects a durable operation whose embedded tenant conflicts with its account context", async () => {
+    const storage = makeStorage({});
+    await expect(beginRequestOperation({
+      id: "request_operation_tenant_mismatch",
+      action: "activate",
+      itemIds: ["tenant:tenant-two:directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      tenantId: "tenant-one",
+      startedAt: NOW
+    }, { storage, now: NOW })).rejects.toThrow("same Microsoft tenant");
+  });
+
+  test("matches legacy completion results to a tenant-scoped durable operation", async () => {
+    const storage = makeStorage({});
+    await beginRequestOperation({
+      id: "request_operation_tenant_completion",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      tenantId: "tenant-one",
+      principalId: "principal-one",
+      startedAt: NOW
+    }, { storage, now: NOW });
+    await completeRequestOperation("request_operation_tenant_completion", {
+      success: true,
+      results: [{ itemId: "directoryRole:reader:/", itemName: "Reader", success: true }],
+      errors: []
+    }, { storage, now: NOW + 1_000 });
+
+    const [operation] = await loadRequestOperations({ storage, now: NOW + 1_000 });
+    expect(operation).toMatchObject({ state: "complete" });
+    expect(operation.items?.[0]).toMatchObject({ state: "terminal", result: { success: true } });
+  });
+
+  test("keeps popup operation recovery inside the current tenant and principal", () => {
+    const operations = sanitizeRequestOperations([
+      {
+        id: "request_operation_tenant_one",
+        action: "activate",
+        itemIds: ["directoryRole:reader:/"],
+        targets: ["directoryRole"],
+        tenantId: "tenant-one",
+        principalId: "principal-one",
+        state: "running",
+        startedAt: NOW - 1_000,
+        updatedAt: NOW - 1_000
+      },
+      {
+        id: "request_operation_tenant_two",
+        action: "activate",
+        itemIds: ["directoryRole:reader:/"],
+        targets: ["directoryRole"],
+        tenantId: "tenant-two",
+        principalId: "principal-two",
+        state: "running",
+        startedAt: NOW,
+        updatedAt: NOW
+      }
+    ], NOW);
+
+    expect(selectNextRequestOperation(operations, new Set(), {
+      tenantId: "tenant-two",
+      principalId: "principal-two"
+    })?.id).toBe("request_operation_tenant_two");
+    expect(selectNextRequestOperation(operations, new Set(), {
+      tenantId: "tenant-three",
+      principalId: "principal-three"
+    })).toBeUndefined();
+  });
+
+  test("detects an in-flight conflict across legacy and tenant-scoped item IDs", async () => {
+    const storage = makeStorage({});
+    await beginRequestOperation({
+      id: "request_operation_legacy_conflict",
+      action: "activate",
+      itemIds: ["directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      tenantId: "tenant-one",
+      principalId: "principal-one",
+      startedAt: NOW
+    }, { storage, now: NOW });
+
+    await expect(beginRequestOperation({
+      id: "request_operation_scoped_conflict",
+      action: "activate",
+      itemIds: ["tenant:tenant-one:directoryRole:reader:/"],
+      targets: ["directoryRole"],
+      tenantId: "tenant-one",
+      principalId: "principal-one",
+      startedAt: NOW + 1
+    }, { storage, now: NOW + 1 })).rejects.toThrow("already in progress");
+  });
+
   test("does not let journal cleanup overwrite an operation started after the initial read", async () => {
     const staleValue = [{ id: "invalid" }];
     const data: Record<string, unknown> = { [REQUEST_OPERATIONS_SESSION_KEY]: staleValue };

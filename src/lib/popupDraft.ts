@@ -11,6 +11,7 @@ const MAX_SELECTED_IDS = 100;
 const MAX_ITEM_ID_LENGTH = 512;
 const MAX_SEARCH_LENGTH = 120;
 const MAX_TICKET_FIELD_LENGTH = 120;
+const MAX_IDENTITY_FIELD_LENGTH = 128;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const withPopupDraftMutationLock = createStorageMutationLock("quickPimPopupDraftMutation");
 
@@ -33,6 +34,8 @@ export interface PopupDraft {
   ticketNumber: string;
   isActivationReviewOpen: boolean;
   requestMode?: PopupRequestMode;
+  tenantId?: string;
+  principalId?: string;
 }
 
 export type PopupDraftInput = Omit<PopupDraft, "updatedAt" | "quickFilters" | "sortDirection"> & {
@@ -74,6 +77,8 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
   }
 
   const selectedIds = sanitizeSelectedIds(value.selectedIds);
+  const tenantId = selectedIds.length ? sanitizeString(value.tenantId, MAX_IDENTITY_FIELD_LENGTH) : "";
+  const principalId = selectedIds.length ? sanitizeString(value.principalId, MAX_IDENTITY_FIELD_LENGTH) : "";
   const sortMode = isSortMode(value.sortMode) ? value.sortMode : "name";
   const draft: PopupDraft = {
     updatedAt,
@@ -88,7 +93,9 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
     ticketSystem: sanitizeString(value.ticketSystem, MAX_TICKET_FIELD_LENGTH),
     ticketNumber: sanitizeString(value.ticketNumber, MAX_TICKET_FIELD_LENGTH),
     isActivationReviewOpen: Boolean(value.isActivationReviewOpen && selectedIds.length),
-    ...(isPopupRequestMode(value.requestMode) ? { requestMode: value.requestMode } : {})
+    ...(isPopupRequestMode(value.requestMode) ? { requestMode: value.requestMode } : {}),
+    ...(tenantId ? { tenantId } : {}),
+    ...(principalId ? { principalId } : {})
   };
 
   return hasPopupDraftContent(draft) ? draft : undefined;

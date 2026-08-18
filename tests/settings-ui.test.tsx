@@ -9,6 +9,7 @@ import { DEFAULT_SETTINGS, SETTINGS_KEY } from "../src/lib/settings";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 import { formatLocalDateTime } from "../src/lib/dateFormat";
 import { MAX_SETTINGS_BACKUP_BYTES } from "../src/lib/settingsBackup";
+import { NOTIFICATION_TEST_ID, NOTIFICATION_TEST_RESULT_ID } from "../src/lib/notificationTest";
 import { TEST_APP_VERSION, TEST_MANIFEST, TEST_RELEASE_TAG, testReleaseUrl } from "./testMetadata";
 
 afterEach(async () => {
@@ -185,6 +186,7 @@ describe("settings Home page", () => {
 
     await waitFor(() => expect(document.body.textContent).toContain("QuickPIM++ is a local-first activation console"));
     await waitFor(() => expect(document.body.textContent).toContain(`QuickPIM++ ${TEST_RELEASE_TAG}`));
+    expect(document.querySelector(".settings-header-version")?.textContent).toBe(`v${TEST_APP_VERSION}`);
     expect(document.body.textContent).toContain("2026-05-18");
     expect(document.body.textContent).not.toContain("5/18/2026");
     expect(document.body.textContent).toContain("Set up role access, personalize the popup, configure activation, and manage local data.");
@@ -544,6 +546,24 @@ describe("settings Access Setup page", () => {
     expect(picker!.textContent).not.toContain("Privileged workstation alias");
     expect(picker!.textContent).not.toContain("Global Administrator");
 
+    await waitFor(() => expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).aliasesByItemId).toEqual({
+      "tenant:tenant-1:directoryRole:windows-laps:/": "Privileged workstation alias",
+      "tenant:tenant-1:pimGroup:group-z:member": "Global Administrator"
+    }));
+
+    const applicationOption = [...picker!.options].find((option) => option.textContent?.includes("Application Administrator"));
+    expect(applicationOption?.value).toBe("tenant:tenant-1:directoryRole:application-admin:/");
+    picker!.value = applicationOption!.value;
+    picker!.dispatchEvent(new Event("change", { bubbles: true }));
+    const aliasInput = document.querySelector<HTMLInputElement>('input[placeholder="Display name"]');
+    expect(aliasInput).toBeTruthy();
+    setFieldValue(aliasInput!, "Application operations");
+    await waitFor(() => expect(getExactButton("Save alias").disabled).toBe(false));
+    clickExactButton("Save alias");
+    await waitFor(() => expect((storageData[SETTINGS_KEY] as typeof DEFAULT_SETTINGS).aliasesByItemId).toMatchObject({
+      "tenant:tenant-1:directoryRole:application-admin:/": "Application operations"
+    }));
+
     const actions = chromeMock.runtime.sendMessage.mock.calls.map(([message]) => message.action);
     expect(actions).not.toContain("getActivationItems");
   });
@@ -564,7 +584,7 @@ describe("settings Access Setup page", () => {
           if (message.action === "openPortalRecoveryTabs") {
             portalOpened = true;
             openedTargets.push(message.targets || []);
-            return { success: true, data: { requestedCount: 3, openedCount: 3, reusedCount: 0, managedCount: 3, grouped: true } };
+            return { success: true, data: { requestedCount: 3, openedCount: 3, reusedCount: 0, managedCount: 3, grouped: true, journeyCreatedAt: 1000 } };
           }
           if (message.action === "getActivationItems" || message.action === "getActiveItems") {
             return { success: true, data: { items: [], errors: [] } };
@@ -832,7 +852,7 @@ describe("settings Access Setup page", () => {
 
     clickButton("Open missing portal pages");
 
-    await waitFor(() => expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "refreshPortalTokens" }));
+    await waitFor(() => expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "refreshPortalTokens" }), 3_000);
     expect(chromeMock.runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "openPortalRecoveryTabs" }));
   });
 
@@ -940,7 +960,7 @@ describe("settings Access Setup page", () => {
         sendMessage: vi.fn(async (message: { action: string; targets?: string[] }) => {
           if (message.action === "openPortalRecoveryTabs") {
             openedTargets.push(message.targets || []);
-            return { success: true, data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true } };
+            return { success: true, data: { requestedCount: 1, openedCount: 1, reusedCount: 0, managedCount: 1, grouped: true, journeyCreatedAt: 1000 } };
           }
           if (message.action === "getTokenStatus" || message.action === "refreshPortalTokens") {
             tokenRequests += 1;
@@ -2661,6 +2681,38 @@ describe("settings dark mode", () => {
     }));
   });
 
+  test("requests Edge optional notification permission before the notification namespace is exposed", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#automation");
+
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    let permissionGranted = false;
+    const createNotification = vi.fn(async () => "quickpim-notification-test");
+    Reflect.deleteProperty(chromeMock, "notifications");
+    chromeMock.permissions.contains.mockImplementation(async () => permissionGranted);
+    chromeMock.permissions.request.mockImplementation(async () => {
+      permissionGranted = true;
+      Object.assign(chromeMock, { notifications: { create: createNotification } });
+      return true;
+    });
+
+    vi.stubGlobal("chrome", chromeMock);
+    vi.resetModules();
+    await import("../src/settings/main");
+
+    await waitFor(() => expect(document.querySelector('input[aria-label="Notify me about request updates"]')).toBeTruthy());
+    expect(document.body.textContent).toContain("Desktop notification deliveryOff");
+    document.querySelector<HTMLInputElement>('input[aria-label="Notify me about request updates"]')!.click();
+
+    await waitFor(() => expect(chromeMock.permissions.request).toHaveBeenCalledWith({ permissions: ["notifications"] }));
+    await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({
+      preferences: expect.objectContaining({ requestNotificationsEnabled: true })
+    }));
+    await waitFor(() => expect(document.body.textContent).toContain("Desktop notification deliveryReady"));
+    expect(document.body.textContent).not.toContain("does not expose extension notifications");
+  });
+
   test("shows and repairs a saved notification preference whose browser permission is missing", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#automation");
@@ -2673,8 +2725,22 @@ describe("settings dark mode", () => {
       return true;
     });
     const createNotification = vi.fn(async () => "quickpim-notification-test");
+    const clearNotification = vi.fn(async () => true);
+    const notificationButtonListeners = new Set<(notificationId: string, buttonIndex: number) => void>();
+    const onButtonClicked = {
+      addListener: vi.fn((listener: (notificationId: string, buttonIndex: number) => void) => {
+        notificationButtonListeners.add(listener);
+      }),
+      removeListener: vi.fn((listener: (notificationId: string, buttonIndex: number) => void) => {
+        notificationButtonListeners.delete(listener);
+      })
+    };
     const chromeMock = {
-      notifications: { create: createNotification },
+      notifications: {
+        create: createNotification,
+        clear: clearNotification,
+        onButtonClicked
+      },
       permissions: {
         contains: vi.fn(async () => permissionGranted),
         request: requestPermission,
@@ -2704,13 +2770,34 @@ describe("settings dark mode", () => {
     clickExactButton("Enable on this browser");
     await waitFor(() => expect(requestPermission).toHaveBeenCalledWith({ permissions: ["notifications"] }));
     await waitFor(() => expect(document.body.textContent).toContain("Desktop notification deliveryReady"));
+    await waitFor(() => expect(onButtonClicked.addListener).toHaveBeenCalled());
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ action: "initializeNotificationDelivery" });
 
     clickExactButton("Send test notification");
     await waitFor(() => expect(createNotification).toHaveBeenCalledWith(
-      "quickpim-notification-test",
-      expect.objectContaining({ title: "QuickPIM++ notifications are ready" })
+      NOTIFICATION_TEST_ID,
+      expect.objectContaining({
+        title: "QuickPIM++ notifications are ready",
+        buttons: [{ title: "Test button 1" }, { title: "Test button 2" }]
+      })
     ));
     await waitFor(() => expect(document.body.textContent).toContain("Test sent"));
+    const feedback = document.querySelector(".notification-health-feedback");
+    expect(feedback?.closest(".notification-health-controls")).toBeTruthy();
+    expect(feedback?.textContent).toContain("Test sent");
+
+    for (const listener of notificationButtonListeners) {
+      listener(NOTIFICATION_TEST_ID, 0);
+    }
+    await waitFor(() => expect(clearNotification).toHaveBeenCalledWith(NOTIFICATION_TEST_ID));
+    await waitFor(() => expect(createNotification).toHaveBeenCalledWith(
+      NOTIFICATION_TEST_RESULT_ID,
+      expect.objectContaining({
+        title: "Test button 1 works",
+        message: expect.stringContaining("supported by this browser")
+      })
+    ));
+    await waitFor(() => expect(document.body.textContent).toContain("Test button 1 works. Notification action events work on this browser."));
   });
 
   test("saves display preferences and applies dark mode to settings", async () => {

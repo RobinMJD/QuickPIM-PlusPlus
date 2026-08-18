@@ -42,6 +42,7 @@ const activeRole: ActivationItem = {
 const blockedActiveRole: ActivationItem = {
   ...activeRole,
   id: "directoryRole:blocked:/",
+  roleDefinitionId: "blocked",
   assignmentScheduleId: undefined,
   assignmentScheduleInstanceId: undefined
 };
@@ -49,6 +50,7 @@ const blockedActiveRole: ActivationItem = {
 const assignedActiveRole: ActivationItem = {
   ...activeRole,
   id: "directoryRole:assigned:/",
+  roleDefinitionId: "assigned",
   activeAssignmentType: "assigned",
   assignmentScheduleId: "assigned-schedule"
 };
@@ -56,6 +58,7 @@ const assignedActiveRole: ActivationItem = {
 const pendingRole: ActivationItem = {
   ...eligibleRole,
   id: "directoryRole:pending:/",
+  roleDefinitionId: "pending",
   displayName: "Pending Admin",
   status: "pendingApproval"
 };
@@ -206,6 +209,22 @@ describe("bundle preflight", () => {
       blockedReason: "A required justification is missing.",
       strictestMaxDurationHours: 4,
       durationHours: 4
+    });
+  });
+
+  test("resolves tenant-qualified bundle identities against the current tenant items", () => {
+    const tenantRole = { ...eligibleRole, tenantId: "tenant-one" };
+    const bundle: QuickPimBundle = {
+      id: "bundle:tenant-ops",
+      name: "Tenant ops",
+      itemIds: ["tenant:tenant-one:directoryRole:reader:/"],
+      defaultJustification: "Complete approved maintenance"
+    };
+
+    expect(getBundlePreflight(bundle, [tenantRole], "")).toMatchObject({
+      readyCount: 1,
+      missingCount: 0,
+      isBlocked: false
     });
   });
 });

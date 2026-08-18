@@ -12,7 +12,12 @@ import {
   shouldShowRemainingActivationTime
 } from "../lib/popupModel";
 import { getDisplayName, getScopeLabel, getUsage } from "../lib/settings";
-import { normalizeActivationItemId } from "../lib/activationIdentity";
+import {
+  activationItemIdentitiesMatch,
+  getActivationItemIdentity,
+  getActivationItemIdentityCandidates,
+  normalizeActivationItemId
+} from "../lib/activationIdentity";
 import type { ActivationItem, PopupRequestMode, QuickPimSettings, ReferenceDataCache } from "../lib/types";
 
 export function RoleList({
@@ -65,9 +70,11 @@ export function RoleList({
         const itemMode = actionState.mode;
         const isActionable = !readonly && actionState.selectable && Boolean(itemMode);
         const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
-        const selected = isSelectable && selectedIds.has(item.id);
+        const selected = isSelectable && [...selectedIds].some((itemId) =>
+          activationItemIdentitiesMatch(itemId, item.id));
         const displayName = getDisplayName(item, settings, referenceData);
-        const isFavorite = favoriteIds.has(normalizeActivationItemId(item.id));
+        const isFavorite = getActivationItemIdentityCandidates(item)
+          .some((identity) => favoriteIds.has(normalizeActivationItemId(identity)));
         const statusTitle = getActivationStatusTitle(item);
         const activeAssignmentType = getEffectiveActiveAssignmentType(item);
         const statusBadgeClass = activeAssignmentType === "assigned"
@@ -91,7 +98,7 @@ export function RoleList({
               className={`favorite-button ${isFavorite ? "active" : ""}`}
               onClick={(event) => {
                 event.stopPropagation();
-                onToggleFavorite?.(item.id);
+                onToggleFavorite?.(getActivationItemIdentity(item));
               }}
               title={isFavorite ? "Remove from favorites" : "Add to favorites"}
               aria-label={`${isFavorite ? "Remove" : "Add"} ${displayName} ${isFavorite ? "from" : "to"} favorites`}

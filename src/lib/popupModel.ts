@@ -14,7 +14,10 @@ import type {
   TokenStatus,
   TokenStatusEntry
 } from "./types";
-import { normalizeActivationItemId } from "./activationIdentity";
+import {
+  activationItemIdentitiesMatch,
+  normalizeActivationItemId
+} from "./activationIdentity";
 export type { PopupTab, RoleTab } from "./types";
 
 export const ENTRA_PORTAL_URLS: Record<RoleTab, string> = {
@@ -189,10 +192,9 @@ export function getRemainingSelectedIdsAfterActivationResults(
   selectedIds: Iterable<string>,
   results: ActivationResult[]
 ): Set<string> {
-  const successfulIds = new Set(results
-    .filter((result) => result.success)
-    .map((result) => normalizeActivationItemId(result.itemId)));
-  return new Set([...selectedIds].filter((itemId) => !successfulIds.has(normalizeActivationItemId(itemId))));
+  const successfulIds = results.filter((result) => result.success).map((result) => result.itemId);
+  return new Set([...selectedIds].filter((itemId) =>
+    !successfulIds.some((successfulId) => activationItemIdentitiesMatch(itemId, successfulId))));
 }
 
 export function normalizeActivationResponse(response: ActivationResponse): ActivationResponse {
@@ -239,11 +241,11 @@ export function buildActivationItemLookup(items: ActivationItem[]): Map<string, 
       item.id,
       normalizeActivationItemId(item.id),
       ...getActivationItemIdentityCandidates(item)
-    ].filter(Boolean));
+    ].filter(Boolean).flatMap((key) => [key, normalizeActivationItemId(key)]));
     for (const key of keys) {
       if (ambiguous.has(key)) continue;
       const current = lookup.get(key);
-      if (current && getActivationItemIdentity(current) !== canonicalIdentity) {
+      if (current && normalizeActivationItemId(getActivationItemIdentity(current)) !== normalizeActivationItemId(canonicalIdentity)) {
         lookup.delete(key);
         ambiguous.add(key);
       } else {
@@ -258,15 +260,14 @@ export function getRequestReconciliationTargets(
   results: ActivationResult[],
   items: Array<Pick<ActivationItem, "id" | "type">>
 ): AccessSetupTarget[] {
-  const itemTargets = new Map(items.map((item) => [normalizeActivationItemId(item.id), item.type]));
   const requested = new Set<AccessSetupTarget>();
   for (const result of results) {
     if (!result.success && !result.outcomeUnknown) {
       continue;
     }
-    const target = itemTargets.get(normalizeActivationItemId(result.itemId));
-    if (target) {
-      requested.add(target);
+    const matches = items.filter((item) => activationItemIdentitiesMatch(item.id, result.itemId));
+    if (matches.length === 1) {
+      requested.add(matches[0].type);
     }
   }
   return (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
@@ -530,7 +531,7 @@ export function getBundlePreflight(
   items: ActivationItem[],
   justification: string
 ): BundlePreflight {
-  const itemsById = new Map(items.map((item) => [item.id, item]));
+  const itemsById = buildActivationItemLookup(items);
   const readyItems: ActivationItem[] = [];
   let alreadyActiveCount = 0;
   let pendingApprovalCount = 0;
@@ -538,7 +539,7 @@ export function getBundlePreflight(
   let blockedCount = 0;
 
   for (const itemId of bundle.itemIds) {
-    const item = itemsById.get(itemId);
+    const item = itemsById.get(itemId) || itemsById.get(normalizeActivationItemId(itemId));
     if (!item) {
       missingCount += 1;
       continue;

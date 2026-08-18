@@ -32,13 +32,14 @@ const BROWSER_SYNC_ATOMIC_GENERATION_MARKER = "a1";
 // Keep each chunk below the 8 KiB per-item ceiling and the complete payload
 // small enough for the previous and next generations to coexist atomically.
 const BROWSER_SYNC_CHUNK_QUOTA_BYTES = 8_000;
-const BROWSER_SYNC_ORPHAN_GRACE_MS = 48 * 60 * 60_000;
+const BROWSER_SYNC_ORPHAN_GRACE_MS = 10 * 60_000;
 // Browser sync has a much tighter write budget than local storage. A device
 // record only needs to prove that the installation is still participating; it
 // does not need to mirror every local settings write.
 const BROWSER_SYNC_DEVICE_HEARTBEAT_MS = 30 * 60_000;
 const BROWSER_SYNC_MINUTE_QUOTA_RETRY_MS = 75_000;
 const BROWSER_SYNC_HOUR_QUOTA_RETRY_MS = 10 * 60_000;
+const BROWSER_SYNC_CAPACITY_QUOTA_RETRY_MS = 10 * 60_000;
 const BROWSER_SYNC_READ_RETRY_DELAYS_MS = [100, 500, 1_500] as const;
 const MAX_SYNC_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000;
 const SYNC_VERIFICATION_FUTURE_TOLERANCE_MS = 5 * 60_000;
@@ -1639,14 +1640,25 @@ async function writeRemoteSnapshot(
     }
     throw error;
   }
-  await removeStaleOrphanedChunks(sync, now, new Set([generation]));
+  try {
+    await removeStaleOrphanedChunks(
+      sync,
+      now,
+      new Set([generation]),
+      new Set(previousGeneration && previousGeneration !== generation ? [previousGeneration] : [])
+    );
+  } catch {
+    // The new manifest is already committed. A later cleanup pass can reclaim
+    // the predecessor if the browser temporarily rejects this removal.
+  }
   return generation;
 }
 
 async function removeStaleOrphanedChunks(
   sync: StorageAreaLike,
   now: number,
-  protectedGenerations: Set<string>
+  protectedGenerations: Set<string>,
+  supersededGenerations = new Set<string>()
 ): Promise<void> {
   const all = await sync.get(null);
   const currentManifest = sanitizeManifest(all[BROWSER_SYNC_MANIFEST_KEY], now);
@@ -1661,7 +1673,7 @@ async function removeStaleOrphanedChunks(
     const timestampPart = generation.split("-", 1)[0];
     if (!/^[0-9a-z]+$/i.test(timestampPart)) return false;
     const generatedAt = Number.parseInt(timestampPart, 36);
-    return Number.isSafeInteger(generatedAt)
+    return supersededGenerations.has(generation) || Number.isSafeInteger(generatedAt)
       && generatedAt > 0
       && now - generatedAt >= BROWSER_SYNC_ORPHAN_GRACE_MS;
   });
@@ -2106,8 +2118,8 @@ function isRecentlyActiveSyncDevice(device: BrowserSyncDevice, now: number): boo
 }
 
 class BrowserSyncWriteQuotaError extends Error {
-  constructor(readonly retryDelayMs: number) {
-    super(browserSyncWriteQuotaMessage());
+  constructor(readonly retryDelayMs: number, message = browserSyncWriteQuotaMessage()) {
+    super(message);
     this.name = "BrowserSyncWriteQuotaError";
   }
 }
@@ -2119,6 +2131,9 @@ function browserSyncWriteQuotaMessage(): string {
 function browserSyncWriteQuotaRetryDelay(error: unknown): number | undefined {
   if (error instanceof BrowserSyncWriteQuotaError) return error.retryDelayMs;
   const message = error instanceof Error ? error.message : String(error || "");
+  if (isBrowserSyncCapacityQuotaMessage(message)) {
+    return BROWSER_SYNC_CAPACITY_QUOTA_RETRY_MS;
+  }
   if (/MAX_WRITE_OPERATIONS_PER_HOUR|write operations per hour/i.test(message)) {
     return BROWSER_SYNC_HOUR_QUOTA_RETRY_MS;
   }
@@ -2128,19 +2143,34 @@ function browserSyncWriteQuotaRetryDelay(error: unknown): number | undefined {
   return undefined;
 }
 
+function browserSyncCapacityQuotaMessage(): string {
+  return "Browser Sync is cleaning superseded cloud snapshots to recover browser storage capacity. Local data is safe, and QuickPIM++ will retry automatically.";
+}
+
+function isBrowserSyncCapacityQuotaMessage(message: string): boolean {
+  return /Resource(?:::|:)kQuotaBytes|QUOTA_BYTES(?!_PER_ITEM)|storage capacity|quota bytes/i.test(message);
+}
+
 async function performBrowserSyncWrite(operation: () => Promise<void>): Promise<void> {
   try {
     await operation();
   } catch (error) {
     const retryDelay = browserSyncWriteQuotaRetryDelay(error);
-    if (retryDelay) throw new BrowserSyncWriteQuotaError(retryDelay);
+    if (retryDelay) {
+      const message = error instanceof Error ? error.message : String(error || "");
+      throw new BrowserSyncWriteQuotaError(
+        retryDelay,
+        isBrowserSyncCapacityQuotaMessage(message) ? browserSyncCapacityQuotaMessage() : browserSyncWriteQuotaMessage()
+      );
+    }
     throw error;
   }
 }
 
 function sanitizeSyncError(error: unknown): string {
-  if (browserSyncWriteQuotaRetryDelay(error)) return browserSyncWriteQuotaMessage();
   const message = error instanceof Error ? error.message : String(error || "Browser sync failed.");
+  if (isBrowserSyncCapacityQuotaMessage(message)) return browserSyncCapacityQuotaMessage();
+  if (browserSyncWriteQuotaRetryDelay(error)) return browserSyncWriteQuotaMessage();
   return sanitizeText(message, 300) || "Browser sync failed.";
 }
 

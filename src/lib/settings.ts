@@ -27,7 +27,10 @@ import { DEFAULT_EXTENSION_DURATION_HOURS, sanitizeExtensionDurationHours } from
 import {
   getActivationItemIdentity,
   getActivationItemIdentityCandidates,
+  getActivationItemTypeFromIdentity,
   getLegacyActivationItemIdentity,
+  getTenantIdFromActivationItemIdentity,
+  getUnscopedActivationItemIdentity,
   normalizeActivationItemId
 } from "./activationIdentity";
 
@@ -278,6 +281,279 @@ export function getDisplayName(
   return alias || getReferenceDisplayName(item, referenceData) || item.displayName || item.sourceName || "Unknown";
 }
 
+export function migrateLegacyAliasesByItemId(
+  aliasesByItemId: Record<string, string>,
+  items: ActivationItem[]
+): Record<string, string> {
+  const canonicalByLegacy = buildCanonicalIdentitiesByLegacy(items);
+
+  let migrated: Record<string, string> | undefined;
+  const canonicalAliasKeys = new Map<string, string>();
+  for (const key of Object.keys(aliasesByItemId)) {
+    const normalizedKey = normalizeActivationItemId(key);
+    if (normalizedKey.startsWith("tenant:")) {
+      canonicalAliasKeys.set(normalizedKey, key);
+    }
+  }
+
+  for (const [storedIdentity, alias] of Object.entries(aliasesByItemId)) {
+    const normalizedStoredIdentity = normalizeActivationItemId(storedIdentity);
+    if (normalizedStoredIdentity.startsWith("tenant:")) continue;
+    const canonicalCandidates = canonicalByLegacy.get(normalizedStoredIdentity);
+    if (!canonicalCandidates || canonicalCandidates.size !== 1) continue;
+
+    const [normalizedCanonicalIdentity, canonicalIdentity] = [...canonicalCandidates.entries()][0];
+    migrated ||= { ...aliasesByItemId };
+    if (!canonicalAliasKeys.has(normalizedCanonicalIdentity)) {
+      migrated[canonicalIdentity] = alias;
+      canonicalAliasKeys.set(normalizedCanonicalIdentity, canonicalIdentity);
+    }
+    delete migrated[storedIdentity];
+  }
+
+  return migrated || aliasesByItemId;
+}
+
+export function migrateLegacyFavoriteItemIds(
+  favoriteItemIds: string[],
+  items: ActivationItem[]
+): string[] {
+  const canonicalByLegacy = buildCanonicalIdentitiesByLegacy(items);
+  const migrated: string[] = [];
+  const seen = new Set<string>();
+  let changed = false;
+
+  for (const storedIdentity of favoriteItemIds) {
+    const normalizedStoredIdentity = normalizeActivationItemId(storedIdentity);
+    const canonicalCandidates = normalizedStoredIdentity.startsWith("tenant:")
+      ? undefined
+      : canonicalByLegacy.get(normalizedStoredIdentity);
+    const nextIdentity = canonicalCandidates?.size === 1
+      ? [...canonicalCandidates.values()][0]
+      : storedIdentity;
+    const normalizedNextIdentity = normalizeActivationItemId(nextIdentity);
+
+    if (seen.has(normalizedNextIdentity)) {
+      changed = true;
+      continue;
+    }
+    seen.add(normalizedNextIdentity);
+    migrated.push(nextIdentity);
+    changed ||= nextIdentity !== storedIdentity;
+  }
+
+  return changed ? migrated : favoriteItemIds;
+}
+
+export function migrateLegacyUsageStatsByItemId(
+  usageStatsByItemId: Record<string, UsageStats>,
+  items: ActivationItem[]
+): Record<string, UsageStats> {
+  const canonicalByLegacy = buildCanonicalIdentitiesByLegacy(items);
+  const canonicalUsageKeys = new Map<string, string>();
+  for (const key of Object.keys(usageStatsByItemId)) {
+    const normalizedKey = normalizeActivationItemId(key);
+    if (normalizedKey.startsWith("tenant:")) {
+      canonicalUsageKeys.set(normalizedKey, key);
+    }
+  }
+
+  let migrated: Record<string, UsageStats> | undefined;
+  for (const [storedIdentity, stats] of Object.entries(usageStatsByItemId)) {
+    const normalizedStoredIdentity = normalizeActivationItemId(storedIdentity);
+    if (normalizedStoredIdentity.startsWith("tenant:")) continue;
+    const canonicalCandidates = canonicalByLegacy.get(normalizedStoredIdentity);
+    if (!canonicalCandidates || canonicalCandidates.size !== 1) continue;
+
+    const [normalizedCanonicalIdentity, canonicalIdentity] = [...canonicalCandidates.entries()][0];
+    migrated ||= { ...usageStatsByItemId };
+    const existingKey = canonicalUsageKeys.get(normalizedCanonicalIdentity);
+    const existing = existingKey ? migrated[existingKey] : undefined;
+    migrated[existingKey || canonicalIdentity] = existing
+      ? mergeUsageStatsForMigration(existing, stats)
+      : stats;
+    canonicalUsageKeys.set(normalizedCanonicalIdentity, existingKey || canonicalIdentity);
+    delete migrated[storedIdentity];
+  }
+
+  return migrated || usageStatsByItemId;
+}
+
+export function migrateLegacyBundleItemIds(
+  bundles: QuickPimBundle[],
+  items: ActivationItem[]
+): QuickPimBundle[] {
+  const canonicalByLegacy = buildCanonicalIdentitiesByLegacy(items);
+  let bundlesChanged = false;
+  const migratedBundles = bundles.map((bundle) => {
+    const seen = new Set<string>();
+    let itemIdsChanged = false;
+    const itemIds: string[] = [];
+    for (const storedIdentity of bundle.itemIds) {
+      const normalizedStoredIdentity = normalizeActivationItemId(storedIdentity);
+      const canonicalCandidates = normalizedStoredIdentity.startsWith("tenant:")
+        ? undefined
+        : canonicalByLegacy.get(normalizedStoredIdentity);
+      const nextIdentity = canonicalCandidates?.size === 1
+        ? [...canonicalCandidates.values()][0]
+        : storedIdentity;
+      const normalizedNextIdentity = normalizeActivationItemId(nextIdentity);
+      if (seen.has(normalizedNextIdentity)) {
+        itemIdsChanged = true;
+        continue;
+      }
+      seen.add(normalizedNextIdentity);
+      itemIds.push(nextIdentity);
+      itemIdsChanged ||= nextIdentity !== storedIdentity;
+    }
+    if (!itemIdsChanged) return bundle;
+    bundlesChanged = true;
+    return { ...bundle, itemIds };
+  });
+  return bundlesChanged ? migratedBundles : bundles;
+}
+
+export function migrateLegacyItemSettingsForItems(
+  settings: QuickPimSettings,
+  items: ActivationItem[]
+): QuickPimSettings {
+  const aliasesByItemId = migrateLegacyAliasesByItemId(settings.aliasesByItemId, items);
+  const favoriteItemIds = migrateLegacyFavoriteItemIds(settings.favoriteItemIds, items);
+  const usageStatsByItemId = migrateLegacyUsageStatsByItemId(settings.usageStatsByItemId, items);
+  const bundles = migrateLegacyBundleItemIds(settings.bundles, items);
+  const activityHistory = migrateLegacyHistoryItemIds(settings.activityHistory, items);
+  const activationHistory = migrateLegacyHistoryItemIds(settings.activationHistory, items);
+  return aliasesByItemId === settings.aliasesByItemId
+    && favoriteItemIds === settings.favoriteItemIds
+    && usageStatsByItemId === settings.usageStatsByItemId
+    && bundles === settings.bundles
+    && activityHistory === settings.activityHistory
+    && activationHistory === settings.activationHistory
+    ? settings
+    : {
+        ...settings,
+        aliasesByItemId,
+        favoriteItemIds,
+        usageStatsByItemId,
+        bundles,
+        activityHistory,
+        activationHistory
+      };
+}
+
+export function migrateLegacyAliasesForItems(
+  settings: QuickPimSettings,
+  items: ActivationItem[]
+): QuickPimSettings {
+  const aliasesByItemId = migrateLegacyAliasesByItemId(settings.aliasesByItemId, items);
+  return aliasesByItemId === settings.aliasesByItemId
+    ? settings
+    : { ...settings, aliasesByItemId };
+}
+
+function buildCanonicalIdentitiesByLegacy(items: ActivationItem[]): Map<string, Map<string, string>> {
+  const canonicalByLegacy = new Map<string, Map<string, string>>();
+  for (const item of items) {
+    if (!item.tenantId?.trim()) continue;
+    const legacyIdentity = normalizeActivationItemId(getLegacyActivationItemIdentity(item));
+    const canonicalIdentity = getActivationItemIdentity(item);
+    const normalizedCanonicalIdentity = normalizeActivationItemId(canonicalIdentity);
+    const candidates = canonicalByLegacy.get(legacyIdentity) || new Map<string, string>();
+    candidates.set(normalizedCanonicalIdentity, canonicalIdentity);
+    canonicalByLegacy.set(legacyIdentity, candidates);
+  }
+  return canonicalByLegacy;
+}
+
+function buildKnownActivationItemLookup(items: ActivationItem[]): Map<string, ActivationItem> {
+  const lookup = new Map<string, ActivationItem>();
+  const ambiguous = new Set<string>();
+  for (const item of items) {
+    const canonicalIdentity = getActivationItemIdentity(item);
+    const keys = new Set([
+      canonicalIdentity,
+      getLegacyActivationItemIdentity(item),
+      item.id,
+      ...getActivationItemIdentityCandidates(item)
+    ].map(normalizeActivationItemId));
+    for (const key of keys) {
+      if (ambiguous.has(key)) continue;
+      const current = lookup.get(key);
+      if (current && normalizeActivationItemId(getActivationItemIdentity(current)) !== normalizeActivationItemId(canonicalIdentity)) {
+        lookup.delete(key);
+        ambiguous.add(key);
+      } else {
+        lookup.set(key, item);
+      }
+    }
+  }
+  return lookup;
+}
+
+function migrateLegacyHistoryItemIds<T extends { itemId: string; tenantId?: string }>(
+  entries: T[],
+  items: ActivationItem[]
+): T[] {
+  const lookup = buildKnownActivationItemLookup(items);
+  let changed = false;
+  const migrated = entries.map((entry) => {
+    const normalizedItemId = normalizeActivationItemId(entry.itemId);
+    const lookupIdentity = !getTenantIdFromActivationItemIdentity(normalizedItemId) && entry.tenantId
+      ? `tenant:${entry.tenantId.trim().toLowerCase()}:${getUnscopedActivationItemIdentity(normalizedItemId)}`
+      : normalizedItemId;
+    const item = lookup.get(normalizeActivationItemId(lookupIdentity)) || lookup.get(normalizedItemId);
+    if (!item) return entry;
+    const canonicalItemId = getActivationItemIdentity(item);
+    const tenantId = item.tenantId || entry.tenantId;
+    if (
+      normalizeActivationItemId(canonicalItemId) === normalizedItemId
+      && (tenantId || "").trim().toLowerCase() === (entry.tenantId || "").trim().toLowerCase()
+    ) {
+      return entry;
+    }
+    changed = true;
+    return {
+      ...entry,
+      itemId: canonicalItemId,
+      ...(tenantId ? { tenantId } : {})
+    };
+  });
+  return changed ? migrated : entries;
+}
+
+function mergeUsageStatsForMigration(left: UsageStats, right: UsageStats): UsageStats {
+  const byInstallationId: NonNullable<UsageStats["byInstallationId"]> = {};
+  for (const installationId of new Set([
+    ...Object.keys(left.byInstallationId || {}),
+    ...Object.keys(right.byInstallationId || {})
+  ])) {
+    const leftEntry = left.byInstallationId?.[installationId];
+    const rightEntry = right.byInstallationId?.[installationId];
+    if (!leftEntry) byInstallationId[installationId] = { ...rightEntry! };
+    else if (!rightEntry) byInstallationId[installationId] = { ...leftEntry };
+    else byInstallationId[installationId] = {
+      activationCount: Math.max(leftEntry.activationCount, rightEntry.activationCount),
+      ...(latestIsoTimestamp(leftEntry.lastUsedAt, rightEntry.lastUsedAt)
+        ? { lastUsedAt: latestIsoTimestamp(leftEntry.lastUsedAt, rightEntry.lastUsedAt) }
+        : {})
+    };
+  }
+  const leftKnown = Object.values(left.byInstallationId || {}).reduce((total, entry) => total + entry.activationCount, 0);
+  const rightKnown = Object.values(right.byInstallationId || {}).reduce((total, entry) => total + entry.activationCount, 0);
+  const legacyActivationCount = Math.max(
+    left.legacyActivationCount ?? Math.max(0, left.activationCount - leftKnown),
+    right.legacyActivationCount ?? Math.max(0, right.activationCount - rightKnown)
+  );
+  const knownTotal = Object.values(byInstallationId).reduce((total, entry) => total + entry.activationCount, 0);
+  const lastUsedAt = latestIsoTimestamp(left.lastUsedAt, right.lastUsedAt);
+  return {
+    activationCount: Math.min(100000, legacyActivationCount + knownTotal),
+    ...(lastUsedAt ? { lastUsedAt } : {}),
+    ...(legacyActivationCount ? { legacyActivationCount } : {}),
+    ...(Object.keys(byInstallationId).length ? { byInstallationId } : {})
+  };
+}
+
 export function getScopeLabel(item: ActivationItem, referenceData?: ReferenceDataCache): string {
   return getReferenceScopeLabel(item, referenceData) || item.scopeLabel || "Scope";
 }
@@ -364,7 +640,8 @@ export function recordActivations(
   bundleName?: string,
   source?: ActivitySource
 ): QuickPimSettings {
-  const usageStatsByItemId = { ...settings.usageStatsByItemId };
+  const migratedSettings = migrateLegacyItemSettingsForItems(settings, items);
+  const usageStatsByItemId = { ...migratedSettings.usageStatsByItemId };
 
   for (const item of items) {
     const itemId = getActivationItemIdentity(item);
@@ -399,11 +676,11 @@ export function recordActivations(
 
   const activationHistory = [
     ...createActivationHistoryEntries(items, bundleName, activatedAt),
-    ...settings.activationHistory
+    ...migratedSettings.activationHistory
   ].slice(0, MAX_HISTORY_ENTRIES);
 
   return {
-    ...settings,
+    ...migratedSettings,
     usageStatsByItemId,
     activationHistory
   };
@@ -424,15 +701,16 @@ export function recordActivityResults(
     source?: ActivitySource;
   }
 ): QuickPimSettings {
-  const itemsById = new Map(input.items.map((item) => [normalizeActivationItemId(item.id), item]));
+  const itemsById = buildKnownActivationItemLookup(input.items);
   const entries = input.response.results.map((result): ActivityHistoryEntry => {
     const item = itemsById.get(normalizeActivationItemId(result.itemId));
+    const itemId = item ? getActivationItemIdentity(item) : result.itemId;
     const historyResult: ActivityResult = result.success ? "success" : "failed";
     return {
-      id: buildActivityHistoryEntryId(input.eventIdPrefix || input.completedAt, input.action, result.itemId, historyResult),
+      id: buildActivityHistoryEntryId(input.eventIdPrefix || input.completedAt, input.action, itemId, historyResult),
       action: input.action,
       result: historyResult,
-      itemId: result.itemId,
+      itemId,
       itemName: item?.displayName || result.itemName,
       itemType: item?.type || inferItemType(result.itemId),
       ...(item?.tenantId ? { tenantId: item.tenantId } : {}),
@@ -481,11 +759,16 @@ export function recordOperationActivity(
   let updated = settings;
   if (input.action === "activate") {
     const existingIds = new Set(settings.activityHistory.map((entry) => entry.id));
-    const itemsById = new Map(input.items.map((item) => [normalizeActivationItemId(item.id), item]));
+    const itemsById = buildKnownActivationItemLookup(input.items);
     const newlyCompletedItems = input.response.results.flatMap((result) => {
       if (!result.success) return [];
-      const eventId = buildActivityHistoryEntryId(input.operationId, input.action, result.itemId, "success");
       const item = itemsById.get(normalizeActivationItemId(result.itemId));
+      const eventId = buildActivityHistoryEntryId(
+        input.operationId,
+        input.action,
+        item ? getActivationItemIdentity(item) : result.itemId,
+        "success"
+      );
       return item && !existingIds.has(eventId) ? [item] : [];
     });
     updated = recordActivations(
@@ -525,8 +808,8 @@ export function createActivationHistoryEntries(
   activatedAt: string
 ): ActivationHistoryEntry[] {
   return items.map((item) => ({
-    id: buildBoundedEventId(`${activatedAt}:${item.id}`),
-    itemId: item.id,
+    id: buildBoundedEventId(`${activatedAt}:${getActivationItemIdentity(item)}`),
+    itemId: getActivationItemIdentity(item),
     itemName: item.displayName,
     itemType: item.type,
     ...(item.tenantId ? { tenantId: item.tenantId } : {}),
@@ -553,13 +836,7 @@ function stableTextHash(value: string): string {
 }
 
 export function expandBundle(bundle: QuickPimBundle, items: ActivationItem[]): BundleExpansion {
-  const itemsById = new Map<string, ActivationItem>();
-  for (const item of items) {
-    for (const identity of getActivationItemIdentityCandidates(item)) {
-      itemsById.set(normalizeActivationItemId(identity), item);
-    }
-    itemsById.set(normalizeActivationItemId(item.id), item);
-  }
+  const itemsById = buildKnownActivationItemLookup(items);
   const bundleItems = bundle.itemIds
     .map((itemId) => itemsById.get(normalizeActivationItemId(itemId)))
     .filter((item): item is ActivationItem => Boolean(item && item.status === "eligible"));
@@ -994,8 +1271,7 @@ function sanitizeExpiryReminderMinutes(value: unknown): number {
 }
 
 function inferItemType(itemId: string): ActivationItem["type"] {
-  const [type] = itemId.split(":");
-  return isActivationItemType(type) ? type : "directoryRole";
+  return getActivationItemTypeFromIdentity(itemId) || "directoryRole";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

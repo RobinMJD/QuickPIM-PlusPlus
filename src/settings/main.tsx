@@ -15,7 +15,7 @@ import {
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../lib/cache";
-import { DEFAULT_DURATION_OPTIONS, ENTRA_PORTAL_URLS, coerceDurationForItems, formatLoadMessages, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
+import { DEFAULT_DURATION_OPTIONS, ENTRA_PORTAL_URLS, attachKnownTenantIdentities, coerceDurationForItems, formatLoadMessages, getDurationOptions, tabLabel as popupTabLabel } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
@@ -26,6 +26,7 @@ import {
   getScopeLabel,
   loadSettings,
   mergeSettings,
+  migrateLegacyItemSettingsForItems,
   mutateSettingsViaBackground
 } from "../lib/settings";
 import {
@@ -36,12 +37,21 @@ import {
 } from "../lib/referenceData";
 import { MAX_USER_JUSTIFICATION_LENGTH, getGenericJustificationWarning } from "../lib/justifications";
 import { APP_BUILD_TIMESTAMP, APP_NAME, APP_RELEASE_TAG, APP_VERSION } from "../lib/appMetadata";
+import {
+  NOTIFICATION_TEST_BUTTON_TITLES,
+  NOTIFICATION_TEST_ID,
+  NOTIFICATION_TEST_RESULT_ID,
+  getNotificationTestButtonResult
+} from "../lib/notificationTest";
 import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import { isOperationTimeoutError } from "../lib/async";
 import { refreshTokenStatusFreshness } from "../lib/token";
 import {
+  activationItemMatchesIdentity,
   getActivationItemIdentity,
   getActivationItemIdentityCandidates,
+  getTenantIdFromActivationItemIdentity,
+  getUnscopedActivationItemIdentity,
   normalizeActivationItemId
 } from "../lib/activationIdentity";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
@@ -146,6 +156,7 @@ interface ChangelogCache {
 interface AccessRefreshOptions {
   skipTargetsWithCurrentTokenCache?: boolean;
   completionMessage?: string;
+  expectedPortalRecoveryJourneyCreatedAt?: number;
 }
 
 function SettingsApp() {
@@ -188,6 +199,7 @@ function SettingsApp() {
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
   const settingsRef = useRef(settings);
   const trackedRequestsRef = useRef(trackedRequests);
+  const itemSettingsMigrationFingerprint = useRef("");
 
   if (!initialSettingsHydration.current) {
     initialSettingsHydration.current = new Promise<void>((resolve) => {
@@ -303,6 +315,30 @@ function SettingsApp() {
   }, [isSettingsReady, referenceData, settings.aliasesByItemId]);
 
   useEffect(() => {
+    if (!isSettingsReady || !items.length) return;
+    const migrated = migrateLegacyItemSettingsForItems(settings, items);
+    if (migrated === settings) return;
+    const fingerprint = JSON.stringify([
+      migrated.aliasesByItemId,
+      migrated.favoriteItemIds,
+      migrated.usageStatsByItemId,
+      migrated.bundles,
+      migrated.activityHistory,
+      migrated.activationHistory
+    ]);
+    if (itemSettingsMigrationFingerprint.current === fingerprint) return;
+    itemSettingsMigrationFingerprint.current = fingerprint;
+    void persistMutation(
+      (latest) => migrateLegacyItemSettingsForItems(latest, items),
+      "Role preferences updated for this Microsoft tenant."
+    ).finally(() => {
+      if (itemSettingsMigrationFingerprint.current === fingerprint) {
+        itemSettingsMigrationFingerprint.current = "";
+      }
+    });
+  }, [isSettingsReady, items, settings]);
+
+  useEffect(() => {
     function handleHashChange() {
       void transitionToTab(tabFromHash(), false);
     }
@@ -414,7 +450,11 @@ function SettingsApp() {
       const nextReferenceData = learnReferenceDataFromItems(loadedReferenceData, eligible.items);
       showProgressStep(3);
       await saveReferenceData(nextReferenceData);
-      setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
+      setItems(applyDisplayData(
+        attachKnownTenantIdentities(eligible.items, effectiveTokenStatus),
+        loadedSettings,
+        nextReferenceData
+      ));
       publishTokenStatus(effectiveTokenStatus);
       setDataCache(nextCache);
       setReferenceData(nextReferenceData);
@@ -625,7 +665,11 @@ function SettingsApp() {
     publishTokenStatus(snapshotTokenStatus);
     setDataCache(nextCache);
     setReferenceData(nextReferenceData);
-    setItems(applyDisplayData(eligible.items, loadedSettings, nextReferenceData));
+    setItems(applyDisplayData(
+      attachKnownTenantIdentities(eligible.items, snapshotTokenStatus),
+      loadedSettings,
+      nextReferenceData
+    ));
     const accessCapabilities = buildAccessCapabilityItems(snapshotTokenStatus, nextCache, enabledRoleFeatures);
     const limitedAreas = accessCapabilities.filter((item) => item.status !== "ready").length;
     const refreshErrors = formatLoadMessages(refreshTargets.flatMap((target) => [
@@ -637,9 +681,13 @@ function SettingsApp() {
       const activeResult = activeResultsByTarget[target];
       return Boolean(eligibleResult && activeResult && !eligibleResult.errors.length && !activeResult.errors.length);
     });
-    if (completedRecoveryTargets.length) {
+    if (completedRecoveryTargets.length && options.expectedPortalRecoveryJourneyCreatedAt !== undefined) {
       try {
-        await sendMessage<AccessSetupTarget[]>({ action: "closePortalRecoveryTabs", targets: completedRecoveryTargets });
+        await sendMessage<AccessSetupTarget[]>({
+          action: "closePortalRecoveryTabs",
+          targets: completedRecoveryTargets,
+          expectedJourneyCreatedAt: options.expectedPortalRecoveryJourneyCreatedAt
+        });
       } catch {
         // Access data remains valid even if the browser rejects optional temporary-tab cleanup.
       }
@@ -850,7 +898,10 @@ function SettingsApp() {
         <div className="brand">
           <img src="/img/QuickPim48.png" alt="" />
           <div>
-            <h1>QuickPIM++ Settings</h1>
+            <div className="settings-brand-title">
+              <h1>QuickPIM++ Settings</h1>
+              <span className="settings-header-version">v{APP_VERSION}</span>
+            </div>
             <p>Set up role access, personalize the popup, configure activation, and manage local data.</p>
           </div>
         </div>
@@ -1281,6 +1332,7 @@ function AccessSetupPanel({
     setIsRunningSetup(true);
     setPortalRecoveryError("");
     let latestRecoveryStatus = portalRecoveryStatus;
+    let recoveryJourneyCreatedAt: number | undefined;
     try {
       if (portalRecoveryStatus.state === "interactionRequired") {
         await continueMicrosoftSignIn();
@@ -1294,7 +1346,8 @@ function AccessSetupPanel({
         buildAccessCapabilityItems(scannedTokens, dataCache, currentFeatures)
       ).filter((target) => initialTargets.includes(target));
       if (remainingTargets.length) {
-        await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
+        const recovery = await sendMessage<PortalRecoveryOpenResult>({ action: "openPortalRecoveryTabs", targets: remainingTargets });
+        recoveryJourneyCreatedAt = recovery.journeyCreatedAt;
         latestRecoveryStatus = await readPortalRecoveryStatus(latestRecoveryStatus);
         publishPortalRecoveryStatus(latestRecoveryStatus);
       }
@@ -1308,14 +1361,19 @@ function AccessSetupPanel({
       latestRecoveryStatus = tokenRefresh.recoveryStatus;
       publishPortalRecoveryStatus(tokenRefresh.recoveryStatus);
       if (tokenRefresh.changedTargets.length) {
-        await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, { skipTargetsWithCurrentTokenCache: true });
+        await onRefreshAccessData(tokenRefresh.tokens, tokenRefresh.changedTargets, {
+          skipTargetsWithCurrentTokenCache: true,
+          expectedPortalRecoveryJourneyCreatedAt: recoveryJourneyCreatedAt
+        });
       }
       if (tokenRefresh.recoveryStatus.state === "interactionRequired") {
         return;
       }
       const unchangedTargets = remainingTargets.filter((target) => !tokenRefresh.changedTargets.includes(target));
       if (unchangedTargets.length) {
-        await onRefreshAccessData(tokenRefresh.tokens, unchangedTargets);
+        await onRefreshAccessData(tokenRefresh.tokens, unchangedTargets, {
+          expectedPortalRecoveryJourneyCreatedAt: recoveryJourneyCreatedAt
+        });
       }
     } catch (setupError) {
       setPortalRecoveryError(setupError instanceof Error ? setupError.message : String(setupError));
@@ -1731,6 +1789,14 @@ function ActivityPanel({
       const normalizedId = normalizeActivationItemId(entry.itemId);
       if (!historyNamesById.has(normalizedId) && entry.itemName.trim()) {
         historyNamesById.set(normalizedId, entry.itemName);
+      }
+      if (entry.tenantId && !getTenantIdFromActivationItemIdentity(normalizedId)) {
+        const tenantScopedId = normalizeActivationItemId(
+          `tenant:${entry.tenantId}:${getUnscopedActivationItemIdentity(normalizedId)}`
+        );
+        if (!historyNamesById.has(tenantScopedId) && entry.itemName.trim()) {
+          historyNamesById.set(tenantScopedId, entry.itemName);
+        }
       }
     }
     const aliasesById = new Map(
@@ -2874,7 +2940,7 @@ function DiagnosticsPanel({
     };
     refreshPortalScanDiagnostic();
     const refreshNotificationPermission = () => {
-      if (!chrome.notifications || !chrome.permissions?.contains) {
+      if (!chrome.permissions?.contains) {
         setNotificationPermissionGranted(false);
         return;
       }
@@ -3090,7 +3156,7 @@ function AliasesPanel({
 }) {
   const [itemId, setItemId] = useState("");
   const [alias, setAlias] = useState("");
-  const selectedItem = items.find((item) => item.id === itemId);
+  const selectedItem = items.find((item) => activationItemMatchesIdentity(item, itemId));
   const aliasPickerGroups = useMemo(() => {
     const compareRawItems = (left: ActivationItem, right: ActivationItem) =>
       left.sourceName.localeCompare(right.sourceName, undefined, { sensitivity: "base" })
@@ -3111,7 +3177,7 @@ function AliasesPanel({
 
   async function saveAlias() {
     if (!selectedItem || !alias.trim()) return;
-    const itemIdentity = selectedItem.id;
+    const itemIdentity = getActivationItemIdentity(selectedItem);
     const nextAlias = alias.trim();
     if (await onMutate((latest) => ({
       ...latest,
@@ -3146,7 +3212,7 @@ function AliasesPanel({
               {aliasPickerGroups.roles.length ? (
                 <optgroup label="Roles">
                   {aliasPickerGroups.roles.map((item) => (
-                    <option value={item.id} key={item.id}>
+                    <option value={getActivationItemIdentity(item)} key={getActivationItemIdentity(item)}>
                       {item.sourceName} / {getScopeLabel(item, referenceData)}
                     </option>
                   ))}
@@ -3155,7 +3221,7 @@ function AliasesPanel({
               {aliasPickerGroups.groups.length ? (
                 <optgroup label="Groups">
                   {aliasPickerGroups.groups.map((item) => (
-                    <option value={item.id} key={item.id}>
+                    <option value={getActivationItemIdentity(item)} key={getActivationItemIdentity(item)}>
                       {item.sourceName} / {getScopeLabel(item, referenceData)}
                     </option>
                   ))}
@@ -3193,7 +3259,7 @@ function AliasesPanel({
             <div className="alias-row" key={id}>
               <div>
                 <strong>{value}</strong>
-                <p className="muted">{items.find((item) => item.id === id)?.sourceName || id}</p>
+                <p className="muted">{items.find((item) => activationItemMatchesIdentity(item, id))?.sourceName || id}</p>
               </div>
               <button className="btn danger" onClick={() => void removeAlias(id)}>
                 Remove
@@ -3871,6 +3937,44 @@ function PreferencesPanel({
     };
   }, [page, draft.requestNotificationsEnabled, draft.expiryReminderMinutes]);
 
+  useEffect(() => {
+    if (page !== "activation" || notificationHealth.permission !== "granted") return;
+    // This also covers permissions granted during an earlier Settings visit.
+    // Waking the worker after permission is available gives it another chance
+    // to bind action listeners before future expiry notifications arrive.
+    void sendRuntimeMessage({ action: "initializeNotificationDelivery" }).catch(() => undefined);
+    const notifications = chrome.notifications;
+    const buttonEvent = notifications?.onButtonClicked;
+    if (!notifications?.create || !buttonEvent?.addListener) return;
+
+    const handleTestButtonClick = (notificationId: string, buttonIndex: number) => {
+      if (notificationId !== NOTIFICATION_TEST_ID) return;
+      const result = getNotificationTestButtonResult(buttonIndex);
+      if (!result) return;
+
+      setNotificationPermissionError("");
+      setNotificationTestMessage(`${result.title}. Notification action events work on this browser.`);
+      void (async () => {
+        try {
+          await notifications.clear?.(notificationId);
+          await notifications.create(NOTIFICATION_TEST_RESULT_ID, {
+            type: "basic",
+            iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
+            title: result.title,
+            message: result.message
+          });
+        } catch {
+          if (isMountedRef.current) {
+            setNotificationPermissionError("The notification button click was received, but its confirmation could not be displayed.");
+          }
+        }
+      })();
+    };
+
+    buttonEvent.addListener(handleTestButtonClick);
+    return () => buttonEvent.removeListener(handleTestButtonClick);
+  }, [page, notificationHealth.permission]);
+
   function updateDraft(patch: Partial<PreferenceDraft>) {
     if (autosaveRetryTimerRef.current !== undefined) {
       window.clearTimeout(autosaveRetryTimerRef.current);
@@ -3972,7 +4076,9 @@ function PreferencesPanel({
   }
 
   async function requestNotificationPermission(): Promise<boolean> {
-    if (!chrome.notifications || !chrome.permissions?.request) {
+    // Edge may not expose an optional API namespace until its permission has
+    // been granted. The Permissions API is therefore the capability gate.
+    if (!chrome.permissions?.request) {
       setNotificationPermissionError("This browser does not expose extension notifications. Request tracking still works in Settings > Activity & Usage.");
       setNotificationHealth((current) => ({ ...current, permission: "unsupported", nextReminderAt: undefined }));
       return false;
@@ -4013,25 +4119,36 @@ function PreferencesPanel({
     if (notificationHealth.permission !== "granted" && !(await requestNotificationPermission())) {
       return;
     }
+    const notifications = chrome.notifications;
+    if (!notifications?.create) {
+      setNotificationPermissionError("Notification permission is enabled, but the browser has not made notification delivery available yet. Reload this Settings page and try the test again.");
+      setNotificationHealth((current) => ({ ...current, permission: "unsupported", nextReminderAt: undefined }));
+      return;
+    }
     try {
-      await chrome.notifications.create("quickpim-notification-test", {
+      await notifications.create(NOTIFICATION_TEST_ID, {
         type: "basic",
         iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
         title: "QuickPIM++ notifications are ready",
-        message: "This browser can deliver PIM request and expiry notifications."
+        message: "This browser can deliver PIM request and expiry notifications.",
+        contextMessage: "Use either test button to verify notification actions.",
+        buttons: NOTIFICATION_TEST_BUTTON_TITLES.map((title) => ({ title }))
       });
-      setNotificationTestMessage("Test sent. If it is not visible, allow notifications for this browser in the operating system.");
+      setNotificationTestMessage("Test sent with two action buttons. Click either one; a second notification will confirm the button event.");
     } catch {
       setNotificationPermissionError("The browser accepted the permission but could not create a test notification. Check browser and operating-system notification settings.");
     }
   }
 
   async function refreshNotificationHealth() {
-    const supported = Boolean(chrome.notifications && chrome.permissions?.contains);
-    let permission: NotificationPermissionState = supported ? "missing" : "unsupported";
-    if (supported) {
+    const permissionApiAvailable = Boolean(chrome.permissions?.contains);
+    let permission: NotificationPermissionState = permissionApiAvailable ? "missing" : "unsupported";
+    if (permissionApiAvailable) {
       try {
-        permission = await chrome.permissions.contains({ permissions: ["notifications"] }) ? "granted" : "missing";
+        const granted = await chrome.permissions.contains({ permissions: ["notifications"] });
+        permission = granted
+          ? chrome.notifications ? "granted" : "unsupported"
+          : "missing";
       } catch {
         permission = "missing";
       }
@@ -4231,15 +4348,19 @@ function PreferencesPanel({
                   </p>
                 ) : null}
               </div>
-              <div className="button-row notification-health-actions">
-                {draft.requestNotificationsEnabled && notificationHealth.permission === "missing" ? (
-                  <button className="btn primary" disabled={isRequestingNotificationPermission} onClick={() => void enableNotificationsOnBrowser()}>
-                    {isRequestingNotificationPermission ? "Enabling..." : "Enable on this browser"}
-                  </button>
-                ) : null}
-                {draft.requestNotificationsEnabled && notificationHealth.permission === "granted" ? (
-                  <button className="btn secondary" onClick={() => void sendTestNotification()}>Send test notification</button>
-                ) : null}
+              <div className="notification-health-controls">
+                <div className="button-row notification-health-actions">
+                  {draft.requestNotificationsEnabled && notificationHealth.permission === "missing" ? (
+                    <button className="btn primary" disabled={isRequestingNotificationPermission} onClick={() => void enableNotificationsOnBrowser()}>
+                      {isRequestingNotificationPermission ? "Enabling..." : "Enable on this browser"}
+                    </button>
+                  ) : null}
+                  {draft.requestNotificationsEnabled && notificationHealth.permission === "granted" ? (
+                    <button className="btn secondary" onClick={() => void sendTestNotification()}>Send test notification</button>
+                  ) : null}
+                </div>
+                {notificationPermissionError ? <p className="notification-health-feedback error" role="alert">{notificationPermissionError}</p> : null}
+                {notificationTestMessage ? <p className="notification-health-feedback success" role="status">{notificationTestMessage}</p> : null}
               </div>
             </div>
             <div className="form-grid settings-section-gap compact-preference-fields">
@@ -4263,8 +4384,6 @@ function PreferencesPanel({
             <p className="muted notification-scope-note">
               Expiry reminders cover activation requests submitted by QuickPIM++ when Microsoft returns an end time. Portal-only activations are not tracked.
             </p>
-            {notificationPermissionError ? <p className="message error settings-inline-message" role="alert">{notificationPermissionError}</p> : null}
-            {notificationTestMessage ? <p className="message success settings-inline-message" role="status">{notificationTestMessage}</p> : null}
           </div>
         </>
       ) : null}

@@ -4,10 +4,11 @@ import {
   PORTAL_RECOVERY_INTERACTION_TIMEOUT_MS,
   PORTAL_RECOVERY_SESSION_KEY,
   PORTAL_RECOVERY_SESSION_TTL_MS,
-  closeCompletedPortalRecoveryTabs,
   closeExpiredPortalRecoveryTabs,
+  closeOrphanedPortalRecoveryTabs,
   closePortalRecoveryTabsForTargets,
   focusPortalRecoveryTabs,
+  getPortalRecoveryJourneyCreatedAt,
   getPortalRecoveryStatus,
   openPortalRecoveryTabs,
   openPortalRecoveryTabsAndReconcile,
@@ -56,6 +57,7 @@ function readyTokenStatus(overrides: Partial<TokenStatus> = {}): TokenStatus {
 function createApis() {
   const storageData: Record<string, unknown> = {};
   const tabs = new Map<number, chrome.tabs.Tab>();
+  const tabGroups = new Map<number, chrome.tabGroups.TabGroup>();
   let nextTabId = 1;
   const create = vi.fn(async (properties: chrome.tabs.CreateProperties) => {
     const tab = {
@@ -80,10 +82,18 @@ function createApis() {
     if (!tab) throw new Error("No tab");
     return tab;
   });
-  const query = vi.fn(async () => [...tabs.values()]);
+  const query = vi.fn(async (queryInfo: chrome.tabs.QueryInfo = {}) => [...tabs.values()].filter((tab) =>
+    queryInfo.groupId === undefined || tab.groupId === queryInfo.groupId
+  ));
   const remove = vi.fn(async (tabIds: number | number[]) => {
     for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
       tabs.delete(tabId);
+    }
+  });
+  const ungroup = vi.fn(async (tabIds: number | number[]) => {
+    for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
+      const tab = tabs.get(tabId);
+      if (tab) tab.groupId = -1;
     }
   });
   const group = vi.fn(async (options: chrome.tabs.GroupOptions) => {
@@ -93,9 +103,25 @@ function createApis() {
       const tab = tabs.get(tabId);
       if (tab) tab.groupId = 44;
     }
+    tabGroups.set(44, {
+      id: 44,
+      collapsed: false,
+      color: "grey",
+      title: "",
+      windowId: 7
+    });
     return 44;
   });
-  const update = vi.fn(async () => undefined);
+  const update = vi.fn(async (groupId: number, properties: chrome.tabGroups.UpdateProperties) => {
+    const current = tabGroups.get(groupId);
+    if (!current) return undefined;
+    const updated = { ...current, ...properties } as chrome.tabGroups.TabGroup;
+    tabGroups.set(groupId, updated);
+    return updated;
+  });
+  const queryGroups = vi.fn(async (queryInfo: chrome.tabGroups.QueryInfo) => [...tabGroups.values()].filter((groupInfo) =>
+    queryInfo.title === undefined || groupInfo.title === queryInfo.title
+  ));
   const activateTab = vi.fn(async (tabId: number, updateProperties: chrome.tabs.UpdateProperties) => {
     const tab = tabs.get(tabId);
     if (!tab) throw new Error("No tab");
@@ -104,16 +130,32 @@ function createApis() {
   });
   const focusWindow = vi.fn(async (windowId: number) => ({ id: windowId } as chrome.windows.Window));
   const apis: PortalRecoveryApis = {
-    tabs: { create, get, query, remove, group, update: activateTab },
-    tabGroups: { update },
+    tabs: { create, get, query, remove, group, ungroup, update: activateTab },
+    tabGroups: { update, query: queryGroups },
     windows: { update: focusWindow },
     storage: {
       get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
-      set: vi.fn(async (value: Record<string, unknown>) => { Object.assign(storageData, value); }),
+      set: vi.fn(async (value: Record<string, unknown>) => {
+        Object.assign(storageData, structuredClone(value));
+      }),
       remove: vi.fn(async (key: string) => { delete storageData[key]; })
     }
   };
-  return { apis, storageData, tabs, create, query, remove, group, update, activateTab, focusWindow };
+  return {
+    apis,
+    storageData,
+    tabs,
+    tabGroups,
+    create,
+    query,
+    remove,
+    ungroup,
+    group,
+    update,
+    queryGroups,
+    activateTab,
+    focusWindow
+  };
 }
 
 describe("managed portal recovery tabs", () => {
@@ -121,7 +163,7 @@ describe("managed portal recovery tabs", () => {
     const fixture = createApis();
 
     const first = await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1000);
-    expect(first).toEqual({ requestedCount: 2, openedCount: 1, reusedCount: 0, managedCount: 2, grouped: true });
+    expect(first).toEqual({ requestedCount: 2, openedCount: 1, reusedCount: 0, managedCount: 2, grouped: true, journeyCreatedAt: 1000 });
     expect(fixture.create).toHaveBeenNthCalledWith(1, { url: recoveryUrl("directoryRole"), active: false });
     expect(fixture.create).toHaveBeenCalledTimes(1);
     expect(fixture.group).toHaveBeenCalledWith({ tabIds: [1], createProperties: { windowId: 7 } });
@@ -132,7 +174,7 @@ describe("managed portal recovery tabs", () => {
     });
 
     const second = await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1100);
-    expect(second).toEqual({ requestedCount: 2, openedCount: 0, reusedCount: 2, managedCount: 2, grouped: true });
+    expect(second).toEqual({ requestedCount: 2, openedCount: 0, reusedCount: 2, managedCount: 2, grouped: true, journeyCreatedAt: 1000 });
     expect(fixture.create).toHaveBeenCalledTimes(1);
 
     fixture.tabs.get(1)!.url = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize";
@@ -169,7 +211,8 @@ describe("managed portal recovery tabs", () => {
       openedCount: 1,
       reusedCount: 0,
       managedCount: 2,
-      grouped: true
+      grouped: true,
+      journeyCreatedAt: 1000
     });
     expect(fixture.create).toHaveBeenCalledTimes(1);
     expect(fixture.create).toHaveBeenCalledWith({
@@ -224,7 +267,8 @@ describe("managed portal recovery tabs", () => {
       openedCount: 1,
       reusedCount: 0,
       managedCount: 3,
-      grouped: true
+      grouped: true,
+      journeyCreatedAt: 1000
     });
 
     expect(fixture.create).toHaveBeenNthCalledWith(1, { url: recoveryUrl("directoryRole"), active: false });
@@ -269,6 +313,26 @@ describe("managed portal recovery tabs", () => {
     expect(fixture.create).toHaveBeenLastCalledWith({ url: recoveryUrl("pimGroup"), active: false });
   });
 
+  test("reopens one staged recovery journey after the user closes its whole group", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1000);
+    fixture.tabs.clear();
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole", "pimGroup"],
+      missingTokenStatus(),
+      fixture.apis,
+      1100
+    )).resolves.toMatchObject({ openedCount: 1, managedCount: 2 });
+
+    expect(fixture.create).toHaveBeenCalledTimes(2);
+    expect(fixture.tabs.size).toBe(1);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({
+      authenticationTarget: "pimGroup",
+      deferredTargets: ["directoryRole"]
+    });
+  });
+
   test("reconstructs a restored recovery tab only from its exact journey marker", async () => {
     const fixture = createApis();
     await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
@@ -286,28 +350,15 @@ describe("managed portal recovery tabs", () => {
     });
   });
 
-  test("closes only the targets that receive a newer usable token", async () => {
-    const fixture = createApis();
-    await openPortalRecoveryTabs(["directoryRole", "azureRole"], missingTokenStatus(), fixture.apis, 1000);
-
-    const graphOnly = readyTokenStatus({ azureManagement: { hasToken: false } });
-    await expect(closeCompletedPortalRecoveryTabs(graphOnly, fixture.apis)).resolves.toEqual(["directoryRole"]);
-    expect(fixture.remove).toHaveBeenCalledWith([1]);
-    expect(fixture.tabs.has(2)).toBe(true);
-    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeTruthy();
-
-    await expect(closeCompletedPortalRecoveryTabs(readyTokenStatus(), fixture.apis)).resolves.toEqual(["azureRole"]);
-    expect(fixture.remove).toHaveBeenCalledWith([2]);
-    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
-  });
-
   test("does not close or keep managing a recovery tab after the user navigates it elsewhere", async () => {
     const fixture = createApis();
     await openPortalRecoveryTabs(["pimGroup"], missingTokenStatus(), fixture.apis, 1000);
     fixture.tabs.get(1)!.url = "https://example.com/keep-this-page";
 
-    await expect(closeCompletedPortalRecoveryTabs(readyTokenStatus(), fixture.apis)).resolves.toEqual([]);
+    await expect(closePortalRecoveryTabsForTargets(["pimGroup"], fixture.apis, 1000)).resolves.toEqual([]);
     expect(fixture.remove).not.toHaveBeenCalled();
+    expect(fixture.ungroup).toHaveBeenCalledWith(1);
+    expect(fixture.tabs.get(1)?.groupId).toBe(-1);
     expect(fixture.tabs.has(1)).toBe(true);
     expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
   });
@@ -358,44 +409,6 @@ describe("managed portal recovery tabs", () => {
     });
   });
 
-  test("does not accept a different portal identity as completion of an existing recovery", async () => {
-    const fixture = createApis();
-    const baseline = readyTokenStatus();
-    await openPortalRecoveryTabs(["pimGroup"], baseline, fixture.apis, 1000);
-    const differentIdentity = readyTokenStatus({
-      graph: { hasToken: true, capturedAt: 3, tenantId: "tenant-b", principalId: "user-b" },
-      graphTargets: {
-        pimGroup: {
-          hasToken: true,
-          capturedAt: 3,
-          tenantId: "tenant-b",
-          principalId: "user-b",
-          grantedScopes: ["PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup"]
-        }
-      }
-    });
-
-    await expect(closeCompletedPortalRecoveryTabs(differentIdentity, fixture.apis)).resolves.toEqual([]);
-    expect(fixture.remove).not.toHaveBeenCalled();
-  });
-
-  test("keeps a PIM group page open for a read-only token", async () => {
-    const fixture = createApis();
-    await openPortalRecoveryTabs(["pimGroup"], missingTokenStatus(), fixture.apis, 1000);
-    const readOnly = readyTokenStatus({
-      graphTargets: {
-        pimGroup: {
-          hasToken: true,
-          capturedAt: 2,
-          grantedScopes: ["PrivilegedEligibilitySchedule.Read.AzureADGroup"]
-        }
-      }
-    });
-
-    await expect(closeCompletedPortalRecoveryTabs(readOnly, fixture.apis)).resolves.toEqual([]);
-    expect(fixture.remove).not.toHaveBeenCalled();
-  });
-
   test("keeps newly opened recovery tabs until an API check proves target capability", async () => {
     const fixture = createApis();
     const statuses = [missingTokenStatus(), readyTokenStatus()];
@@ -433,6 +446,242 @@ describe("managed portal recovery tabs", () => {
     await expect(closeExpiredPortalRecoveryTabs(fixture.apis, 1000 + PORTAL_RECOVERY_SESSION_TTL_MS - 1)).resolves.toEqual([]);
     await expect(closeExpiredPortalRecoveryTabs(fixture.apis, 1000 + PORTAL_RECOVERY_SESSION_TTL_MS)).resolves.toEqual(["pimGroup"]);
     expect(fixture.tabs.size).toBe(0);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
+  });
+
+  test("keeps an expired session owned when tab removal fails and does not open duplicates", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["pimGroup"], missingTokenStatus(), fixture.apis, 1000);
+    fixture.remove.mockRejectedValue(new Error("Tabs are temporarily locked"));
+
+    await expect(closeExpiredPortalRecoveryTabs(
+      fixture.apis,
+      1000 + PORTAL_RECOVERY_SESSION_TTL_MS
+    )).resolves.toEqual([]);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeTruthy();
+
+    await expect(openPortalRecoveryTabs(
+      ["pimGroup"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000 + PORTAL_RECOVERY_SESSION_TTL_MS + 1
+    )).resolves.toMatchObject({ openedCount: 0, reusedCount: 1, managedCount: 1 });
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+    expect(fixture.tabs.size).toBe(1);
+  });
+
+  test("opens a different requested source even when an expired tab cannot be removed", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["pimGroup"], missingTokenStatus(), fixture.apis, 1000);
+    fixture.remove.mockRejectedValue(new Error("Tabs are temporarily locked"));
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000 + PORTAL_RECOVERY_SESSION_TTL_MS + 1
+    )).resolves.toMatchObject({ openedCount: 1, reusedCount: 0, managedCount: 1 });
+
+    expect(fixture.create).toHaveBeenCalledTimes(2);
+    expect(fixture.tabs.size).toBe(2);
+    await expect(getPortalRecoveryJourneyCreatedAt(
+      fixture.apis,
+      1000 + PORTAL_RECOVERY_SESSION_TTL_MS + 2
+    )).resolves.toBe(1000 + PORTAL_RECOVERY_SESSION_TTL_MS + 1);
+  });
+
+  test("status reconciliation closes an expired session without requiring a popup refresh", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+
+    await expect(getPortalRecoveryStatus(
+      fixture.apis,
+      1000 + PORTAL_RECOVERY_SESSION_TTL_MS
+    )).resolves.toEqual({
+      state: "idle",
+      managedTargets: [],
+      interactionTargets: [],
+      grouped: false
+    });
+    expect(fixture.tabs.size).toBe(0);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
+  });
+
+  test("persists ownership immediately before grouping can yield", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+
+    const firstStorageWrite = vi.mocked(fixture.apis.storage.set).mock.invocationCallOrder[0];
+    const grouping = fixture.group.mock.invocationCallOrder[0];
+    expect(firstStorageWrite).toBeLessThan(grouping);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeTruthy();
+  });
+
+  test("persists deferred sign-in intent before grouping can yield", async () => {
+    const fixture = createApis();
+
+    await openPortalRecoveryTabs(["directoryRole", "pimGroup"], missingTokenStatus(), fixture.apis, 1000);
+
+    const storageSet = vi.mocked(fixture.apis.storage.set);
+    const stagedWriteIndex = storageSet.mock.calls.findIndex(([value]) => {
+      const session = value[PORTAL_RECOVERY_SESSION_KEY] as Record<string, unknown> | undefined;
+      return session?.authenticationTarget === "directoryRole"
+        && Array.isArray(session.deferredTargets)
+        && session.deferredTargets.includes("pimGroup");
+    });
+    expect(stagedWriteIndex).toBeGreaterThanOrEqual(0);
+    expect(storageSet.mock.invocationCallOrder[stagedWriteIndex]).toBeLessThan(
+      fixture.group.mock.invocationCallOrder[0]
+    );
+  });
+
+  test("keeps durable ownership and intent when grouping metadata cannot be saved", async () => {
+    const fixture = createApis();
+    const storageSet = vi.mocked(fixture.apis.storage.set);
+    storageSet.mockImplementation(async (value: Record<string, unknown>) => {
+      if (storageSet.mock.calls.length >= 3) {
+        throw new Error("Final group metadata save failed");
+      }
+      Object.assign(fixture.storageData, structuredClone(value));
+    });
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole", "pimGroup"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000
+    )).resolves.toMatchObject({ openedCount: 1, managedCount: 2, grouped: true });
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({
+      tabsByTarget: { directoryRole: 1 },
+      authenticationTarget: "directoryRole",
+      deferredTargets: ["pimGroup"]
+    });
+  });
+
+  test("keeps a created tab owned when browser grouping fails", async () => {
+    const fixture = createApis();
+    fixture.group.mockRejectedValue(new Error("Tab grouping unavailable"));
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000
+    )).resolves.toEqual({
+      requestedCount: 1,
+      openedCount: 1,
+      reusedCount: 0,
+      managedCount: 1,
+      grouped: false,
+      journeyCreatedAt: 1000
+    });
+    expect(fixture.tabs.size).toBe(1);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({
+      tabsByTarget: { directoryRole: 1 }
+    });
+
+    await expect(closePortalRecoveryTabsForTargets(
+      ["directoryRole"],
+      fixture.apis,
+      1000
+    )).resolves.toEqual(["directoryRole"]);
+    expect(fixture.tabs.size).toBe(0);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
+  });
+
+  test("keeps only failed tab removals owned and finishes them on retry", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(
+      ["directoryRole", "pimGroup", "azureRole"],
+      readyTokenStatus(),
+      fixture.apis,
+      1000
+    );
+    const remove = fixture.remove;
+    remove.mockImplementation(async (tabIds: number | number[]) => {
+      if (Array.isArray(tabIds)) {
+        throw new Error("Batch close failed");
+      }
+      if (tabIds === 2) {
+        throw new Error("PIM Groups tab is temporarily locked");
+      }
+      fixture.tabs.delete(tabIds);
+    });
+
+    await expect(closePortalRecoveryTabsForTargets(
+      ["directoryRole", "pimGroup", "azureRole"],
+      fixture.apis,
+      1000
+    )).resolves.toEqual(["directoryRole", "azureRole"]);
+    expect([...fixture.tabs.keys()]).toEqual([2]);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({
+      tabsByTarget: { pimGroup: 2 }
+    });
+
+    remove.mockImplementation(async (tabIds: number | number[]) => {
+      for (const tabId of Array.isArray(tabIds) ? tabIds : [tabIds]) {
+        fixture.tabs.delete(tabId);
+      }
+    });
+    await expect(closePortalRecoveryTabsForTargets(
+      ["pimGroup"],
+      fixture.apis,
+      1000
+    )).resolves.toEqual(["pimGroup"]);
+    expect(fixture.tabs.size).toBe(0);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
+  });
+
+  test("closes a newly created tab if durable ownership cannot be persisted", async () => {
+    const fixture = createApis();
+    vi.mocked(fixture.apis.storage.set).mockRejectedValue(new Error("Storage unavailable"));
+
+    await expect(openPortalRecoveryTabs(
+      ["directoryRole"],
+      missingTokenStatus(),
+      fixture.apis,
+      1000
+    )).resolves.toMatchObject({ openedCount: 0, managedCount: 0 });
+    expect(fixture.remove).toHaveBeenCalledWith(1);
+    expect(fixture.tabs.size).toBe(0);
+  });
+
+  test("removes an orphaned exact QuickPIM++ recovery group after a worker restart", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+    delete fixture.storageData[PORTAL_RECOVERY_SESSION_KEY];
+
+    await expect(closeOrphanedPortalRecoveryTabs(fixture.apis, 1100)).resolves.toEqual([1]);
+    expect(fixture.tabs.size).toBe(0);
+  });
+
+  test("never treats tabs from the active recovery group as orphans", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+
+    await expect(closeOrphanedPortalRecoveryTabs(fixture.apis, 1100)).resolves.toEqual([]);
+    expect(fixture.tabs.size).toBe(1);
+  });
+
+  test("does not let a stale verifier close a newer recovery journey", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["pimGroup"], missingTokenStatus(), fixture.apis, 1000);
+    await expect(getPortalRecoveryJourneyCreatedAt(fixture.apis, 1100)).resolves.toBe(1000);
+
+    await expect(closePortalRecoveryTabsForTargets(
+      ["pimGroup"],
+      fixture.apis,
+      999
+    )).resolves.toEqual([]);
+    expect(fixture.tabs.size).toBe(1);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeTruthy();
+  });
+
+  test("removes malformed durable ownership records instead of retrying them forever", async () => {
+    const fixture = createApis();
+    fixture.storageData[PORTAL_RECOVERY_SESSION_KEY] = { version: 99, createdAt: 1000 };
+
+    await expect(getPortalRecoveryJourneyCreatedAt(fixture.apis, 1100)).resolves.toBeUndefined();
     expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toBeUndefined();
   });
 });

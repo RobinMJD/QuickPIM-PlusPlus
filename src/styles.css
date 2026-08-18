@@ -197,6 +197,21 @@ button {
   color: #0f172a;
 }
 
+.settings-brand-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-header-version {
+  flex: 0 0 auto;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .brand p,
 .muted {
   margin: 3px 0 0;
@@ -3095,6 +3110,38 @@ a.btn {
   flex: 0 0 auto;
 }
 
+.notification-health-controls {
+  display: grid;
+  flex: 0 1 420px;
+  gap: 8px;
+  justify-items: end;
+  min-width: 230px;
+}
+
+.notification-health-feedback {
+  width: 100%;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.notification-health-feedback.success {
+  border-color: #86efac;
+  background: #dcfce7;
+  color: #14532d;
+}
+
+.notification-health-feedback.error {
+  border-color: #fecaca;
+  background: #fee2e2;
+  color: #991b1b;
+}
+
 .notification-scope-note {
   margin-top: 8px;
 }
@@ -4176,6 +4223,22 @@ body.dark-mode .textarea {
   color: #f8fafc;
 }
 
+body.dark-mode .settings-header-version {
+  color: #94a3b8;
+}
+
+body.dark-mode .notification-health-feedback.success {
+  border-color: #166534;
+  background: #123522;
+  color: #bbf7d0;
+}
+
+body.dark-mode .notification-health-feedback.error {
+  border-color: #991b1b;
+  background: #3f1717;
+  color: #fecaca;
+}
+
 body.dark-mode .brand p,
 body.dark-mode .muted,
 body.dark-mode .role-meta,
@@ -4853,6 +4916,12 @@ body.dark-mode .autosave-status.error {
   .notification-health {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .notification-health-controls {
+    width: 100%;
+    min-width: 0;
+    justify-items: start;
   }
 
   .settings-header {

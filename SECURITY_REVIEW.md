@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.2.
+Reviewed for v2.18.8.
+
+## v2.18.8 Tenant Identity Compatibility Review
+
+The tenant-qualified identity rollout was audited across aliases, favorites, usage counters, bundles, popup drafts, in-progress operations, automatic recovery, and activity history. Legacy tenantless identifiers now migrate only when a current item or an explicit history tenant resolves them unambiguously. Newly written records use tenant-qualified identities, while compatibility matching accepts an old unscoped result only when it cannot cross a known tenant boundary.
+
+Popup drafts saved before account metadata existed are rebound only when every selected item is still available and its tenant or principal proves it belongs to the current Microsoft context. Explicitly mismatched or unverifiable selections are cleared. Durable request operations reject conflicting embedded tenants, recover legacy result identifiers safely, and remain isolated by tenant and principal.
 
 ## v2.18.0 Lifecycle And Concurrency Review
 
