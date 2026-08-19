@@ -409,6 +409,7 @@ function PopupApp() {
   const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const requestProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const expiredActivationRefreshTimers = useRef<Partial<Record<AccessSetupTarget, number>>>({});
   const refreshRunId = useRef(0);
   const activeRefreshRunId = useRef<number | undefined>(undefined);
   const manualRefreshRunId = useRef<number | undefined>(undefined);
@@ -500,6 +501,10 @@ function PopupApp() {
     if (requestProgressClearTimer.current) {
       clearTimeout(requestProgressClearTimer.current);
     }
+    for (const timer of Object.values(expiredActivationRefreshTimers.current)) {
+      if (timer !== undefined) window.clearTimeout(timer);
+    }
+    expiredActivationRefreshTimers.current = {};
   }, []);
 
   const displayItems = useMemo(
@@ -1777,6 +1782,32 @@ function PopupApp() {
     }
   }
 
+  function queueExpiredActivationRefresh(item: ActivationItem): void {
+    const target = item.type;
+    if (expiredActivationRefreshTimers.current[target] !== undefined) return;
+
+    const recheck = () => {
+      if (activeRefreshRunId.current !== undefined) {
+        expiredActivationRefreshTimers.current[target] = window.setTimeout(recheck, 1_000);
+        return;
+      }
+      delete expiredActivationRefreshTimers.current[target];
+      void refresh({
+        force: false,
+        showLoading: false,
+        suppressMessage: true,
+        targets: [target],
+        recoverMissingPortalAccess: false,
+        quietWhenCached: true
+      });
+    };
+
+    // Microsoft continuations are scheduled one second after expiry. Recheck
+    // shortly after that boundary so the old row disappears and the queued
+    // extension can become the new active assignment without blocking the UI.
+    expiredActivationRefreshTimers.current[target] = window.setTimeout(recheck, 1_500);
+  }
+
   function renderLoadedActivationData(
     nextSettings: QuickPimSettings,
     nextTokens: TokenStatus,
@@ -2837,6 +2868,7 @@ function PopupApp() {
               emptyText={quickFilters.has("active") ? "No active PIM roles or groups found." : undefined}
               onToggle={toggleSelected}
               onToggleFavorite={(itemId) => void toggleFavorite(itemId)}
+              onActivationExpired={queueExpiredActivationRefresh}
             />
           </section>
           <ActivationBar

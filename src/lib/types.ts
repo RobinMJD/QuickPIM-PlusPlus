@@ -377,6 +377,8 @@ export interface TrackedRequestExtensionResult {
   message: string;
   sourceRequestId: string;
   requestId?: string;
+  requestStatus?: TrackedPimRequestStatus;
+  requiresApproval?: boolean;
   scheduledStartAt?: string;
   scheduledEndAt?: string;
   durationHours?: number;

@@ -132,6 +132,37 @@ export async function clearDataCache(): Promise<void> {
   await withDataCacheMutationLock(() => chrome.storage.local.remove(DATA_CACHE_KEY));
 }
 
+export async function invalidateActiveCacheTargets(
+  targets: AccessSetupTarget[],
+  invalidatedAt = Date.now()
+): Promise<void> {
+  const uniqueTargets = [...new Set(targets)].filter((target) => CACHE_TARGETS.includes(target));
+  if (!uniqueTargets.length) return;
+
+  await withDataCacheMutationLock(async () => {
+    const current = await loadDataCache();
+    const activeByTarget = { ...(current.activeByTarget || {}) };
+    for (const target of uniqueTargets) {
+      const entry = activeByTarget[target];
+      if (entry) {
+        activeByTarget[target] = markCacheEntryInvalid(entry, invalidatedAt);
+      }
+    }
+
+    const next: QuickPimDataCache = {
+      ...current,
+      version: 2,
+      ...(Object.keys(activeByTarget).length ? { activeByTarget } : {})
+    };
+    if (current.active) {
+      // Legacy aggregate entries cannot be invalidated by target. Expire the
+      // aggregate so it cannot reintroduce a stale active assignment.
+      next.active = markCacheEntryInvalid(current.active, invalidatedAt);
+    }
+    await chrome.storage.local.set({ [DATA_CACHE_KEY]: next });
+  });
+}
+
 export function mergeDataCachesForSave(current: QuickPimDataCache, incoming: QuickPimDataCache): QuickPimDataCache {
   const safeCurrent = sanitizeDataCache(current);
   const safeIncoming = sanitizeDataCache(incoming);
@@ -260,10 +291,12 @@ export function getTargetCacheStatus(options: {
   const entry = getTargetEntry(options.cache, options.bucket, options.target);
   const exactEntry = entry;
   if (isCacheSnapshotUsable(exactEntry, usableTtlMs, now, options.cacheKey)) {
+    const prepared = prepareTargetCacheEntry(exactEntry, options.bucket, now);
     return {
       target: options.target,
-      entry: markDiagnosticsFromCache({ ...exactEntry, errors: [] }, true),
-      isFresh: isCacheEntryFresh(exactEntry, options.freshTtlMs, now, options.cacheKey),
+      entry: markDiagnosticsFromCache({ ...prepared.entry, errors: [] }, true),
+      isFresh: !prepared.removedExpiredItems
+        && isCacheEntryFresh(exactEntry, options.freshTtlMs, now, options.cacheKey),
       isUsable: true
     };
   }
@@ -273,9 +306,10 @@ export function getTargetCacheStatus(options: {
     && options.compatibleCacheKey?.(entry.cacheKey)
     && isCacheSnapshotUsable(entry, usableTtlMs, now)
   ) {
+    const prepared = prepareTargetCacheEntry(entry, options.bucket, now);
     return {
       target: options.target,
-      entry: markDiagnosticsFromCache({ ...entry, errors: [] }, true),
+      entry: markDiagnosticsFromCache({ ...prepared.entry, errors: [] }, true),
       // A scope change can keep same-account display data usable, but it must
       // still trigger a fresh API check before request capabilities are trusted.
       isFresh: false,
@@ -285,15 +319,56 @@ export function getTargetCacheStatus(options: {
 
   const legacyEntry = getLegacyTargetEntry(options.cache, options.bucket, options.target);
   if (isCacheSnapshotUsable(legacyEntry, usableTtlMs, now, options.legacyCacheKey)) {
+    const prepared = prepareTargetCacheEntry(legacyEntry, options.bucket, now);
     return {
       target: options.target,
-      entry: markDiagnosticsFromCache({ ...legacyEntry, errors: [] }, true),
-      isFresh: isCacheEntryFresh(legacyEntry, options.freshTtlMs, now, options.legacyCacheKey),
+      entry: markDiagnosticsFromCache({ ...prepared.entry, errors: [] }, true),
+      isFresh: !prepared.removedExpiredItems
+        && isCacheEntryFresh(legacyEntry, options.freshTtlMs, now, options.legacyCacheKey),
       isUsable: true
     };
   }
 
   return { target: options.target, isFresh: false, isUsable: false };
+}
+
+function prepareTargetCacheEntry(
+  entry: CachedActivationEntry,
+  bucket: CacheBucket,
+  now: number
+): { entry: CachedActivationEntry; removedExpiredItems: boolean } {
+  if (bucket !== "active") {
+    return { entry, removedExpiredItems: false };
+  }
+
+  const items = entry.items.filter((item) => {
+    if (item.status !== "active" || !item.activeUntil) return true;
+    const activeUntil = Date.parse(item.activeUntil);
+    return !Number.isFinite(activeUntil) || activeUntil > now;
+  });
+  const removedCount = entry.items.length - items.length;
+  if (!removedCount) {
+    return { entry, removedExpiredItems: false };
+  }
+
+  return {
+    entry: {
+      ...entry,
+      items,
+      ...(entry.totalItems !== undefined
+        ? { totalItems: Math.max(0, entry.totalItems - removedCount) }
+        : {})
+    },
+    removedExpiredItems: true
+  };
+}
+
+function markCacheEntryInvalid(entry: CachedActivationEntry, invalidatedAt: number): CachedActivationEntry {
+  return {
+    ...entry,
+    fetchedAt: 0,
+    refreshStartedAt: Math.max(entry.refreshStartedAt || 0, invalidatedAt)
+  };
 }
 
 export function mergeTargetEntries(entries: Array<CachedActivationEntry | undefined>, fetchedAt = Date.now(), cacheKey?: string): CachedActivationEntry {

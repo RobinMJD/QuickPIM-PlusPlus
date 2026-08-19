@@ -2264,7 +2264,15 @@ function TrackedRequestDetails({
       <div className="button-row request-detail-actions">
         <button className="btn" onClick={onRefresh} disabled={isRefreshing}>Check status</button>
         <button className="btn" onClick={onOpenPortal}>Open Microsoft PIM</button>
-        {extensionDurationHours ? <button className="btn primary" onClick={onExtend} disabled={isExtending}>{isExtending ? "Queuing..." : `Extend ${formatExtensionDuration(extensionDurationHours)}`}</button> : null}
+        {extensionDurationHours ? (
+          <button className="btn primary" onClick={onExtend} disabled={isExtending}>
+            {isExtending
+              ? request.activationRequirements?.approval ? "Requesting approval..." : "Scheduling..."
+              : request.activationRequirements?.approval
+                ? `Request ${formatExtensionDuration(extensionDurationHours)} extension`
+                : `Extend ${formatExtensionDuration(extensionDurationHours)}`}
+          </button>
+        ) : null}
         {canRetry ? (
           <button className="btn primary" onClick={() => onPrepare(request.action)}>
             Retry {request.action === "activate" ? "activation" : "deactivation"}

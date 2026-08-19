@@ -3,6 +3,7 @@ import {
   DEFAULT_EXTENSION_DURATION_HOURS,
   buildTrackedRequestExtensionPlan,
   formatExtensionDuration,
+  getTrackedRequestExtensionSubmissionCopy,
   requireTrackedRequestExtensionRequestId,
   sanitizeExtensionDurationHours
 } from "../src/lib/requestExtension";
@@ -65,6 +66,54 @@ describe("tracked PIM request extension", () => {
     expect(sanitizeExtensionDurationHours(3)).toBe(0.5);
     expect(formatExtensionDuration(0.5)).toBe("30 minutes");
     expect(formatExtensionDuration(1)).toBe("1 hour");
+  });
+
+  test("distinguishes approval-required extension submissions from scheduled continuations", () => {
+    expect(getTrackedRequestExtensionSubmissionCopy(
+      { itemName: "Global Reader", activationRequirements: { approval: true } },
+      0.5,
+      "pendingApproval"
+    )).toEqual({
+      title: "PIM extension awaiting approval",
+      message: "Global Reader extension for 30 minutes was submitted for approval. If approved, it will start after the current activation ends.",
+      requiresApproval: true
+    });
+    expect(getTrackedRequestExtensionSubmissionCopy(
+      { itemName: "Global Reader", activationRequirements: { approval: true } },
+      1,
+      "scheduled"
+    )).toEqual({
+      title: "PIM extension scheduled",
+      message: "Global Reader is scheduled for 1 hour more access after its current activation ends.",
+      requiresApproval: false
+    });
+    expect(getTrackedRequestExtensionSubmissionCopy(
+      { itemName: "Global Reader", activationRequirements: { approval: true } },
+      2,
+      "submitted"
+    ).requiresApproval).toBe(true);
+  });
+
+  test("tracks an approval-required continuation without treating its future window as active", () => {
+    const continuation = createTrackedPimRequest({
+      item: { ...directoryRole, activationRequirements: { ...directoryRole.activationRequirements, approval: true } },
+      action: "activate",
+      requestId: "approval-extension",
+      payload: { status: "PendingApproval" },
+      requestedAt: "2026-08-04T10:00:00.000Z",
+      scheduledStartAt: "2026-08-04T12:00:01.000Z",
+      durationHours: 0.5,
+      justification: "Continue production maintenance",
+      continuationOfRequestId: "original-request",
+      now: NOW
+    });
+
+    expect(continuation).toMatchObject({
+      status: "pendingApproval",
+      activeFrom: "2026-08-04T12:00:01.000Z",
+      activeUntil: "2026-08-04T12:30:01.000Z",
+      continuationOfRequestId: "original-request"
+    });
   });
 
   test("does not leave an accepted extension permanently queued without a tracking id", () => {

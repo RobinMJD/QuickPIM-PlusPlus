@@ -14,6 +14,7 @@ import {
   getPendingTrackedRequestCount,
   getRequestTrackingMaintenanceTime,
   getTrackedExpiryReminderDecision,
+  getTrackedRequestActiveCacheInvalidationTargets,
   markTrackedRequestCheckFailure,
   mutateTrackedRequests,
   normalizeTrackedRequestStatus,
@@ -107,6 +108,31 @@ describe("tracked PIM requests", () => {
       tenantId: "tenant-1"
     });
     expect(request?.nextCheckAt).toBe("2026-07-14T10:00:30.000Z");
+  });
+
+  test("invalidates active-role cache when tracked request lifecycle changes", () => {
+    const scheduled = createRequest({
+      id: "scheduled-extension",
+      requestId: "scheduled-extension",
+      status: "scheduled",
+      activeFrom: "2026-07-14T13:00:01.000Z",
+      activeUntil: "2026-07-14T13:30:01.000Z"
+    });
+    const active = { ...scheduled, status: "active" as const };
+    const expired = { ...active, status: "expired" as const };
+
+    expect(getTrackedRequestActiveCacheInvalidationTargets(
+      { version: 1, requests: [scheduled] },
+      { version: 1, requests: [active] }
+    )).toEqual(["directoryRole"]);
+    expect(getTrackedRequestActiveCacheInvalidationTargets(
+      { version: 1, requests: [active] },
+      { version: 1, requests: [expired] }
+    )).toEqual(["directoryRole"]);
+    expect(getTrackedRequestActiveCacheInvalidationTargets(
+      { version: 1, requests: [active] },
+      { version: 1, requests: [active] }
+    )).toEqual([]);
   });
 
   test("normalizes Microsoft lifecycle states and derives expiry", () => {
@@ -375,6 +401,47 @@ describe("tracked PIM requests", () => {
 
     const reconciled = reconcileTrackedExtensionSources(
       { version: 1, requests: [source, continuation] },
+      NOW
+    );
+    expect(reconciled.requests[0]).toMatchObject({
+      extensionAttemptState: undefined,
+      extensionRequestId: undefined,
+      extensionLastError: "The previous extension request was not completed."
+    });
+  });
+
+  test("keeps the source extension locked while its continuation awaits approval", () => {
+    const source = createRequest({
+      status: "active",
+      activeUntil: "2026-07-14T14:00:00.000Z",
+      extensionAttemptState: "queued",
+      extensionRequestId: "extension-pending"
+    });
+    const continuation = createRequest({
+      id: "directoryRole:extension-pending",
+      requestId: "extension-pending",
+      status: "pendingApproval",
+      continuationOfRequestId: source.requestId
+    });
+
+    const reconciled = reconcileTrackedExtensionSources(
+      { version: 1, requests: [source, continuation] },
+      NOW
+    );
+    expect(reconciled).toEqual({ version: 1, requests: [source, continuation] });
+  });
+
+  test("releases an orphaned extension lock after Microsoft visibility grace expires", () => {
+    const source = createRequest({
+      status: "active",
+      activeUntil: "2026-07-14T14:00:00.000Z",
+      extensionAttemptState: "queued",
+      extensionRequestId: "missing-extension",
+      extensionRequestedAt: new Date(NOW - ACTIVE_ASSIGNMENT_VISIBILITY_GRACE_MS - 1).toISOString()
+    });
+
+    const reconciled = reconcileTrackedExtensionSources(
+      { version: 1, requests: [source] },
       NOW
     );
     expect(reconciled.requests[0]).toMatchObject({

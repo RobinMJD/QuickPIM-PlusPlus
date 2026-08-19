@@ -36,6 +36,7 @@ import {
   saveReferenceData
 } from "./lib/referenceData";
 import {
+  invalidateActiveCacheTargets,
   loadDataCache,
   saveDataCache,
   splitActivationResultByTarget,
@@ -66,6 +67,7 @@ import {
   getPendingTrackedRequestCount,
   getRequestTrackingMaintenanceTime,
   getTrackedExpiryReminderDecision,
+  getTrackedRequestActiveCacheInvalidationTargets,
   isTrackedRequestPending,
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
@@ -164,6 +166,7 @@ import {
 import {
   buildTrackedRequestExtensionPlan,
   formatExtensionDuration,
+  getTrackedRequestExtensionSubmissionCopy,
   requireTrackedRequestExtensionRequestId
 } from "./lib/requestExtension";
 import {
@@ -438,10 +441,22 @@ function trackedNotificationClicked(notificationId: string): void {
   if (!notificationId.startsWith(REQUEST_TRACKING_NOTIFICATION_PREFIX)) {
     return;
   }
+  // Edge can surface both the body-click and button-click events for a single
+  // action. Notifications with explicit actions are handled only by their
+  // buttons so an Extend click cannot also open Activity behind the popup.
+  if (trackedNotificationHasExplicitActions(notificationId)) {
+    return;
+  }
   runBestEffort(runIfExtensionEnabled(async () => {
     await openTrackedRequestDetails();
     await clearNotification(notificationId);
   }));
+}
+
+function trackedNotificationHasExplicitActions(notificationId: string): boolean {
+  return notificationId.endsWith(":expiry-extend")
+    || notificationId.endsWith(":expiry-details")
+    || notificationId.endsWith(":expiry-missed");
 }
 
 function trackedNotificationButtonClicked(notificationId: string, buttonIndex: number): void {
@@ -815,9 +830,11 @@ async function performTrackedRequestMaintenance(
     }, now))
     : initialStore;
   const notifiedStore = await notifyTrackedRequestChanges(initialStore, updatedStore, settings, now);
+  const invalidationTargets = getTrackedRequestActiveCacheInvalidationTargets(initialStore, notifiedStore);
   await Promise.all([
     updateTrackedRequestBadge(notifiedStore),
-    scheduleTrackedRequestMaintenance(notifiedStore, settings)
+    scheduleTrackedRequestMaintenance(notifiedStore, settings),
+    ...(invalidationTargets.length ? [invalidateActiveCacheTargets(invalidationTargets, now)] : [])
   ]);
   return notifiedStore;
 }
@@ -1019,6 +1036,17 @@ async function notifyTrackedRequestChanges(
   }
 
   const previousById = new Map(previousStore.requests.map((request) => [request.id, request]));
+  const continuationBySourceRequestId = new Map<string, TrackedPimRequest>();
+  for (const candidate of nextStore.requests) {
+    if (!candidate.continuationOfRequestId) continue;
+    const status = getEffectiveTrackedRequestStatus(candidate, now);
+    if (isTerminalExtensionRequestStatus(status)) continue;
+    const key = candidate.continuationOfRequestId.toLowerCase();
+    const current = continuationBySourceRequestId.get(key);
+    if (!current || candidate.updatedAt > current.updatedAt) {
+      continuationBySourceRequestId.set(key, candidate);
+    }
+  }
   const patches = new Map<string, Partial<TrackedPimRequest>>();
   const reminderMinutes = settings.preferences.expiryReminderMinutes;
   await mapWithConcurrency(nextStore.requests, 3, async (request) => {
@@ -1049,7 +1077,8 @@ async function notifyTrackedRequestChanges(
         ? await showExpiryReminderNotification(
             request,
             reminderMinutes,
-            settings.preferences.defaultExtensionDurationHours
+            settings.preferences.defaultExtensionDurationHours,
+            continuationBySourceRequestId.get(request.requestId.toLowerCase())
           )
         : await showMissedExpiryReminderNotification(request);
       patches.set(request.id, {
@@ -1092,20 +1121,55 @@ async function showTrackedRequestNotification(
   request: TrackedPimRequest,
   status: TrackedPimRequestStatus
 ): Promise<NotificationDeliveryResult> {
-  const action = request.action === "activate" ? "activation" : "deactivation";
-  const message = status === "active"
-    ? `${request.itemName} is now active.`
-    : status === "completed"
-      ? `${request.itemName} deactivation completed.`
-      : `${request.itemName} ${action} was ${trackedRequestStatusLabel(status).toLowerCase()}.`;
-  return createRequestNotification(request, `Request ${trackedRequestStatusLabel(status).toLowerCase()}`, message, status);
+  const isExtension = Boolean(request.continuationOfRequestId);
+  const action = isExtension ? "extension" : request.action === "activate" ? "activation" : "deactivation";
+  const approvalScheduled = status === "scheduled" && request.activationRequirements?.approval === true;
+  const message = approvalScheduled
+    ? `${request.itemName} ${action} was approved and is scheduled.`
+    : status === "active"
+      ? `${request.itemName} ${isExtension ? "extension" : "access"} is now active.`
+      : status === "completed"
+        ? `${request.itemName} ${action} completed.`
+        : `${request.itemName} ${action} was ${trackedRequestStatusLabel(status).toLowerCase()}.`;
+  const title = approvalScheduled
+    ? `${isExtension ? "Extension" : "Request"} approved`
+    : `${isExtension ? "Extension" : "Request"} ${trackedRequestStatusLabel(status).toLowerCase()}`;
+  return createRequestNotification(request, title, message, status);
 }
 
 async function showExpiryReminderNotification(
   request: TrackedPimRequest,
   reminderMinutes: number,
-  preferredExtensionDurationHours: number
+  preferredExtensionDurationHours: number,
+  continuation?: TrackedPimRequest
 ): Promise<NotificationDeliveryResult> {
+  const continuationStatus = continuation
+    ? getEffectiveTrackedRequestStatus(continuation)
+    : undefined;
+  if (continuationStatus || request.extensionAttemptState === "queued") {
+    const title = continuationStatus === "pendingApproval"
+      ? "PIM extension approval pending"
+      : continuationStatus === "scheduled"
+        ? "PIM extension scheduled"
+        : continuationStatus === "active"
+          ? "PIM extension active"
+          : "PIM extension requested";
+    const state = continuationStatus === "pendingApproval"
+      ? "Its continuation is awaiting approval."
+      : continuationStatus === "scheduled"
+        ? "Its continuation is already scheduled."
+        : continuationStatus === "active"
+          ? "Its continuation is already active."
+          : "Its continuation request is being processed.";
+    return createRequestNotification(
+      request,
+      title,
+      `${request.itemName} expires in about ${reminderMinutes} minutes. ${state}`,
+      "active",
+      "expiry-details",
+      [{ title: "View details" }]
+    );
+  }
   let extensionDurationHours: number | undefined;
   try {
     extensionDurationHours = buildTrackedRequestExtensionPlan(
@@ -1123,7 +1187,11 @@ async function showExpiryReminderNotification(
     extensionDurationHours ? "expiry-extend" : "expiry-details",
     extensionDurationHours
       ? [
-          { title: `Extend ${formatExtensionDuration(extensionDurationHours)}` },
+          {
+            title: request.activationRequirements?.approval
+              ? `Request ${formatExtensionDuration(extensionDurationHours)}`
+              : `Extend ${formatExtensionDuration(extensionDurationHours)}`
+          },
           { title: "View details" }
         ]
       : [{ title: "View details" }]
@@ -1146,7 +1214,7 @@ async function createRequestNotification(
         iconUrl: chrome.runtime.getURL("img/QuickPim128.png"),
         title,
         message,
-        contextMessage: buttons?.length ? "Choose an action below or click to open details." : "Click to open request details.",
+        contextMessage: buttons?.length ? "Choose an action below." : "Click to open request details.",
         ...(buttons?.length ? { buttons } : {})
       }
     );
@@ -1166,6 +1234,7 @@ async function handleExtensionNotificationClick(notificationId: string): Promise
     notificationId.startsWith(getTrackedNotificationPrefix(candidate))
   );
   if (!request) {
+    await clearNotification(notificationId);
     await createStandaloneRequestNotification(
       "Extension could not be prepared",
       "The tracked request is no longer available. Open Activity for current request details."
@@ -1174,11 +1243,20 @@ async function handleExtensionNotificationClick(notificationId: string): Promise
   }
 
   const result = await extendTrackedRequest(request.id);
+  await clearNotification(notificationId);
+  if (result.success) {
+    await invalidateActiveCacheTargets([request.itemType]);
+  }
   await createStandaloneRequestNotification(
-    result.success ? "PIM extension queued" : "PIM extension needs attention",
+    result.success
+      ? result.requiresApproval
+        ? "PIM extension awaiting approval"
+        : result.requestStatus === "scheduled"
+          ? "PIM extension scheduled"
+          : "PIM extension requested"
+      : "PIM extension needs attention",
     result.message
   );
-  if (result.success) await clearNotification(notificationId);
 }
 
 function getTrackedNotificationPrefix(request: TrackedPimRequest): string {
@@ -1269,7 +1347,8 @@ async function scheduleTrackedRequestMaintenance(
 }
 
 function isNotifiableRequestStatus(status: TrackedPimRequestStatus): boolean {
-  return status === "active" || status === "completed" || status === "denied" || status === "failed" || status === "canceled";
+  return status === "scheduled" || status === "active" || status === "completed"
+    || status === "denied" || status === "failed" || status === "canceled";
 }
 
 function getSafeTrackedAzureScope(value: string | undefined): string {
@@ -1988,7 +2067,21 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
     && !isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(request))
   );
   if (continuation) {
-    return extensionFailure(source.requestId, "An extension is already queued for this activation.");
+    const continuationStatus = getEffectiveTrackedRequestStatus(continuation);
+    if (continuationStatus === "unknown" || continuationStatus === "statusUnavailable") {
+      return extensionFailure(
+        source.requestId,
+        "An extension request already exists, but Microsoft has not exposed its current status. Check Microsoft PIM before retrying."
+      );
+    }
+    return extensionSuccess(
+      source,
+      continuation.requestId,
+      continuation.durationHours || settings.preferences.defaultExtensionDurationHours,
+      continuationStatus,
+      continuation.activeFrom,
+      continuation.activeUntil
+    );
   }
 
   if (source.extensionAttemptState === "queued") {
@@ -2049,21 +2142,21 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
     }
 
     const extensionRequestId = requireTrackedRequestExtensionRequestId(result);
+    const requestStatus = result.requestStatus || "submitted";
 
     await patchTrackedExtensionSource(source.id, {
       extensionAttemptState: "queued",
       extensionRequestId,
       extensionLastError: undefined
     });
-    return {
-      success: true,
-      message: `${source.itemName} is queued for ${formatExtensionDuration(plan.durationHours)} more access after its current activation ends.`,
-      sourceRequestId: source.requestId,
-      requestId: extensionRequestId,
-      scheduledStartAt: plan.startDateTime,
-      scheduledEndAt: plan.endDateTime,
-      durationHours: plan.durationHours
-    };
+    return extensionSuccess(
+      source,
+      extensionRequestId,
+      plan.durationHours,
+      requestStatus,
+      plan.startDateTime,
+      plan.endDateTime
+    );
   } catch (error) {
     const detail = sanitizeErrorMessage(error);
     await patchTrackedExtensionSource(source.id, {
@@ -2076,6 +2169,28 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
       `${detail} The result may be unknown; check Microsoft PIM before retrying.`
     );
   }
+}
+
+function extensionSuccess(
+  source: TrackedPimRequest,
+  requestId: string,
+  durationHours: number,
+  requestStatus: TrackedPimRequestStatus,
+  scheduledStartAt?: string,
+  scheduledEndAt?: string
+): TrackedRequestExtensionResult {
+  const copy = getTrackedRequestExtensionSubmissionCopy(source, durationHours, requestStatus);
+  return {
+    success: true,
+    message: copy.message,
+    sourceRequestId: source.requestId,
+    requestId,
+    requestStatus,
+    requiresApproval: copy.requiresApproval,
+    ...(scheduledStartAt ? { scheduledStartAt } : {}),
+    ...(scheduledEndAt ? { scheduledEndAt } : {}),
+    durationHours
+  };
 }
 
 async function patchTrackedExtensionSource(
@@ -4573,7 +4688,7 @@ async function activateItems(
                 itemName: item.displayName,
                 success: true,
                 ...(requestId ? { requestId } : {}),
-                requestStatus: "submitted"
+                requestStatus: trackedRequest?.status || "submitted"
               }
             });
           }
@@ -4597,6 +4712,7 @@ async function activateItems(
               itemName: item.displayName,
               success: true,
               requestId,
+              requestStatus: trackedRequest?.status || "submitted",
               ...(!requestId || !trackingStored ? { trackingUnavailable: true } : {})
             },
             trackedRequest
@@ -4728,7 +4844,7 @@ async function deactivateItems(
                 itemName: item.displayName,
                 success: true,
                 ...(requestId ? { requestId } : {}),
-                requestStatus: "submitted"
+                requestStatus: trackedRequest?.status || "submitted"
               }
             });
           }
@@ -4752,6 +4868,7 @@ async function deactivateItems(
               itemName: item.displayName,
               success: true,
               requestId,
+              requestStatus: trackedRequest?.status || "submitted",
               ...(!requestId || !trackingStored ? { trackingUnavailable: true } : {})
             },
             trackedRequest

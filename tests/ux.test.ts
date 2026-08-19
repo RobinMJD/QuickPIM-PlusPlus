@@ -501,6 +501,36 @@ describe("popup cache helpers", () => {
     expect(status.entry).toBeUndefined();
   });
 
+  test("expires active rows at their Microsoft end time before the cache TTL", () => {
+    const now = Date.parse("2026-05-18T12:45:00.000Z");
+    const status = getTargetCacheStatus({
+      cache: {
+        activeByTarget: {
+          directoryRole: {
+            items: [{
+              ...directoryRole,
+              status: "active",
+              activeAssignmentType: "activated",
+              activeUntil: new Date(now - 1).toISOString()
+            }],
+            errors: [],
+            fetchedAt: now - 60_000,
+            cacheKey: "graph:directory"
+          }
+        }
+      },
+      bucket: "active",
+      target: "directoryRole",
+      cacheKey: "graph:directory",
+      now,
+      freshTtlMs: DEFAULT_ACTIVE_CACHE_TTL_MS
+    });
+
+    expect(status.isUsable).toBe(true);
+    expect(status.isFresh).toBe(false);
+    expect(status.entry?.items).toEqual([]);
+  });
+
   test("can seed per-target display from a legacy aggregate cache", () => {
     const now = Date.parse("2026-05-18T12:05:00.000Z");
     const entries = getTargetEntriesFromCache(

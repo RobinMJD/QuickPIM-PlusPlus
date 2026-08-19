@@ -1,6 +1,12 @@
 import { getEffectiveTrackedRequestStatus } from "./requestTracking";
 import { getGenericJustificationWarning } from "./justifications";
-import type { ActivationItem, ActivationResult, TicketInfo, TrackedPimRequest } from "./types";
+import type {
+  ActivationItem,
+  ActivationResult,
+  TicketInfo,
+  TrackedPimRequest,
+  TrackedPimRequestStatus
+} from "./types";
 
 export const EXTENSION_DURATION_OPTIONS = [0.5, 1, 2, 4] as const;
 export const DEFAULT_EXTENSION_DURATION_HOURS = EXTENSION_DURATION_OPTIONS[0];
@@ -12,6 +18,12 @@ export interface TrackedRequestExtensionPlan {
   endDateTime: string;
   justification: string;
   ticketInfo: TicketInfo;
+}
+
+export interface TrackedRequestExtensionSubmissionCopy {
+  title: string;
+  message: string;
+  requiresApproval: boolean;
 }
 
 export function sanitizeExtensionDurationHours(value: unknown): number {
@@ -34,6 +46,42 @@ export function requireTrackedRequestExtensionRequestId(result: ActivationResult
     );
   }
   return requestId;
+}
+
+export function getTrackedRequestExtensionSubmissionCopy(
+  request: Pick<TrackedPimRequest, "itemName" | "activationRequirements">,
+  durationHours: number,
+  status: TrackedPimRequestStatus
+): TrackedRequestExtensionSubmissionCopy {
+  const duration = formatExtensionDuration(durationHours);
+  const requiresApproval = status === "pendingApproval"
+    || (status === "submitted" && request.activationRequirements?.approval === true);
+  if (requiresApproval) {
+    return {
+      title: "PIM extension awaiting approval",
+      message: `${request.itemName} extension for ${duration} was submitted for approval. If approved, it will start after the current activation ends.`,
+      requiresApproval: true
+    };
+  }
+  if (status === "scheduled") {
+    return {
+      title: "PIM extension scheduled",
+      message: `${request.itemName} is scheduled for ${duration} more access after its current activation ends.`,
+      requiresApproval: false
+    };
+  }
+  if (status === "active") {
+    return {
+      title: "PIM extension active",
+      message: `${request.itemName} continuation is already active.`,
+      requiresApproval: false
+    };
+  }
+  return {
+    title: "PIM extension requested",
+    message: `${request.itemName} extension for ${duration} was accepted and is being scheduled after its current activation ends.`,
+    requiresApproval: false
+  };
 }
 
 export function buildTrackedRequestExtensionPlan(

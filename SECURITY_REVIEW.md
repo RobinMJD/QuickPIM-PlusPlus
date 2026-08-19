@@ -1,8 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.10.
+Reviewed for v2.18.12.
 
-## v2.18.10 Release Pipeline Safety Review
+## v2.18.12 Extension Lifecycle Review
+
+Scheduled continuations now retain Microsoft approval state instead of reporting every accepted request as immediately queued. Approval-required extensions remain non-duplicable while pending, notify when approved, scheduled, active, denied, failed, or canceled, and present a details-only expiry reminder after a continuation has already been requested. Active-assignment cache entries are invalidated when tracked continuations become active or expire, and stale active rows are removed at their Microsoft end time.
+
+## v2.18.11 Release Pipeline Safety Review
 
 Release packaging and publication now require a successful `CI` workflow for the exact tagged commit. The gate polls by immutable commit SHA and fails closed for failed, cancelled, timed-out, skipped, neutral, or missing CI outcomes, so GitHub and Store publication jobs cannot race ahead of the repository's primary validation workflow.
 

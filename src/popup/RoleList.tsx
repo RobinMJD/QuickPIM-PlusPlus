@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { formatDateOnly, formatLocalDateTime } from "../lib/dateFormat";
 import {
   formatActivationItemStatusLabel,
@@ -20,6 +20,8 @@ import {
 } from "../lib/activationIdentity";
 import type { ActivationItem, PopupRequestMode, QuickPimSettings, ReferenceDataCache } from "../lib/types";
 
+const MAX_EXPIRY_TIMER_DELAY_MS = 2_147_000_000;
+
 export function RoleList({
   items,
   settings,
@@ -35,6 +37,7 @@ export function RoleList({
   emptyText = "No eligible roles or groups found.",
   onToggle,
   onToggleFavorite,
+  onActivationExpired,
   readonly = false
 }: {
   items: ActivationItem[];
@@ -51,20 +54,66 @@ export function RoleList({
   emptyText?: string;
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
+  onActivationExpired?: (item: ActivationItem) => void;
   readonly?: boolean;
 }) {
-  const [, refreshExpiredActionStates] = useState(0);
-  const handleActivationExpired = useCallback(() => {
-    refreshExpiredActionStates((current) => current + 1);
-  }, []);
+  const [activeNow, setActiveNow] = useState(() => Date.now());
+  const notifiedExpiries = useRef(new Map<string, string>());
+  const onActivationExpiredRef = useRef(onActivationExpired);
+  onActivationExpiredRef.current = onActivationExpired;
 
-  if (!items.length) {
+  useEffect(() => {
+    const now = Date.now();
+    const activeIdentities = new Set<string>();
+    let nextExpiry: number | undefined;
+
+    for (const item of items) {
+      if (item.status !== "active" || !item.activeUntil) continue;
+      const expiresAt = Date.parse(item.activeUntil);
+      if (!Number.isFinite(expiresAt)) continue;
+      const identity = getActivationItemIdentity(item);
+      activeIdentities.add(identity);
+      if (expiresAt <= now) {
+        if (notifiedExpiries.current.get(identity) !== item.activeUntil) {
+          notifiedExpiries.current.set(identity, item.activeUntil);
+          onActivationExpiredRef.current?.(item);
+        }
+        continue;
+      }
+      if (notifiedExpiries.current.get(identity) !== item.activeUntil) {
+        notifiedExpiries.current.delete(identity);
+      }
+      nextExpiry = nextExpiry === undefined ? expiresAt : Math.min(nextExpiry, expiresAt);
+    }
+
+    for (const identity of notifiedExpiries.current.keys()) {
+      if (!activeIdentities.has(identity)) notifiedExpiries.current.delete(identity);
+    }
+
+    if (nextExpiry === undefined) return;
+    const timeoutId = window.setTimeout(
+      () => setActiveNow(Date.now()),
+      Math.min(MAX_EXPIRY_TIMER_DELAY_MS, Math.max(50, nextExpiry - now + 20))
+    );
+    return () => window.clearTimeout(timeoutId);
+  }, [activeNow, items]);
+
+  const handleActivationExpired = useCallback(() => {
+    setActiveNow(Date.now());
+  }, []);
+  const visibleItems = items.filter((item) => {
+    if (item.status !== "active" || !item.activeUntil) return true;
+    const expiresAt = Date.parse(item.activeUntil);
+    return !Number.isFinite(expiresAt) || expiresAt > activeNow;
+  });
+
+  if (!visibleItems.length) {
     return <div className="empty-state">{emptyText}</div>;
   }
 
   return (
     <div className="item-list">
-      {items.map((item) => {
+      {visibleItems.map((item) => {
         const usage = getUsage(item, settings);
         const actionState = getRowActionState(item);
         const itemMode = actionState.mode;

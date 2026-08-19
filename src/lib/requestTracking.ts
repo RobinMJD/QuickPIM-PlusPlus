@@ -2,6 +2,7 @@ import { parseIsoDurationMs } from "./pim";
 import { sanitizeErrorMessage, validateCapturedToken } from "./security";
 import { createStorageMutationLock } from "./storageMutation";
 import type {
+  AccessSetupTarget,
   ActivationItem,
   ActivityAction,
   TrackedPimRequest,
@@ -409,6 +410,33 @@ export function getPendingTrackedRequestCount(store: TrackedPimRequestStore): nu
   ).length;
 }
 
+export function getTrackedRequestActiveCacheInvalidationTargets(
+  previousStore: TrackedPimRequestStore,
+  nextStore: TrackedPimRequestStore
+): AccessSetupTarget[] {
+  const previousById = new Map(previousStore.requests.map((request) => [request.id, request]));
+  const targets = new Set<AccessSetupTarget>();
+
+  for (const request of nextStore.requests) {
+    const previous = previousById.get(request.id);
+    const statusChanged = previous?.status !== request.status;
+    const activeWindowChanged = previous?.activeFrom !== request.activeFrom
+      || previous?.activeUntil !== request.activeUntil;
+    const activationLifecycleChanged = request.action === "activate"
+      && (request.status === "active" || request.status === "expired")
+      && (statusChanged || activeWindowChanged);
+    const deactivationCompleted = request.action === "deactivate"
+      && request.status === "completed"
+      && statusChanged;
+
+    if (activationLifecycleChanged || deactivationCompleted) {
+      targets.add(request.itemType);
+    }
+  }
+
+  return [...targets];
+}
+
 export function reconcileTrackedExtensionSources(
   store: TrackedPimRequestStore,
   now = Date.now()
@@ -422,10 +450,6 @@ export function reconcileTrackedExtensionSources(
         : [];
     })
   );
-  if (!retryableSourceIds.size) {
-    return store;
-  }
-
   let changed = false;
   const requests = store.requests.map((request) => {
     const continuationExists = request.extensionRequestId

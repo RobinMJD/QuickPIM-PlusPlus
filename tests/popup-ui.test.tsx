@@ -4538,6 +4538,25 @@ describe("popup draft persistence", () => {
     expect(document.body.textContent).toContain("PIM active");
   });
 
+  test("does not render a cached active row after its Microsoft end time", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const expiredItem: ActivationItem = {
+      ...pimGroupItem,
+      status: "active",
+      activeAssignmentType: "activated",
+      activeUntil: new Date(Date.now() - 1_000).toISOString(),
+      assignmentScheduleId: "expired-schedule"
+    };
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS };
+    vi.stubGlobal("chrome", popupChromeMock(storageData, expiredItem));
+    vi.resetModules();
+    await import("../src/popup/main");
+
+    await waitFor(() => expect(document.body.textContent).toContain("0 eligible items"));
+    expect(document.body.textContent).not.toContain("Privileged Group");
+    expect(document.body.textContent).not.toContain("PIM active");
+  });
+
   test("shows compact bundle settings with clear review and immediate activation actions", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     const bundleItem: ActivationItem = {
