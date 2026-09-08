@@ -12,7 +12,8 @@ import {
   normalizePimGroup
 } from "./lib/pim";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
-import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage } from "./lib/apiErrors";
+import { readMicrosoftApiError } from "./lib/microsoftApiError";
+import { runWithActivationPreflight } from "./lib/activationSubmission";
 import { mapWithConcurrency, mapWithConcurrencySettled } from "./lib/concurrency";
 import { collectPaginatedValues } from "./lib/pagination";
 import { withAbortableTimeout } from "./lib/async";
@@ -4651,10 +4652,13 @@ async function activateItems(
           const validationRequest = buildActivationValidationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
           if (validationRequest) {
             assertAllowedApiUrl(validationRequest.endpoint, validationRequest.tokenKind);
-            await sendActivationRequest(validationRequest, token);
           }
 
-          const data = await sendActivationRequest(request, token);
+          const data = await runWithActivationPreflight(
+            item,
+            validationRequest ? () => sendActivationRequest(validationRequest, token) : undefined,
+            () => sendActivationRequest(request, token)
+          );
           const requestId = getResponseIdentifier(data.payload, request, data.location);
           microsoftAccepted = true;
           acceptedRequestId = requestId;
@@ -4769,7 +4773,7 @@ async function sendActivationRequest(request: ActivationRequest, token: string):
   }, MICROSOFT_API_WRITE_TIMEOUT_MS);
 
   if (!response.ok) {
-    throw new Error(await getSafeApiErrorMessage(response));
+    throw await readMicrosoftApiError(response);
   }
 
   return {
@@ -5110,47 +5114,11 @@ async function safeJson(response: Response): Promise<unknown> {
 }
 
 async function getSafeApiErrorMessage(response: Response): Promise<string> {
-  const fallback = `Microsoft API returned HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}.`;
-  const contentType = (response.headers.get("content-type") || "").toLowerCase();
-  let payload: unknown;
-  let text = "";
-  try {
-    text = (await response.text()).slice(0, 8_192);
-    payload = text ? JSON.parse(text) : undefined;
-  } catch {
-    payload = undefined;
-  }
-  const apiMessage = getApiErrorMessage(payload, response);
-  if (apiMessage) return sanitizeErrorMessage(apiMessage);
-  if (contentType.includes("text/html") || /<\s*!doctype|<\s*html/i.test(text)) {
-    return sanitizeErrorMessage(`${fallback} The Microsoft gateway returned an HTML error page; retry after the portal session is ready.`);
-  }
-  const plainText = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
-  return sanitizeErrorMessage(plainText || fallback);
+  return (await readMicrosoftApiError(response)).message;
 }
 
 function dedupeItems(items: ActivationItem[]): ActivationItem[] {
   return [...new Map(items.map((item) => [normalizeActivationItemId(getActivationItemIdentity(item)), item])).values()];
-}
-
-function getApiErrorMessage(payload: unknown, response?: Response): string | undefined {
-  const authenticateHeader = response?.headers.get("www-authenticate") || response?.headers.get("WWW-Authenticate");
-  if (authenticateHeader && isClaimsChallengeMessage(authenticateHeader)) {
-    return CLAIMS_CHALLENGE_MESSAGE;
-  }
-
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return undefined;
-  }
-  const error = (payload as Record<string, unknown>).error;
-  if (!error || typeof error !== "object" || Array.isArray(error)) {
-    return undefined;
-  }
-  const message = (error as Record<string, unknown>).message;
-  if (typeof message !== "string") {
-    return undefined;
-  }
-  return isClaimsChallengeMessage(message) ? CLAIMS_CHALLENGE_MESSAGE : message;
 }
 
 async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]): Promise<boolean> {

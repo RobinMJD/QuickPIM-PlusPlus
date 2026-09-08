@@ -25,22 +25,20 @@ test("popup stays within its fixed viewport and supports a keyboard selection fl
   const page = await openExtensionPage("popup.html", { width: 520, height: 600 });
 
   await expect(page.getByRole("heading", { name: "QuickPIM++" })).toBeVisible();
+  const row = page.locator(".role-row.selectable").first();
+  await expect(row).toBeVisible();
   const idleFooter = page.locator(".activation-footer-actions");
   const idleFooterHeight = await idleFooter.evaluate((element) => element.getBoundingClientRect().height);
   await expect(idleFooter).toHaveCSS("justify-content", "flex-end");
   const idleSettings = idleFooter.getByRole("button", { name: "Settings" });
   await expect(idleSettings).toBeVisible();
-  const idleSettingsRight = await idleSettings.evaluate((element) => element.getBoundingClientRect().right);
-  expect(idleSettingsRight).toBeGreaterThan(500);
-  const row = page.locator(".role-row.selectable").first();
-  await expect(row).toBeVisible();
+  await expect.poll(() => idleSettings.evaluate((element) => element.getBoundingClientRect().right)).toBeGreaterThan(500);
   await row.focus();
   await page.keyboard.press("Space");
   await expect(page.getByRole("button", { name: /Continue with 1 selected/i })).toBeVisible();
   const selectedSettings = page.locator(".activation-footer-actions").getByRole("button", { name: "Settings" });
   await expect(selectedSettings).toBeVisible();
-  const selectedSettingsRight = await selectedSettings.evaluate((element) => element.getBoundingClientRect().right);
-  expect(selectedSettingsRight).toBeGreaterThan(500);
+  await expect.poll(() => selectedSettings.evaluate((element) => element.getBoundingClientRect().right)).toBeGreaterThan(500);
 
   const geometry = await page.evaluate(() => {
     const content = document.querySelector<HTMLElement>(".content");
@@ -424,11 +422,6 @@ async function seedPopupRole(worker: Worker): Promise<void> {
       oid: "visual-principal",
       preferred_username: "admin@contoso.onmicrosoft.com"
     })}.signature`;
-    await chrome.storage.session.set({
-      graphToken: token,
-      tokenTimestamp: Date.now(),
-      tokenSource: "portal"
-    });
     const settingsKey = "quickPimSettings.v1";
     const stored = await chrome.storage.local.get(settingsKey);
     const settings = stored[settingsKey] && typeof stored[settingsKey] === "object"
@@ -459,7 +452,8 @@ async function seedPopupRole(worker: Worker): Promise<void> {
         preferences: {
           ...preferences,
           enabledFeatures: ["directoryRole", "bundles"],
-          autoEnabledFeaturesInitialized: true
+          autoEnabledFeaturesInitialized: true,
+          backgroundPreRefreshEnabled: false
         }
       }
     });
@@ -492,6 +486,12 @@ async function seedPopupRole(worker: Worker): Promise<void> {
         eligibleByTarget: { directoryRole: entry },
         activeByTarget: { directoryRole: empty }
       }
+    });
+    // Seed the cache before exposing the synthetic token to startup tasks.
+    await chrome.storage.session.set({
+      graphToken: token,
+      tokenTimestamp: Date.now(),
+      tokenSource: "portal"
     });
   });
 }

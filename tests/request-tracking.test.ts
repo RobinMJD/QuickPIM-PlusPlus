@@ -355,6 +355,63 @@ describe("tracked PIM requests", () => {
     expect(expired.activeAssignmentMissingSince).toBeUndefined();
   });
 
+  test("resolves an administrative-unit request only from an active assignment at the same scope", () => {
+    const scopedRole: ActivationItem = {
+      ...directoryRole,
+      id: "directoryRole:role-1:/administrativeUnits/au-1",
+      directoryScopeId: "/administrativeUnits/au-1",
+      scopeLabel: "Restricted AU 1"
+    };
+    const request = createTrackedPimRequest({
+      item: scopedRole,
+      action: "activate",
+      requestId: "au-request",
+      payload: { status: "Provisioned" },
+      requestedAt: new Date(NOW).toISOString(),
+      durationHours: 2,
+      tenantId: "tenant-1",
+      justification: "Maintain restricted administrative-unit groups",
+      now: NOW
+    });
+    if (!request) throw new Error("Scoped test request could not be created.");
+    const tenantActive: ActivationItem = {
+      ...directoryRole,
+      status: "active",
+      activeAssignmentType: "activated",
+      activeUntil: "2026-07-14T14:00:00.000Z"
+    };
+    const otherAuActive: ActivationItem = {
+      ...tenantActive,
+      id: "directoryRole:role-1:/administrativeUnits/au-2",
+      directoryScopeId: "/administrativeUnits/au-2",
+      activeUntil: "2026-07-14T13:00:00.000Z"
+    };
+
+    const waiting = reconcileTrackedRequestWithActiveAssignments(request, [tenantActive, otherAuActive], NOW);
+    expect(waiting.activeUntil).toBeUndefined();
+    expect(waiting).toMatchObject({
+      directoryScopeId: scopedRole.directoryScopeId,
+      activeAssignmentMissingSince: "2026-07-14T10:00:00.000Z",
+      lastError: "Waiting for the active assignment to become visible."
+    });
+
+    const matchingAuActive: ActivationItem = {
+      ...otherAuActive,
+      id: scopedRole.id,
+      directoryScopeId: "/AdministrativeUnits/AU-1/",
+      activeUntil: "2026-07-14T12:00:00.000Z"
+    };
+    const resolved = reconcileTrackedRequestWithActiveAssignments(
+      waiting,
+      [tenantActive, otherAuActive, matchingAuActive],
+      NOW + 30_000
+    );
+    expect(resolved).toMatchObject({ status: "active", activeUntil: matchingAuActive.activeUntil });
+    expect(resolved.lastError).toBeUndefined();
+    expect(resolved.activeAssignmentMissingSince).toBeUndefined();
+    expect(resolved.nextCheckAt).toBeUndefined();
+  });
+
   test("keeps a future accepted continuation scheduled until its exact start", () => {
     const scheduled = createTrackedPimRequest({
       item: directoryRole,

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   applyQuickFilters,
+  buildActivationItemLookup,
   filterAssignedActiveItems,
   formatActivationItemStatusLabel,
   formatRemainingActivationTime,
@@ -134,6 +135,41 @@ describe("popup action helpers", () => {
       activeAssignmentType: "activated",
       assignmentScheduleId: "pim-schedule-1"
     });
+  });
+
+  test("keeps administrative-unit activations selectable while the same tenant-wide role is active", () => {
+    const scopes = ["/", "/administrativeUnits/au-1", "/administrativeUnits/au-2"];
+    const eligibilities: ActivationItem[] = scopes.map((directoryScopeId) => ({
+      ...eligibleRole,
+      id: `directoryRole:groups-admin:${directoryScopeId}`,
+      tenantId: "tenant-1",
+      sourceName: "Groups Administrator",
+      displayName: "Groups Administrator",
+      roleDefinitionId: "groups-admin",
+      directoryScopeId,
+      scopeLabel: directoryScopeId === "/" ? "Tenant" : directoryScopeId
+    }));
+    const tenantActive: ActivationItem = {
+      ...eligibilities[0],
+      status: "active",
+      activeAssignmentType: "activated",
+      activeUntil: "2026-05-18T16:00:00.000Z",
+      assignmentScheduleId: "tenant-schedule"
+    };
+
+    const rows = mergeEligibleWithActive(eligibilities, [tenantActive], { includeActiveOnly: true });
+    const lookup = buildActivationItemLookup(rows);
+    const now = Date.parse("2026-05-18T12:00:00.000Z");
+
+    expect(rows).toHaveLength(3);
+    expect(rows.map((item) => item.status)).toEqual(["active", "eligible", "eligible"]);
+    expect(getRowActionState(rows[0], now)).toMatchObject({ mode: "deactivate", selectable: true });
+    for (const eligible of eligibilities.slice(1)) {
+      const scopedRow = lookup.get(eligible.id);
+      expect(scopedRow).toEqual(eligible);
+      expect(getRowActionState(scopedRow!, now)).toMatchObject({ mode: "activate", selectable: true });
+      expect(scopedRow?.assignmentScheduleId).toBeUndefined();
+    }
   });
 
   test("hides assigned active roles by default without hiding PIM activations", () => {

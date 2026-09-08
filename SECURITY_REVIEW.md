@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.12.
+Reviewed for v2.18.13.
+
+## v2.18.13 Scoped Activation Review
+
+An explicit duplicate-assignment response from the optional Entra validation-only request no longer prevents the actual scoped activation from being submitted. Only HTTP 400/409 with a recognized duplicate service code or the precise legacy duplicate message qualifies. The actual request retains the original principal, role, scope, duration, and policy inputs and executes once outside the fallback handler. Actual-write rejection or ambiguity is never converted into success or retried by this fallback; permission, MFA, policy, throttling, and transport failures in validation still stop submission.
+
+Structured error handling retains bounded service codes and HTTP status independently of localized messages while preserving token redaction and claims-challenge recovery. Regression coverage checks tenant/AU activation in both orders, distinct AU identities and locks, scope-specific tracking, pending approval propagation, and actual-write failure handling. Microsoft remains authoritative for same-scope duplicates and all activation policy enforcement. The reported tenant scenario requires confirmation with the released extension; simulated API regressions do not substitute for that live check.
 
 ## v2.18.12 Extension Lifecycle Review
 

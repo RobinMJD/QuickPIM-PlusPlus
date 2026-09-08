@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.18.12**
+Current version: **v2.18.13**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -47,6 +47,8 @@ Click any screenshot to view it at full size.
 ### Microsoft Entra Roles
 
 Browse and activate eligible directory roles, including tenant, administrative-unit, and device-scoped assignments. QuickPIM++ resolves friendly role and scope names when Microsoft exposes them and distinguishes PIM activations from permanently assigned roles.
+
+The same role can be active at distinct scopes at the same time, including tenant-wide and restricted administrative-unit assignments. A duplicate response from the optional validation check is resolved by submitting the exact requested scope once; Microsoft still enforces eligibility, approval, MFA, and duplicate-assignment rules on the actual activation.
 
 ### PIM Groups
 

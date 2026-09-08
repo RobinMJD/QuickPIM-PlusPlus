@@ -34,6 +34,35 @@ describe("activation request locking", () => {
     await first;
   });
 
+  test("locks the same role independently for tenant-wide and administrative-unit requests", async () => {
+    const tenantRole = { ...role, tenantId: "tenant-1" };
+    const auRole = {
+      ...tenantRole,
+      id: "directoryRole:reader:/administrativeUnits/au-1",
+      directoryScopeId: "/administrativeUnits/au-1"
+    };
+    const pending = deferred<void>();
+    const tenantRequest = runWithActivationItemLock(tenantRole, async () => pending.promise);
+    const auRequest = runWithActivationItemLock(auRole, async () => pending.promise);
+
+    try {
+      await expect(runWithActivationItemLock({
+        ...auRole,
+        id: "directoryRole:reader:/administrativeUnits/au-2",
+        directoryScopeId: "/administrativeUnits/au-2"
+      }, async () => "au-2 accepted")).resolves.toBe("au-2 accepted");
+      await expect(runWithActivationItemLock({
+        ...auRole,
+        id: "same-au-different-client-id",
+        roleDefinitionId: "READER",
+        directoryScopeId: "/AdministrativeUnits/AU-1/"
+      }, async () => undefined)).rejects.toThrow("already in progress");
+    } finally {
+      pending.resolve();
+      await Promise.all([tenantRequest, auRequest]);
+    }
+  });
+
   test("allows different items and releases a lock after failure", async () => {
     const otherRole = { ...role, id: "directoryRole:admin:/", roleDefinitionId: "admin" };
     await expect(Promise.all([
