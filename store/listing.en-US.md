@@ -32,13 +32,21 @@ Highlights:
 - Policy-aware duration choices plus clear approval, justification, ticket, and active-until details.
 - Local activity history and optional request-status notifications.
 - Optional browser-account sync for useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity within Chrome or Edge.
-- Guided Access Setup that opens only the Microsoft portal pages needed to refresh access.
+- Guided Role Access recovery that opens only the Microsoft portal pages needed to refresh access.
 - Session-only token storage, local-only access data, and bounded browser-account sync controls for non-token convenience data.
 - Dark mode, configurable tabs, import/export, and background cache refresh.
 
 QuickPIM++ does not require a dedicated app registration, manual token entry, or a developer-controlled backend. It works with validated Microsoft portal tokens available in the signed-in browser session. Tokens and extension settings are not sold or sent to the developer.
 
-Full functionality requires a Microsoft Entra tenant with Privileged Identity Management and an account that is eligible for at least one supported role or PIM group.
+Getting started:
+
+1. Use a work or school account in a Microsoft Entra tenant licensed for Privileged Identity Management (PIM). Your administrator must already have assigned the account eligible access to at least one supported role or PIM group. A personal Microsoft account or a permanent active assignment without eligibility is not sufficient for activation.
+2. Sign in to https://entra.microsoft.com/ in the same browser profile as QuickPIM++. Confirm that your eligible assignment appears in the portal's PIM My roles page.
+3. Open the extension popup, then Settings > Role Access > Open missing portal pages. Complete Microsoft sign-in, MFA, or tenant selection if requested. Return and select Recheck now if access has not refreshed automatically.
+4. Reopen the popup, select Entra Roles and your eligible assignment, then Continue. Choose an offered Activation time and enter any required justification or ticket details. Select Activate 1 selected to submit a real Microsoft PIM activation request.
+5. An approved activation displays active access and an expiry time. If the role requires approval, the request remains pending until its configured approver responds. Check Settings > Activity & Usage and the Microsoft PIM portal for its status.
+
+PIM Groups and Azure Roles follow the same pattern but need their own eligible assignments. Without the corresponding access, a source may be empty or hidden; enabled sources are controlled in Settings > Popup & Appearance. Settings and appearance can be explored without tenant access, but the extension has no sample roles or built-in demo account. QuickPIM++ cannot create eligibility or bypass Microsoft licensing, MFA, approval, or role policies.
 
 ## Privacy Disclosure
 
@@ -46,23 +54,20 @@ QuickPIM++ handles authentication tokens, PIM assignment metadata, request ident
 
 ## Certification Notes
 
-QuickPIM++ requires a Microsoft Entra tenant with Privileged Identity Management enabled for full activation testing.
+Use the complete text in [certification-notes.txt](certification-notes.txt) for Partner Center's **Notes for certification** field. The automated Edge publisher reads this same file. The notes identify the primary purpose, required test account, exact UI steps, expected results, and missing-access behavior.
 
-Basic UI review:
+For a review of v2.18.13, also explain that the update fixes activation of the same Entra role at different scopes (for example directory and administrative unit) while preserving Microsoft's policy enforcement. The existing v2.18.13 package can be resubmitted with clearer metadata; the reviewer instructions do not require an extension version bump.
 
-1. Install the extension.
-2. Open the popup and Settings page.
-3. Verify Access Setup, aliases, justifications, bundles, preferences, import/export, activity history, and dark mode.
+Reviewer reference:
 
-Full activation review:
-
-1. Sign in to the Microsoft Entra admin center with an account eligible for PIM.
-2. Open Settings > Access Setup.
-3. Select Open missing portal pages and allow the Microsoft PIM pages to finish loading.
-4. Return to the popup.
-5. Select an eligible role or group, choose an allowed duration and justification, and submit the activation.
-
-QuickPIM++ stores tokens in browser session storage. Settings remain local or use the signed-in browser's extension sync service when Browser Sync is enabled; no data is sent to developer-controlled servers.
+- Test with an authorized non-production tenant/account. The account needs an existing eligible assignment and a [PIM license](https://learn.microsoft.com/en-us/entra/id-governance/privileged-identity-management/pim-getting-started) such as Microsoft Entra ID P2 or Microsoft Entra ID Governance. QuickPIM++ does not supply a shared test account or create tenant access.
+- Use the submitted Edge package in Edge, rather than the Chrome Web Store edition. Pin it from the browser's Extensions menu and use the same browser profile for the Microsoft portal session.
+- Settings > Role Access contains **Access status & recovery**. Recovery opens the needed Microsoft pages in a collapsed background tab group. **Continue Microsoft sign-in** indicates that the tester must complete the Microsoft prompt. **Recheck now** refreshes the access checks.
+- **Activate 1 selected** sends a real PIM request. Use a meaningful justification such as `Microsoft Edge certification: verify temporary activation of the test account role.` Generic `test` or `testing` is intentionally rejected.
+- Check **Settings > Activity & Usage > Requests > Check status** and the matching Microsoft PIM portal. Pending approval is expected for approval-protected assignments; it is not a completed activation.
+- To test early deactivation where supported, select the active assignment, then **Continue > Disable 1 selected**. Microsoft may require the activation to remain active for five minutes first.
+- PIM Groups and Azure Roles require their own eligible assignments. Tenant-free checks cover Settings, saved justifications, appearance, and backup controls; they do not validate PIM activation.
+- Screenshots use fictional demonstration data. They do not represent credentials or a demo mode available in the submitted package.
 
 ## Assets
 

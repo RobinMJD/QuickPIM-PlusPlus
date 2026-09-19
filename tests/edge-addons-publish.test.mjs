@@ -5,10 +5,19 @@ import {
   extractEdgeOperationId,
   getEdgeOperationStatus,
   getMissingEdgeAddonsConfig,
+  readEdgeAddonsConfig,
   sanitizeEdgeAddonsMessage
 } from "../scripts/publish-edge-addons.mjs";
 
 describe("Microsoft Edge Add-ons publisher", () => {
+  test("uses the reviewed certification instructions when no nonblank override is supplied", () => {
+    const notes = readFileSync("store/certification-notes.txt", "utf8").trim();
+    expect(readEdgeAddonsConfig({}).certificationNotes).toBe(notes);
+    expect(readEdgeAddonsConfig({ EDGE_ADDONS_CERTIFICATION_NOTES: "  \n" }).certificationNotes).toBe(notes);
+    expect(readEdgeAddonsConfig({ EDGE_ADDONS_CERTIFICATION_NOTES: " Custom review instructions " }).certificationNotes)
+      .toBe("Custom review instructions");
+  });
+
   test("reports missing credentials without exposing configured values", () => {
     expect(
       getMissingEdgeAddonsConfig({
@@ -54,6 +63,7 @@ describe("Microsoft Edge Add-ons publisher", () => {
     expect(workflow).toContain("EDGE_ADDONS_CLIENT_ID");
     expect(workflow).toContain("EDGE_ADDONS_API_KEY");
     expect(workflow).toContain("EDGE_ADDONS_PRODUCT_ID");
+    expect(workflow).not.toContain("vars.EDGE_ADDONS_CERTIFICATION_NOTES");
     expect(workflow).toContain(
       "EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name)"
     );

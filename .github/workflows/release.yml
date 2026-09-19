@@ -202,4 +202,4 @@ jobs:
           EDGE_ADDONS_API_KEY: ${{ secrets.EDGE_ADDONS_API_KEY }}
           EDGE_ADDONS_PRODUCT_ID: ${{ secrets.EDGE_ADDONS_PRODUCT_ID }}
           EDGE_ADDONS_ZIP: release/quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip
-          EDGE_ADDONS_CERTIFICATION_NOTES: ${{ vars.EDGE_ADDONS_CERTIFICATION_NOTES }}
+          # The publisher reads the reviewed instructions from store/certification-notes.txt.

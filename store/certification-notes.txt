@@ -1,0 +1,12 @@
+PURPOSE: QuickPIM++ lists and activates the signed-in user's existing eligible Microsoft PIM roles from a browser popup.
+
+REQUIRED: Use the submitted Edge package and an authorized test work/school account in a PIM-licensed Microsoft Entra tenant, with at least one eligible Entra role. A permanent active assignment without eligibility or a personal Microsoft account is insufficient. Use the same Edge profile for the extension and Microsoft portal. No separate app registration or manual token entry is needed.
+
+TEST STEPS:
+1. Install and pin QuickPIM++. Sign in at https://entra.microsoft.com/ and confirm an eligible assignment under PIM > My roles.
+2. Open popup > Settings > Role Access > Open missing portal pages. Pages open in a background tab group. If prompted, choose Continue Microsoft sign-in and complete sign-in, MFA or tenant selection. Return and use Recheck now if needed.
+3. Reopen popup > Entra Roles; click Refresh if needed. Expect the eligible role and its scope. Select one role > Continue.
+4. Choose an offered Activation time. Fill any required justification and ticket fields. Example: Microsoft Edge certification: verify temporary activation of the test account role. Generic "test" is rejected.
+5. Click Activate 1 selected. This sends a REAL PIM request. Expect active access with an expiry time, or pending approval if required. Verify in Settings > Activity & Usage > Requests and in the Microsoft PIM portal.
+
+PIM Groups/Azure Roles need separate eligibility. Missing sign-in/eligibility shows access or empty states, not demo roles. Enable source tabs in Settings > Popup & Appearance. Settings/appearance can be reviewed without tenant access. No demo account is supplied. Microsoft licensing, MFA and approval policies remain enforced. No developer backend is used; tokens stay in browser session storage.

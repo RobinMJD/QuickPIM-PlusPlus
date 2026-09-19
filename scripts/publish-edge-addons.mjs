@@ -1,12 +1,14 @@
 import { existsSync, readFileSync } from "node:fs";
-import { basename } from "node:path";
-import { pathToFileURL } from "node:url";
+import { basename, dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { fetchWithPolicy } from "./http-request.mjs";
 
 const EDGE_ADDONS_API_BASE = "https://api.addons.microsoftedge.microsoft.com/v1";
 const REQUIRED_ENV = ["EDGE_ADDONS_CLIENT_ID", "EDGE_ADDONS_API_KEY", "EDGE_ADDONS_PRODUCT_ID", "EDGE_ADDONS_ZIP"];
-const DEFAULT_CERTIFICATION_NOTES =
-  "QuickPIM++ uses Microsoft portal tokens captured locally to display and activate eligible Entra, PIM group, and Azure roles. Settings and tokens remain in browser storage; no developer-controlled backend is used.";
+const DEFAULT_CERTIFICATION_NOTES = readFileSync(
+  resolve(dirname(fileURLToPath(import.meta.url)), "../store/certification-notes.txt"),
+  "utf8"
+).trim();
 
 export function getMissingEdgeAddonsConfig(env = process.env) {
   return REQUIRED_ENV.filter((key) => !String(env[key] || "").trim());
@@ -18,7 +20,7 @@ export function readEdgeAddonsConfig(env = process.env) {
     apiKey: String(env.EDGE_ADDONS_API_KEY || "").trim(),
     productId: String(env.EDGE_ADDONS_PRODUCT_ID || "").trim(),
     zipPath: String(env.EDGE_ADDONS_ZIP || "").trim(),
-    certificationNotes: String(env.EDGE_ADDONS_CERTIFICATION_NOTES || DEFAULT_CERTIFICATION_NOTES).trim(),
+    certificationNotes: String(env.EDGE_ADDONS_CERTIFICATION_NOTES || "").trim() || DEFAULT_CERTIFICATION_NOTES,
     pollAttempts: readPositiveInteger(env.EDGE_ADDONS_POLL_ATTEMPTS, 40),
     pollIntervalMs: readPositiveInteger(env.EDGE_ADDONS_POLL_INTERVAL_MS, 15_000)
   };
