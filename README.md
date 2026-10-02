@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.18.13**
+Current version: **v2.18.14**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -78,7 +78,7 @@ Work with eligible Azure resource roles across subscriptions, resource groups, m
 ## A Shorter Path To Activation
 
 1. Install QuickPIM++ from the Chrome Web Store or Microsoft Edge Add-ons.
-2. Sign in to the Microsoft Entra admin center or Azure portal with your usual administrative account.
+2. Sign in to the Microsoft Entra admin center with your usual administrative account.
 3. Use the popup Refresh action when access needs to be captured or renewed.
 4. Choose an Entra role, PIM group, Azure role, or bundle.
 5. Select **Continue**, review the allowed duration and required audit inputs, then submit.

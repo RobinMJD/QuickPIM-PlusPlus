@@ -56,7 +56,7 @@ QuickPIM++ handles authentication tokens, PIM assignment metadata, request ident
 
 Use the complete text in [certification-notes.txt](certification-notes.txt) for Partner Center's **Notes for certification** field. The automated Edge publisher reads this same file. The notes identify the primary purpose, required test account, exact UI steps, expected results, and missing-access behavior.
 
-For a review of v2.18.13, also explain that the update fixes activation of the same Entra role at different scopes (for example directory and administrative unit) while preserving Microsoft's policy enforcement. The existing v2.18.13 package can be resubmitted with clearer metadata; the reviewer instructions do not require an extension version bump.
+For a review of v2.18.14, explain that the update rejects malformed token timestamps without breaking status rendering. It also includes the earlier fix for activating the same Entra role at different scopes (for example directory and administrative unit) while preserving Microsoft's policy enforcement. Follow the complete certification notes above to test the submitted package.
 
 Reviewer reference:
 

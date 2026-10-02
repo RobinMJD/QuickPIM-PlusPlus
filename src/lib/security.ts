@@ -1,6 +1,6 @@
 import type { TokenKind } from "./types";
 import { CLAIMS_CHALLENGE_MESSAGE, isClaimsChallengeMessage, redactClaimsChallengePayloads } from "./apiErrors";
-import { decodeToken } from "./token";
+import { decodeToken, getNumericDateMs, getTokenExpiryMs } from "./token";
 
 const API_HOSTS: Record<TokenKind, string> = {
   graph: "graph.microsoft.com",
@@ -65,21 +65,21 @@ export function validateCapturedToken(token: string, tokenKind: TokenKind, now =
     return { ok: false, reason: "Token is not a valid JWT." };
   }
 
-  const exp = Number(decoded.exp);
-  if (!Number.isFinite(exp) || exp <= 0) {
+  const expiresAtMs = getTokenExpiryMs(decoded);
+  if (expiresAtMs === undefined) {
     return { ok: false, reason: "Token does not contain a usable expiry." };
   }
 
-  if (exp * 1000 <= now) {
+  if (expiresAtMs <= now) {
     return { ok: false, reason: "Token is expired." };
   }
 
   if (decoded.nbf !== undefined) {
-    const nbf = Number(decoded.nbf);
-    if (!Number.isFinite(nbf) || nbf <= 0) {
+    const notBeforeMs = getNumericDateMs(decoded.nbf);
+    if (notBeforeMs === undefined) {
       return { ok: false, reason: "Token does not contain a usable not-before time." };
     }
-    if (nbf * 1000 > now + TOKEN_CLOCK_SKEW_MS) {
+    if (notBeforeMs > now + TOKEN_CLOCK_SKEW_MS) {
       return { ok: false, reason: "Token is not valid yet." };
     }
   }

@@ -11,6 +11,22 @@ import {
 const now = Date.parse("2026-05-18T12:00:00.000Z");
 
 describe("session token storage", () => {
+  test("removes malformed legacy and session expiry values while preserving a usable token", async () => {
+    const claims = { aud: "https://graph.microsoft.com", scp: "RoleAssignmentSchedule.ReadWrite.Directory" };
+    const usable = makeToken({ ...claims, exp: (now + 60_250) / 1000 });
+    const localData: Record<string, unknown> = { graphToken: makeToken({ ...claims, exp: Number.MAX_VALUE }), tokenTimestamp: now };
+    const sessionData: Record<string, unknown> = {
+      graphDirectoryRoleToken: usable,
+      graphDirectoryRoleTokenTimestamp: now,
+      graphToken: makeToken({ ...claims, exp: 10_000_000_000_000 }),
+      tokenTimestamp: now
+    };
+    expect(await migrateLegacyLocalTokensToSession({ local: makeStorageArea(localData), session: makeStorageArea(sessionData), now })).toBe(false);
+    expect(sessionData.graphDirectoryRoleToken).toBe(usable);
+    expect(sessionData).not.toHaveProperty("graphToken");
+    expect(localData).not.toHaveProperty("graphToken");
+  });
+
   test("migrates valid legacy local tokens to session storage and removes all local token keys", async () => {
     const graphToken = makeToken({
       aud: "https://graph.microsoft.com",

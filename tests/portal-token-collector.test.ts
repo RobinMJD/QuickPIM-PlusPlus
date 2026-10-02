@@ -9,6 +9,21 @@ afterEach(() => {
 });
 
 describe("portal token collector", () => {
+  test("skips malformed expiries while still collecting a fractional NumericDate", async () => {
+    const audience = { aud: "https://graph.microsoft.com" };
+    const usable = createJwt({ ...audience, exp: Date.now() / 1000 + 3600.25 });
+    window.localStorage.setItem("token-cache", JSON.stringify([
+      ...[10_000_000_000_000, Number.MAX_VALUE, "10000000000000", [10_000_000_000_000], { valueOf: 0, toString: 0 }].map((exp) => createJwt({ ...audience, exp })),
+      usable
+    ]));
+    const sendMessage = vi.fn((_message: unknown, callback: (response: unknown) => void) => callback({ success: true, data: { captured: ["graph"] } }));
+    vi.stubGlobal("chrome", { runtime: { sendMessage, onMessage: { addListener: vi.fn() } } });
+    vi.stubGlobal("setInterval", vi.fn(() => 1));
+    new Function(readFileSync(join(process.cwd(), "public/portalTokenCollector.js"), "utf8"))();
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+    expect(sendMessage.mock.calls[0][0]).toMatchObject({ action: "capturePortalTokens", tokens: [usable] });
+  });
+
   test("bounds IndexedDB reads so one portal database cannot stall later scans", () => {
     const collector = readFileSync(join(process.cwd(), "public/portalTokenCollector.js"), "utf8");
 

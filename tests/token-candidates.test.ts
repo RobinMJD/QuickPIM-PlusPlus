@@ -7,6 +7,14 @@ import {
 const NOW = Date.parse("2026-07-15T10:00:00.000Z");
 
 describe("portal token candidate selection", () => {
+  test("cannot let an unrepresentable high-scoring expiry displace a usable token", () => {
+    const claims = { aud: "https://graph.microsoft.com", tid: "tenant-1", oid: "user-1", scp: "RoleAssignmentSchedule.ReadWrite.Directory" };
+    const usable = createToken({ ...claims, exp: (NOW + 60_250) / 1000 });
+    const malformed = createToken({ ...claims, exp: 10_000_000_000_000, scp: `${claims.scp} PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup` });
+    expect(selectPortalTokenCandidates([malformed, usable], { now: NOW }).map((candidate) => candidate.token)).toEqual([usable]);
+    expect(selectBestStoredGraphTokenForTarget([{ token: malformed }, { token: usable }], "directoryRole", NOW)?.token).toBe(usable);
+  });
+
   test("keeps separate Graph tokens needed by Entra roles and PIM Groups", () => {
     const directoryToken = createToken({
       aud: "https://graph.microsoft.com",

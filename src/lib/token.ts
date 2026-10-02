@@ -1,7 +1,5 @@
 import type { TokenKind, TokenStatus, TokenStatusEntry } from "./types";
 
-const TOKEN_MAX_AGE_MINUTES = 45;
-
 export function makeTokenStatus(
   token?: string,
   timestamp?: number,
@@ -14,8 +12,11 @@ export function makeTokenStatus(
 
   const decoded = decodeToken(token);
   const expiresAtMs = getTokenExpiryMs(decoded);
+  if (expiresAtMs === undefined) {
+    return { hasToken: false };
+  }
   const tokenAge = Math.max(0, Math.round((now - timestamp) / 60000));
-  const expiresInMinutes = expiresAtMs === undefined ? undefined : Math.max(0, Math.floor((expiresAtMs - now) / 60000));
+  const expiresInMinutes = Math.max(0, Math.floor((expiresAtMs - now) / 60000));
   const principalName = getPrincipalName(decoded);
 
   return {
@@ -25,9 +26,9 @@ export function makeTokenStatus(
     ...(principalName ? { principalName } : {}),
     capturedAt: timestamp,
     tokenAge,
-    expiresAt: expiresAtMs === undefined ? undefined : new Date(expiresAtMs).toISOString(),
+    expiresAt: new Date(expiresAtMs).toISOString(),
     expiresInMinutes,
-    isExpired: expiresAtMs === undefined ? tokenAge > TOKEN_MAX_AGE_MINUTES : expiresAtMs <= now,
+    isExpired: expiresAtMs <= now,
     grantedScopes: getGrantedScopes(decoded),
     source
   };
@@ -111,9 +112,18 @@ function isDecodedTokenExpired(decoded: Record<string, unknown>, now: number): b
   return expiresAtMs !== undefined && expiresAtMs <= now;
 }
 
-function getTokenExpiryMs(decoded: Record<string, unknown> | null): number | undefined {
-  const exp = Number(decoded?.exp);
-  return Number.isFinite(exp) && exp > 0 ? exp * 1000 : undefined;
+export function getTokenExpiryMs(decoded: Record<string, unknown> | null): number | undefined {
+  return getNumericDateMs(decoded?.exp);
+}
+
+export function getNumericDateMs(value: unknown): number | undefined {
+  // NumericDate permits fractional seconds, but must be a JSON number. Avoid
+  // coercing objects or strings and only accept timestamps Date can format.
+  if (typeof value !== "number") return undefined;
+  const milliseconds = value * 1000;
+  return Number.isFinite(milliseconds) && milliseconds > 0 && milliseconds <= 8_640_000_000_000_000
+    ? milliseconds
+    : undefined;
 }
 
 function getGrantedScopes(decoded: Record<string, unknown> | null): string[] {

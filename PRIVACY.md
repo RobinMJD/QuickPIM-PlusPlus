@@ -1,6 +1,6 @@
 # QuickPIM++ Privacy Policy
 
-Effective date: August 10, 2026
+Effective date: October 2, 2026
 
 QuickPIM++ is a local-first browser extension for activating Microsoft Entra Privileged Identity Management roles, Azure resource roles, and PIM-enabled groups.
 
@@ -68,7 +68,7 @@ You can clear captured tokens, learned names, tracked requests, recent justifica
 
 You can disable Browser Sync independently on each installation, rename any installation shown in the sync list by its generated static ID, and delete the synchronized cloud copy. Backup & Restore remains available for moving data between Chrome and Edge or installations without native extension sync.
 
-The full reset action purges the synchronized cloud copy before clearing local and session data. If the browser cannot confirm the cloud purge, QuickPIM++ leaves local data intact and reports the problem rather than completing a partial reset.
+The full reset action attempts to purge the synchronized cloud copy, then clears local and session data. If the browser cannot confirm the cloud purge, QuickPIM++ records a durable pending-deletion marker, blocks restoration of stale synchronized data, and retries cloud cleanup later. Local reset completion does not mean cloud deletion has already succeeded.
 
 You can also remove all local extension data by uninstalling QuickPIM++ from the browser.
 

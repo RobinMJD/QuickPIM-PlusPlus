@@ -15,6 +15,7 @@ import {
 } from "../src/lib/graphTokenCapabilities";
 import { validateQuickPimMessage } from "../src/lib/messages";
 import { buildActivationRequest } from "../src/lib/pim";
+import { assertFreshToken, makeTokenStatus } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
 
 const now = Date.parse("2026-05-18T12:00:00.000Z");
@@ -70,6 +71,37 @@ describe("security allowlists and token validation", () => {
         now
       )
     ).toMatchObject({ ok: true });
+  });
+
+  test.each([
+    10_000_000_000_000,
+    Number.MAX_VALUE,
+    8_640_000_000_001,
+    "10000000000000",
+    [10_000_000_000_000],
+    { valueOf: 0, toString: 0 },
+    null
+  ])("rejects malformed expiry %j without crashing token status", (exp) => {
+    const token = makeToken({ aud: "https://graph.microsoft.com", exp });
+    expect(validateCapturedToken(token, "graph", now)).toMatchObject({ ok: false, reason: "Token does not contain a usable expiry." });
+    expect(() => assertFreshToken(token, "graph", now)).toThrow(/expiry is invalid/i);
+    expect(makeTokenStatus(token, now, "portal", now)).toEqual({ hasToken: false });
+  });
+
+  test("preserves fractional NumericDate expiry and the Date upper boundary", () => {
+    const expiresAt = now + 60_250;
+    const token = makeToken({ aud: "https://graph.microsoft.com", exp: expiresAt / 1000, nbf: (now - 250) / 1000 });
+    expect(validateCapturedToken(token, "graph", now)).toMatchObject({ ok: true });
+    expect(() => assertFreshToken(token, "graph", now)).not.toThrow();
+    expect(makeTokenStatus(token, now, "portal", now)).toMatchObject({ hasToken: true, isExpired: false, expiresAt: new Date(expiresAt).toISOString() });
+    const upperBoundary = makeToken({ aud: "https://graph.microsoft.com", exp: 8_640_000_000_000 });
+    expect(validateCapturedToken(upperBoundary, "graph", now)).toMatchObject({ ok: true });
+    expect(makeTokenStatus(upperBoundary, now, "portal", now)).toMatchObject({ expiresAt: new Date(8_640_000_000_000_000).toISOString() });
+  });
+
+  test.each([10_000_000_000_000, Number.MAX_VALUE, "1", [], { valueOf: 0, toString: 0 }])("rejects malformed not-before %j without coercion", (nbf) => {
+    const token = makeToken({ aud: "https://graph.microsoft.com", exp: (now + 60_000) / 1000, nbf });
+    expect(validateCapturedToken(token, "graph", now)).toMatchObject({ ok: false, reason: "Token does not contain a usable not-before time." });
   });
 
   test("redacts bearer tokens and long API payloads before displaying errors", () => {

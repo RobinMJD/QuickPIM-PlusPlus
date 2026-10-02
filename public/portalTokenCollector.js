@@ -320,7 +320,11 @@
         "https://management.core.windows.net/",
         "797f4846-ba00-4fd7-ba43-dac1f8f63013"
       ]);
-      return Number(decoded.exp) * 1000 > Date.now() && audiences.some((audience) => allowedAudiences.has(audience));
+      const expiresAtMs = typeof decoded.exp === "number" ? decoded.exp * 1000 : Number.NaN;
+      return Number.isFinite(expiresAtMs)
+        && expiresAtMs > Date.now()
+        && expiresAtMs <= 8_640_000_000_000_000
+        && audiences.some((audience) => allowedAudiences.has(audience));
     } catch {
       return false;
     }
