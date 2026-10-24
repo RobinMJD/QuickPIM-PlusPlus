@@ -32,6 +32,8 @@ export type QuickPimMessage =
   | { action: "restoreSettingsBackup"; settings: QuickPimSettings; store: TrackedPimRequestStore }
   | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
+  | { action: "acceptDeactivationRetry"; retryId: string }
+  | { action: "cancelDeactivationRetry"; retryId: string }
   | { action: "initializeNotificationDelivery" }
   | { action: "dismissRequestOperations"; operationIds: string[] }
   | { action: "capturePortalTokens"; tokens: string[]; source?: string }
@@ -244,6 +246,13 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (message.action === "extendTrackedRequest") {
     const requestId = sanitizeSingleRequestId(message.requestId);
     return { action: "extendTrackedRequest", requestId };
+  }
+
+  if (message.action === "acceptDeactivationRetry" || message.action === "cancelDeactivationRetry") {
+    if (typeof message.retryId !== "string" || !/^[a-zA-Z0-9-]{1,100}$/.test(message.retryId)) {
+      throw new Error("Disable retry identifier is invalid.");
+    }
+    return { action: message.action, retryId: message.retryId };
   }
 
   if (message.action === "dismissRequestOperations") {

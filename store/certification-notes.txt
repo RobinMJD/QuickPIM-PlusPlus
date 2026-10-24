@@ -1,6 +1,6 @@
-PURPOSE: QuickPIM++ lists and activates the signed-in user's existing eligible Microsoft PIM roles from a browser popup.
+PURPOSE: QuickPIM++ lists and activates the signed-in user's eligible Microsoft PIM roles from a popup.
 
-REQUIRED: Use the submitted Edge package and an authorized test work/school account in a PIM-licensed Microsoft Entra tenant, with at least one eligible Entra role. A permanent active assignment without eligibility or a personal Microsoft account is insufficient. Use the same Edge profile for the extension and Microsoft portal. No separate app registration or manual token entry is needed.
+REQUIRED: Use the submitted Edge package and an authorized test work/school account in a PIM-licensed Entra tenant, with an eligible Entra role. Permanent active assignments and personal Microsoft accounts are insufficient. Use the same Edge profile for extension and portal. No app registration or manual token entry is needed.
 
 TEST STEPS:
 1. Install and pin QuickPIM++. Sign in at https://entra.microsoft.com/ and confirm an eligible assignment under PIM > My roles.
@@ -8,5 +8,6 @@ TEST STEPS:
 3. Reopen popup > Entra Roles; click Refresh if needed. Expect the eligible role and its scope. Select one role > Continue.
 4. Choose an offered Activation time. Fill any required justification and ticket fields. Example: Microsoft Edge certification: verify temporary activation of the test account role. Generic "test" is rejected.
 5. Click Activate 1 selected. This sends a REAL PIM request. Expect active access with an expiry time, or pending approval if required. Verify in Settings > Activity & Usage > Requests and in the Microsoft PIM portal.
+6. Disable an activated test item before five minutes. If Microsoft rejects it, choose Retry automatically at ... or Not now. An accepted retry runs once after the minimum, even with the popup closed. Cancel retry stops a waiting retry. Verify the result in Activity and Microsoft PIM.
 
-PIM Groups/Azure Roles need separate eligibility. Missing sign-in/eligibility shows access or empty states, not demo roles. Enable source tabs in Settings > Popup & Appearance. Settings/appearance can be reviewed without tenant access. No demo account is supplied. Microsoft licensing, MFA and approval policies remain enforced. No developer backend is used; tokens stay in browser session storage.
+PIM Groups/Azure Roles need separate eligibility. Enable sources in Settings > Popup & Appearance. Missing access shows empty/access states; no demo account or sample roles are supplied. Settings can be reviewed without tenant access. Licensing, MFA and approval remain enforced. No developer backend; tokens stay in browser session storage.

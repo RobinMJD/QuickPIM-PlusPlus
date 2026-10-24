@@ -31,6 +31,7 @@ Highlights:
 - Activation bundles that skip already-active items and validate requirements before submission.
 - Policy-aware duration choices plus clear approval, justification, ticket, and active-until details.
 - Local activity history and optional request-status notifications.
+- An optional, cancellable background retry when Microsoft temporarily blocks early deactivation.
 - Optional browser-account sync for useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity within Chrome or Edge.
 - Guided Role Access recovery that opens only the Microsoft portal pages needed to refresh access.
 - Session-only token storage, local-only access data, and bounded browser-account sync controls for non-token convenience data.
@@ -56,7 +57,7 @@ QuickPIM++ handles authentication tokens, PIM assignment metadata, request ident
 
 Use the complete text in [certification-notes.txt](certification-notes.txt) for Partner Center's **Notes for certification** field. The automated Edge publisher reads this same file. The notes identify the primary purpose, required test account, exact UI steps, expected results, and missing-access behavior.
 
-For a review of v2.18.14, explain that the update rejects malformed token timestamps without breaking status rendering. It also includes the earlier fix for activating the same Entra role at different scopes (for example directory and administrative unit) while preserving Microsoft's policy enforcement. Follow the complete certification notes above to test the submitted package.
+For a review of v2.18.15, explain that a five-minute-minimum deactivation rejection offers **Retry automatically at …**. Accepting schedules one background retry for the exact original activation; **Cancel retry** cancels it before execution. The browser must be running with usable access to the original Microsoft account. No portal sign-in is opened automatically and an uncertain result is never resent. Follow the complete certification notes above to test the submitted package.
 
 Reviewer reference:
 

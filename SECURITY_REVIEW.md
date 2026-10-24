@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.14.
+Reviewed for v2.18.15.
+
+## v2.18.15 Deferred Disable Review
+
+Only a definite Microsoft HTTP 400/409 rejection containing the five-minute active-duration minimum creates a retry offer. The user must explicitly accept it. A local, non-synchronized record pins tenant, principal, role/group, scope/access type, and both assignment schedule identifiers; raw responses and tokens are excluded. A one-shot browser alarm claims the record durably, checks a fresh active assignment with the original account, and sends one deactivation through the existing operation ledger and item lock. It never opens sign-in pages or retries an ambiguous write. Pending retries can be cancelled; interrupted attempts fail closed on worker restart. Retries more than 15 minutes late stop rather than unexpectedly disabling access later. Records are bounded, ignored after 24 hours, and pruned on browser startup or retry-record changes; a full reset removes them and their alarm.
+
+Regression coverage includes explicit opt-in, cancellation, popup closure, real browser alarms, replacement activations, account/scope isolation, concurrent dispatch, missing access, late execution, and uncertain outcomes. Live Microsoft tenant deactivation remains a user acceptance check. Development-tool dependency advisories were resolved within the existing major versions.
 
 ## v2.18.14 Security Review
 

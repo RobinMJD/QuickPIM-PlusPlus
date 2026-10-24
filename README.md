@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.18.14**
+Current version: **v2.18.15**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -69,6 +69,7 @@ Work with eligible Azure resource roles across subscriptions, resource groups, m
 - Skip already-active bundle entries and preflight blocked, pending, or policy-limited items.
 - Keep activation and deactivation selections separate so each request has one clear intent.
 - Track approval, provisioning, completion, denial, failure, and expiry from Settings > Activity & Usage.
+- If Microsoft rejects an early disable because of its five-minute minimum, choose **Retry automatically at …**. One background retry checks the exact original activation before disabling it. You can close the popup or cancel the queued retry; the browser must be running with usable access to the same Microsoft account. A missed window, sign-in requirement, or uncertain result stops the retry visibly.
 - Continue selected PIM access after expiry with a policy-capped scheduled extension.
 - Optionally notify when a request changes state or active access is close to expiry.
 - Preserve popup selections and request inputs when the popup closes or Microsoft requires an interactive prompt.

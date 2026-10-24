@@ -5063,3 +5063,20 @@ body.dark-mode .autosave-status.error {
     animation: none;
   }
 }
+.deactivation-retries {
+  margin: 8px 12px;
+  max-height: 180px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.deactivation-retry {
+  padding: 10px 12px;
+  border: 1px solid #d7dce5;
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+
+.deactivation-retry + .deactivation-retry { margin-top: 6px; }
+.deactivation-retry p { margin: 4px 0 8px; }
+.deactivation-retry .button-row { flex-wrap: wrap; gap: 8px; }

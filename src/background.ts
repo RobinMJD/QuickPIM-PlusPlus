@@ -12,7 +12,7 @@ import {
   normalizePimGroup
 } from "./lib/pim";
 import { azureManagementUrl, encodePathSegment, graphApiUrl } from "./lib/apiUrls";
-import { readMicrosoftApiError } from "./lib/microsoftApiError";
+import { MicrosoftApiError, readMicrosoftApiError } from "./lib/microsoftApiError";
 import { runWithActivationPreflight } from "./lib/activationSubmission";
 import { mapWithConcurrency, mapWithConcurrencySettled } from "./lib/concurrency";
 import { collectPaginatedValues } from "./lib/pagination";
@@ -175,6 +175,11 @@ import {
   isAmbiguousMicrosoftWriteFailure,
   isTransientMicrosoftFailure
 } from "./lib/requestOutcome";
+import {
+  DEACTIVATION_RETRY_ALARM, acceptDeactivationRetry, cancelDeactivationRetry,
+  loadDeactivationRetries, offerDeactivationRetry, recoverInterruptedDeactivationRetries,
+  runDueDeactivationRetries, isMinimumActiveDurationMessage, type DeactivationRetry
+} from "./lib/deactivationRetry";
 import { retryOnceIf } from "./lib/retry";
 import {
   clearStoredTokens,
@@ -239,6 +244,7 @@ interface ActivationSubmissionOptions {
   startDateTime?: string;
   continuationOfRequestId?: string;
   operationId?: string;
+  suppressDeactivationRetryOffer?: boolean;
 }
 interface ActivationWriteResponse {
   payload: unknown;
@@ -327,6 +333,9 @@ let extensionResetInProgress = false;
 let suppressBackgroundStorageEventsUntil = 0;
 const bestEffortTasks = new Set<Promise<unknown>>();
 const requestOperationTasks = new Map<string, { fingerprint: string; task: Promise<ActivationResponse> }>();
+let deactivationRetryTask: Promise<void> | undefined;
+let deactivationRetryInitialization: Promise<void> | undefined;
+let deactivationRetryAlarmUpdates: Promise<void> = Promise.resolve();
 const requestExtensionTasks = new Map<string, Promise<TrackedRequestExtensionResult>>();
 const REQUEST_TRACKING_NOTIFICATION_PREFIX = "quickpim-request:";
 const BROWSER_SYNC_PERIOD_MINUTES = 30;
@@ -423,7 +432,9 @@ chrome.permissions?.onRemoved?.addListener(notificationPermissionRemoved);
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (extensionResetInProgress) return;
-  if (alarm.name === PRE_REFRESH_ALARM_NAME) {
+  if (alarm.name === DEACTIVATION_RETRY_ALARM) {
+    runBestEffort(runIfExtensionEnabled(runDeactivationRetryMaintenance));
+  } else if (alarm.name === PRE_REFRESH_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runBackgroundPreRefresh));
   } else if (alarm.name === REQUEST_TRACKING_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runTrackedRequestMaintenance));
@@ -551,6 +562,7 @@ async function initializeEnabledBackgroundServices(runPreRefresh = false): Promi
     await Promise.allSettled([
       chrome.alarms?.clear?.(PRE_REFRESH_ALARM_NAME),
       chrome.alarms?.clear?.(REQUEST_TRACKING_ALARM_NAME),
+      chrome.alarms?.clear?.(DEACTIVATION_RETRY_ALARM),
       chrome.alarms?.clear?.(BROWSER_SYNC_ALARM_NAME),
       chrome.alarms?.clear?.(PORTAL_RECOVERY_CLEANUP_ALARM_NAME),
       chrome.alarms?.clear?.(PORTAL_RECOVERY_VERIFY_ALARM_NAME),
@@ -565,6 +577,7 @@ async function initializeEnabledBackgroundServices(runPreRefresh = false): Promi
   await Promise.all([
     initializeBackgroundRefresh(),
     initializeRequestTracking(),
+    initializeDeactivationRetries(),
     initializeBrowserSync(),
     reconcilePendingRequestOperations(),
     initializePortalRecoveryLifecycle()
@@ -1614,6 +1627,18 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
         ),
         message.items
       );
+    case "acceptDeactivationRetry":
+      if (!chrome.alarms?.create) throw new Error("Background alarms are unavailable in this browser.");
+      await acceptDeactivationRetry(message.retryId);
+      try { await scheduleDeactivationRetryAlarm(); } catch (error) {
+        await cancelDeactivationRetry(message.retryId);
+        throw error;
+      }
+      return true;
+    case "cancelDeactivationRetry":
+      await cancelDeactivationRetry(message.retryId);
+      await scheduleDeactivationRetryAlarm();
+      return true;
     case "deactivateItems":
       return runDurableRequestOperation(
         {
@@ -1653,6 +1678,7 @@ async function resetAllExtensionData(): Promise<void> {
         bestEffortTasks.size
         || requestOperationTasks.size
         || requestExtensionTasks.size
+        || deactivationRetryTask
         || portalTokenRefreshInFlight
         || requestTrackingMaintenanceInFlight
         || requestTrackingMaintenanceFollowUp
@@ -2042,6 +2068,72 @@ async function deactivateItemsWithPortalRecovery(
     "deactivation",
     (retryItems) => deactivateItems(retryItems, justification, ticketInfo, options)
   );
+}
+
+async function initializeDeactivationRetries(): Promise<void> {
+  deactivationRetryInitialization ||= recoverInterruptedDeactivationRetries();
+  await deactivationRetryInitialization;
+  await scheduleDeactivationRetryAlarm();
+}
+
+async function scheduleDeactivationRetryAlarm(notBefore = 0): Promise<void> {
+  // An older clear must not race a newly accepted retry's alarm creation.
+  const update = deactivationRetryAlarmUpdates.catch(() => undefined).then(async () => {
+    if (!chrome.alarms) return;
+    const queued = (await loadDeactivationRetries()).filter((entry) => entry.state === "queued");
+    if (!queued.length) {
+      await chrome.alarms.clear(DEACTIVATION_RETRY_ALARM);
+      return;
+    }
+    await chrome.alarms.create(DEACTIVATION_RETRY_ALARM, {
+      when: Math.max(Date.now() + 100, notBefore, Math.min(...queued.map((entry) => entry.retryAt)))
+    });
+  });
+  deactivationRetryAlarmUpdates = update;
+  await update;
+}
+
+async function runDeactivationRetryMaintenance(): Promise<void> {
+  if (deactivationRetryTask) return deactivationRetryTask;
+  const task = runWithServiceWorkerKeepAlive(async () => {
+    await initializeDeactivationRetries();
+    await runDueDeactivationRetries({
+      readActiveItems: async (entry) => {
+        const settings = await loadSettings();
+        if (!settings.preferences.enabledFeatures.includes(entry.item.type)) {
+          throw new Error("This role source was disabled. No automatic disable request was sent.");
+        }
+        const tokens = await getStoredTokens();
+        const kind = entry.item.type === "azureRole" ? "azureManagement" : "graph";
+        const token = getTokenForActivation(tokens, entry.item, kind);
+        if (!token) throw new Error("The original account needs Microsoft sign-in. Refresh access, then disable manually.");
+        assertRequestTokenReady(entry.item, token, kind, "deactivation");
+        const result = await getActiveItems([entry.item.type]);
+        if (result.errors.length) throw new Error(result.errors.join(" "));
+        return result.items;
+      },
+      submit: (entry: DeactivationRetry, current) => runDurableRequestOperation({
+        id: `deactivation-retry-${entry.id}`,
+        action: "deactivate",
+        itemIds: [current.id], targets: [current.type],
+        tenantId: current.tenantId, principalId: current.principalId,
+        items: createRequestOperationItems([current]),
+        startedAt: Date.now(), justification: entry.justification, ticketInfo: entry.ticketInfo
+      }, () => deactivateItems([current], entry.justification, entry.ticketInfo, {
+        operationId: `deactivation-retry-${entry.id}`, suppressDeactivationRetryOffer: true
+      }), [current])
+    });
+  });
+  deactivationRetryTask = task;
+  let notBefore = 0;
+  try { await task; } catch (error) {
+    // A local storage failure before claiming must not create a hot alarm loop.
+    notBefore = Date.now() + 60_000;
+    throw error;
+  } finally {
+    deactivationRetryTask = undefined;
+    await scheduleDeactivationRetryAlarm(notBefore);
+  }
 }
 
 async function extendTrackedRequest(requestId: string): Promise<TrackedRequestExtensionResult> {
@@ -3708,6 +3800,7 @@ function getDirectoryRoleActiveInstanceItems(
         ),
         status: "active" as const,
         activeAssignmentType,
+        ...(role.startDateTime ? { activeFrom: role.startDateTime } : {}),
         ...(activeUntil ? { activeUntil } : {}),
         ...(isSelfActivated && role.roleAssignmentScheduleId ? { assignmentScheduleId: role.roleAssignmentScheduleId } : {}),
         ...(isSelfActivated && role.id ? { assignmentScheduleInstanceId: role.id } : {})
@@ -4063,6 +4156,7 @@ function getActivePimGroupInstanceItems(
         ...item,
         status: "active" as const,
         activeAssignmentType,
+        ...((schedule.startDateTime || schedule.scheduleInfo?.startDateTime) ? { activeFrom: schedule.startDateTime || schedule.scheduleInfo?.startDateTime } : {}),
         assignmentScheduleId: isSelfActivated ? schedule.assignmentScheduleId : undefined,
         assignmentScheduleInstanceId: isSelfActivated ? schedule.id : undefined,
         ...(activeUntil ? { activeUntil } : {})
@@ -4431,6 +4525,7 @@ async function getActiveAzureRolesForScopes(
             ...item,
             status: "active" as const,
             activeAssignmentType,
+            ...(role.properties?.startDateTime ? { activeFrom: role.properties.startDateTime } : {}),
             assignmentScheduleId: isSelfActivated ? item.assignmentScheduleId : undefined,
             assignmentScheduleInstanceId: isSelfActivated ? item.assignmentScheduleInstanceId : undefined,
             ...(activeUntil ? { activeUntil } : {})
@@ -4881,6 +4976,14 @@ async function deactivateItems(
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         const detail = sanitizeErrorMessage(error);
+        if (!microsoftAccepted && !options.suppressDeactivationRetryOffer
+          && error instanceof MicrosoftApiError && [400, 409].includes(error.status)
+          && isMinimumActiveDurationMessage(error.message)) {
+          const request = buildDeactivationRequest(item, justification.trim(), ticketInfo);
+          const token = getTokenForActivation(tokens, item, request.tokenKind);
+          const tenantId = token ? getTokenTenantId(token) : undefined;
+          if (tenantId) await offerDeactivationRetry({ ...item, tenantId }, justification.trim(), ticketInfo).catch(() => undefined);
+        }
         const outcomeUnknown = microsoftAccepted || isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
         const result: ActivationResult = {
           itemId: item.id,

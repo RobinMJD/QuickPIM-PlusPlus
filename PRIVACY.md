@@ -1,6 +1,6 @@
 # QuickPIM++ Privacy Policy
 
-Effective date: October 2, 2026
+Effective date: October 24, 2026
 
 QuickPIM++ is a local-first browser extension for activating Microsoft Entra Privileged Identity Management roles, Azure resource roles, and PIM-enabled groups.
 
@@ -39,6 +39,8 @@ On official Store installations, browser sync is enabled by default. A bounded s
 
 QuickPIM++ does not operate a developer-controlled backend service and does not send this local extension data to the developer.
 
+If Microsoft rejects an early deactivation because of its five-minute minimum, QuickPIM++ can offer a single automatic retry. Choosing it stores the original activation identifiers, intended retry time, optional note/ticket details, and outcome only in local extension storage. Retry history expires after 24 hours; stored entries are cleaned on the next browser startup or retry-record change. These retry records are not synchronized or included in backups. You can cancel a waiting retry from the popup. Execution requires the same Microsoft account and an unchanged active assignment; unavailable access, interrupted or uncertain attempts, and missed retry windows stop without automatically opening sign-in pages.
+
 ## Data Sharing
 
 QuickPIM++ sends activation and read requests only to Microsoft Graph and Azure Management APIs for the signed-in Microsoft tenant and scopes available to the current user.
@@ -54,7 +56,7 @@ QuickPIM++ requests the minimum browser permissions needed for its purpose:
 - `storage` to keep local settings, aliases, learned names, cached data, session-only captured portal tokens, temporary recovery-tab identifiers, and the optional browser-account sync payload.
 - `webRequest` to detect Microsoft portal requests containing usable Microsoft Graph or Azure Management bearer tokens.
 - `tabGroups` to place extension-created portal-recovery pages in a labeled collapsed group; QuickPIM++ does not use it to reorganize unrelated tabs.
-- `alarms` to refresh stale role data and check unresolved QuickPIM++ request status with bounded one-shot schedules.
+- `alarms` to refresh stale role data, check unresolved QuickPIM++ requests, and run an explicitly accepted deactivation retry after Microsoft's minimum active duration, using bounded one-shot schedules.
 - Optional `notifications`, requested only when enabled in Preferences, to report request status changes or approaching expiry.
 - Access to `graph.microsoft.com` and `management.azure.com` to read PIM data and submit activation requests for enabled features.
 - Access to `entra.microsoft.com` to support portal-driven token capture during Access Setup.

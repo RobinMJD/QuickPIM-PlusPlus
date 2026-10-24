@@ -13,6 +13,8 @@ import {
   updateCacheFromTargetResults
 } from "../lib/cache";
 import { CLAIMS_CHALLENGE_MESSAGE } from "../lib/apiErrors";
+import { DEACTIVATION_RETRY_KEY, loadDeactivationRetries, type DeactivationRetry } from "../lib/deactivationRetry";
+
 import {
   buildAccessCapabilityItems,
   buildTokenCacheKey,
@@ -394,6 +396,16 @@ function PopupApp() {
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
   const [activationProgress, setActivationProgress] = useState<OperationProgress | null>(null);
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
+  const [deactivationRetries, setDeactivationRetries] = useState<DeactivationRetry[]>([]);
+  const [retryActionId, setRetryActionId] = useState<string>();
+  const visibleFailureErrors = activationFailureNotice?.errors.filter((text) =>
+    !text.includes("at least 5 minutes before it can be disabled")
+    || !deactivationRetries.some((entry) => ["offered", "queued"].includes(entry.state)
+      && text.startsWith(`${entry.item.displayName}:`)));
+  const visibleActivationFailureNotice = activationFailureNotice && visibleFailureErrors?.length
+    ? { ...activationFailureNotice, errors: visibleFailureErrors } : null;
+
+
   const [dismissedIdentityMismatchDetail, setDismissedIdentityMismatchDetail] = useState<string | undefined>();
   const [isActivating, setIsActivating] = useState(false);
   const [requestMode, setRequestMode] = useState<PopupRequestMode | undefined>();
@@ -429,6 +441,46 @@ function PopupApp() {
   const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
   const resolvedActivationIdentityKey = useRef<string | undefined>(undefined);
   const itemSettingsMigrationFingerprint = useRef("");
+
+  useEffect(() => {
+    let disposed = false;
+    const reload = () => void loadDeactivationRetries().then((entries) => {
+      if (!disposed) setDeactivationRetries(entries);
+    }).catch(() => undefined);
+    const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area === "local" && changes[DEACTIVATION_RETRY_KEY]) reload();
+    };
+    reload();
+    chrome.storage.onChanged?.addListener(changed);
+    return () => { disposed = true; chrome.storage.onChanged?.removeListener(changed); };
+  }, []);
+
+  async function changeDeactivationRetry(entry: DeactivationRetry, accept: boolean): Promise<void> {
+    setRetryActionId(entry.id);
+    try {
+      await sendMessage({ action: accept ? "acceptDeactivationRetry" : "cancelDeactivationRetry", retryId: entry.id });
+      setDeactivationRetries(await loadDeactivationRetries());
+      if (accept) {
+        setActivationFailureNotice((notice) => {
+          if (!notice) return notice;
+          const errors = notice.errors.filter((text) => !text.includes("at least 5 minutes before it can be disabled"));
+          return errors.length ? { ...notice, errors } : null;
+        });
+        const remaining = new Set([...selectedIds].filter((id) => !activationItemIdentitiesMatch(id, getActivationItemIdentity(entry.item))));
+        setSelectedIds(remaining);
+        if (!remaining.size) {
+          setRequestMode(undefined);
+          setIsActivationReviewOpen(false);
+          selectionIdentityRef.current = {};
+          setSelectionIdentity({});
+          latestPopupDraft.current = undefined;
+          await clearPopupDraft();
+        }
+      }
+    } catch (error) {
+      setError(sanitizeErrorMessage(error));
+    } finally { setRetryActionId(undefined); }
+  }
 
   tokenStatusRef.current = tokenStatus;
   portalRecoveryStatusRef.current = portalRecoveryStatus;
@@ -2765,15 +2817,40 @@ function PopupApp() {
         </nav>
       ) : null}
 
-      {activationFailureNotice ? (
+      {visibleActivationFailureNotice ? (
         <ActivationFailureBanner
-          notice={activationFailureNotice}
+          notice={visibleActivationFailureNotice}
           onOpenPortal={(target) => void openPortalForTarget(target)}
           onOpenAccessSetup={() => void openSettingsSection("role-access")}
           onDismiss={() => setActivationFailureNotice(null)}
         />
       ) : error && refreshProgress?.status !== "error" && activationProgress?.status !== "error" ? (
         <DismissibleErrorMessage onDismiss={() => setError("")}>{error}</DismissibleErrorMessage>
+      ) : null}
+      {deactivationRetries.length ? (
+        <section className="deactivation-retries" aria-label="Disable retries" aria-live="polite">
+          {deactivationRetries.map((entry) => (
+            <div className="deactivation-retry" key={entry.id}>
+              <div>
+                <strong>{entry.item.displayName}</strong><span className="muted"> · {entry.item.scopeLabel}</span>
+                <p>{entry.state === "offered" ? "Retry once after Microsoft's five-minute minimum."
+                  : entry.state === "queued" ? `Disable queued for ${new Date(entry.retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}. You can close this popup.`
+                  : entry.state === "running" ? "Checking the original activation and retrying disable…"
+                  : entry.detail}</p>
+              </div>
+              <div className="button-row">
+                {entry.state === "offered" ? <button className="btn" disabled={Boolean(retryActionId) || isActivating}
+                  onClick={() => void changeDeactivationRetry(entry, true)}>
+                  Retry automatically at {new Date(entry.retryAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                </button> : null}
+                <button className="btn subtle" disabled={Boolean(retryActionId) || entry.state === "running"}
+                  onClick={() => void changeDeactivationRetry(entry, false)}>
+                  {entry.state === "queued" ? "Cancel retry" : entry.state === "offered" ? "Not now" : "Dismiss"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </section>
       ) : null}
       {message && !activationFailureNotice && !(showInitialAccessState && isMissingAccessSummary(message)) ? <p className="message">{message}</p> : null}
       {isLoading ? (

@@ -49,6 +49,7 @@ export interface BaseActivationItem {
   sourceScopeLabel?: string;
   status: ActivationStatus;
   activeAssignmentType?: ActiveAssignmentType;
+  activeFrom?: string;
   activeUntil?: string;
   assignmentScheduleId?: string;
   assignmentScheduleInstanceId?: string;
@@ -530,6 +531,7 @@ export interface AzureRoleApi {
     linkedRoleEligibilityScheduleId?: string;
     linkedRoleEligibilityScheduleInstanceId?: string;
     scope?: string;
+    startDateTime?: string;
     endDateTime?: string;
     assignmentType?: string;
     expandedProperties?: {
@@ -562,6 +564,7 @@ export interface PimGroupApi {
   eligibilityScheduleId?: string;
   assignmentType?: string;
   memberType?: string;
+  startDateTime?: string;
   endDateTime?: string;
   scheduleInfo?: {
     startDateTime?: string;

@@ -672,6 +672,7 @@ function sanitizeCachedActivationItem(value: unknown, cacheKey?: string): Activa
     ...(tenantId ? { tenantId } : {}),
     ...(sanitizeOptionalString(value.sourceScopeLabel) ? { sourceScopeLabel: sanitizeOptionalString(value.sourceScopeLabel) } : {}),
     ...(ASSIGNMENT_TYPES.has(String(value.activeAssignmentType)) ? { activeAssignmentType: value.activeAssignmentType as ActivationItem["activeAssignmentType"] } : {}),
+    ...(sanitizeTimestamp(value.activeFrom) ? { activeFrom: sanitizeTimestamp(value.activeFrom) } : {}),
     ...(sanitizeTimestamp(value.activeUntil) ? { activeUntil: sanitizeTimestamp(value.activeUntil) } : {}),
     ...(sanitizeIdentityString(value.assignmentScheduleId) ? { assignmentScheduleId: sanitizeIdentityString(value.assignmentScheduleId) } : {}),
     ...(sanitizeIdentityString(value.assignmentScheduleInstanceId) ? { assignmentScheduleInstanceId: sanitizeIdentityString(value.assignmentScheduleInstanceId) } : {}),
