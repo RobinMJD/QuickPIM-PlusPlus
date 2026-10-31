@@ -402,6 +402,8 @@ export interface RequestOperationItemRecord {
   tenantId?: string;
   principalId?: string;
   scopeLabel?: string;
+  scopeId?: string;
+  accessId?: "member" | "owner";
   state: RequestOperationItemState;
   updatedAt: number;
   requestId?: string;
@@ -431,6 +433,12 @@ export interface RequestOperationRecord {
   sourceInstallationId?: string;
   sourceDeviceName?: string;
   revision?: number;
+  kind?: "extension";
+  waitingForAccess?: boolean;
+  scheduledStartAt?: string;
+  sourceRequestId?: string;
+  // Token-free, validated snapshot. Only never-sent items may resume after restart.
+  resumePayload?: { items: ActivationItem[]; durationHours?: number; justification?: string; ticketInfo?: TicketInfo; bundleName?: string };
   response?: ActivationResponse;
   error?: string;
 }

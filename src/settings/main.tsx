@@ -1,3 +1,4 @@
+import { RequestActivity, useRequestActivity } from "../components/RequestActivity";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
@@ -100,7 +101,7 @@ import {
   sanitizeTrackedRequestStore,
   trackedRequestStatusLabel
 } from "../lib/requestTracking";
-import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore, TrackedRequestExtensionResult } from "../lib/types";
+import type { AccessSetupTarget, ActivationItem, ActivationSnapshot, ActivityAction, ActivityResult, PortalRecoveryFocusResult, PortalRecoveryOpenResult, PortalRecoveryStatus, PortalTokenRefreshResult, QuickPimBundle, QuickPimDataCache, QuickPimFeature, QuickPimSettings, ReferenceDataCache, TokenStatus, TrackedPimRequest, TrackedPimRequestStatus, TrackedPimRequestStore } from "../lib/types";
 
 type SettingsTab = "home" | "role-access" | "appearance" | "aliases" | "activation" | "justifications" | "bundles" | "activity" | "sync" | "diagnostics" | "backup" | "reset" | "about";
 type PreferencePage = "appearance" | "activation";
@@ -1738,6 +1739,7 @@ function ActivityPanel({
   onTrackedRequestsChange: (store: TrackedPimRequestStore) => void;
   onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
 }) {
+  const requestActivity = useRequestActivity();
   const [view, setView] = useState<"requests" | "history" | "usage">("requests");
   const [requestSearch, setRequestSearch] = useState("");
   const [requestStatusFilter, setRequestStatusFilter] = useState<"all" | "pending" | "active" | "attention" | "finished">("all");
@@ -1926,15 +1928,10 @@ function ActivityPanel({
     setRequestMessage("");
     setExtendingRequestId(request.id);
     try {
-      const result = await sendMessage<TrackedRequestExtensionResult>(
-        { action: "extendTrackedRequest", requestId: request.id },
-        { timeoutMs: 110_000, timeoutMessage: "The extension request is still being checked. Review Microsoft PIM before retrying." }
-      );
-      if (result.success) {
-        setRequestMessage(result.message);
-      } else {
-        setRequestError(result.message);
-      }
+      await sendMessage({ action: "startRequestOperation", request: { action: "extendTrackedRequest", requestId: request.id } },
+        { timeoutMs: 15_000, timeoutMessage: "The extension handoff is taking longer than expected. Check Requests before retrying." });
+      setRequestMessage("Extension is continuing in the background. You can start other requests or close this page.");
+      void requestActivity.reload();
       onTrackedRequestsChange(await loadTrackedRequests());
     } catch (extensionError) {
       setRequestError(extensionError instanceof Error ? extensionError.message : String(extensionError));
@@ -1949,6 +1946,8 @@ function ActivityPanel({
 
   return (
     <section className="panel">
+      <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
+        onDismiss={async (id) => { await sendMessage({ action: "dismissRequestOperations", operationIds: [id] }); await requestActivity.reload(); }} />
       <div className="panel-title-row">
         <div>
           <h2>Activity & Usage</h2>

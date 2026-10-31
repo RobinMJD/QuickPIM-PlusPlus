@@ -129,6 +129,7 @@ import {
   sanitizeErrorMessage,
   validateCapturedToken
 } from "./lib/security";
+import { clearSubmittedPopupDraft } from "./lib/popupDraft";
 import { assertFreshToken, decodeToken, makeTokenStatus } from "./lib/token";
 import { shouldAllowCapturedTokenIdentityChange } from "./lib/tokenCapture";
 import { selectBestStoredGraphTokenForTarget, selectPortalTokenCandidates } from "./lib/tokenCandidates";
@@ -142,6 +143,7 @@ import {
   loadRequestOperations,
   trackedRequestMatchesOperation,
   touchRequestOperation,
+  setRequestOperationAccessWait,
   updateRequestOperationItem
 } from "./lib/requestOperations";
 import {
@@ -394,6 +396,9 @@ chrome.storage.onChanged?.addListener((changes, areaName) => {
     }));
     scheduleBrowserSyncAfterStorageChange(BROWSER_SYNC_LOCAL_CHANGE_DEBOUNCE_MS);
   }
+  if (areaName === "session" && Object.keys(changes).some((key) => /Token$/.test(key))) {
+    runBestEffort(runIfExtensionEnabled(reconcilePendingRequestOperations));
+  }
   if (areaName === "local" && changes[REQUEST_TRACKING_KEY]) {
     runBestEffort(runIfExtensionEnabled(initializeRequestTracking));
   }
@@ -432,7 +437,9 @@ chrome.permissions?.onRemoved?.addListener(notificationPermissionRemoved);
 
 chrome.alarms?.onAlarm?.addListener((alarm) => {
   if (extensionResetInProgress) return;
-  if (alarm.name === DEACTIVATION_RETRY_ALARM) {
+  if (alarm.name === "quickpim-request-recovery") {
+    runBestEffort(runIfExtensionEnabled(reconcilePendingRequestOperations));
+  } else if (alarm.name === DEACTIVATION_RETRY_ALARM) {
     runBestEffort(runIfExtensionEnabled(runDeactivationRetryMaintenance));
   } else if (alarm.name === PRE_REFRESH_ALARM_NAME) {
     runBestEffort(runIfExtensionEnabled(runBackgroundPreRefresh));
@@ -1470,7 +1477,7 @@ async function performBackgroundPreRefresh(): Promise<void> {
   }
 }
 
-async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender): Promise<unknown> {
+async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>, sender: chrome.runtime.MessageSender, onRequestAccepted?: (id: string) => void): Promise<unknown> {
   switch (message.action) {
     case "getTokenStatus":
       return getTokenStatus();
@@ -1593,8 +1600,19 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       ]);
       return restored;
     }
+    case "startRequestOperation":
+      return new Promise<{ operationId: string }>((resolve, reject) => {
+        let accepted = false;
+        void handleMessage(message.request, sender, (operationId) => {
+          accepted = true;
+          resolve({ operationId });
+        }).then((result) => {
+          if (!accepted) reject(new Error(result && typeof result === "object" && "message" in result && typeof result.message === "string"
+            ? sanitizeErrorMessage(result.message) : "The request could not be started. Check Activity for an existing request."));
+        }, (error) => { if (!accepted) reject(error); });
+      });
     case "extendTrackedRequest":
-      return extendTrackedRequest(message.requestId);
+      return extendTrackedRequest(message.requestId, onRequestAccepted);
     case "getRequestOperations":
       return loadRequestOperationsForPopup();
     case "dismissRequestOperations":
@@ -1615,7 +1633,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           durationHours: message.durationHours,
           justification: message.justification,
           ticketInfo: message.ticketInfo,
-          bundleName: message.bundleName
+          bundleName: message.bundleName,
+          resumePayload: { items: message.items, durationHours: message.durationHours, justification: message.justification, ticketInfo: message.ticketInfo, bundleName: message.bundleName }
         },
         () => activateItemsWithPortalRecovery(
           message.items,
@@ -1625,7 +1644,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           message.bundleName,
           { operationId: message.operationId }
         ),
-        message.items
+        message.items,
+        onRequestAccepted
       );
     case "acceptDeactivationRetry":
       if (!chrome.alarms?.create) throw new Error("Background alarms are unavailable in this browser.");
@@ -1650,7 +1670,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           items: createRequestOperationItems(message.items),
           startedAt: Date.now(),
           justification: message.justification,
-          ticketInfo: message.ticketInfo
+          ticketInfo: message.ticketInfo,
+          resumePayload: { items: message.items, justification: message.justification, ticketInfo: message.ticketInfo }
         },
         () => deactivateItemsWithPortalRecovery(
           message.items,
@@ -1658,7 +1679,8 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
           message.ticketInfo || {},
           { operationId: message.operationId }
         ),
-        message.items
+        message.items,
+        onRequestAccepted
       );
     default:
       throw new Error("Unsupported QuickPIM++ message");
@@ -1735,11 +1757,65 @@ async function loadRequestOperationsForPopup(): Promise<RequestOperationRecord[]
     return operations;
   }
 
-  await Promise.allSettled(orphaned.map((operation) => reconcileOrphanedRequestOperation(operation)));
+  runBestEffort(Promise.allSettled(orphaned.map((operation) => reconcileOrphanedRequestOperation(operation))));
   return loadRequestOperations();
 }
 
 async function reconcileOrphanedRequestOperation(operation: RequestOperationRecord): Promise<void> {
+  const resumable = operation.resumePayload && (operation.state === "running" || operation.state === "uncertain")
+    && Date.now() - operation.startedAt < 15 * 60_000
+    && operation.items?.some((item) => item.state === "prepared");
+  if (resumable && !requestOperationTasks.has(operation.id)) {
+    const payload = operation.resumePayload!;
+    const tokens = await getStoredTokens();
+    const ready = payload.items.every((item) => {
+      try {
+        const kind = item.type === "azureRole" ? "azureManagement" : "graph";
+        const token = getTokenForActivation(tokens, item, kind);
+        if (!token) return false;
+        assertRequestTokenReady(item, token, kind, operation.action === "activate" ? "activation" : "deactivation");
+        assertTokenCanActivate(item, token, kind, "request recovery");
+        return true;
+      } catch { return false; }
+    });
+    if (!ready) {
+      if (!operation.waitingForAccess) await setRequestOperationAccessWait(operation.id, true);
+      await chrome.alarms?.create("quickpim-request-recovery", { delayInMinutes: 1 });
+      return;
+    }
+    if (operation.waitingForAccess) await setRequestOperationAccessWait(operation.id, false);
+    if (requestOperationTasks.has(operation.id)) return;
+    const unsent = payload.items.filter((item) => operation.items?.some((entry) => entry.state === "prepared" && activationItemIdentitiesMatch(entry.itemId, item.id)));
+    // Register synchronously before awaiting source metadata; concurrent readers
+    // must not reconcile a resuming operation as an abandoned write.
+    const task = runWithServiceWorkerKeepAlive(async () => {
+      const response = operation.action === "activate"
+        ? await activateItems(unsent, payload.durationHours!, payload.justification || "", payload.ticketInfo || {}, payload.bundleName, { operationId: operation.id, startDateTime: operation.scheduledStartAt, continuationOfRequestId: operation.sourceRequestId })
+        : await deactivateItems(unsent, payload.justification || "", payload.ticketInfo || {}, { operationId: operation.id });
+      const previous = (operation.items || []).filter((item) => item.state !== "prepared").map((item): ActivationResult => item.result || {
+        itemId: item.itemId, itemName: item.itemName, success: Boolean(item.requestId),
+        ...(item.requestId ? { requestId: item.requestId, requestStatus: "submitted" as const } : { outcomeUnknown: true, error: "The previous submission outcome is unknown. Check Microsoft PIM before retrying." })
+      });
+      const results = [...previous, ...response.results];
+      const combined = { success: results.every((item) => item.success), results, errors: results.filter((item) => !item.success) };
+      await completeRequestOperation(operation.id, combined);
+      await invalidateActiveCacheTargets(operation.targets).catch(() => undefined);
+      await mutateSettings((settings) => recordOperationActivity(settings, {
+        operationId: operation.id, action: operation.action, items: payload.items, response: combined,
+        requestedAt: new Date(operation.startedAt).toISOString(), completedAt: new Date().toISOString(),
+        durationHours: operation.durationHours, justification: operation.justification, bundleName: operation.bundleName
+      })).catch(() => undefined);
+      if (operation.kind === "extension" && operation.sourceRequestId && combined.results[0]?.requestId) {
+        const store = await loadTrackedRequests();
+        const source = store.requests.find((request) => request.requestId === operation.sourceRequestId);
+        if (source) await patchTrackedExtensionSource(source.id, { extensionAttemptState: "queued", extensionRequestId: combined.results[0].requestId, extensionLastError: undefined });
+      }
+      return combined;
+    });
+    requestOperationTasks.set(operation.id, { fingerprint: getRequestOperationFingerprint(operation), task });
+    void task.catch((error) => failRequestOperation(operation.id, sanitizeErrorMessage(error), { uncertain: true })).finally(() => requestOperationTasks.delete(operation.id)).catch(() => undefined);
+    return;
+  }
   await retryPendingTrackedRequests(operation);
   const refreshedOperation = (await loadRequestOperations()).find((candidate) => candidate.id === operation.id) || operation;
   const store = await loadTrackedRequests().catch(() => undefined);
@@ -1785,7 +1861,9 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
       success: false,
       error: outcomeUnknown
         ? "QuickPIM++ restarted while Microsoft may have been processing this item. Check Microsoft PIM before retrying to avoid a duplicate request."
-        : "QuickPIM++ restarted before this item was sent. It is safe to start a new request.",
+        : refreshedOperation.resumePayload && Date.now() - refreshedOperation.startedAt >= 15 * 60_000
+          ? "This unsent request's 15-minute recovery window expired. It was not sent; start a new request if still needed."
+          : "QuickPIM++ restarted before this item was sent. It is safe to start a new request.",
       ...(outcomeUnknown ? { outcomeUnknown: true } : {})
     };
   });
@@ -1874,9 +1952,10 @@ function inferOperationItemType(itemId: string): ActivationItem["type"] {
 
 async function runDurableRequestOperation(
   operation: Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets" | "startedAt"> &
-    Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "items" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName">>,
+    Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "items" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName" | "kind" | "scheduledStartAt" | "sourceRequestId" | "resumePayload">>,
   execute: () => Promise<ActivationResponse>,
-  activityItems: ActivationItem[]
+  activityItems: ActivationItem[],
+  onAccepted?: (id: string) => void
 ): Promise<ActivationResponse> {
   const source = await getBrowserSyncInstallationIdentity(
     getBrowserSyncApis(await getDistributionInfo())
@@ -1901,6 +1980,8 @@ async function runDurableRequestOperation(
     if (existingOperation.fingerprint !== fingerprint) {
       throw new Error("This request operation ID is already being used for different role work.");
     }
+    const saved = (await loadRequestOperations()).find((operation) => operation.id === sourcedOperation.id);
+    if (saved) onAccepted?.(saved.id);
     return existingOperation.task;
   }
 
@@ -1910,6 +1991,7 @@ async function runDurableRequestOperation(
       throw new Error("This request operation ID was already used for different role work.");
     }
     if (stored?.state === "complete" && stored.response) {
+      onAccepted?.(stored.id);
       return stored.response;
     }
     if (stored?.state === "error") {
@@ -1939,6 +2021,10 @@ async function runDurableRequestOperation(
       }
       throw new Error("The existing QuickPIM++ request is still being reconciled. Check Microsoft PIM before retrying.");
     }
+    onAccepted?.(operation.id);
+    // A submitted form is distinct from a new draft. Clean only a matching old
+    // draft, including when the originating popup disappeared before the ACK.
+    await clearSubmittedPopupDraft(sourcedOperation).catch(() => undefined);
     const heartbeat = setInterval(() => {
       void touchRequestOperation(operation.id).catch(() => undefined);
     }, 60_000);
@@ -1991,6 +2077,7 @@ async function runDurableRequestOperation(
       ...(source?.deviceName ? { sourceDeviceName: source.deviceName } : {})
     };
     await completeRequestOperation(operation.id, response);
+    await invalidateActiveCacheTargets(operation.targets).catch(() => undefined);
     await mutateSettings((settings) => recordOperationActivity(
       operation.justification?.trim() ? addRecentJustification(settings, operation.justification) : settings,
       {
@@ -2136,19 +2223,19 @@ async function runDeactivationRetryMaintenance(): Promise<void> {
   }
 }
 
-async function extendTrackedRequest(requestId: string): Promise<TrackedRequestExtensionResult> {
+async function extendTrackedRequest(requestId: string, onAccepted?: (id: string) => void): Promise<TrackedRequestExtensionResult> {
   const existing = requestExtensionTasks.get(requestId);
   if (existing) {
     return existing;
   }
-  const task = performTrackedRequestExtension(requestId).finally(() => {
+  const task = runWithServiceWorkerKeepAlive(() => performTrackedRequestExtension(requestId, onAccepted)).finally(() => {
     requestExtensionTasks.delete(requestId);
   });
   requestExtensionTasks.set(requestId, task);
   return task;
 }
 
-async function performTrackedRequestExtension(requestId: string): Promise<TrackedRequestExtensionResult> {
+async function performTrackedRequestExtension(requestId: string, onAccepted?: (id: string) => void): Promise<TrackedRequestExtensionResult> {
   const [initialStore, settings] = await Promise.all([loadTrackedRequests(), loadSettings()]);
   let source = initialStore.requests.find((request) => request.id === requestId || request.requestId === requestId);
   if (!source) {
@@ -2197,16 +2284,24 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
     return extensionFailure(source.requestId, sanitizeErrorMessage(error));
   }
 
-  const attemptedAt = new Date().toISOString();
-  await patchTrackedExtensionSource(source.id, {
-    extensionAttemptState: "submitting",
-    extensionRequestedAt: attemptedAt,
-    extensionRequestId: undefined,
-    extensionLastError: undefined
-  });
+  let writePrepared = false;
 
   try {
-    const response = await activateItemsWithPortalRecovery(
+    const operationId = `extension-${crypto.randomUUID()}`;
+    const response = await runDurableRequestOperation({
+      id: operationId, action: "activate", kind: "extension", sourceRequestId: source.requestId,
+      scheduledStartAt: plan.startDateTime, itemIds: [plan.item.id], targets: [plan.item.type],
+      tenantId: source.tenantId, principalId: source.principalId, startedAt: Date.now(),
+      items: createRequestOperationItems([plan.item]), durationHours: plan.durationHours,
+      justification: plan.justification, ticketInfo: plan.ticketInfo,
+      resumePayload: { items: [plan.item], durationHours: plan.durationHours, justification: plan.justification, ticketInfo: plan.ticketInfo }
+    }, async () => {
+      await patchTrackedExtensionSource(source.id, {
+        extensionAttemptState: "submitting", extensionRequestedAt: new Date().toISOString(),
+        extensionRequestId: undefined, extensionLastError: undefined
+      });
+      writePrepared = true;
+      return activateItemsWithPortalRecovery(
       [plan.item],
       plan.durationHours,
       plan.justification,
@@ -2214,9 +2309,10 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
       undefined,
       {
         startDateTime: plan.startDateTime,
-        continuationOfRequestId: source.requestId
+        continuationOfRequestId: source.requestId,
+        operationId
       }
-    );
+    ); }, [plan.item], onAccepted);
     const result = response.results[0];
     if (!result?.success) {
       const detail = result?.error || "Microsoft did not accept the extension request.";
@@ -2252,6 +2348,7 @@ async function performTrackedRequestExtension(requestId: string): Promise<Tracke
     );
   } catch (error) {
     const detail = sanitizeErrorMessage(error);
+    if (!writePrepared) return extensionFailure(source.requestId, detail);
     await patchTrackedExtensionSource(source.id, {
       extensionAttemptState: "uncertain",
       extensionRequestId: undefined,
@@ -4716,6 +4813,11 @@ async function activateItems(
     throw new Error("Duration must be greater than 0.");
   }
 
+  if (items.some((item) => item.activationPolicyState === "pending")) {
+    items = await enrichActivationPolicies(items);
+    if (items.some((item) => item.activationPolicyState === "pending")) throw new Error("QuickPIM++ could not verify the selected activation policy. Refresh access and retry.");
+    validateQuickPimMessage({ action: "activateItems", items, durationHours, justification, ticketInfo, operationId: options.operationId || "policy-check" });
+  }
   const tokens = await getStoredTokens();
   const submittedAt = new Date().toISOString();
   const startDateTime = options.startDateTime || submittedAt;

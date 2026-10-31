@@ -1,4 +1,6 @@
-import type { PopupRequestMode, PopupTab, SortDirection, SortMode } from "./types";
+import { loadRequestOperations } from "./requestOperations";
+import { activationItemIdentitiesMatch } from "./activationIdentity";
+import type { RequestOperationRecord, PopupRequestMode, PopupTab, SortDirection, SortMode } from "./types";
 import type { QuickFilter } from "./popupModel";
 import { MAX_ACTIVATION_DURATION_HOURS, MIN_ACTIVATION_DURATION_HOURS } from "./duration";
 import { sanitizeUserJustification } from "./justifications";
@@ -22,6 +24,7 @@ const QUICK_FILTERS: QuickFilter[] = ["active"];
 
 export interface PopupDraft {
   updatedAt: number;
+  submittedOperationId?: string;
   tab: PopupTab;
   search: string;
   sortMode: SortMode;
@@ -46,7 +49,17 @@ export type PopupDraftInput = Omit<PopupDraft, "updatedAt" | "quickFilters" | "s
 
 export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | undefined> {
   const result = await chrome.storage.local.get(POPUP_DRAFT_KEY);
-  return sanitizePopupDraft(result[POPUP_DRAFT_KEY], now);
+  const draft = sanitizePopupDraft(result[POPUP_DRAFT_KEY], now);
+  if (draft?.selectedIds.length) {
+    const operations = await loadRequestOperations();
+    const submitted = operations.some((operation) => operation.id === draft.submittedOperationId
+      || (["running", "uncertain"].includes(operation.state) && operation.action === draft.requestMode
+        && operation.itemIds.length === draft.selectedIds.length
+        && operation.justification === (draft.justification || undefined)
+        && draft.selectedIds.every((id) => operation.itemIds.some((candidate) => activationItemIdentitiesMatch(id, candidate)))));
+    if (submitted) return { ...draft, selectedIds: [], isActivationReviewOpen: false, requestMode: undefined, justification: "", ticketSystem: "", ticketNumber: "" };
+  }
+  return draft;
 }
 
 export async function savePopupDraft(draft: PopupDraftInput, now = Date.now()): Promise<void> {
@@ -66,6 +79,26 @@ export async function clearPopupDraft(): Promise<void> {
   return withPopupDraftMutationLock(() => storage.remove(POPUP_DRAFT_KEY));
 }
 
+export async function clearSubmittedPopupDraft(operation: Pick<RequestOperationRecord, "id" | "itemIds" | "action" | "justification" | "durationHours" | "tenantId" | "principalId" | "ticketInfo">): Promise<void> {
+  const storage = chrome.storage.local;
+  await withPopupDraftMutationLock(async () => {
+    // Read the raw draft here: loadPopupDraft deliberately hides submitted
+    // selections and would prevent this cleanup after the popup disappeared.
+    const stored = await storage.get(POPUP_DRAFT_KEY);
+    const draft = sanitizePopupDraft(stored[POPUP_DRAFT_KEY]);
+    if (!draft || draft.selectedIds.length !== operation.itemIds.length
+      || draft.requestMode !== operation.action
+      || (draft.tenantId && operation.tenantId && draft.tenantId.toLowerCase() !== operation.tenantId.toLowerCase())
+      || (draft.principalId && operation.principalId && draft.principalId.toLowerCase() !== operation.principalId.toLowerCase())
+      || draft.justification.trim() !== (operation.justification || "").trim()
+      || draft.ticketSystem.trim() !== (operation.ticketInfo?.ticketSystem || "").trim()
+      || draft.ticketNumber.trim() !== (operation.ticketInfo?.ticketNumber || "").trim()
+      || (operation.action === "activate" && draft.durationHours !== operation.durationHours)
+      || draft.selectedIds.some((id) => !operation.itemIds.some((submitted) => activationItemIdentitiesMatch(id, submitted)))) return;
+    await storage.remove(POPUP_DRAFT_KEY);
+  });
+}
+
 export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -82,6 +115,7 @@ export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft
   const sortMode = isSortMode(value.sortMode) ? value.sortMode : "name";
   const draft: PopupDraft = {
     updatedAt,
+    ...(typeof value.submittedOperationId === "string" && /^[a-zA-Z0-9_-]{1,100}$/.test(value.submittedOperationId) ? { submittedOperationId: value.submittedOperationId } : {}),
     tab: isPopupTab(value.tab) ? value.tab : "directoryRole",
     search: sanitizeString(value.search, MAX_SEARCH_LENGTH),
     sortMode,

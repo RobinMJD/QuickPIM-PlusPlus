@@ -12,6 +12,8 @@ import type {
   TrackedPimRequest,
   TrackedPimRequestStatus
 } from "./types";
+import { requestBlocksItem } from "./requestActivity";
+import { validateQuickPimMessage } from "./messages";
 import { createStorageMutationLock } from "./storageMutation";
 import {
   activationItemIdentitiesMatch,
@@ -20,7 +22,7 @@ import {
   getUnscopedActivationItemIdentity,
   normalizeActivationItemId
 } from "./activationIdentity";
-import { sanitizeTrackedRequestStore } from "./requestTracking";
+import { loadTrackedRequests, sanitizeTrackedRequestStore } from "./requestTracking";
 
 export const REQUEST_OPERATIONS_LOCAL_KEY = "quickPimRequestOperations.v2";
 // Compatibility export for callers that used the old constant name.
@@ -36,7 +38,7 @@ const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const withRequestOperationMutationLock = createStorageMutationLock("quickPimRequestOperationMutation");
 
 export type RequestOperationIdentity = Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets"> &
-  Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId">>;
+  Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "kind" | "scheduledStartAt" | "sourceRequestId">>;
 
 interface StorageAreaLike {
   get(key: string): Promise<Record<string, unknown>>;
@@ -87,7 +89,7 @@ export async function loadRequestOperations(
 
 export async function beginRequestOperation(
   operation: Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets" | "startedAt"> &
-    Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "items" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName">>,
+    Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "items" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "sourceDeviceName" | "kind" | "scheduledStartAt" | "sourceRequestId" | "resumePayload">>,
   options: { storage?: StorageAreaLike; now?: number } = {}
 ): Promise<boolean> {
   const storage = options.storage || chrome.storage.local;
@@ -99,14 +101,18 @@ export async function beginRequestOperation(
   if (embeddedTenantIds.size > 1 || (normalizedTenantId && embeddedTenantIds.size && !embeddedTenantIds.has(normalizedTenantId))) {
     throw new Error("Every request operation item must belong to the same Microsoft tenant.");
   }
-  const items = operation.items?.length
+  // The items can be prepared a millisecond before the enclosing operation.
+  // Keep the journal timestamp invariant without discarding their scope/name.
+  const items = (operation.items?.length
     ? operation.items
-    : operation.itemIds.flatMap((itemId) => createPreparedOperationItem(itemId, now, operation.tenantId, operation.principalId) || []);
+    : operation.itemIds.flatMap((itemId) => createPreparedOperationItem(itemId, now, operation.tenantId, operation.principalId) || []))
+    .map((item) => ({ ...item, updatedAt: Math.max(item.updatedAt, operation.startedAt) }));
   if (items.length !== new Set(operation.itemIds.map(normalizeActivationItemId)).size) {
     throw new Error("Request operation items are incomplete or ambiguous.");
   }
   let claimed = false;
-  await mutateOperations(storage, now, (current) => {
+  await mutateOperations(storage, now, async (current) => {
+    const tracked = options.storage ? [] : (await loadTrackedRequests()).requests;
     const existing = current.find((item) => item.id === operation.id);
     if (existing) {
       if (getRequestOperationFingerprint(existing) !== getRequestOperationFingerprint(operation)) {
@@ -115,13 +121,12 @@ export async function beginRequestOperation(
       return current;
     }
 
-    const conflicting = current.find((candidate) =>
-      (candidate.state === "running" || candidate.state === "uncertain")
-      && tenantBoundariesMatch(candidate.tenantId, operation.tenantId)
-      && tenantBoundariesMatch(candidate.principalId, operation.principalId)
-      && candidate.itemIds.some((itemId) =>
-        operation.itemIds.some((requestedItemId) => activationItemIdentitiesMatch(itemId, requestedItemId)))
-    );
+    const conflicting = current.find((candidate) => operation.items?.some((item) => requestBlocksItem(candidate, {
+      id: item.itemId, tenantId: item.tenantId || operation.tenantId,
+      principalId: item.principalId || operation.principalId || ""
+    } as ActivationItem, tracked)) || (!operation.items?.length && (candidate.state === "running" || candidate.state === "uncertain")
+      && tenantBoundariesMatch(candidate.tenantId, operation.tenantId) && tenantBoundariesMatch(candidate.principalId, operation.principalId)
+      && candidate.itemIds.some((id) => operation.itemIds.some((requested) => activationItemIdentitiesMatch(id, requested)))));
     if (conflicting) {
       throw new Error("A QuickPIM++ request for one or more selected items is already in progress.");
     }
@@ -153,6 +158,8 @@ export function createRequestOperationItems(items: ActivationItem[], now = Date.
       ...(item.tenantId ? { tenantId: item.tenantId } : {}),
       ...(item.principalId ? { principalId: item.principalId } : {}),
       ...(item.scopeLabel ? { scopeLabel: item.scopeLabel } : {}),
+      scopeId: item.type === "directoryRole" ? item.directoryScopeId : item.type === "azureRole" ? item.scope : item.groupId,
+      ...(item.type === "pimGroup" ? { accessId: item.accessId } : {}),
       state: "prepared",
       updatedAt: now
     });
@@ -174,7 +181,10 @@ export function getRequestOperationFingerprint(operation: RequestOperationIdenti
     durationHours: operation.durationHours ?? null,
     justification: normalizeFingerprintText(operation.justification) || null,
     ticketInfo: ticketSystem || ticketNumber ? { ticketSystem, ticketNumber } : null,
-    bundleName: normalizeFingerprintText(operation.bundleName) || null
+    bundleName: normalizeFingerprintText(operation.bundleName) || null,
+    kind: operation.kind || null,
+    scheduledStartAt: operation.scheduledStartAt || null,
+    sourceRequestId: operation.sourceRequestId || null
   });
 }
 
@@ -300,6 +310,7 @@ export async function completeRequestOperation(
       items,
       state: uncertain ? "uncertain" : followUpPending ? "running" : "complete",
       response,
+      resumePayload: undefined,
       updatedAt: now,
       revision: (operation.revision || 0) + 1,
       ...(uncertain || followUpPending ? {} : { terminalAt: now })
@@ -314,6 +325,11 @@ export async function failRequestOperation(
 ): Promise<void> {
   const state = options.uncertain ? "uncertain" : "error";
   await updateRequestOperation(id, { state, error: error.slice(0, 1_000) }, options);
+}
+
+export async function setRequestOperationAccessWait(id: string, waiting: boolean): Promise<void> {
+  await mutateOperations(chrome.storage.local, Date.now(), (current) => current.map((operation) => operation.id === id
+    ? { ...operation, waitingForAccess: waiting, updatedAt: Date.now(), revision: (operation.revision || 0) + 1 } : operation));
 }
 
 export async function touchRequestOperation(
@@ -335,7 +351,7 @@ export async function dismissRequestOperations(
   const storage = options.storage || chrome.storage.local;
   const now = options.now ?? Date.now();
   const idSet = new Set(ids);
-  await mutateOperations(storage, now, (current) => current.filter((item) => !idSet.has(item.id)));
+  await mutateOperations(storage, now, (current) => current.filter((item) => !idSet.has(item.id) || item.state === "running" || item.state === "uncertain"));
 }
 
 export function sanitizeRequestOperations(value: unknown, now = Date.now()): RequestOperationRecord[] {
@@ -377,6 +393,7 @@ async function updateRequestOperation(
       ? {
         ...item,
         ...update,
+        ...((update.state === "error" || (update.state === "uncertain" && !item.items?.some((entry) => entry.state === "prepared"))) ? { resumePayload: undefined } : {}),
         updatedAt: now,
         revision: (item.revision || 0) + 1,
         ...((update.state === "complete" || update.state === "error") ? { terminalAt: now } : {})
@@ -387,12 +404,12 @@ async function updateRequestOperation(
 async function mutateOperations(
   storage: StorageAreaLike,
   now: number,
-  mutation: (current: RequestOperationRecord[]) => RequestOperationRecord[]
+  mutation: (current: RequestOperationRecord[]) => RequestOperationRecord[] | Promise<RequestOperationRecord[]>
 ): Promise<RequestOperationRecord[]> {
   return withRequestOperationMutationLock(async () => {
     const result = await storage.get(REQUEST_OPERATIONS_LOCAL_KEY);
     const current = sanitizeRequestOperations(result[REQUEST_OPERATIONS_LOCAL_KEY], now);
-    const next = sanitizeRequestOperations(mutation(current), now);
+    const next = sanitizeRequestOperations(await mutation(current), now);
     await saveOperations(storage, next);
     return next;
   });
@@ -469,9 +486,35 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     ...(typeof value.sourceInstallationId === "string" ? { sourceInstallationId: value.sourceInstallationId.slice(0, 80) } : {}),
     ...(typeof value.sourceDeviceName === "string" ? { sourceDeviceName: value.sourceDeviceName.slice(0, 60) } : {}),
     revision: clampRevision(value.revision),
+    ...(value.kind === "extension" ? { kind: "extension" as const } : {}),
+    ...(value.waitingForAccess === true ? { waitingForAccess: true } : {}),
+    ...(typeof value.scheduledStartAt === "string" && Number.isFinite(Date.parse(value.scheduledStartAt)) ? { scheduledStartAt: value.scheduledStartAt } : {}),
+    ...(typeof value.sourceRequestId === "string" ? { sourceRequestId: value.sourceRequestId.slice(0, 512) } : {}),
+    ...(sanitizeResumePayload(value, itemIds) ? { resumePayload: sanitizeResumePayload(value, itemIds) } : {}),
     ...(response ? { response } : {}),
     ...(typeof value.error === "string" ? { error: value.error.slice(0, 1_000) } : {})
   };
+}
+
+function snapshotActivationItem(item: ActivationItem): ActivationItem {
+  const fields = ["id", "type", "tenantId", "sourceName", "displayName", "principalId", "scopeLabel", "status", "activeFrom", "activeUntil", "activeAssignmentType", "roleDefinitionId", "directoryScopeId", "groupId", "accessId", "scope", "assignmentScheduleId", "assignmentScheduleInstanceId", "activationPolicyState", "subscriptionId", "subscriptionName", "roleEligibilityScheduleId"];
+  const safe = Object.fromEntries(Object.entries(item).filter(([key, value]) => fields.includes(key) && typeof value === "string").map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 2048) : value]));
+  if (item.activationRequirements) safe.activationRequirements = Object.fromEntries(Object.entries(item.activationRequirements)
+    .filter(([key, value]) => ["justification", "ticket", "approval"].includes(key) ? typeof value === "boolean" : key === "maxDurationHours" && typeof value === "number" && Number.isFinite(value)));
+  return safe as unknown as ActivationItem;
+}
+
+function sanitizeResumePayload(value: Record<string, unknown>, itemIds: string[]): RequestOperationRecord["resumePayload"] {
+  if (!isRecord(value.resumePayload)) return undefined;
+  try {
+    const request = validateQuickPimMessage({ ...value.resumePayload, action: value.action === "activate" ? "activateItems" : "deactivateItems", operationId: value.id });
+    if (request.action !== "activateItems" && request.action !== "deactivateItems") return undefined;
+    if (request.items.length !== itemIds.length || request.items.some((item) => !itemIds.some((id) => activationItemIdentitiesMatch(id, item.id)))) return undefined;
+    if (request.items.some((item) => (typeof value.tenantId === "string" && item.tenantId?.toLowerCase() !== value.tenantId.toLowerCase())
+      || (typeof value.principalId === "string" && item.principalId.toLowerCase() !== value.principalId.toLowerCase()))) return undefined;
+    if (request.justification !== value.justification || (request.action === "activateItems" && request.durationHours !== value.durationHours)) return undefined;
+    return { items: request.items.map(snapshotActivationItem), ...(request.action === "activateItems" ? { durationHours: request.durationHours, bundleName: request.bundleName } : {}), justification: request.justification, ticketInfo: request.ticketInfo };
+  } catch { return undefined; }
 }
 
 function sanitizeRequestOperationItems(
@@ -505,6 +548,8 @@ function sanitizeRequestOperationItems(
       ...(tenantId ? { tenantId } : {}),
       ...(principalId ? { principalId } : {}),
       ...(typeof candidate.scopeLabel === "string" ? { scopeLabel: candidate.scopeLabel.slice(0, 512) } : {}),
+      ...(typeof candidate.scopeId === "string" ? { scopeId: candidate.scopeId.slice(0, 2048) } : {}),
+      ...(candidate.accessId === "member" || candidate.accessId === "owner" ? { accessId: candidate.accessId } : {}),
       state: candidate.state,
       updatedAt,
       ...(typeof candidate.requestId === "string" ? { requestId: candidate.requestId.slice(0, 512) } : {}),
@@ -687,7 +732,7 @@ function tenantBoundariesMatch(left: string | undefined, right: string | undefin
   return left.toLowerCase() === right.toLowerCase();
 }
 
-function requestOperationMatchesIdentity(
+export function requestOperationMatchesIdentity(
   operation: RequestOperationRecord,
   identity: { tenantId?: string; principalId?: string }
 ): boolean {

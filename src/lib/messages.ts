@@ -32,6 +32,7 @@ export type QuickPimMessage =
   | { action: "restoreSettingsBackup"; settings: QuickPimSettings; store: TrackedPimRequestStore }
   | { action: "extendTrackedRequest"; requestId: string }
   | { action: "getRequestOperations" }
+  | { action: "startRequestOperation"; request: Extract<QuickPimMessage, { action: "activateItems" | "deactivateItems" | "extendTrackedRequest" }> }
   | { action: "acceptDeactivationRetry"; retryId: string }
   | { action: "cancelDeactivationRetry"; retryId: string }
   | { action: "initializeNotificationDelivery" }
@@ -88,6 +89,15 @@ const MAX_SETTINGS_MESSAGE_LENGTH = 1024 * 1024;
 export function validateQuickPimMessage(message: unknown): QuickPimMessage {
   if (!isRecord(message) || typeof message.action !== "string") {
     throw new Error("Unsupported QuickPIM++ message.");
+  }
+
+  if (message.action === "startRequestOperation") {
+    if (!isRecord(message.request) || !["activateItems", "deactivateItems", "extendTrackedRequest"].includes(String(message.request.action))) {
+      throw new Error("Unsupported background request action.");
+    }
+    const request = validateQuickPimMessage(message.request);
+    if (request.action !== "activateItems" && request.action !== "deactivateItems" && request.action !== "extendTrackedRequest") throw new Error("Invalid background request.");
+    return { action: "startRequestOperation", request };
   }
 
   if (SIMPLE_ACTIONS.has(message.action)) {

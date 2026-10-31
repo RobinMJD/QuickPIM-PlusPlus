@@ -12,7 +12,6 @@ import {
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../lib/cache";
-import { CLAIMS_CHALLENGE_MESSAGE } from "../lib/apiErrors";
 import { DEACTIVATION_RETRY_KEY, loadDeactivationRetries, type DeactivationRetry } from "../lib/deactivationRetry";
 
 import {
@@ -37,9 +36,6 @@ import {
   getDeactivatableItems,
   getBundlePreflight,
   getDurationOptions,
-  getRemainingSelectedIdsAfterActivationResults,
-  normalizeActivationResponse,
-  getRequestReconciliationTargets,
   getRowActionState,
   mergeEligibleWithActive,
   getPortalUrlForTab,
@@ -54,7 +50,6 @@ import {
 } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
-  addRecentJustification,
   addSavedJustification,
   buildFeatureCacheKey,
   expandBundle,
@@ -86,8 +81,8 @@ import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import { sanitizeErrorMessage } from "../lib/security";
 import {
   activationItemIdentitiesMatch,
-  getActivationItemIdentity,
   getActivationItemTypeFromIdentity,
+  getActivationItemIdentity,
   normalizeActivationItemId
 } from "../lib/activationIdentity";
 import { getIdentityContext, type IdentityContext } from "../lib/identityContext";
@@ -106,7 +101,9 @@ import {
   hasPortableSettingsData,
   stringifySettingsBackup
 } from "../lib/settingsBackup";
-import { selectNextRequestOperation } from "../lib/requestOperations";
+import { RequestActivity, useRequestActivity } from "../components/RequestActivity";
+import { requestBlocksItem } from "../lib/requestActivity";
+import type { QuickPimMessage } from "../lib/messages";
 import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
 import {
@@ -129,12 +126,10 @@ import type {
   AccessSetupTarget,
   ActivationSnapshot,
   ActivationItem,
-  ActivationResponse,
   QuickPimBundle,
   QuickPimFeature,
   QuickPimDataCache,
   ReferenceDataCache,
-  RequestOperationRecord,
   QuickPimSettings,
   PopupRequestMode,
   PortalRecoveryFocusResult,
@@ -143,7 +138,6 @@ import type {
   PortalTokenRefreshResult,
   SortDirection,
   SortMode,
-  TicketInfo,
   TokenStatus
 } from "../lib/types";
 
@@ -152,16 +146,6 @@ interface ActivationFailureNotice {
   recoveryTargets: RoleTab[];
 }
 
-const ACTIVATION_STEPS: readonly ProgressStepDefinition[] = [
-  { id: "request", label: "Sending activation request", weight: 20, expectedDurationMs: 20_000 },
-  { id: "record", label: "Saving activation result", weight: 2, expectedDurationMs: 2_000 },
-  { id: "refresh", label: "Refreshing activation status", weight: 6, expectedDurationMs: 8_000 }
-];
-const DEACTIVATION_STEPS: readonly ProgressStepDefinition[] = [
-  { id: "request", label: "Sending deactivation request", weight: 20, expectedDurationMs: 20_000 },
-  { id: "record", label: "Saving deactivation result", weight: 2, expectedDurationMs: 2_000 },
-  { id: "refresh", label: "Refreshing deactivation status", weight: 6, expectedDurationMs: 8_000 }
-];
 const REFRESH_LOCAL_STEP: ProgressStepDefinition = {
   id: "local",
   label: "Reading local state",
@@ -199,8 +183,6 @@ const PORTAL_RECOVERY_WAIT_TIMEOUT_MS = 15_000;
 const PORTAL_RECOVERY_POLL_INTERVAL_MS = 750;
 const PORTAL_RECOVERY_BACKGROUND_POLL_INTERVAL_MS = 1_000;
 const ACTIVATION_SNAPSHOT_TIMEOUT_MS = 25_000;
-const ACTIVATION_REQUEST_TIMEOUT_MS = 180_000;
-const REQUEST_OPERATION_POLL_INTERVAL_MS = 750;
 
 function createRequestOperationId(): string {
   if (typeof crypto.randomUUID === "function") {
@@ -326,48 +308,6 @@ async function waitForManagedPortalRecovery(
   };
 }
 
-function buildActivationFailureNotice(
-  errors: ActivationResponse["errors"],
-  activatableItems: Array<Pick<ActivationItem, "id" | "type">>
-): ActivationFailureNotice {
-  const recoveryTargets = new Set<RoleTab>();
-  const formattedErrors = errors.map((errorItem) => {
-    const rawError = errorItem.error || "";
-    const formatted = formatActivationError(errorItem);
-    const target = errorItem.accessRecoveryTarget
-      || findUniqueItemByIdentity(activatableItems, errorItem.itemId)?.type
-      || inferRoleTabFromItemId(errorItem.itemId);
-    if (
-      target
-      && (
-        errorItem.accessRecoveryTarget
-        || formatLoadMessages([rawError]).includes(CLAIMS_CHALLENGE_MESSAGE)
-      )
-    ) {
-      recoveryTargets.add(target);
-    }
-    return formatted;
-  });
-
-  return {
-    errors: [...new Set(formattedErrors)],
-    recoveryTargets: [...recoveryTargets]
-  };
-}
-
-function formatActivationError(item: ActivationResponse["errors"][number]): string {
-  const error = item.error || "Activation failed.";
-  const formatted = formatLoadMessages([error])[0] || error;
-  if (formatted === CLAIMS_CHALLENGE_MESSAGE) {
-    return `${item.itemName}: Microsoft requires an additional sign-in or MFA challenge before this request can continue.`;
-  }
-  return `${item.itemName}: ${formatted}`;
-}
-
-function inferRoleTabFromItemId(itemId: string): RoleTab | undefined {
-  return getActivationItemTypeFromIdentity(itemId);
-}
-
 function PopupApp() {
   const [tab, setTab] = useState<PopupTab>("directoryRole");
   const [settings, setSettings] = useState<QuickPimSettings>(DEFAULT_SETTINGS);
@@ -394,7 +334,6 @@ function PopupApp() {
   const [refreshProgress, setRefreshProgress] = useState<OperationProgress | null>(null);
   const [refreshSuccessKey, setRefreshSuccessKey] = useState(0);
   const [isActivationReviewOpen, setIsActivationReviewOpen] = useState(false);
-  const [activationProgress, setActivationProgress] = useState<OperationProgress | null>(null);
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
   const [deactivationRetries, setDeactivationRetries] = useState<DeactivationRetry[]>([]);
   const [retryActionId, setRetryActionId] = useState<string>();
@@ -420,21 +359,18 @@ function PopupApp() {
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshSuccessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const refreshProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const requestProgressClearTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const expiredActivationRefreshTimers = useRef<Partial<Record<AccessSetupTarget, number>>>({});
   const refreshRunId = useRef(0);
   const activeRefreshRunId = useRef<number | undefined>(undefined);
   const manualRefreshRunId = useRef<number | undefined>(undefined);
-  const requestProgressRunId = useRef(0);
   const activationRequestInFlight = useRef(false);
+  const submissionIdRef = useRef<string | undefined>(undefined);
+  const requestActivity = useRequestActivity();
+  const refreshedOperations = useRef(new Set<string>());
   const selectedIdsRef = useRef(selectedIds);
   const requestModeRef = useRef(requestMode);
   const selectionIdentityRef = useRef(selectionIdentity);
   const restoredDraftSelectionNeedsValidation = useRef(false);
-  const backgroundOperationIdRef = useRef<string | undefined>(undefined);
-  const operationPollFailureCount = useRef(0);
-  const ownedRequestOperationIds = useRef(new Set<string>());
-  const reconciledRequestOperationIds = useRef(new Set<string>());
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
@@ -549,9 +485,6 @@ function PopupApp() {
     }
     if (refreshProgressClearTimer.current) {
       clearTimeout(refreshProgressClearTimer.current);
-    }
-    if (requestProgressClearTimer.current) {
-      clearTimeout(requestProgressClearTimer.current);
     }
     for (const timer of Object.values(expiredActivationRefreshTimers.current)) {
       if (timer !== undefined) window.clearTimeout(timer);
@@ -870,114 +803,13 @@ function PopupApp() {
   }, [isPopupDraftReady]);
 
   useEffect(() => {
-    if (!isPopupDraftReady) {
-      return;
-    }
-
-    let active = true;
-    let timer: number | undefined;
-    const schedule = () => {
-      if (active) {
-        timer = window.setTimeout(() => void poll(), REQUEST_OPERATION_POLL_INTERVAL_MS);
-      }
-    };
-    const poll = async () => {
-      try {
-        const operations = await sendMessage<RequestOperationRecord[]>(
-          { action: "getRequestOperations" },
-          { timeoutMs: 3_000, timeoutMessage: "Background request status check timed out." }
-        );
-        if (!active) {
-          return;
-        }
-        if (!Array.isArray(operations)) {
-          throw new Error("Background request status is invalid.");
-        }
-        operationPollFailureCount.current = 0;
-        const excludedOperationIds = new Set([
-          ...ownedRequestOperationIds.current,
-          ...reconciledRequestOperationIds.current
-        ]);
-        const operation = selectNextRequestOperation(operations, excludedOperationIds, {
-          tenantId: identityContext.tenantId,
-          principalId: identityContext.principalId
-        });
-        if (!operation) {
-          return;
-        }
-        const terminalOperation = operation.state === "complete" || operation.state === "error";
-
-        if (!terminalOperation && operation.state === "running") {
-          backgroundOperationIdRef.current = operation.id;
-          activationRequestInFlight.current = true;
-          setIsActivating(true);
-          setRequestMode(operation.action);
-          setIsActivationReviewOpen(true);
-          const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
-          selectionIdentityRef.current = operationIdentity;
-          setSelectionIdentity(operationIdentity);
-          if (operation.durationHours !== undefined) {
-            setDurationHours(operation.durationHours);
-          }
-          if (operation.justification !== undefined) {
-            setJustification(operation.justification);
-          }
-          setSelectedIds((current) => {
-            const next = new Set(current);
-            operation.itemIds.forEach((id) => {
-              const item = getItemByPersistedId(itemsById, id);
-              if (item) next.add(item.id);
-            });
-            return setsEqual(current, next) ? current : next;
-          });
-          setActivationProgress((current) => {
-            const progressId = `background-${operation.id}`;
-            if (current?.operationId === progressId) {
-              return current;
-            }
-            const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
-            return advanceOperationProgress(createOperationProgress(progressId, steps), 1, {
-              label: "Request continues in the background"
-            });
-          });
-          return;
-        }
-
-        if (!hasActivationDataLoaded && operation.state !== "uncertain") {
-          return;
-        }
-        reconciledRequestOperationIds.current.add(operation.id);
-        await reconcileDetachedRequestOperation(operation);
-      } catch (pollError) {
-        operationPollFailureCount.current += 1;
-        if (backgroundOperationIdRef.current && operationPollFailureCount.current >= 8) {
-          backgroundOperationIdRef.current = undefined;
-          activationRequestInFlight.current = false;
-          setIsActivating(false);
-          setActivationProgress(null);
-          setError(
-            `QuickPIM++ could not read the background request status after several attempts. ${pollError instanceof Error ? pollError.message : String(pollError)}`
-          );
-        }
-      } finally {
-        schedule();
-      }
-    };
-
-    void poll();
-    return () => {
-      active = false;
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [
-    hasActivationDataLoaded,
-    identityContext.principalId,
-    identityContext.tenantId,
-    isPopupDraftReady,
-    itemsById
-  ]);
+    if (!hasActivationDataLoaded) return;
+    const completed = requestActivity.operations.filter((operation) => operation.response && !refreshedOperations.current.has(operation.id));
+    if (!completed.length) return;
+    completed.forEach((operation) => refreshedOperations.current.add(operation.id));
+    const targets = [...new Set(completed.flatMap((operation) => operation.targets))];
+    void refresh({ force: true, showLoading: false, suppressMessage: true, targets }).catch(() => undefined);
+  }, [requestActivity.operations, hasActivationDataLoaded]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -1090,6 +922,7 @@ function PopupApp() {
 
   function buildCurrentPopupDraft(overrides: Partial<PopupDraftInput> = {}): PopupDraftInput {
     return {
+      submittedOperationId: submissionIdRef.current,
       tab,
       search,
       sortMode,
@@ -1137,7 +970,6 @@ function PopupApp() {
     selectionIdentityRef.current = {};
     setSelectionIdentity({});
     restoredDraftSelectionNeedsValidation.current = false;
-    setActivationProgress(null);
     setActivationFailureNotice(null);
     setError("");
     latestPopupDraft.current = undefined;
@@ -1189,8 +1021,7 @@ function PopupApp() {
       progressVisible = true;
       setError("");
       setActivationFailureNotice(null);
-      setActivationProgress(null);
-      setRefreshSuccessKey(0);
+        setRefreshSuccessKey(0);
       if (refreshProgressClearTimer.current) {
         clearTimeout(refreshProgressClearTimer.current);
         refreshProgressClearTimer.current = undefined;
@@ -1967,538 +1798,65 @@ function PopupApp() {
   function dismissRequestErrors() {
     setError("");
     setActivationFailureNotice(null);
-    setActivationProgress((current) => current?.status === "error" ? null : current);
   }
 
-  async function reconcileDetachedRequestOperation(operation: RequestOperationRecord): Promise<void> {
-    const operationLabel = operation.action === "activate" ? "activation" : "deactivation";
-    const steps = operation.action === "activate" ? ACTIVATION_STEPS : DEACTIVATION_STEPS;
-    let requestProgress = advanceOperationProgress(
-      createOperationProgress(`background-${operation.id}`, steps),
-      2,
-      { label: "Background request completed" }
-    );
-    activationRequestInFlight.current = false;
-    backgroundOperationIdRef.current = undefined;
-    setIsActivating(false);
-    setActivationProgress(requestProgress);
-    if (operation.durationHours !== undefined) {
-      setDurationHours(operation.durationHours);
-    }
-    if (operation.justification !== undefined) {
-      setJustification(operation.justification);
-    }
-
-    let reconciliationPersisted = false;
-    try {
-      if (operation.state === "error" || !operation.response) {
-        const detail = operation.error || "The background request stopped before a result was available.";
-        const restorableIds = [...operation.itemIds];
-        setActivationFailureNotice(null);
-        setError(detail);
-        setSelectedIds(new Set(restorableIds));
-        setRequestMode(operation.action);
-        const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
-        selectionIdentityRef.current = operationIdentity;
-        setSelectionIdentity(operationIdentity);
-        setIsActivationReviewOpen(true);
-        await flushPopupDraft({
-          selectedIds: restorableIds,
-          durationHours: operation.durationHours ?? durationHours,
-          justification: operation.justification ?? justification,
-          isActivationReviewOpen: true,
-          requestMode: operation.action,
-          ...operationIdentity
-        });
-        requestProgress = failOperationProgress(
-          requestProgress,
-          detail,
-          `${operationLabel === "activation" ? "Activation" : "Deactivation"} stopped in the background`
-        );
-        setActivationProgress(requestProgress);
-        reconciliationPersisted = true;
-        return;
-      }
-
-      const response = normalizeActivationResponse(operation.response);
-      const operationItems: Array<Pick<ActivationItem, "id" | "type">> = operation.items?.length
-        ? operation.items.map((item) => ({ id: item.itemId, type: item.itemType }))
-        : operation.itemIds.flatMap((id) => {
-            const visibleItem = getItemByPersistedId(itemsById, id);
-            const inferredType = inferRoleTabFromItemId(id);
-            return visibleItem
-              ? [{ id: visibleItem.id, type: visibleItem.type }]
-              : inferredType
-                ? [{ id, type: inferredType }]
-                : [];
-          });
-      const successfulIds = response.results
-        .filter((result) => result.success)
-        .map((result) => result.itemId);
-      const failedIds = response.errors.map((result) => result.itemId);
-      const failedSelectionIds = operation.itemIds.filter((id) =>
-        failedIds.some((failedId) => activationItemIdentitiesMatch(id, failedId)));
-      const successCount = successfulIds.length;
-      const failureNotice = response.errors.length
-        ? buildActivationFailureNotice(response.errors, operationItems)
-        : null;
-
-      setError("");
-      setActivationFailureNotice(failureNotice);
-      setSelectedIds((current) => {
-        const next = new Set(
-          [...current].filter((id) =>
-            !successfulIds.some((successfulId) => activationItemIdentitiesMatch(id, successfulId)))
-        );
-        failedSelectionIds.forEach((id) => next.add(id));
-        return next;
-      });
-      setMessage(formatRequestConfirmation(
-        operationLabel,
-        successCount,
-        response.errors.length,
-        response.results.filter((result) => result.success && result.trackingUnavailable).length
-      ));
-
-      const reconciliationTargets = getRequestReconciliationTargets(response.results, operationItems);
-
-      if (failedSelectionIds.length) {
-        setRequestMode(operation.action);
-        const operationIdentity = { tenantId: operation.tenantId, principalId: operation.principalId };
-        selectionIdentityRef.current = operationIdentity;
-        setSelectionIdentity(operationIdentity);
-        setIsActivationReviewOpen(true);
-        await flushPopupDraft({
-          selectedIds: failedSelectionIds,
-          durationHours: operation.durationHours ?? durationHours,
-          justification: operation.justification ?? justification,
-          isActivationReviewOpen: true,
-          requestMode: operation.action,
-          ...operationIdentity
-        });
-      } else {
-        setRequestMode(undefined);
-        selectionIdentityRef.current = {};
-        setSelectionIdentity({});
-        setIsActivationReviewOpen(false);
-        latestPopupDraft.current = undefined;
-        await clearPopupDraft();
-      }
-
-      if (reconciliationTargets.length) {
-        try {
-          await refresh({
-            force: true,
-            showLoading: false,
-            suppressMessage: true,
-            targets: reconciliationTargets
-          });
-        } catch {
-          // The Microsoft request result remains authoritative. The normal
-          // cache/background refresh will reconcile display state later.
-        }
-      }
-
-      if (failureNotice) {
-        requestProgress = failOperationProgress(
-          requestProgress,
-          failureNotice.errors.join("\n"),
-          `${operationLabel === "activation" ? "Activation" : "Deactivation"} completed with an issue`
-        );
-      } else {
-        requestProgress = completeOperationProgress(
-          requestProgress,
-          `${operationLabel === "activation" ? "Activation" : "Deactivation"} complete`
-        );
-        requestProgressClearTimer.current = setTimeout(() => {
-          setActivationProgress(null);
-          requestProgressClearTimer.current = undefined;
-        }, 350);
-      }
-      setActivationProgress(requestProgress);
-      reconciliationPersisted = true;
-    } finally {
-      if (reconciliationPersisted) {
-        await acknowledgeRequestOperations([operation.id]);
-      } else {
-        reconciledRequestOperationIds.current.delete(operation.id);
-      }
-    }
-  }
-
-  async function acknowledgeRequestOperations(operationIds: string[]): Promise<void> {
-    if (!operationIds.length) {
+  async function submitRequest(request: Extract<QuickPimMessage, { action: "activateItems" | "deactivateItems" }>) {
+    if (activationRequestInFlight.current) return;
+    if (request.items.some((item) => requestActivity.operations.some((operation) => requestBlocksItem(operation, item, requestActivity.tracked)))) {
+      setError("A request for this item and scope is already in progress. You can request other items.");
       return;
     }
+    activationRequestInFlight.current = true;
+    submissionIdRef.current = request.operationId;
+    latestPopupDraft.current = { ...buildCurrentPopupDraft(), submittedOperationId: request.operationId };
+    setIsActivating(true);
+    setError(""); setMessage(""); setActivationFailureNotice(null);
     try {
-      await sendMessage<boolean>(
-        { action: "dismissRequestOperations", operationIds },
-        { timeoutMs: 3_000, timeoutMessage: "Background request cleanup timed out." }
-      );
-      operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
-    } catch {
-      // Keeping the local ownership marker prevents duplicate reconciliation in this popup.
+      await sendMessage<{ operationId: string }>({ action: "startRequestOperation", request }, {
+        timeoutMs: 15_000,
+        timeoutMessage: "The background handoff is taking longer than expected. Check Requests before retrying this item."
+      });
+      // Only the submitted form is cleared. Background updates never edit a new draft.
+      submissionIdRef.current = undefined;
+      selectedIdsRef.current = new Set(); requestModeRef.current = undefined;
+      setSelectedIds(new Set()); setIsActivationReviewOpen(false); setRequestMode(undefined);
+      setJustification(""); setTicketSystem(""); setTicketNumber("");
+      selectionIdentityRef.current = {}; setSelectionIdentity({});
+      await flushPopupDraft({ selectedIds: [], isActivationReviewOpen: false, requestMode: undefined,
+        justification: "", ticketSystem: "", ticketNumber: "", submittedOperationId: undefined });
+      void requestActivity.reload();
+    } catch (error) {
+      submissionIdRef.current = undefined;
+      setError(error instanceof Error ? error.message : String(error));
+      void requestActivity.reload();
+    } finally {
+      activationRequestInFlight.current = false;
+      setIsActivating(false);
     }
-  }
-
-  async function ensureActivationPolicies(items: ActivationItem[]): Promise<ActivationItem[]> {
-    const pendingItems = getUniquePolicyCandidates(items.filter((item) => item.activationPolicyState === "pending"));
-    if (!pendingItems.length) {
-      return items;
-    }
-
-    const enriched = await enrichActivationPolicies(pendingItems);
-    const resolvedItems = applyPolicyEnrichment(items, enriched);
-    if (resolvedItems.some((item) => item.activationPolicyState === "pending")) {
-      throw new Error("QuickPIM++ could not verify the selected activation policy. Refresh access and retry.");
-    }
-    setEligibleItems((current) => applyPolicyEnrichment(current, enriched));
-    setActiveItems((current) => applyPolicyEnrichment(current, enriched));
-    return resolvedItems;
   }
 
   async function activate(items: ActivationItem[], bundle?: QuickPimBundle) {
-    if (activationRequestInFlight.current) {
-      return;
+    const selected = getActivatableItems(items);
+    if (!selected.length) { setError("Select at least one eligible role or group."); return; }
+    const requirements = getActivationRequirements(selected);
+    const reason = requirements.needsJustification ? bundle?.defaultJustification || justification : "";
+    if (requirements.needsJustification && (!reason.trim() || getGenericJustificationWarning(reason))) {
+      setError(getGenericJustificationWarning(reason) || "Enter a justification or choose a saved one."); return;
     }
-    let activatableItems = getActivatableItems(items);
-    if (!activatableItems.length) {
-      setActivationFailureNotice(null);
-      setError(items.length ? "No selected items are currently eligible to activate." : "Select at least one role or group.");
-      return;
+    const ticketInfo = requirements.needsTicket ? { ticketSystem: ticketSystem.trim(), ticketNumber: ticketNumber.trim() } : {};
+    if (requirements.needsTicket && (!ticketInfo.ticketSystem || !ticketInfo.ticketNumber)) {
+      setError("Enter both the ticket system and ticket number required by the selected policy."); return;
     }
-
-    if (activatableItems.some((item) => item.activationPolicyState === "pending")) {
-      activationRequestInFlight.current = true;
-      setIsActivating(true);
-      setError("");
-      setMessage("Checking the selected activation policy...");
-      try {
-        activatableItems = getActivatableItems(await ensureActivationPolicies(activatableItems));
-      } catch (policyError) {
-        setMessage("");
-        setError(policyError instanceof Error ? policyError.message : String(policyError));
-        return;
-      } finally {
-        activationRequestInFlight.current = false;
-        setIsActivating(false);
-      }
-      setMessage("");
-    }
-
-    const activationRequirements = getActivationRequirements(activatableItems);
-    const effectiveJustification = activationRequirements.needsJustification ? bundle?.defaultJustification || justification : "";
-    const effectiveDuration = coerceDurationForItems(bundle?.defaultDurationHours || durationHours, activatableItems);
-    const effectiveTicketInfo: TicketInfo = activationRequirements.needsTicket
-      ? { ticketSystem: ticketSystem.trim(), ticketNumber: ticketNumber.trim() }
-      : {};
-
-    if (activationRequirements.needsJustification) {
-      if (!effectiveJustification.trim()) {
-        setActivationFailureNotice(null);
-        setError("Enter a justification or choose a saved one.");
-        return;
-      }
-      const genericJustificationWarning = getGenericJustificationWarning(effectiveJustification);
-      if (genericJustificationWarning) {
-        setActivationFailureNotice(null);
-        setError(genericJustificationWarning);
-        return;
-      }
-    }
-    if (activationRequirements.needsTicket && (!effectiveTicketInfo.ticketSystem || !effectiveTicketInfo.ticketNumber)) {
-      setActivationFailureNotice(null);
-      setError("Enter both the ticket system and ticket number required by the selected policy.");
-      return;
-    }
-
-    if (requestProgressClearTimer.current) {
-      clearTimeout(requestProgressClearTimer.current);
-      requestProgressClearTimer.current = undefined;
-    }
-    if (refreshProgressClearTimer.current) {
-      clearTimeout(refreshProgressClearTimer.current);
-      refreshProgressClearTimer.current = undefined;
-    }
-    setRefreshProgress(null);
-    let requestProgress = createOperationProgress(
-      `request-${++requestProgressRunId.current}`,
-      ACTIVATION_STEPS
-    );
-    let requestCompleted = false;
-    let requestContinuesInBackground = false;
-    activationRequestInFlight.current = true;
-    setIsActivating(true);
-    setActivationProgress(requestProgress);
-    scrollPopupToTop();
-    setError("");
-    setActivationFailureNotice(null);
-    setMessage("");
-    const operationIds: string[] = [];
-    const sendActivationOperation = (
-      requestItems: ActivationItem[],
-      timeoutMessage: string
-    ) => {
-      const operationId = createRequestOperationId();
-      operationIds.push(operationId);
-      ownedRequestOperationIds.current.add(operationId);
-      return sendMessage<ActivationResponse>(
-        {
-          action: "activateItems",
-          items: requestItems,
-          durationHours: effectiveDuration,
-          justification: effectiveJustification,
-          ticketInfo: effectiveTicketInfo,
-          bundleName: bundle?.name,
-          operationId
-        },
-        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage }
-      );
-    };
-    try {
-      await flushPopupDraft({
-        selectedIds: activatableItems.map((item) => item.id),
-        durationHours: effectiveDuration,
-        justification: effectiveJustification,
-        isActivationReviewOpen: true,
-        requestMode: "activate"
-      }).catch(() => undefined);
-      const requestItems = attachKnownTenantIdentities(activatableItems, tokenStatus);
-      const response = normalizeActivationResponse(await sendActivationOperation(
-        requestItems,
-        "The activation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      ));
-      requestProgress = advanceOperationProgress(requestProgress, 2);
-      setActivationProgress(requestProgress);
-      const successItems = response.results
-        .filter((result) => result.success)
-        .map((result) => findUniqueItemByIdentity(activatableItems, result.itemId))
-        .filter((item): item is ActivationItem => Boolean(item));
-
-      setSettings((current) => addRecentJustification(current, effectiveJustification));
-      const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
-      setSelectedIds(remainingSelectedIds);
-      requestProgress = advanceOperationProgress(requestProgress, 3);
-      setActivationProgress(requestProgress);
-      const failureNotice = response.errors.length
-        ? buildActivationFailureNotice(response.errors, activatableItems)
-        : null;
-      if (response.errors.length) {
-        setActivationFailureNotice(failureNotice);
-      } else {
-        setActivationFailureNotice(null);
-      }
-      const reconciliationTargets = getRequestReconciliationTargets(response.results, activatableItems);
-      if (reconciliationTargets.length) {
-        try {
-          await refresh({
-            force: true,
-            showLoading: false,
-            suppressMessage: true,
-            targets: reconciliationTargets
-          });
-        } catch {
-          // A submitted Microsoft write must not be reported as failed merely
-          // because the follow-up read could not be completed.
-        }
-      }
-      if (remainingSelectedIds.size) {
-        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "activate" });
-      } else {
-        setRequestMode(undefined);
-        selectionIdentityRef.current = {};
-        setSelectionIdentity({});
-        latestPopupDraft.current = undefined;
-        await clearPopupDraft();
-      }
-      setMessage(formatRequestConfirmation(
-        "activation",
-        successItems.length,
-        response.errors.length,
-        response.results.filter((result) => result.success && result.trackingUnavailable).length
-      ));
-      if (failureNotice) {
-        setActivationProgress(null);
-      } else {
-        requestProgress = completeOperationProgress(requestProgress, "Activation complete");
-        requestCompleted = true;
-        setActivationProgress(requestProgress);
-      }
-      await acknowledgeRequestOperations(operationIds);
-    } catch (activationError) {
-      const detail = activationError instanceof Error ? activationError.message : String(activationError);
-      setActivationFailureNotice(null);
-      setError(detail);
-      requestProgress = failOperationProgress(requestProgress, detail, "Activation stopped at this step");
-      setActivationProgress(requestProgress);
-      if (isOperationTimeoutError(activationError)) {
-        requestContinuesInBackground = true;
-        operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
-      } else {
-        await acknowledgeRequestOperations(operationIds);
-      }
-    } finally {
-      if (!requestContinuesInBackground) {
-        activationRequestInFlight.current = false;
-        setIsActivating(false);
-      }
-      if (requestCompleted) {
-        requestProgressClearTimer.current = setTimeout(() => {
-          setActivationProgress(null);
-          requestProgressClearTimer.current = undefined;
-        }, 350);
-      }
-    }
+    await submitRequest({ action: "activateItems", items: attachKnownTenantIdentities(selected, tokenStatus),
+      durationHours: coerceDurationForItems(bundle?.defaultDurationHours || durationHours, selected),
+      justification: reason, ticketInfo, bundleName: bundle?.name, operationId: createRequestOperationId() });
   }
 
   async function deactivate(items: ActivationItem[]) {
-    if (activationRequestInFlight.current) {
-      return;
-    }
-    const deactivatableItems = getDeactivatableItems(items);
-    if (!deactivatableItems.length) {
-      setActivationFailureNotice(null);
-      setError(items.length ? "No selected items are currently active." : "Select at least one active role or group.");
-      return;
-    }
-
-    if (requestProgressClearTimer.current) {
-      clearTimeout(requestProgressClearTimer.current);
-      requestProgressClearTimer.current = undefined;
-    }
-    if (refreshProgressClearTimer.current) {
-      clearTimeout(refreshProgressClearTimer.current);
-      refreshProgressClearTimer.current = undefined;
-    }
-    setRefreshProgress(null);
-    let requestProgress = createOperationProgress(
-      `request-${++requestProgressRunId.current}`,
-      DEACTIVATION_STEPS
-    );
-    let requestCompleted = false;
-    let requestContinuesInBackground = false;
-    activationRequestInFlight.current = true;
-    setIsActivating(true);
-    setActivationProgress(requestProgress);
-    scrollPopupToTop();
-    setError("");
-    setActivationFailureNotice(null);
-    setMessage("");
-    const operationIds: string[] = [];
-    const sendDeactivationOperation = (
-      requestItems: ActivationItem[],
-      timeoutMessage: string
-    ) => {
-      const operationId = createRequestOperationId();
-      operationIds.push(operationId);
-      ownedRequestOperationIds.current.add(operationId);
-      return sendMessage<ActivationResponse>(
-        {
-          action: "deactivateItems",
-          items: requestItems,
-          justification,
-          ticketInfo: {},
-          operationId
-        },
-        { timeoutMs: ACTIVATION_REQUEST_TIMEOUT_MS, timeoutMessage }
-      );
-    };
-    try {
-      await flushPopupDraft({
-        selectedIds: deactivatableItems.map((item) => item.id),
-        justification,
-        isActivationReviewOpen: true,
-        requestMode: "deactivate"
-      }).catch(() => undefined);
-      const requestItems = attachKnownTenantIdentities(deactivatableItems, tokenStatus);
-      const response = normalizeActivationResponse(await sendDeactivationOperation(
-        requestItems,
-        "The deactivation request timed out. QuickPIM++ will keep checking it in the background; do not submit a duplicate request."
-      ));
-      requestProgress = advanceOperationProgress(requestProgress, 2);
-      setActivationProgress(requestProgress);
-      const successItems = response.results
-        .filter((result) => result.success)
-        .map((result) => findUniqueItemByIdentity(deactivatableItems, result.itemId))
-        .filter((item): item is ActivationItem => Boolean(item));
-
-      if (justification.trim()) {
-        setSettings((current) => addRecentJustification(current, justification));
-      }
-
-      const remainingSelectedIds = getRemainingSelectedIdsAfterActivationResults(selectedIds, response.results);
-      setSelectedIds(remainingSelectedIds);
-      requestProgress = advanceOperationProgress(requestProgress, 3);
-      setActivationProgress(requestProgress);
-      const failureNotice = response.errors.length
-        ? buildActivationFailureNotice(response.errors, deactivatableItems)
-        : null;
-      if (response.errors.length) {
-        setActivationFailureNotice(failureNotice);
-      } else {
-        setActivationFailureNotice(null);
-      }
-      const reconciliationTargets = getRequestReconciliationTargets(response.results, deactivatableItems);
-      if (reconciliationTargets.length) {
-        try {
-          await refresh({
-            force: true,
-            showLoading: false,
-            suppressMessage: true,
-            targets: reconciliationTargets
-          });
-        } catch {
-          // Keep the accepted deactivation result even if reconciliation waits
-          // for the next refresh cycle.
-        }
-      }
-      if (remainingSelectedIds.size) {
-        await flushPopupDraft({ selectedIds: [...remainingSelectedIds], isActivationReviewOpen: true, requestMode: "deactivate" });
-      } else {
-        setRequestMode(undefined);
-        selectionIdentityRef.current = {};
-        setSelectionIdentity({});
-        latestPopupDraft.current = undefined;
-        await clearPopupDraft();
-      }
-      setMessage(formatRequestConfirmation(
-        "deactivation",
-        successItems.length,
-        response.errors.length,
-        response.results.filter((result) => result.success && result.trackingUnavailable).length
-      ));
-      if (failureNotice) {
-        setActivationProgress(null);
-      } else {
-        requestProgress = completeOperationProgress(requestProgress, "Deactivation complete");
-        requestCompleted = true;
-        setActivationProgress(requestProgress);
-      }
-      await acknowledgeRequestOperations(operationIds);
-    } catch (activationError) {
-      const detail = activationError instanceof Error ? activationError.message : String(activationError);
-      setActivationFailureNotice(null);
-      setError(detail);
-      requestProgress = failOperationProgress(requestProgress, detail, "Deactivation stopped at this step");
-      setActivationProgress(requestProgress);
-      if (isOperationTimeoutError(activationError)) {
-        requestContinuesInBackground = true;
-        operationIds.forEach((id) => ownedRequestOperationIds.current.delete(id));
-      } else {
-        await acknowledgeRequestOperations(operationIds);
-      }
-    } finally {
-      if (!requestContinuesInBackground) {
-        activationRequestInFlight.current = false;
-        setIsActivating(false);
-      }
-      if (requestCompleted) {
-        requestProgressClearTimer.current = setTimeout(() => {
-          setActivationProgress(null);
-          requestProgressClearTimer.current = undefined;
-        }, 350);
-      }
-    }
+    const selected = getDeactivatableItems(items);
+    if (!selected.length) { setError("Select at least one active role or group."); return; }
+    await submitRequest({ action: "deactivateItems", items: attachKnownTenantIdentities(selected, tokenStatus),
+      justification, ticketInfo: {}, operationId: createRequestOperationId() });
   }
 
   async function saveCurrentJustification() {
@@ -2771,6 +2129,9 @@ function PopupApp() {
         />
       ) : null}
 
+      <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
+        identity={identityContext} onOpenAccess={() => void openSettingsSection("role-access")} onDismiss={async (id) => { await sendMessage({ action: "dismissRequestOperations", operationIds: [id] }); await requestActivity.reload(); }} />
+
       {!showInitialAccessState && visibleTabs.length ? (
         <nav className="tab-bar" role="tablist" aria-label="Role types">
           {visibleTabs.map((visibleTab) => {
@@ -2824,7 +2185,7 @@ function PopupApp() {
           onOpenAccessSetup={() => void openSettingsSection("role-access")}
           onDismiss={() => setActivationFailureNotice(null)}
         />
-      ) : error && refreshProgress?.status !== "error" && activationProgress?.status !== "error" ? (
+      ) : error && refreshProgress?.status !== "error" ? (
         <DismissibleErrorMessage onDismiss={() => setError("")}>{error}</DismissibleErrorMessage>
       ) : null}
       {deactivationRetries.length ? (
@@ -2878,14 +2239,6 @@ function PopupApp() {
           } : undefined}
         />
       ) : null}
-      {activationProgress && !activationFailureNotice ? (
-        <SmartProgressPanel
-          key={activationProgress.operationId}
-          title={`${requestMode === "deactivate" ? "Deactivation" : "Activation"} in progress`}
-          progress={activationProgress}
-          onDismiss={activationProgress.status === "error" ? dismissRequestErrors : undefined}
-        />
-      ) : null}
 
       {showInitialAccessState ? (
         <InitialAccessState
@@ -2932,6 +2285,7 @@ function PopupApp() {
           <section className="content" id="popup-tab-panel" role="tabpanel" aria-label={tabLabel(currentRoleTab)}>
             <RoleList
               items={visibleEligibleItems}
+              isRequestPending={(item) => requestActivity.operations.some((operation) => requestBlocksItem(operation, item, requestActivity.tracked))}
               settings={settings}
               referenceData={referenceData}
               selectedIds={selectedIds}
@@ -3679,7 +3033,7 @@ function ActivationBar(props: {
               </button>
               <button className="btn primary" onClick={isDeactivateMode ? props.onDeactivate : props.onActivate} disabled={props.isActivating}>
                 {props.isActivating
-                  ? isDeactivateMode ? "Disabling..." : "Activating..."
+                  ? "Starting request…"
                   : isDeactivateMode ? `Disable ${props.selectedCount} selected` : `Activate ${props.selectedCount} selected`}
               </button>
             </>
@@ -3858,39 +3212,6 @@ function formatBundleDuration(durationHours: number | undefined): string {
   return `${durationHours} hour${durationHours === 1 ? "" : "s"}`;
 }
 
-function formatRequestConfirmation(
-  requestType: "activation" | "deactivation",
-  successCount: number,
-  errorCount: number,
-  trackingUnavailableCount = 0
-): string {
-  const itemLabel = (count: number) => `item${count === 1 ? "" : "s"}`;
-  const noun = requestType === "deactivation" ? "Deactivation" : "Activation";
-  if (successCount && !errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}.${formatTrackingUnavailable(trackingUnavailableCount)}`;
-  }
-  if (successCount && errorCount) {
-    return `${noun} request submitted for ${successCount} ${itemLabel(successCount)}; ${errorCount} failed.${formatTrackingUnavailable(trackingUnavailableCount)}`;
-  }
-  return `${noun} failed for ${errorCount} ${itemLabel(errorCount)}.`;
-}
-
-function formatTrackingUnavailable(count: number): string {
-  return count > 0
-    ? ` Microsoft accepted ${count === 1 ? "it" : "them"}, but did not return ${count === 1 ? "a tracking ID" : "tracking IDs"}; verify status in Microsoft PIM.`
-    : "";
-}
-
-function scrollPopupToTop(): void {
-  const scrollingElement = document.scrollingElement || document.documentElement;
-  if (typeof scrollingElement.scrollTo === "function") {
-    scrollingElement.scrollTo({ top: 0, behavior: "smooth" });
-    return;
-  }
-  scrollingElement.scrollTop = 0;
-  document.body.scrollTop = 0;
-}
-
 function normalizeRefreshTargets(targets: AccessSetupTarget[], enabledRoleFeatures: AccessSetupTarget[]): AccessSetupTarget[] {
   const enabled = new Set(enabledRoleFeatures);
   return targets.filter((target, index) => enabled.has(target) && targets.indexOf(target) === index);
@@ -3929,10 +3250,6 @@ function getItemByPersistedId(
   return itemsById.get(itemId) || itemsById.get(normalizeActivationItemId(itemId));
 }
 
-function findUniqueItemByIdentity<T extends { id: string }>(items: T[], itemId: string): T | undefined {
-  const matches = items.filter((item) => activationItemIdentitiesMatch(item.id, itemId));
-  return matches.length === 1 ? matches[0] : undefined;
-}
 
 function setsEqual<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {
   return left.size === right.size && [...left].every((value) => right.has(value));

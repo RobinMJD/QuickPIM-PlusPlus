@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 import {
   POPUP_DRAFT_KEY,
   clearPopupDraft,
+  clearSubmittedPopupDraft,
   hasPopupDraftContent,
   sanitizePopupDraft,
   savePopupDraft
@@ -11,6 +12,26 @@ import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 const now = Date.parse("2026-06-12T12:00:00.000Z");
 
 describe("popup draft storage", () => {
+  test("cleans the submitted raw draft after popup closure without reconstructing its form", async () => {
+    const draft = { updatedAt: Date.now(), submittedOperationId: "submitted_test_1234", tab: "directoryRole", sortMode: "name", selectedIds: ["directoryRole:reader:/"], durationHours: 1, justification: "Investigate production issue", ticketSystem: "ServiceNow", ticketNumber: "INC-123", isActivationReviewOpen: true, requestMode: "activate", tenantId: "tenant-one", principalId: "principal-one" };
+    const remove = vi.fn(async () => undefined);
+    vi.stubGlobal("chrome", { storage: { local: { get: async () => ({ [POPUP_DRAFT_KEY]: draft }), remove } } });
+    await clearSubmittedPopupDraft({ id: draft.submittedOperationId, itemIds: draft.selectedIds, action: "activate", durationHours: 1, justification: draft.justification, tenantId: draft.tenantId, principalId: draft.principalId, ticketInfo: { ticketSystem: draft.ticketSystem, ticketNumber: draft.ticketNumber } });
+    expect(remove).toHaveBeenCalledWith(POPUP_DRAFT_KEY);
+    vi.unstubAllGlobals();
+  });
+
+  test("does not clear a new draft with changed parameters, account or tenant", async () => {
+    const original = { updatedAt: Date.now(), tab: "directoryRole", sortMode: "name", selectedIds: ["directoryRole:reader:/"], durationHours: 1, justification: "Investigate production issue", ticketSystem: "ServiceNow", ticketNumber: "INC-123", isActivationReviewOpen: true, requestMode: "activate", tenantId: "tenant-one", principalId: "principal-one" };
+    const remove = vi.fn(async () => undefined);
+    for (const update of [{ durationHours: 2 }, { ticketNumber: "INC-999" }, { justification: "Resolve another incident" }, { principalId: "other-account" }, { tenantId: "other-tenant" }]) {
+      vi.stubGlobal("chrome", { storage: { local: { get: async () => ({ [POPUP_DRAFT_KEY]: { ...original, ...update } }), remove } } });
+      await clearSubmittedPopupDraft({ id: "submitted_test_1234", itemIds: original.selectedIds, action: "activate", durationHours: 1, justification: original.justification, tenantId: original.tenantId, principalId: original.principalId, ticketInfo: { ticketSystem: original.ticketSystem, ticketNumber: original.ticketNumber } });
+    }
+    expect(remove).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
   test("sanitizes persisted popup request state", () => {
     const draft = sanitizePopupDraft(
       {

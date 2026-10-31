@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.15.
+Reviewed for v2.18.16.
+
+## v2.18.16 Background Request Review
+
+Activation, deactivation, bundles, and access extensions hand off to durable background operations before the UI confirms startup. Stored snapshots exclude tokens and raw API objects. Account, tenant, role/group, scope, duration, justification, and ticket details are isolated from later popup drafts. Conflicting in-flight, pending approval, and uncertain operations remain guarded per account and item/scope; unrelated requests can proceed.
+
+After restart, only items durably recorded as prepared and never sent may resume, within 15 minutes of the original action and after fresh access to the original account is available. No sign-in tab opens automatically for restart recovery. Sending or uncertain items are never automatically replayed. Accepted request IDs and per-item results are reconciled rather than restarting progress. Popup and real browser restart tests use synthetic accounts and an offline Microsoft API stub; they do not change tenant privileges.
 
 ## v2.18.15 Deferred Disable Review
 

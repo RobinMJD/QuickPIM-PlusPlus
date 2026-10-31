@@ -18,6 +18,14 @@ import {
 const NOW = Date.parse("2026-07-22T10:00:00.000Z");
 
 describe("background request operation journal", () => {
+  test("retains item names and scopes when preparation slightly precedes operation creation", async () => {
+    const data: Record<string, unknown> = {}; const storage = makeStorage(data);
+    await beginRequestOperation({ id: "request_scope_timestamp", action: "activate", itemIds: ["directoryRole:groups:/administrativeUnits/unit-a"], targets: ["directoryRole"], startedAt: NOW,
+      items: [{ itemId: "directoryRole:groups:/administrativeUnits/unit-a", itemName: "Groups Administrator", itemType: "directoryRole", scopeLabel: "Restricted unit A", scopeId: "/administrativeUnits/unit-a", state: "prepared", updatedAt: NOW - 1 }] }, { storage, now: NOW });
+    const stored = await loadRequestOperations({ storage, now: NOW });
+    expect(stored[0].items?.[0]).toMatchObject({ itemName: "Groups Administrator", scopeLabel: "Restricted unit A", scopeId: "/administrativeUnits/unit-a", updatedAt: NOW });
+  });
+
   test("correlates recovered Microsoft requests by operation id and bounds legacy matches", () => {
     const operation = {
       id: "request_operation_recovery",

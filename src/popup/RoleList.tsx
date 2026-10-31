@@ -38,6 +38,7 @@ export function RoleList({
   onToggle,
   onToggleFavorite,
   onActivationExpired,
+  isRequestPending,
   readonly = false
 }: {
   items: ActivationItem[];
@@ -55,6 +56,7 @@ export function RoleList({
   onToggle?: (itemId: string) => void;
   onToggleFavorite?: (itemId: string) => void;
   onActivationExpired?: (item: ActivationItem) => void;
+  isRequestPending?: (item: ActivationItem) => boolean;
   readonly?: boolean;
 }) {
   const [activeNow, setActiveNow] = useState(() => Date.now());
@@ -117,7 +119,8 @@ export function RoleList({
         const usage = getUsage(item, settings);
         const actionState = getRowActionState(item);
         const itemMode = actionState.mode;
-        const isActionable = !readonly && actionState.selectable && Boolean(itemMode);
+        const requestPending = Boolean(isRequestPending?.(item));
+        const isActionable = !readonly && !requestPending && actionState.selectable && Boolean(itemMode);
         const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
         const selected = isSelectable && [...selectedIds].some((itemId) =>
           activationItemIdentitiesMatch(itemId, item.id));
@@ -139,7 +142,7 @@ export function RoleList({
           ? formatLocalDateTime(item.activeUntil)
           : "";
         const policySummary = showEnablementDetails ? getRowPolicySummary(item) : [];
-        const rowTitle = actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
+        const rowTitle = requestPending ? "A request for this item and scope is in progress. You can request other items." : actionState.reason || (!isSelectable && requestMode && itemMode ? `Clear the current selection to ${itemMode === "activate" ? "activate" : "deactivate"} this item.` : undefined);
         const body = (
           <>
             <button
@@ -180,7 +183,7 @@ export function RoleList({
                 </span>
               ) : null}
               <span className={`badge status-badge ${statusBadgeClass}`} title={statusTitle}>
-                {formatActivationItemStatusLabel(item)}
+                {requestPending ? "request in progress" : formatActivationItemStatusLabel(item)}
               </span>
               {shouldShowRemainingActivationTime(item, showRemainingActivationTime) && item.activeUntil ? (
                 <RemainingActivationTime activeUntil={item.activeUntil} onExpired={handleActivationExpired} />
@@ -211,7 +214,7 @@ export function RoleList({
             title={rowTitle}
             tabIndex={0}
             role="group"
-            aria-label={`${displayName}. ${formatActivationItemStatusLabel(item)}.${rowTitle ? ` ${rowTitle}` : ""}`}
+            aria-label={`${displayName}. ${requestPending ? "request in progress" : formatActivationItemStatusLabel(item)}.${rowTitle ? ` ${rowTitle}` : ""}`}
             aria-disabled={!isSelectable}
           >
             <input

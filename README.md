@@ -10,7 +10,7 @@ QuickPIM++ keeps just-in-time access intact while removing the repeated portal n
   <a href="https://microsoftedge.microsoft.com/addons/detail/quickpim/kkonicmefghaignpfelhjfpmpecjgfld"><img src="docs/images/store-badges/microsoft-edge-addons.png" alt="Get it from Microsoft Edge" height="58"></a>
 </p>
 
-Current version: **v2.18.15**
+Current version: **v2.18.16**
 
 ![QuickPIM++ popup showing eligible Microsoft Entra roles](docs/images/screenshot-01-popup-roles-1280x800.png)
 
@@ -69,6 +69,9 @@ Work with eligible Azure resource roles across subscriptions, resource groups, m
 - Skip already-active bundle entries and preflight blocked, pending, or policy-limited items.
 - Keep activation and deactivation selections separate so each request has one clear intent.
 - Track approval, provisioning, completion, denial, failure, and expiry from Settings > Activity & Usage.
+- Activate, deactivate, extend access, or submit a bundle, then keep working. The compact **Requests** strip shows ongoing and recent work; **View requests** reveals each item, scope, duration, submitted parameters, and Microsoft status. Closing the popup does not cancel requests, and reopening it does not rebuild their submitted forms.
+- A separate selection can be prepared while other requests run. Only requests for the same account, item and scope are blocked. Submitted parameters remain fixed even when you edit a new form.
+- After a browser restart, accepted or uncertain writes are reconciled without automatic resubmission. Never-sent items may resume within 15 minutes when usable access to the original Microsoft account returns. No work executes while the browser is closed.
 - If Microsoft rejects an early disable because of its five-minute minimum, choose **Retry automatically at …**. One background retry checks the exact original activation before disabling it. You can close the popup or cancel the queued retry; the browser must be running with usable access to the same Microsoft account. A missed window, sign-in requirement, or uncertain result stops the retry visibly.
 - Continue selected PIM access after expiry with a policy-capped scheduled extension.
 - Optionally notify when a request changes state or active access is close to expiry.

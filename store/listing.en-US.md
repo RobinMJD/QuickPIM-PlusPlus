@@ -30,6 +30,7 @@ Highlights:
 - Favorites, aliases, search, sorting, saved justifications, and recent reason history.
 - Activation bundles that skip already-active items and validate requirements before submission.
 - Policy-aware duration choices plus clear approval, justification, ticket, and active-until details.
+- Requests continue in the background while you close the popup or start unrelated work. Expand Requests to see each item, scope, submitted parameters, approval state, and result.
 - Local activity history and optional request-status notifications.
 - An optional, cancellable background retry when Microsoft temporarily blocks early deactivation.
 - Optional browser-account sync for useful preferences, aliases, favorites, justifications, bundles, usage, and recent activity within Chrome or Edge.
@@ -57,7 +58,7 @@ QuickPIM++ handles authentication tokens, PIM assignment metadata, request ident
 
 Use the complete text in [certification-notes.txt](certification-notes.txt) for Partner Center's **Notes for certification** field. The automated Edge publisher reads this same file. The notes identify the primary purpose, required test account, exact UI steps, expected results, and missing-access behavior.
 
-For a review of v2.18.15, explain that a five-minute-minimum deactivation rejection offers **Retry automatically at …**. Accepting schedules one background retry for the exact original activation; **Cancel retry** cancels it before execution. The browser must be running with usable access to the original Microsoft account. No portal sign-in is opened automatically and an uncertain result is never resent. Follow the complete certification notes above to test the submitted package.
+For a review of v2.18.16, test popup closure and browser restart using the Requests strip. Submitted parameters remain fixed and independent requests can run together. Only never-sent work can resume after a restart, with fresh original-account access within 15 minutes; uncertain writes are never replayed. Also verify that a five-minute-minimum deactivation rejection offers **Retry automatically at …**. Accepting schedules one background retry for the exact original activation; **Cancel retry** cancels it before execution. The browser must be running with usable access to the original Microsoft account. No portal sign-in is opened automatically and an uncertain result is never resent. Follow the complete certification notes above to test the submitted package.
 
 Reviewer reference:
 

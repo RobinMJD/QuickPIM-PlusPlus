@@ -102,10 +102,12 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).not.toContain("catch (error) {\n        return await activateItems");
   });
 
-  test("keeps popup submission locked while a timed-out request continues in the background", () => {
-    expect(popup).toContain("let requestContinuesInBackground = false");
-    expect(popup).toContain("requestContinuesInBackground = true");
-    expect(popup).toContain("if (!requestContinuesInBackground) {");
+  test("hands request actions to durable background work without locking the next form", () => {
+    expect(popup).toContain('action: "startRequestOperation"');
+    expect(popup).toContain("requestActivity.operations");
+    expect(popup).not.toContain('label: "Request continues in the background"');
+    expect(background).toContain("onAccepted?.(operation.id)");
+    expect(background).toContain("resumePayload");
   });
 
   test("keeps portal-recovery polling serialized and preserves the last known state on transient failures", () => {

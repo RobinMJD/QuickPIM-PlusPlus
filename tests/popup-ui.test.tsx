@@ -2876,244 +2876,32 @@ describe("popup compact controls", () => {
     expect(document.body.textContent).not.toContain("Continue");
   });
 
-  test("shows activation progress through request and refresh before final confirmation", async () => {
-    document.body.innerHTML = '<div id="root"></div>';
-    const eligibleItem: ActivationItem = {
-      id: "directoryRole:reader:/",
-      type: "directoryRole",
-      sourceName: "Reader",
-      displayName: "Reader",
-      principalId: "principal-1",
-      scopeLabel: "Tenant",
-      status: "eligible",
-      roleDefinitionId: "reader",
-      directoryScopeId: "/",
-      activationRequirements: {
-        justification: false,
-        ticket: false
-      }
-    };
-    const activation = deferred<{
-      success: true;
-      data: {
-        success: true;
-        results: Array<{ itemId: string; itemName: string; success: true }>;
-        errors: [];
-      };
-    }>();
-    const refreshedEligible = deferred<{ success: true; data: { items: ActivationItem[]; errors: [] } }>();
-    const refreshedActive = deferred<{ success: true; data: { items: ActivationItem[]; errors: [] } }>();
-    const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
-      [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: [eligibleItem]
-        },
-        active: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: []
-        }
-      }
-    };
-
-    const chromeMock = {
-      runtime: {
-        sendMessage: vi.fn((message: { action: string }) => {
-          if (message.action === "activateItems") {
-            return activation.promise;
-          }
-          if (message.action === "getActivationItems") {
-            return refreshedEligible.promise;
-          }
-          if (message.action === "getActiveItems") {
-            return refreshedActive.promise;
-          }
-          if (message.action === "getTokenStatus") {
-            return Promise.resolve({
-              success: true,
-              data: {
-                graph: { hasToken: false },
-                azureManagement: { hasToken: false }
-              }
-            });
-          }
-          return Promise.resolve({ success: true, data: true });
-        })
-      },
-      storage: {
-        local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
-          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
-          remove: vi.fn(async () => undefined)
-        }
-      },
-      tabs: {
-        create: vi.fn()
-      }
-    };
-
-    vi.stubGlobal("chrome", chromeMock);
-    vi.resetModules();
-    await import("../src/popup/main");
-
-    await waitFor(() => expect(document.body.textContent).toContain("Reader"));
-    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
-    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
-    expect(document.body.textContent).not.toContain("Activation time");
-    expect(document.body.textContent).not.toContain("Activate 1 selected");
+  test("hands activation to the background and frees the form immediately after acknowledgement", async () => {
+    const harness = await renderRequestPopup();
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     clickButton("Continue");
     await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
     clickButton("Activate 1 selected");
-
-    await waitFor(() => expect(document.body.textContent).toContain("Activation in progressStep 1/3Sending activation request"));
-    await waitFor(() => expect(storageData[POPUP_DRAFT_KEY]).toMatchObject({
-      selectedIds: [eligibleItem.id],
-      isActivationReviewOpen: true,
-      requestMode: "activate"
-    }));
-    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      action: "activateItems",
-      operationId: expect.stringMatching(/^[a-zA-Z0-9_-]{8,80}$/)
-    }));
-    activation.resolve({
-      success: true,
-      data: {
-        success: true,
-        results: [{ itemId: eligibleItem.id, itemName: "Reader", success: true }],
-        errors: []
-      }
-    });
-
-    await waitFor(() => expect(document.body.textContent).toContain("Activation in progressStep 3/3Refreshing activation status"));
-    refreshedEligible.resolve({ success: true, data: { items: [], errors: [] } });
-    refreshedActive.resolve({ success: true, data: { items: [{ ...eligibleItem, status: "active" }], errors: [] } });
-
-    await waitFor(() => expect(document.body.textContent).toContain("Activation request submitted for 1 item."));
-    expect(document.body.textContent).not.toContain("Forced refresh completed.");
+    await waitFor(() => expect(document.body.textContent).toContain("1 request in progress"));
+    expect(document.querySelector(".activation-review-back-button")).toBeNull();
+    expect(document.querySelector(".smart-progress-panel")).toBeNull();
+    clickButton("View requests");
+    await waitFor(() => expect(document.querySelector(".request-activity-card")).toBeTruthy());
+    expect(document.body.textContent).toContain("Preparing request");
+    expect(document.body.textContent).toContain("Reader");
+    expect(harness.send).toHaveBeenCalledWith(expect.objectContaining({ action: "startRequestOperation", request: expect.objectContaining({ action: "activateItems", durationHours: 0.5 }) }));
   });
 
-  test("reconnects to a background activation after the popup is reopened", async () => {
-    document.body.innerHTML = '<div id="root"></div>';
-    const eligibleItem: ActivationItem = {
-      id: "directoryRole:reader:/",
-      type: "directoryRole",
-      sourceName: "Reader",
-      displayName: "Reader",
-      principalId: "principal-1",
-      scopeLabel: "Tenant",
-      status: "eligible",
-      roleDefinitionId: "reader",
-      directoryScopeId: "/",
-      activationRequirements: { justification: false, ticket: false }
-    };
-    const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
-      [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: [eligibleItem]
-        },
-        active: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: []
-        }
-      },
-      [POPUP_DRAFT_KEY]: {
-        version: 1,
-        updatedAt: Date.now(),
-        tab: "directoryRole",
-        search: "",
-        sortMode: "name",
-        quickFilters: [],
-        selectedIds: [eligibleItem.id],
-        durationHours: 0.5,
-        justification: "",
-        ticketSystem: "",
-        ticketNumber: "",
-        isActivationReviewOpen: true,
-        requestMode: "activate"
-      }
-    };
-    let operations: RequestOperationRecord[] = [{
-      id: "request_background_test",
-      action: "activate",
-      itemIds: [eligibleItem.id],
-      targets: ["directoryRole"],
-      state: "running",
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-      durationHours: 0.5
-    }];
-    const sendMessage = vi.fn((message: { action: string; operationIds?: string[] }) => {
-      if (message.action === "getRequestOperations") {
-        return Promise.resolve({ success: true, data: operations });
-      }
-      if (message.action === "dismissRequestOperations") {
-        operations = operations.filter((operation) => !message.operationIds?.includes(operation.id));
-        return Promise.resolve({ success: true, data: true });
-      }
-      if (message.action === "getTokenStatus") {
-        return Promise.resolve({
-          success: true,
-          data: { graph: { hasToken: false }, azureManagement: { hasToken: false } }
-        });
-      }
-      if (message.action === "getActivationSnapshot") {
-        return Promise.resolve({
-          success: true,
-          data: {
-            eligible: { items: [], errors: [] },
-            active: { items: [{ ...eligibleItem, status: "active" }], errors: [] }
-          }
-        });
-      }
-      return Promise.resolve({ success: true, data: true });
-    });
-    vi.stubGlobal("chrome", {
-      runtime: { sendMessage },
-      storage: {
-        local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
-          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
-          remove: vi.fn(async (key: string) => {
-            delete storageData[key];
-          })
-        }
-      },
-      tabs: { create: vi.fn() }
-    });
-    vi.resetModules();
-    await import("../src/popup/main");
-
-    await waitFor(() => expect(document.body.textContent).toContain("Request continues in the background"), 3_000);
-    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "activateItems" }));
-
-    operations = [{
-      ...operations[0],
-      state: "complete",
-      updatedAt: Date.now(),
-      response: {
-        success: true,
-        results: [{ itemId: eligibleItem.id, itemName: "Reader", success: true }],
-        errors: []
-      }
-    }];
-
-    await waitFor(() => expect(document.body.textContent).toContain("Activation request submitted for 1 item."), 4_000);
-    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-      action: "dismissRequestOperations",
-      operationIds: ["request_background_test"]
-    }));
-    expect(storageData).not.toHaveProperty(POPUP_DRAFT_KEY);
+  test("reopens ongoing work without rebuilding its submitted form", async () => {
+    const harness = await renderRequestPopup({ existing: true });
+    await waitFor(() => expect(document.body.textContent).toContain("1 request in progress"));
+    expect(document.querySelector(".activation-review-back-button")).toBeNull();
+    clickButton("View requests");
+    await waitFor(() => expect(document.querySelector(".request-activity-card")).toBeTruthy());
+    expect(document.body.textContent).toContain("Preparing request");
+    expect(document.body.textContent).toContain("Tenant");
+    expect(harness.send).not.toHaveBeenCalledWith(expect.objectContaining({ action: "startRequestOperation" }));
+    expect(document.querySelectorAll('.role-row input[type="checkbox"]')).toHaveLength(0);
   });
 
   test("marks required justification with a red asterisk", async () => {
@@ -3393,96 +3181,18 @@ describe("popup compact controls", () => {
     expect(document.querySelector('#justification-picker-list')?.getAttribute("aria-label")).toBe("Saved justifications");
   });
 
-  test("shows activation errors without waiting forever", async () => {
-    document.body.innerHTML = '<div id="root"></div>';
-    const eligibleItem: ActivationItem = {
-      id: "pimGroup:group-1:member",
-      type: "pimGroup",
-      sourceName: "Cybersec PIM Group",
-      displayName: "Cybersec PIM Group",
-      principalId: "principal-1",
-      scopeLabel: "Member",
-      status: "eligible",
-      groupId: "group-1",
-      accessId: "member",
-      activationRequirements: {
-        justification: false,
-        ticket: false
-      }
-    };
-    const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
-      [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: [eligibleItem]
-        },
-        active: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: []
-        }
-      }
-    };
-
-    const chromeMock = {
-      runtime: {
-        sendMessage: vi.fn((message: { action: string }) => {
-          if (message.action === "activateItems") {
-            const permissionError = JSON.stringify({
-              errorCode: "PermissionScopeNotGranted",
-              message: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup."
-            });
-            return Promise.resolve({
-              success: true,
-              data: {
-                success: false,
-                results: [{ itemId: eligibleItem.id, itemName: "Cybersec PIM Group", success: false, error: permissionError }],
-                errors: [{ itemId: eligibleItem.id, itemName: "Cybersec PIM Group", success: false, error: permissionError }]
-              }
-            });
-          }
-          if (message.action === "getTokenStatus") {
-            return Promise.resolve({
-              success: true,
-              data: {
-                graph: { hasToken: false },
-                azureManagement: { hasToken: false }
-              }
-            });
-          }
-          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
-        })
-      },
-      storage: {
-        local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
-          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
-          remove: vi.fn(async () => undefined)
-        }
-      },
-      tabs: {
-        create: vi.fn()
-      }
-    };
-
-    vi.stubGlobal("chrome", chromeMock);
-    vi.resetModules();
-    await import("../src/popup/main");
-
-    await waitFor(() => expect(document.body.textContent).toContain("Cybersec PIM Group"));
-    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
-    await waitFor(() => expect(document.body.textContent).toContain("Continue"));
+  test("keeps background permission failures visible in request details without occupying the form", async () => {
+    await renderRequestPopup({ error: JSON.stringify({ errorCode: "PermissionScopeNotGranted", message: "Authorization failed due to missing permission scope PrivilegedAssignmentSchedule.ReadWrite.AzureADGroup." }) });
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     clickButton("Continue");
-    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected"));
-    clickButton("Activate 1 selected");
-
-    await waitFor(() => expect(document.body.textContent).toContain("Cybersec PIM Group: PIM Groups access is limited"));
-    expect(document.body.textContent).toContain("Cybersec PIM Group: PIM Groups access is limited in the captured portal token.");
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected")); clickButton("Activate 1 selected");
+    await waitFor(() => expect(document.body.textContent).toContain("1 request needs attention"));
+    clickButton("View requests");
+    await waitFor(() => expect(document.querySelector(".request-activity-card")).toBeTruthy());
+    document.querySelector<HTMLElement>(".request-activity-card summary")!.click();
+    expect(document.body.textContent).toContain("Microsoft Graph access is limited");
     expect(document.body.textContent).not.toContain("PermissionScopeNotGranted");
+    expect(document.querySelector(".activation-review-back-button")).toBeNull();
   });
 
   test("selects active rows for deactivation and prevents mixing with activation selections", async () => {
@@ -3639,8 +3349,8 @@ describe("popup compact controls", () => {
 
     await waitFor(() =>
       expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({
-        action: "deactivateItems",
-        items: [expect.objectContaining({ id: activeItem.id, status: "active" })]
+        action: "startRequestOperation",
+        request: expect.objectContaining({ action: "deactivateItems", items: [expect.objectContaining({ id: activeItem.id, status: "active" })] })
       }))
     );
     expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ action: "activateItems" }));
@@ -3830,109 +3540,19 @@ describe("popup compact controls", () => {
     expect(text).not.toContain("6/12/2026");
   });
 
-  test("shows matching portal actions for claims challenge activation errors", async () => {
-    document.body.innerHTML = '<div id="root"></div>';
-    const eligibleItem: ActivationItem = {
-      id: "directoryRole:user-admin:/",
-      type: "directoryRole",
-      sourceName: "User Administrator",
-      displayName: "User Administrator",
-      principalId: "principal-1",
-      scopeLabel: "Tenant",
-      status: "eligible",
-      roleDefinitionId: "user-admin",
-      directoryScopeId: "/",
-      activationRequirements: {
-        justification: true,
-        ticket: false
-      }
-    };
-    const storageData: Record<string, unknown> = {
-      [SETTINGS_KEY]: DEFAULT_SETTINGS,
-      [DATA_CACHE_KEY]: {
-        eligible: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: [eligibleItem]
-        },
-        active: {
-          fetchedAt: Date.now(),
-          cacheKey: "graph:missing|azure:missing",
-          errors: [],
-          items: []
-        }
-      }
-    };
-    const claims = encodeURIComponent(JSON.stringify({ access_token: { acrs: { essential: true, value: "c1" } } }));
-    const createTab = vi.fn();
-
-    vi.stubGlobal("chrome", {
-      runtime: {
-        getURL: (path: string) => `chrome-extension://quickpim/${path}`,
-        sendMessage: vi.fn((message: { action: string }) => {
-          if (message.action === "activateItems") {
-            const error = `Authorization failed. &claims=${claims}`;
-            return Promise.resolve({
-              success: true,
-              data: {
-                success: false,
-                results: [{ itemId: eligibleItem.id, itemName: "User Administrator", success: false, error }],
-                errors: [{ itemId: eligibleItem.id, itemName: "User Administrator", success: false, error }]
-              }
-            });
-          }
-          if (message.action === "getTokenStatus") {
-            return Promise.resolve({
-              success: true,
-              data: {
-                graph: { hasToken: false },
-                azureManagement: { hasToken: false }
-              }
-            });
-          }
-          return Promise.resolve({ success: true, data: { items: [], errors: [] } });
-        })
-      },
-      storage: {
-        local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
-          set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
-          remove: vi.fn(async () => undefined)
-        }
-      },
-      tabs: {
-        create: createTab
-      }
-    });
-    vi.resetModules();
-    await import("../src/popup/main");
-
-    await waitFor(() => expect(document.body.textContent).toContain("User Administrator"));
-    document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+  test("shows claims recovery in request details and never exposes the claims payload", async () => {
+    const harness = await renderRequestPopup({ error: 'Authorization failed. &claims=%7B%22secretChallenge%22%3Atrue%7D' });
+    document.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
     clickButton("Continue");
-    await waitFor(() => expect(document.querySelector<HTMLTextAreaElement>(".justification-textarea")).toBeTruthy());
-    setFieldValue(document.querySelector<HTMLTextAreaElement>(".justification-textarea")!, "Needed to resolve helpdesk escalation.");
-    clickButton("Activate 1 selected");
-
-    await waitFor(() => expect(document.body.textContent).toContain("User Administrator: Microsoft requires an additional sign-in or MFA challenge"));
-    expect(document.body.textContent).toContain("User Administrator: Microsoft requires an additional sign-in or MFA challenge");
-    expect(document.body.textContent).toContain("QuickPIM++ already tried to refresh access in the background");
-    expect(document.body.textContent).toContain("Complete the Microsoft prompt, then retry the still-selected item");
-    expect(document.body.textContent).toContain("Activate 1 selected");
-    expect(document.body.textContent).not.toContain(claims);
+    await waitFor(() => expect(document.body.textContent).toContain("Activate 1 selected")); clickButton("Activate 1 selected");
+    await waitFor(() => expect(document.body.textContent).toContain("1 request needs attention"));
+    clickButton("View requests");
+    await waitFor(() => expect(document.querySelector(".request-activity-card")).toBeTruthy());
+    document.querySelector<HTMLElement>(".request-activity-card summary")!.click();
+    expect(document.body.textContent).not.toContain("secretChallenge");
     expect(document.body.textContent).not.toContain("claims=");
-    expect(document.querySelectorAll(".activation-error-panel")).toHaveLength(1);
-    expect(document.querySelector(".smart-progress-panel")).toBeFalsy();
-    expect((document.body.textContent?.match(/User Administrator: Microsoft requires an additional sign-in or MFA challenge/g) || [])).toHaveLength(1);
-
-    clickButton("Open Entra Roles portal");
-    await waitFor(() => expect(createTab).toHaveBeenCalledWith(expect.objectContaining({ url: expect.stringContaining("aadmigratedroles") })));
-
-    clickButton("Access Setup");
-    await waitFor(() => expect(createTab).toHaveBeenCalledWith({ url: "chrome-extension://quickpim/settings.html#role-access" }));
-    document.querySelector<HTMLButtonElement>('.activation-error-panel button[aria-label="Dismiss error"]')?.click();
-    await waitFor(() => expect(document.querySelector(".activation-error-panel")).toBeFalsy());
+    clickButton("Access details");
+    await waitFor(() => expect(harness.createTab).toHaveBeenCalledWith({ url: "chrome-extension://quickpim/settings.html#role-access" }));
   });
 
   test("toggles favorite rows with a star button and keeps favorites first", async () => {
@@ -5120,3 +4740,31 @@ describe("popup dark mode", () => {
     await waitFor(() => expect(document.body.classList.contains("dark-mode")).toBe(true));
   });
 });
+
+async function renderRequestPopup(options: { existing?: boolean; error?: string } = {}) {
+  document.body.innerHTML = '<div id="root"></div>';
+  const now = Date.now();
+  const item: ActivationItem = { id: "directoryRole:reader:/", type: "directoryRole", sourceName: "Reader", displayName: "Reader", principalId: "principal-1", scopeLabel: "Tenant", status: "eligible", roleDefinitionId: "reader", directoryScopeId: "/", activationRequirements: { justification: false, ticket: false } };
+  const operation = (id: string): RequestOperationRecord => ({ id, action: "activate", itemIds: [item.id], targets: ["directoryRole"], startedAt: now, updatedAt: now, state: options.error ? "complete" : "running", durationHours: 0.5,
+    items: [{ itemId: item.id, itemName: item.displayName, itemType: item.type, principalId: item.principalId, scopeLabel: item.scopeLabel, state: options.error ? "terminal" : "prepared", updatedAt: now,
+      ...(options.error ? { result: { itemId: item.id, itemName: item.displayName, success: false, error: options.error } } : {}) }] });
+  const storage: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS,
+    [DATA_CACHE_KEY]: { eligible: { fetchedAt: now, cacheKey: "graph:missing|azure:missing", errors: [], items: [item] }, active: { fetchedAt: now, cacheKey: "graph:missing|azure:missing", errors: [], items: [] } },
+    "quickPimRequestOperations.v2": options.existing ? [operation("request_existing")] : []
+  };
+  const createTab = vi.fn();
+  const send = vi.fn(async (message: Record<string, any>) => {
+    if (message.action === "startRequestOperation") {
+      storage["quickPimRequestOperations.v2"] = [operation(message.request.operationId)];
+      return { success: true, data: { operationId: message.request.operationId } };
+    }
+    if (message.action === "getRequestOperations") return { success: true, data: storage["quickPimRequestOperations.v2"] };
+    if (message.action === "getTokenStatus") return { success: true, data: { graph: { hasToken: false }, azureManagement: { hasToken: false } } };
+    return { success: true, data: { items: [], errors: [] } };
+  });
+  vi.stubGlobal("chrome", { runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage: send },
+    storage: { local: { get: async (key: string) => ({ [key]: storage[key] }), set: async (value: Record<string, unknown>) => Object.assign(storage, value), remove: async (key: string) => { delete storage[key]; } } }, tabs: { create: createTab } });
+  vi.resetModules(); await import("../src/popup/main");
+  await waitFor(() => expect(document.body.textContent).toContain("Reader"));
+  return { send, storage, createTab };
+}

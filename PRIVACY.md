@@ -1,6 +1,6 @@
 # QuickPIM++ Privacy Policy
 
-Effective date: October 24, 2026
+Effective date: November 1, 2026
 
 QuickPIM++ is a local-first browser extension for activating Microsoft Entra Privileged Identity Management roles, Azure resource roles, and PIM-enabled groups.
 
@@ -34,6 +34,8 @@ QuickPIM++ avoids fetching feature areas that are disabled in Preferences, and A
 ## Data Storage
 
 Captured tokens are stored only in session storage and are cleared when the local browser session ends. Settings, learned names, aliases, favorites, justifications, bundles, cached role data, activity history, and bounded tracked-request records use local extension storage.
+
+Request operations also retain a validated, token-free snapshot of never-sent items so work can continue after popup closure or a browser restart. Snapshots include account/tenant identifiers, role or group identifiers, scope, requested duration, justification, and ticket details. They are local only, excluded from browser sync and backups, and removed after a response is recorded. Completed operation metadata is bounded to 100 records for up to 30 days; nonterminal records expire after seven days. Only never-sent items may resume automatically, within 15 minutes and with access to the original account. Requests that may already have reached Microsoft are never automatically resent. The popup's Requests details and Activity & Usage show outcomes, including partial and uncertain results.
 
 On official Store installations, browser sync is enabled by default. A bounded subset of non-token convenience data may be stored in the signed-in browser account's extension sync service. Chrome Sync and Microsoft Edge Sync are separate services and do not synchronize directly with each other. Tokens, API caches, learned names, popup drafts, in-progress requests, and notification permission are never included. Sync can be disabled for each installation and its cloud copy can be deleted from Settings.
 

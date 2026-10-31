@@ -7,7 +7,7 @@ export async function runWithActivationItemLock<T>(
   item: ActivationItem,
   operation: () => Promise<T>
 ): Promise<T> {
-  const identity = getActivationItemIdentity(item);
+  const identity = `${getActivationItemIdentity(item)}:principal:${item.principalId.trim().toLowerCase()}`;
   if (inFlightActivationItems.has(identity)) {
     throw new Error(`A QuickPIM++ request for ${item.displayName || item.sourceName || "this item"} is already in progress.`);
   }

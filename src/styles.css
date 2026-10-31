@@ -5080,3 +5080,28 @@ body.dark-mode .autosave-status.error {
 .deactivation-retry + .deactivation-retry { margin-top: 6px; }
 .deactivation-retry p { margin: 4px 0 8px; }
 .deactivation-retry .button-row { flex-wrap: wrap; gap: 8px; }
+
+.request-activity { margin: 10px 12px; border: 1px solid #d5ddea; border-radius: 10px; background: #fff; display: flex; flex-direction: column; flex: 0 1 auto; min-height: 42px; max-height: 42vh; overflow: hidden; }
+.request-activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 12px; font-weight: 600; }
+.request-activity-heading .btn { padding: 6px 8px; min-height: 32px; }
+.request-activity-details { max-height: min(42vh, 340px); overflow-y: auto; padding: 0 12px 10px; border-top: 1px solid #d5ddea; font-size: 12px; }
+.request-activity-details > p { margin: 8px 0; }
+.request-activity-card { padding: 10px 0; overflow-wrap: anywhere; }
+.request-activity-card + .request-activity-card { border-top: 1px solid #d5ddea; }
+.request-activity-card > time { float: right; color: #64748b; }
+.request-activity-card ul { list-style: none; padding: 0; margin: 6px 0; }
+.request-activity-card li { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.request-activity-card details > summary { cursor: pointer; padding: 4px 0; }
+.request-activity-card dl { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 5px; }
+.request-activity-card dt { color: #64748b; }
+.request-activity-card dd { margin: 0; white-space: pre-wrap; }
+.request-attention { color: var(--danger, #b42318); }
+
+body.dark-mode .request-activity { background: #192231; border-color: #3b485c; }
+body.dark-mode .request-activity-details, body.dark-mode .request-activity-card + .request-activity-card { border-color: #3b485c; }
+body.dark-mode .request-attention { color: #ffb4b4; }
+
+body.dark-mode .request-activity-card > time, body.dark-mode .request-activity-card dt { color: #a6b5ca; }
+
+.request-activity-heading { flex-shrink: 0; }
+.request-activity-details { flex: 1 1 auto; min-height: 0; }
