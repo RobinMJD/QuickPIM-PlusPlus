@@ -69,6 +69,13 @@ jobs:
       - name: Verify tag and all version consumers
         run: node scripts/check-version-sync.mjs "$RELEASE_TAG"
 
+      - name: Verify reviewed release notes
+        run: |
+          NOTES="docs/releases/${RELEASE_TAG}.md"
+          test -s "$NOTES"
+          grep -Fxq "## Changelog" "$NOTES"
+          grep -Fxq "## Links" "$NOTES"
+
       - name: Check Microsoft Edge compatibility
         run: npm run check:edge
 
@@ -107,6 +114,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout reviewed release notes
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
       - name: Download verified Store ZIP
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -131,7 +144,7 @@ jobs:
               fi
             done
           else
-            gh release create "$RELEASE_TAG" "${ASSETS[@]/#/release/}" --repo "$GITHUB_REPOSITORY" --title "QuickPIM++ $RELEASE_TAG" --generate-notes --verify-tag
+            gh release create "$RELEASE_TAG" "${ASSETS[@]/#/release/}" --repo "$GITHUB_REPOSITORY" --title "QuickPIM++ $RELEASE_TAG" --notes-file "docs/releases/${RELEASE_TAG}.md" --verify-tag
           fi
 
   chrome-web-store:
