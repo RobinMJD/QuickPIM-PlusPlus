@@ -56,11 +56,14 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onD
   const [actionError, setActionError] = useState("");
   const visible = operations.filter((operation) => requestOperationMatchesIdentity(operation, identity));
   if (!visible.length) return null;
-  return <section className="request-activity" aria-label="Requests">
+  const summary = getRequestActivitySummary(visible, tracked);
+  const pending = visible.some((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).pending));
+  return <section className={`request-activity${expanded ? " is-expanded" : ""}${pending ? " has-pending" : ""}`} aria-label="Requests">
     <div className="request-activity-heading">
-      <span role="status" aria-live="polite">{error ? "Request status temporarily unavailable" : getRequestActivitySummary(visible, tracked)}</span>
-      <button className="btn subtle" aria-expanded={expanded} aria-controls="request-activity-details" onClick={() => setExpanded(!expanded)}>{expanded ? "Hide requests" : "View requests"}</button>
+      <span role="status" aria-live="polite">{error ? "Request status temporarily unavailable" : summary}</span>
+      <button className="btn subtle" aria-expanded={expanded} aria-controls="request-activity-details" onClick={() => setExpanded((current) => !current)}>{expanded ? "Hide requests" : "View requests"}</button>
     </div>
+    {pending ? <div className="request-activity-progress" role="progressbar" aria-label="Request progress" aria-valuetext={error ? "Request status temporarily unavailable" : summary}><span /></div> : null}
     {expanded ? <div className="request-activity-details" id="request-activity-details">
       <p className="muted">You can close this popup or start another request. Submitted requests keep their original parameters.</p>
       {error || actionError ? <p role="status">{actionError || error}</p> : null}

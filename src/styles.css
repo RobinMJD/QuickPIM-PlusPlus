@@ -960,7 +960,9 @@ body.dark-mode .field-clear-button:focus-visible {
 }
 
 .content {
-  flex: 1 1 auto;
+  /* A long role list must scroll within its remaining space, rather than use
+     its intrinsic height to squeeze the request panel down to its heading. */
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   padding: 12px;
@@ -5082,6 +5084,14 @@ body.dark-mode .autosave-status.error {
 .deactivation-retry .button-row { flex-wrap: wrap; gap: 8px; }
 
 .request-activity { margin: 10px 12px; border: 1px solid #d5ddea; border-radius: 10px; background: #fff; display: flex; flex-direction: column; flex: 0 1 auto; min-height: 42px; max-height: 42vh; overflow: hidden; }
+.request-activity.has-pending { min-height: 58px; }
+.request-activity.is-expanded { min-height: 160px; }
+.request-activity-progress { flex: 0 0 4px; margin: 0 12px 10px; border-radius: 4px; overflow: hidden; background: #dbeafe; }
+.request-activity-progress > span { display: block; width: 35%; height: 100%; border-radius: inherit; background: #2563eb; animation: request-activity-pulse 1.6s ease-in-out infinite alternate; }
+@keyframes request-activity-pulse { from { transform: translateX(0); } to { transform: translateX(185%); } }
+@media (prefers-reduced-motion: reduce) { .request-activity-progress > span { animation: none; width: 100%; } }
+body.dark-mode .request-activity-progress { background: #253958; }
+body.dark-mode .request-activity-progress > span { background: #7aa7ff; }
 .request-activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 12px; font-weight: 600; }
 .request-activity-heading .btn { padding: 6px 8px; min-height: 32px; }
 .request-activity-details { max-height: min(42vh, 340px); overflow-y: auto; padding: 0 12px 10px; border-top: 1px solid #d5ddea; font-size: 12px; }

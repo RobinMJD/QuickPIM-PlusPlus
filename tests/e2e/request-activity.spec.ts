@@ -92,6 +92,7 @@ test("popup closure preserves a running activation, its parameters, and a separa
   await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1);
   page = await popup();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("1 request in progress");
+  await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeInViewport({ ratio: 1 });
   await page.getByRole("button", { name: "View requests" }).click();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("Application Support");
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("4 hours");
@@ -295,6 +296,45 @@ test("request details remain usable in dark mode and through keyboard navigation
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await release();
 });
+
+for (const darkMode of [false, true]) {
+  test(`request progress and expanded details stay visible above a long role list (${darkMode ? "dark" : "light"})`, async ({}, info) => {
+    items = [...items, ...Array.from({ length: 30 }, (_, index) => ({ ...items[0], id: `pimGroup:extra-${index}:member`, groupId: `extra-${index}`, displayName: `Additional eligible role ${index + 1}`, sourceName: `Additional eligible role ${index + 1}` }))];
+    await seed();
+    if (darkMode) await worker.evaluate(async () => {
+      const data = await chrome.storage.local.get("quickPimSettings.v1");
+      await chrome.storage.local.set({ "quickPimSettings.v1": { ...data["quickPimSettings.v1"], preferences: { ...data["quickPimSettings.v1"].preferences, darkMode: true } } });
+    });
+    const page = await popup();
+    const syncReminder = page.getByRole("button", { name: "Do not remind me", exact: true });
+    if (await syncReminder.isVisible()) await syncReminder.click();
+    await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+    await start(page, [items[0]]);
+    await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("1 request in progress");
+    await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeInViewport({ ratio: 1 });
+    await page.getByRole("button", { name: "View requests", exact: true }).click();
+    await page.screenshot({ path: info.outputPath(`request-panel-${darkMode ? "dark" : "light"}.png`) });
+    const details = page.locator("#request-activity-details");
+    expect(await details.evaluate((element) => element.clientHeight)).toBeGreaterThan(100);
+    await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toBeInViewport();
+    await expect(page.getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
+    await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
+    await page.getByRole("button", { name: "Hide requests", exact: true }).click();
+    await submitFromUI(page, items[1].displayName);
+    await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("2 requests in progress");
+    expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await release();
+    await expect.poll(async () => (await evidence()).operations.every((op) => op.state === "complete")).toBe(true);
+    await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "View requests", exact: true }).click();
+    expect(await details.evaluate((element) => element.clientHeight)).toBeGreaterThan(100);
+    await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeInViewport();
+    await page.getByRole("article", { name: "Activate Application Support", exact: true }).scrollIntoViewIfNeeded();
+    await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toBeInViewport();
+    await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
+    await page.screenshot({ path: info.outputPath(`request-results-${darkMode ? "dark" : "light"}.png`) });
+  });
+}
 
 function installOfflineMicrosoft() {
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });

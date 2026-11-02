@@ -4606,7 +4606,7 @@ describe("popup role row styling", () => {
     expect(shellRule).toContain("height: 100%;");
     expect(shellRule).toContain("min-height: 0;");
     expect(shellRule).toContain("overflow: hidden;");
-    expect(contentRule).toContain("flex: 1 1 auto;");
+    expect(contentRule).toContain("flex: 1 1 0;");
     expect(contentRule).toContain("min-height: 0;");
     expect(contentRule).toContain("overflow-y: auto;");
     expect(reviewContentRule).toContain("flex-shrink: 999;");
