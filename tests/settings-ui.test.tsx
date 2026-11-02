@@ -1096,6 +1096,9 @@ describe("settings Access Setup page", () => {
     vi.resetModules();
     await import("../src/settings/main");
     await waitFor(() => expect(document.body.textContent).toContain("Role Access"));
+    // Keep the initial read unresolved, but wait until its resolver exists.
+    // Otherwise a fast click can release nothing and leave the mock hanging.
+    await waitFor(() => expect(resolveInitialTokenStatus).toBeTypeOf("function"));
 
     const recheckButton = clickButton("Recheck now");
     expect(recheckButton.disabled).toBe(false);

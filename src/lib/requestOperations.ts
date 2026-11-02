@@ -12,7 +12,7 @@ import type {
   TrackedPimRequest,
   TrackedPimRequestStatus
 } from "./types";
-import { requestBlocksItem } from "./requestActivity";
+import { isRequestOperationFinished, requestBlocksItem } from "./requestActivity";
 import { validateQuickPimMessage } from "./messages";
 import { createStorageMutationLock } from "./storageMutation";
 import {
@@ -354,6 +354,38 @@ export async function dismissRequestOperations(
   await mutateOperations(storage, now, (current) => current.filter((item) => !idSet.has(item.id) || item.state === "running" || item.state === "uncertain"));
 }
 
+export async function markRequestOperationResultsSeen(
+  ids: string[],
+  options: { storage?: StorageAreaLike; now?: number; tracked?: TrackedPimRequest[] } = {}
+): Promise<string[]> {
+  const storage = options.storage || chrome.storage.local;
+  const now = options.now ?? Date.now();
+  const tracked = options.tracked || (await loadTrackedRequests()).requests;
+  const wanted = new Set(ids);
+  const acknowledged: string[] = [];
+  await mutateOperations(storage, now, (current) => current.map((operation) => {
+    if (!wanted.has(operation.id) || !isRequestOperationFinished(operation, tracked)) return operation;
+    acknowledged.push(operation.id);
+    return operation.popupResultSeenAt ? operation : {
+      ...operation, popupResultSeenAt: now, revision: (operation.revision || 0) + 1
+    };
+  }));
+  return acknowledged;
+}
+
+export async function archiveLegacyPopupResults(
+  previousVersion: string | undefined,
+  options: { storage?: StorageAreaLike; now?: number; tracked?: TrackedPimRequest[] } = {}
+): Promise<void> {
+  if (!previousVersion || !/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(previousVersion)) return;
+  const [major, minor, patch] = previousVersion.split(".").map(Number);
+  if (!(major < 2 || (major === 2 && (minor < 18 || (minor === 18 && patch < 18))))) return;
+  const operations = await loadRequestOperations(options);
+  // Only existing final results are acknowledged. Pending and uncertain work
+  // stays visible, and the durable journal and Activity history are retained.
+  if (operations.length) await markRequestOperationResultsSeen(operations.map((operation) => operation.id), options);
+}
+
 export function sanitizeRequestOperations(value: unknown, now = Date.now()): RequestOperationRecord[] {
   if (!Array.isArray(value)) return [];
   const sanitized = value
@@ -434,6 +466,7 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
   const updatedAt = sanitizeEpochMilliseconds(value.updatedAt);
   if (startedAt === undefined || updatedAt === undefined) return undefined;
   const terminalAt = sanitizeEpochMilliseconds(value.terminalAt);
+  const popupResultSeenAt = sanitizeEpochMilliseconds(value.popupResultSeenAt);
   const nextActionAt = sanitizeEpochMilliseconds(value.nextActionAt);
   const retentionAnchor = Math.max(terminalAt || 0, nextActionAt || 0, updatedAt);
   const terminal = value.state === "complete" || value.state === "error";
@@ -472,6 +505,8 @@ function sanitizeRequestOperation(value: unknown, now: number): RequestOperation
     startedAt,
     updatedAt,
     ...(terminalAt ? { terminalAt } : {}),
+    ...(popupResultSeenAt !== undefined && popupResultSeenAt >= startedAt && popupResultSeenAt <= now
+      ? { popupResultSeenAt } : {}),
     ...(nextActionAt ? { nextActionAt } : {}),
     ...(value.action === "activate"
       && typeof value.durationHours === "number"

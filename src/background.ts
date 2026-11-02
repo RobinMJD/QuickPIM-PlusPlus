@@ -138,6 +138,7 @@ import {
   completeRequestOperation,
   createRequestOperationItems,
   dismissRequestOperations,
+  archiveLegacyPopupResults,
   failRequestOperation,
   getRequestOperationFingerprint,
   loadRequestOperations,
@@ -374,9 +375,12 @@ chrome.webRequest.onSendHeaders.addListener(
 
 runBestEffort(initializeBackgroundRuntime());
 
-chrome.runtime.onInstalled?.addListener(() => {
+chrome.runtime.onInstalled?.addListener((details) => {
   distributionInfoPromise = undefined;
-  runBestEffort(initializeBackgroundRuntime(true));
+  runBestEffort((async () => {
+    if (details?.reason === "update") await archiveLegacyPopupResults(details.previousVersion).catch(() => undefined);
+    await initializeBackgroundRuntime(true);
+  })());
 });
 
 chrome.runtime.onStartup?.addListener(() => {

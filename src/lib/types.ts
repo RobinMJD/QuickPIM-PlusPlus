@@ -425,6 +425,8 @@ export interface RequestOperationRecord {
   startedAt: number;
   updatedAt: number;
   terminalAt?: number;
+  // Local presentation acknowledgement; never affects execution or history.
+  popupResultSeenAt?: number;
   nextActionAt?: number;
   durationHours?: number;
   justification?: string;

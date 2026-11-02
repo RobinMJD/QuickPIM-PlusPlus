@@ -34,10 +34,20 @@ export function requestBlocksItem(operation: RequestOperationRecord, item: Activ
       || progress.label.startsWith("Outcome unknown") || progress.label === "Status unavailable";
   }) || false;
 }
+export function isRequestOperationFinished(operation: RequestOperationRecord, tracked: TrackedPimRequest[]): boolean {
+  return ["complete", "error"].includes(operation.state) && !(operation.items || []).some((item) => {
+    const progress = getRequestItemProgress(operation, item, tracked);
+    return progress.pending || progress.label.startsWith("Outcome unknown") || progress.label === "Status unavailable";
+  });
+}
+
+export function shouldShowPopupRequest(operation: RequestOperationRecord, tracked: TrackedPimRequest[], shownThisPopup = false): boolean {
+  return !isRequestOperationFinished(operation, tracked) || !operation.popupResultSeenAt || shownThisPopup;
+}
 export function getRequestActivitySummary(operations: RequestOperationRecord[], tracked: TrackedPimRequest[]): string {
   const pending = operations.filter((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).pending)).length;
   const attention = operations.filter((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).attention)).length;
   if (pending) return `${pending} request${pending === 1 ? "" : "s"} in progress${attention ? ` · ${attention} need attention` : ""}`;
   if (attention) return `${attention} request${attention === 1 ? "" : "s"} need${attention === 1 ? "s" : ""} attention`;
-  return `${operations.length} recent request${operations.length === 1 ? "" : "s"}`;
+  return `${operations.length} new result${operations.length === 1 ? "" : "s"}`;
 }

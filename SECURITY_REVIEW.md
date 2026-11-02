@@ -1,6 +1,10 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.17.
+Reviewed for v2.18.18.
+
+## v2.18.18 Popup Result Acknowledgement
+
+Viewed final results receive a bounded local timestamp under the existing journal mutation lock. Acknowledgement never deletes the operation, changes its execution checkpoint, extends its retention timestamp, or removes Activity history. Pending approval, provisioning, scheduled, unknown, and unavailable outcomes stay visible. The upgrade migration acknowledges only existing final results from versions before v2.18.18. No permissions, token handling, Microsoft writes, or sync data are added.
 
 ## v2.18.16 Background Request Review
 

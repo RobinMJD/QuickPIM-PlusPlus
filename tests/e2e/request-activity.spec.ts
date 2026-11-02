@@ -184,7 +184,7 @@ test("real browser restart preserves uncertain writes without submitting them ag
   await expect(reopened.getByRole("region", { name: "Requests", exact: true })).toContainText("Outcome unknown");
   await expect(reopened.getByRole("button", { name: "Activate 1 selected", exact: true })).toHaveCount(0);
   await reopened.screenshot({ path: info.outputPath("request-restart-uncertain.png") });
-  const snapshot = await evidence(); expect(snapshot.operations[0].id).toBe(originalId); expect(snapshot.operations[0].justification).toBe(reason);
+  const snapshot = await evidence(); expect(snapshot.operations[0].popupResultSeenAt).toBeUndefined(); expect(snapshot.operations[0].id).toBe(originalId); expect(snapshot.operations[0].justification).toBe(reason);
   expect(snapshot.harness.writes).toHaveLength(1);
   await seed(true); await reopened.reload();
   expect((await evidence()).harness.writes).toHaveLength(1);
@@ -224,6 +224,7 @@ test("accepted approval requests keep their identity and status across a real br
   const id = (await evidence()).operations[0].id; await context.close(); await launch();
   const reopened = await popup(); await reopened.getByRole("button", { name: "View requests" }).click();
   await expect(reopened.getByRole("region", { name: "Requests", exact: true })).toContainText("Awaiting approval");
+  expect((await evidence()).operations[0].popupResultSeenAt).toBeUndefined();
   expect((await evidence()).operations[0].id).toBe(id); expect((await evidence()).harness.writes).toHaveLength(1);
 });
 
@@ -335,6 +336,69 @@ for (const darkMode of [false, true]) {
     await page.screenshot({ path: info.outputPath(`request-results-${darkMode ? "dark" : "light"}.png`) });
   });
 }
+
+test("a completed result is shown once after popup closure without removing its history", async () => {
+  let page = await popup(); await start(page, [items[0]]); await page.close(); await release();
+  await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
+  page = await popup();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("1 new result");
+  // A collapsed strip does not count as reading the actual result.
+  await page.close(); page = await popup();
+  await expect(page.getByRole("button", { name: "View requests", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true }).getByText("Active", { exact: true })).toBeInViewport();
+  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  await page.close(); await context.close(); await launch(); await seed(true); page = await popup();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+  expect((await evidence()).operations).toHaveLength(1);
+  const history = await worker.evaluate(async () => (await chrome.storage.local.get("quickPimRequests.v1"))["quickPimRequests.v1"]);
+  expect(history.requests[0].operationId).toBe((await evidence()).operations[0].id);
+  expect(history.requests).toHaveLength(1);
+  await start(page, [items[1]]);
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeVisible();
+  await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
+  const settings = await context.newPage(); await settings.setViewportSize({ width: 1000, height: 720 });
+  await settings.goto(`chrome-extension://${extensionId}/settings.html#activity`);
+  await settings.getByRole("region", { name: "Requests", exact: true }).getByRole("button", { name: "View requests", exact: true }).click();
+  await settings.getByRole("article", { name: "Activate Application Support", exact: true }).scrollIntoViewIfNeeded();
+  await expect(settings.getByRole("article", { name: "Activate Application Support", exact: true })).toBeInViewport();
+  await settings.close();
+});
+
+test("viewing a running request shows its completion once, then Hide requests clears only the finished result", async ({}, info) => {
+  const page = await popup(); await start(page, [items[0]]);
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
+  await release();
+  await expect(page.getByRole("region", { name: "Requests", exact: true }).getByText("Active", { exact: true })).toBeInViewport();
+  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("requestTestHarness");
+    await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, hold: true } });
+  });
+  await start(page, [items[1]]);
+  await page.screenshot({ path: info.outputPath("one-result-and-running-request.png") });
+  await page.getByRole("button", { name: "Hide requests", exact: true }).click();
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeInViewport();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("request in progress");
+  await page.screenshot({ path: info.outputPath("only-running-request.png") });
+  expect((await evidence()).operations).toHaveLength(2);
+});
+
+test("completed results below the scroll fold are not consumed until viewed", async () => {
+  let page = await popup();
+  for (const item of items.slice(0, 3)) await start(page, [item]);
+  await page.close(); await release();
+  await expect.poll(async () => (await evidence()).operations.filter((op) => op.state === "complete").length).toBe(3);
+  page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect.poll(async () => (await evidence()).operations.filter((op) => op.popupResultSeenAt).length).toBe(1);
+  await page.close(); page = await popup();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("2 new results");
+  expect((await evidence()).operations).toHaveLength(3);
+});
 
 function installOfflineMicrosoft() {
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });

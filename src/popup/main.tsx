@@ -2130,7 +2130,7 @@ function PopupApp() {
       ) : null}
 
       <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
-        identity={identityContext} onOpenAccess={() => void openSettingsSection("role-access")} onDismiss={async (id) => { await sendMessage({ action: "dismissRequestOperations", operationIds: [id] }); await requestActivity.reload(); }} />
+        identity={identityContext} onOpenAccess={() => void openSettingsSection("role-access")} />
 
       {!showInitialAccessState && visibleTabs.length ? (
         <nav className="tab-bar" role="tablist" aria-label="Role types">

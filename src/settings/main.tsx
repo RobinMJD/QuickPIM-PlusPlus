@@ -1946,7 +1946,7 @@ function ActivityPanel({
 
   return (
     <section className="panel">
-      <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
+      <RequestActivity mode="history" operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
         onDismiss={async (id) => { await sendMessage({ action: "dismissRequestOperations", operationIds: [id] }); await requestActivity.reload(); }} />
       <div className="panel-title-row">
         <div>
