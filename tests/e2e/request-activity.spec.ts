@@ -366,7 +366,7 @@ test("a completed result is shown once after popup closure without removing its 
   await settings.close();
 });
 
-test("viewing a running request shows its completion once, then Hide requests clears only the finished result", async ({}, info) => {
+test("starting another request clears a viewed completion without hiding pending work", async ({}, info) => {
   const page = await popup(); await start(page, [items[0]]);
   await page.getByRole("button", { name: "View requests", exact: true }).click();
   await expect(page.getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
@@ -378,7 +378,7 @@ test("viewing a running request shows its completion once, then Hide requests cl
     await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, hold: true } });
   });
   await start(page, [items[1]]);
-  await page.screenshot({ path: info.outputPath("one-result-and-running-request.png") });
+  await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Hide requests", exact: true }).click();
   await page.getByRole("button", { name: "View requests", exact: true }).click();
   await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);

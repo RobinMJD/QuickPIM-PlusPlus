@@ -46,19 +46,19 @@ export function useRequestActivity() {
   return { operations, tracked, error, reload };
 }
 
-function RequestResult({ label, finished, onViewed, children }: { label: string; finished: boolean; onViewed: () => void; children: ReactNode }) {
+function RequestResult({ id, label, finished, onViewed, children }: { id: string; label: string; finished: boolean; onViewed: (id: string) => void; children: ReactNode }) {
   const card = useRef<HTMLElement>(null);
   useEffect(() => {
     const result = card.current?.querySelector(".request-result-label");
     if (!finished || !result || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting && entry.intersectionRatio === 1 && document.visibilityState === "visible") onViewed();
+      if (entry.isIntersecting && entry.intersectionRatio === 1 && document.visibilityState === "visible") onViewed(id);
     }, { threshold: 1 });
     const observe = () => { observer.disconnect(); observer.observe(result); };
     observe();
     document.addEventListener("visibilitychange", observe);
     return () => { observer.disconnect(); document.removeEventListener("visibilitychange", observe); };
-  }, [finished, onViewed]);
+  }, [finished, id, onViewed]);
   return <article ref={card} className="request-activity-card" aria-label={label}>{children}</article>;
 }
 
@@ -72,7 +72,17 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
   const [expanded, setExpanded] = useState(false);
   const [actionError, setActionError] = useState("");
   const shownThisPopup = useRef(new Set<string>());
+  const knownOperations = useRef(new Set<string>());
   const [dismissed, setDismissed] = useState<string[]>([]);
+  const matching = operations.filter((operation) => requestOperationMatchesIdentity(operation, identity));
+  useEffect(() => {
+    const hasNewRequest = matching.some((operation) => !knownOperations.current.has(operation.id));
+    knownOperations.current = new Set(matching.map((operation) => operation.id));
+    if (mode !== "popup" || !hasNewRequest || !shownThisPopup.current.size) return;
+    const viewed = [...shownThisPopup.current];
+    shownThisPopup.current.clear();
+    setDismissed((current) => [...new Set([...current, ...viewed])]);
+  }, [operations, mode, identity.tenantId, identity.principalId]);
   const recordViewed = useCallback((id: string) => {
     if (shownThisPopup.current.has(id)) return;
     shownThisPopup.current.add(id);
@@ -83,8 +93,7 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
       setActionError("Could not remember this result as viewed. It will remain available.");
     });
   }, []);
-  const visible = operations.filter((operation) => requestOperationMatchesIdentity(operation, identity)
-    && (mode === "history" || ((!isRequestOperationFinished(operation, tracked) || !dismissed.includes(operation.id))
+  const visible = matching.filter((operation) => (mode === "history" || ((!isRequestOperationFinished(operation, tracked) || !dismissed.includes(operation.id))
     && shouldShowPopupRequest(operation, tracked, shownThisPopup.current.has(operation.id)))));
   if (!visible.length) return null;
   const summary = mode === "history" && visible.every((operation) => isRequestOperationFinished(operation, tracked))
@@ -106,7 +115,7 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
         const progress = (operation.items || []).map((item) => getRequestItemProgress(operation, item, tracked));
         const canDismiss = isRequestOperationFinished(operation, tracked);
         const verb = operation.kind === "extension" ? "Extend" : operation.action === "activate" ? "Activate" : "Deactivate";
-        return <RequestResult key={operation.id} label={`${verb} ${operation.bundleName || operation.items?.[0]?.itemName || "request"}`} finished={canDismiss && mode === "popup"} onViewed={() => recordViewed(operation.id)}>
+        return <RequestResult key={operation.id} id={operation.id} label={`${verb} ${operation.bundleName || operation.items?.[0]?.itemName || "request"}`} finished={canDismiss && mode === "popup"} onViewed={recordViewed}>
           <strong>{verb}{operation.bundleName ? ` bundle ${operation.bundleName}` : ""}{operation.itemIds.length > 1 ? ` · ${operation.itemIds.length} items` : ""}</strong>
           <time dateTime={new Date(operation.startedAt).toISOString()}>{new Date(operation.startedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
           <ul>{operation.items?.map((item, index) => <li key={item.itemId}>
