@@ -400,6 +400,142 @@ test("completed results below the scroll fold are not consumed until viewed", as
   expect((await evidence()).operations).toHaveLength(3);
 });
 
+async function seedUiResult(selected = [items[0]], failLast = false) {
+  const now = Date.now();
+  const operation: RequestOperationRecord = {
+    id: "ui_audit_result_1234", action: "activate", state: "complete", itemIds: selected.map((item) => item.id), targets: [...new Set(selected.map((item) => item.type))],
+    tenantId: tenant, principalId: principal, startedAt: now, updatedAt: now, durationHours: 4, justification: reason,
+    items: createRequestOperationItems(selected, now).map((item, index) => ({ ...item, state: "terminal", result: { itemId: item.itemId, itemName: item.itemName, success: !(failLast && index === selected.length - 1), requestStatus: failLast && index === selected.length - 1 ? "failed" : "active", ...(failLast && index === selected.length - 1 ? { error: "The final item was denied by policy." } : {}) } }))
+  };
+  await worker.evaluate(async (operation) => chrome.storage.local.set({ "quickPimRequestOperations.v2": [operation] }), operation);
+  return operation;
+}
+async function afterPaint(page: Page) { await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); }
+
+test("audit: a bundle is unread until every final outcome has been visible", async ({}, info) => {
+  const selected = Array.from({ length: 12 }, (_, index) => ({ ...items[0], id: `pimGroup:audit-${index}:member`, groupId: `audit-${index}`, displayName: `Audit bundle item ${index + 1}` }));
+  await seedUiResult(selected, true);
+  const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  const labels = page.locator(".request-result-label"); await expect(labels.first()).toBeInViewport({ ratio: 1 }); await afterPaint(page);
+  await page.screenshot({ path: info.outputPath("bundle-first-outcome.png") });
+  expect((await evidence()).operations[0].popupResultSeenAt).toBeUndefined();
+  for (const label of await labels.all()) { await label.scrollIntoViewIfNeeded(); await afterPaint(page); }
+  await expect(labels.last()).toHaveText("Failed");
+  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  await page.screenshot({ path: info.outputPath("bundle-final-outcome.png") });
+});
+
+test("audit: new work does not remove a result whose parameters are being inspected", async ({}, info) => {
+  await seedUiResult(); const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  const card = page.getByRole("article", { name: "Activate Application Support", exact: true });
+  await card.getByText("Parameters and result", { exact: true }).click(); await card.locator("summary").focus();
+  await start(page, [items[1]]);
+  await expect(card.locator("details")).toHaveAttribute("open", ""); await expect(card.locator("summary")).toBeFocused();
+  await page.screenshot({ path: info.outputPath("inspection-preserved.png") });
+});
+
+test("audit: dismissing the last result preserves keyboard focus and the next request starts collapsed", async () => {
+  await seedUiResult(); const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  const dismiss = page.getByRole("button", { name: "Dismiss result", exact: true }); await dismiss.focus(); await page.keyboard.press("Enter");
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeFocused();
+  await start(page, [items[1]]);
+  await expect(page.getByRole("button", { name: "View requests", exact: true })).toHaveAttribute("aria-expanded", "false");
+});
+
+test("audit: status storage failures are visible without a cached request and recover without stale errors", async () => {
+  const page = await context.newPage();
+  await page.addInitScript(() => {
+    const storage = chrome.storage.local as unknown as { get: (key: unknown) => Promise<Record<string, unknown>> };
+    const original = storage.get.bind(storage);
+    Object.assign(window, { restoreAuditRead: () => { storage.get = original; } });
+    storage.get = async (key) => { if (["quickPimRequestOperations.v2", "quickPimRequests.v1"].includes(String(key))) throw new Error("Synthetic read failure"); return original(key); };
+  });
+  await page.goto(`chrome-extension://${extensionId}/popup.html`);
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("temporarily unavailable");
+  await page.evaluate(() => (window as any).restoreAuditRead());
+  await page.getByRole("button", { name: "Retry request status", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+  await start(page, [items[1]]);
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).not.toContainText("unavailable");
+});
+
+test("audit: failed result acknowledgement can be retried without losing history or leaving stale messages", async () => {
+  await seedUiResult(); const page = await context.newPage();
+  await page.addInitScript(() => {
+    const storage = chrome.storage.local as unknown as { set: (values: Record<string, unknown>) => Promise<void> };
+    const original = storage.set.bind(storage);
+    Object.assign(window, { restoreAuditWrite: () => { storage.set = original; } });
+    storage.set = async (values) => {
+      if ((values["quickPimRequestOperations.v2"] as Array<{ popupResultSeenAt?: number }> | undefined)?.some((op) => op.popupResultSeenAt)) throw new Error("Synthetic acknowledgement failure");
+      return original(values);
+    };
+  });
+  await page.goto(`chrome-extension://${extensionId}/popup.html`); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("Could not remember");
+  expect((await evidence()).operations[0].popupResultSeenAt).toBeUndefined();
+  await page.evaluate(() => (window as any).restoreAuditWrite());
+  await page.getByRole("button", { name: "Dismiss result", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+  expect((await evidence()).operations).toHaveLength(1);
+  await start(page, [items[1]]); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).not.toContainText("Could not remember");
+});
+
+test("audit: changing accounts resets expanded request details and preserves account boundaries", async () => {
+  await seedUiResult(); const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  const other = "33333333-3333-4333-8333-333333333333", now = Date.now();
+  const op: RequestOperationRecord = { id: "audit_other_account", action: "activate", state: "running", tenantId: tenant, principalId: other, itemIds: [items[1].id], targets: ["pimGroup"], startedAt: now, updatedAt: now, items: createRequestOperationItems([{ ...items[1], principalId: other }], now) };
+  await worker.evaluate(async ({ other, op }) => {
+    const tokens = await chrome.storage.session.get(["graphToken", "azureManagementToken"]);
+    const change = (token: string) => { const parts = token.split("."); const claims = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))); claims.oid = other; claims.preferred_username = "other@example.invalid"; parts[1] = btoa(JSON.stringify(claims)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); return parts.join("."); };
+    const data = await chrome.storage.local.get("quickPimRequestOperations.v2");
+    await chrome.storage.local.set({ "quickPimRequestOperations.v2": [...data["quickPimRequestOperations.v2"], op] });
+    await chrome.storage.session.set({ graphToken: change(tokens.graphToken), azureManagementToken: change(tokens.azureManagementToken), tokenTimestamp: Date.now(), azureManagementTokenTimestamp: Date.now() });
+  }, { other, op });
+  await expect(page.getByRole("button", { name: "View requests", exact: true })).toHaveAttribute("aria-expanded", "false");
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeVisible();
+});
+
+test("audit: request details, queued disable retries and banners keep footer controls usable", async ({}, info) => {
+  await seedUiResult(); const now = Date.now();
+  const active = { ...items[1], status: "active", activeAssignmentType: "activated", activeFrom: new Date(now - 10_000).toISOString(), activeUntil: new Date(now + 3600_000).toISOString(), assignmentScheduleId: "audit-schedule", assignmentScheduleInstanceId: "audit-instance" };
+  await worker.evaluate(async ({ active, now }) => chrome.storage.local.set({ "quickPimDeactivationRetries.v1": [{ id: "audit-retry", item: active, justification: "Incorrect role selected for the approved task", ticketInfo: {}, state: "queued", createdAt: now, updatedAt: now, retryAt: now + 290_000 }] }), { active, now });
+  const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Cancel retry", exact: true })).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
+  expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true);
+  await page.screenshot({ path: info.outputPath("stacked-notices.png") });
+  await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+  await page.locator(".role-row").filter({ hasText: items[1].displayName }).locator('input[type="checkbox"]').check();
+  await page.getByRole("button", { name: /Continue/ }).click();
+  await expect(page.getByRole("button", { name: "Activate 1 selected", exact: true })).toBeInViewport({ ratio: 1 });
+  await page.getByRole("button", { name: "Back to role selection", exact: true }).click();
+  await page.getByRole("button", { name: "Cancel retry", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Cancel retry", exact: true })).toHaveCount(0);
+});
+
+test("audit: long parameters, dark mode, reduced motion and rapid disclosure toggles remain usable", async ({}, info) => {
+  const op = await seedUiResult([{ ...items[0], displayName: "LongRole".repeat(40), scopeLabel: "LongScope".repeat(35) }]);
+  op.justification = "Detailed justification ".repeat(40); op.ticketInfo = { ticketSystem: "ServiceDesk".repeat(10), ticketNumber: "INC".repeat(40) };
+  await worker.evaluate(async (op) => {
+    const data = await chrome.storage.local.get("quickPimSettings.v1");
+    await chrome.storage.local.set({ "quickPimRequestOperations.v2": [op], "quickPimSettings.v1": { ...data["quickPimSettings.v1"], preferences: { ...data["quickPimSettings.v1"].preferences, darkMode: true } } });
+  }, op);
+  const page = await popup(); await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.getByRole("button", { name: "View requests", exact: true }).click(); await page.locator(".request-activity-card summary").click();
+  const pane = page.locator(".request-activity-details"); expect(await pane.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: info.outputPath("long-parameters-dark.png") });
+  await start(page, [items[1]]);
+  for (let index = 0; index < 8; index++) await page.getByRole("button", { name: index % 2 ? "View requests" : "Hide requests", exact: true }).click();
+  await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(page.locator(".request-activity-progress > span")).toHaveCSS("animation-name", "none");
+});
+
 function installOfflineMicrosoft() {
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
   let serial = Promise.resolve();

@@ -9,6 +9,7 @@ export function getRequestItemProgress(operation: RequestOperationRecord, item: 
     && activationItemIdentitiesMatch(candidate.itemId, item.itemId)
     && candidate.tenantId?.toLowerCase() === (item.tenantId || operation.tenantId)?.toLowerCase()
     && candidate.principalId?.toLowerCase() === (item.principalId || operation.principalId)?.toLowerCase());
+  if (!request && (item.result?.trackingUnavailable || item.pendingTrackedRequest)) return { label: "Status unavailable", pending: false, attention: true };
   const uncertain = item.state === "uncertain" || item.result?.outcomeUnknown || (operation.state === "uncertain" && item.state !== "prepared" && !item.result);
   const status = request ? getEffectiveTrackedRequestStatus(request) : uncertain ? undefined : item.result?.requestStatus;
   if (operation.state === "running" && item.result?.accessRecoveryTarget) return { label: "Waiting for Microsoft sign-in", pending: true, attention: true };
@@ -47,7 +48,7 @@ export function shouldShowPopupRequest(operation: RequestOperationRecord, tracke
 export function getRequestActivitySummary(operations: RequestOperationRecord[], tracked: TrackedPimRequest[]): string {
   const pending = operations.filter((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).pending)).length;
   const attention = operations.filter((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).attention)).length;
-  if (pending) return `${pending} request${pending === 1 ? "" : "s"} in progress${attention ? ` · ${attention} need attention` : ""}`;
+  if (pending) return `${pending} request${pending === 1 ? "" : "s"} in progress${attention ? ` · ${attention} ${attention === 1 ? "needs" : "need"} attention` : ""}`;
   if (attention) return `${attention} request${attention === 1 ? "" : "s"} need${attention === 1 ? "s" : ""} attention`;
   return `${operations.length} new result${operations.length === 1 ? "" : "s"}`;
 }

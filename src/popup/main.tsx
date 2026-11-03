@@ -2129,7 +2129,7 @@ function PopupApp() {
         />
       ) : null}
 
-      <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error}
+      <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error} onRetry={requestActivity.retry}
         identity={identityContext} onOpenAccess={() => void openSettingsSection("role-access")} />
 
       {!showInitialAccessState && visibleTabs.length ? (

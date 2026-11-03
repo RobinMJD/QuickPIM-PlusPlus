@@ -83,6 +83,15 @@ describe("durable request presentation", () => {
     expect(records.find((op) => op.id === pending.id)?.popupResultSeenAt).toBeUndefined();
     expect(records).toHaveLength(2);
   });
+  test("an accepted write with missing status tracking stays visible and protected until tracking recovers", () => {
+    const entry = operation(); entry.state = "complete"; entry.popupResultSeenAt = Date.now();
+    entry.items![0].state = "terminal"; entry.items![0].result = { itemId: item.id, itemName: item.displayName, success: true, trackingUnavailable: true };
+    expect(isRequestOperationFinished(entry, [])).toBe(false);
+    expect(shouldShowPopupRequest(entry, [])).toBe(true);
+    expect(requestBlocksItem(entry, item)).toBe(true);
+    const tracked = { operationId: entry.id, itemId: item.id, tenantId: item.tenantId, principalId: item.principalId, status: "active" } as TrackedPimRequest;
+    expect(isRequestOperationFinished(entry, [tracked])).toBe(true);
+  });
   test("validates the nested background handoff and refuses arbitrary actions or recursive envelopes", () => {
     const request = { action: "activateItems", operationId: "request_test_1234", items: [item], durationHours: 4, justification: operation().justification, ticketInfo: operation().ticketInfo };
     expect(validateQuickPimMessage({ action: "startRequestOperation", request })).toMatchObject({ request: { action: "activateItems", durationHours: 4 } });

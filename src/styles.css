@@ -57,7 +57,8 @@ button {
   max-width: 100%;
   height: 100%;
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background: #f7f8fa;
 }
 
@@ -972,6 +973,10 @@ body.dark-mode .field-clear-button:focus-visible {
 .app-shell.activation-review-open > .content {
   flex-shrink: 999;
 }
+
+/* Stacked notices can exceed the fixed popup height. Keep every section
+   reachable, with a useful role viewport and the footer always available. */
+.app-shell > .content { min-height: 100px; }
 
 .settings-content {
   max-width: 1240px;
@@ -2418,10 +2423,11 @@ a.btn {
 }
 
 .activation-bar {
-  position: relative;
+  position: sticky;
+  bottom: 0;
   z-index: 20;
   display: flex;
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   flex-direction: column;
   width: 100%;
   min-height: 47px;
@@ -5113,5 +5119,7 @@ body.dark-mode .request-attention { color: #ffb4b4; }
 
 body.dark-mode .request-activity-card > time, body.dark-mode .request-activity-card dt { color: #a6b5ca; }
 
-.request-activity-heading { flex-shrink: 0; }
+.request-activity-heading { flex-shrink: 0; flex-wrap: wrap; }
+.request-activity-heading > span { flex: 1 1 140px; min-width: 0; }
+.request-activity-empty { margin: 0 12px 10px; font-size: 12px; }
 .request-activity-details { flex: 1 1 auto; min-height: 0; }

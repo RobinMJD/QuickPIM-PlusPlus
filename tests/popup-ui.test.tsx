@@ -4456,7 +4456,8 @@ describe("popup role row styling", () => {
     expect(settingsDocumentRule).toContain("max-width: none;");
     expect(shellRule).toContain("width: 100%;");
     expect(shellRule).toContain("max-width: 100%;");
-    expect(shellRule).toContain("overflow: hidden;");
+    expect(shellRule).toContain("overflow-x: hidden;");
+    expect(shellRule).toContain("overflow-y: auto;");
   });
 
   test("right-aligns activation count and status badge in the status column", () => {
@@ -4589,7 +4590,7 @@ describe("popup role row styling", () => {
     expect(successRule).toContain("animation: refreshSuccessFade 4s ease forwards;");
   });
 
-  test("pins a compact activation footer while only the role content scrolls", () => {
+  test("pins a compact activation footer and allows crowded notices to scroll", () => {
     const css = readFileSync(join(process.cwd(), "src/styles.css"), "utf8");
     const shellRule = css.match(/\.app-shell\s*\{[^}]+\}/)?.[0] || "";
     const contentRule = css.match(/\.content\s*\{[^}]+\}/)?.[0] || "";
@@ -4605,7 +4606,7 @@ describe("popup role row styling", () => {
     expect(shellRule).toContain("flex-direction: column;");
     expect(shellRule).toContain("height: 100%;");
     expect(shellRule).toContain("min-height: 0;");
-    expect(shellRule).toContain("overflow: hidden;");
+    expect(shellRule).toContain("overflow-y: auto;");
     expect(contentRule).toContain("flex: 1 1 0;");
     expect(contentRule).toContain("min-height: 0;");
     expect(contentRule).toContain("overflow-y: auto;");
@@ -4615,15 +4616,15 @@ describe("popup role row styling", () => {
     expect(activeFilterRule).toContain("min-height: 40px;");
     expect(contentRule).toContain("padding-bottom: 12px;");
     expect(contentRule).not.toContain("padding-bottom: 248px;");
-    expect(activationRule).toContain("position: relative;");
+    expect(activationRule).toContain("position: sticky;");
+    expect(activationRule).toContain("bottom: 0;");
     expect(activationRule).toContain("z-index: 20;");
     expect(activationRule).toContain("display: flex;");
-    expect(activationRule).toContain("flex: 0 1 auto;");
+    expect(activationRule).toContain("flex: 0 0 auto;");
     expect(activationRule).toContain("flex-direction: column;");
     expect(activationRule).toContain("min-height: 47px;");
     expect(activationRule).toContain("overflow: hidden;");
     expect(activationRule).not.toContain("position: fixed;");
-    expect(activationRule).not.toContain("position: sticky;");
     expect(activationReviewRule).toContain("flex: 1 1 auto;");
     expect(activationReviewRule).toContain("min-height: 0;");
     expect(activationReviewRule).toContain("overflow-y: auto;");

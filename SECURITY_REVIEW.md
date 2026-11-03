@@ -1,6 +1,10 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.18.
+Reviewed for v2.18.19.
+
+## v2.18.19 Request UI Recovery
+
+The popup acknowledges a finished bundle only after all item outcomes have actually been visible, excluding the area covered by the pinned action footer. Open or focused result details survive the arrival of new work. Account changes reset local disclosure state; the existing tenant/principal journal filter remains authoritative. Accepted writes whose status tracking is unavailable remain unresolved and duplicate-protected until tracking recovers. Status-read and acknowledgement failures preserve the journal and expose a recoverable UI notice. This change adds no permissions, dependencies, tokens, or Microsoft write paths. Browser tests use synthetic accounts and offline API responses.
 
 ## v2.18.18 Popup Result Acknowledgement
 
