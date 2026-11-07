@@ -5091,7 +5091,6 @@ body.dark-mode .autosave-status.error {
 
 .request-activity { margin: 10px 12px; border: 1px solid #d5ddea; border-radius: 10px; background: #fff; display: flex; flex-direction: column; flex: 0 1 auto; min-height: 42px; max-height: 42vh; overflow: hidden; }
 .request-activity.has-pending { min-height: 58px; }
-.request-activity.is-expanded { min-height: 160px; }
 .request-activity-progress { flex: 0 0 4px; margin: 0 12px 10px; border-radius: 4px; overflow: hidden; background: #dbeafe; }
 .request-activity-progress > span { display: block; width: 35%; height: 100%; border-radius: inherit; background: #2563eb; animation: request-activity-pulse 1.6s ease-in-out infinite alternate; }
 @keyframes request-activity-pulse { from { transform: translateX(0); } to { transform: translateX(185%); } }
@@ -5100,7 +5099,10 @@ body.dark-mode .request-activity-progress { background: #253958; }
 body.dark-mode .request-activity-progress > span { background: #7aa7ff; }
 .request-activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 12px; font-weight: 600; }
 .request-activity-heading .btn { padding: 6px 8px; min-height: 32px; }
-.request-activity-details { max-height: min(42vh, 340px); overflow-y: auto; padding: 0 12px 10px; border-top: 1px solid #d5ddea; font-size: 12px; }
+.request-activity-dialog { width: calc(100% - 24px); max-width: 720px; height: min(440px, calc(100vh - 24px)); max-height: calc(100vh - 24px); padding: 0; border: 1px solid #d5ddea; border-radius: 10px; background: #fff; color: inherit; overflow: hidden; }
+.request-activity-dialog[open] { display: flex; flex-direction: column; }
+.request-activity-dialog::backdrop { background: rgba(15, 23, 42, 0.28); }
+.request-activity-details { overflow-y: auto; overscroll-behavior: contain; padding: 0 12px 10px; border-top: 1px solid #d5ddea; font-size: 12px; }
 .request-activity-details > p { margin: 8px 0; }
 .request-activity-card { padding: 10px 0; overflow-wrap: anywhere; }
 .request-activity-card + .request-activity-card { border-top: 1px solid #d5ddea; }
@@ -5114,6 +5116,9 @@ body.dark-mode .request-activity-progress > span { background: #7aa7ff; }
 .request-attention { color: var(--danger, #b42318); }
 
 body.dark-mode .request-activity { background: #192231; border-color: #3b485c; }
+body.dark-mode .request-activity-dialog { background: #192231; border-color: #3b485c; }
+.status-badge.request-pending { background: #dbeafe; color: #1d4ed8; white-space: normal; }
+body.dark-mode .status-badge.request-pending { background: #253958; color: #a7c7ff; }
 body.dark-mode .request-activity-details, body.dark-mode .request-activity-card + .request-activity-card { border-color: #3b485c; }
 body.dark-mode .request-attention { color: #ffb4b4; }
 

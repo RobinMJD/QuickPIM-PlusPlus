@@ -71,7 +71,14 @@ async function seed(restoreOnlyTokens = false) {
 }
 async function popup() { const page = await context.newPage(); await page.goto(`chrome-extension://${extensionId}/popup.html`); return page; }
 async function evidence() { return worker.evaluate(async () => { const data = await chrome.storage.local.get(["requestTestHarness", "quickPimRequestOperations.v2", "quickPimPopupDraft.v1"]); return { harness: data.requestTestHarness as { hold: boolean; writes: Array<Record<string, any>>; unexpected: string[] }, operations: (data["quickPimRequestOperations.v2"] || []) as RequestOperationRecord[], draft: data["quickPimPopupDraft.v1"] }; }); }
-async function release(approval = false) { await expect.poll(async () => (await evidence()).harness.writes.length).toBeGreaterThan(0); await worker.evaluate(async (approval) => { const data = await chrome.storage.local.get("requestTestHarness"); await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, hold: false, approval } }); }, approval); }
+async function release(approval = false, confirm = true) {
+  await expect.poll(async () => (await evidence()).harness.writes.length).toBeGreaterThan(0);
+  await worker.evaluate(async ({ approval, confirm }) => {
+    const data = await chrome.storage.local.get("requestTestHarness"); const harness = data.requestTestHarness;
+    await chrome.storage.local.set({ requestTestHarness: { ...harness, hold: false, approval,
+      confirmedGroups: !approval && confirm ? harness.writes.filter((write: any) => write.action !== "selfDeactivate").map((write: any) => write.groupId).filter(Boolean) : [] } });
+  }, { approval, confirm });
+}
 async function submitFromUI(page: Page, name: string) {
   await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
   await page.locator(".role-row").filter({ hasText: name }).locator('input[type="checkbox"]').check();
@@ -292,6 +299,7 @@ test("request details remain usable in dark mode and through keyboard navigation
   const parameters = page.locator(".request-activity-card summary"); await parameters.focus(); await page.keyboard.press("Enter");
   await expect(page.locator(".request-activity-card details")).toHaveAttribute("open", "");
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("INC-1245");
+  if (await page.getByRole("dialog", { name: "Request details", exact: true }).isVisible()) await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("requests-dark-details.png") });
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -318,9 +326,9 @@ for (const darkMode of [false, true]) {
     const details = page.locator("#request-activity-details");
     expect(await details.evaluate((element) => element.clientHeight)).toBeGreaterThan(100);
     await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toBeInViewport();
-    await expect(page.getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
+    await expect(page.locator("#request-activity-details").getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
+    if (await page.getByRole("dialog", { name: "Request details", exact: true }).isVisible()) await page.keyboard.press("Escape");
     await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
-    await page.getByRole("button", { name: "Hide requests", exact: true }).click();
     await submitFromUI(page, items[1].displayName);
     await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("2 requests in progress");
     expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight && document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -332,22 +340,23 @@ for (const darkMode of [false, true]) {
     await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeInViewport();
     await page.getByRole("article", { name: "Activate Application Support", exact: true }).scrollIntoViewIfNeeded();
     await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toBeInViewport();
+    if (await page.getByRole("dialog", { name: "Request details", exact: true }).isVisible()) await page.keyboard.press("Escape");
     await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
     await page.screenshot({ path: info.outputPath(`request-results-${darkMode ? "dark" : "light"}.png`) });
   });
 }
 
-test("a completed result is shown once after popup closure without removing its history", async () => {
+test("a completed result expires across popup and browser restarts without removing history", async () => {
   let page = await popup(); await start(page, [items[0]]); await page.close(); await release();
   await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
   page = await popup();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("1 new result");
-  // A collapsed strip does not count as reading the actual result.
+  // Reopening does not restart the completion notice lifetime.
   await page.close(); page = await popup();
   await expect(page.getByRole("button", { name: "View requests", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "View requests", exact: true }).click();
   await expect(page.getByRole("region", { name: "Requests", exact: true }).getByText("Active", { exact: true })).toBeInViewport();
-  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt), { timeout: 13_000 }).toBe(true);
   await page.close(); await context.close(); await launch(); await seed(true); page = await popup();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
   expect((await evidence()).operations).toHaveLength(1);
@@ -366,38 +375,26 @@ test("a completed result is shown once after popup closure without removing its 
   await settings.close();
 });
 
-test("starting another request clears a viewed completion without hiding pending work", async ({}, info) => {
-  const page = await popup(); await start(page, [items[0]]);
-  await page.getByRole("button", { name: "View requests", exact: true }).click();
-  await expect(page.getByText("Submitting to Microsoft", { exact: true })).toBeInViewport();
-  await release();
-  await expect(page.getByRole("region", { name: "Requests", exact: true }).getByText("Active", { exact: true })).toBeInViewport();
-  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
-  await worker.evaluate(async () => {
-    const data = await chrome.storage.local.get("requestTestHarness");
-    await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, hold: true } });
-  });
-  await start(page, [items[1]]);
-  await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "Hide requests", exact: true }).click();
+test("starting another request never extends a completed notice or removes pending work", async ({}, info) => {
+  const completed = await seedUiResult();
+  await worker.evaluate(async (completed) => chrome.storage.local.set({ "quickPimRequestOperations.v2": [{ ...completed, startedAt: Date.now() - 30_000, terminalAt: Date.now() - 20_000, updatedAt: Date.now() - 20_000, items: completed.items?.map(item => ({ ...item, updatedAt: Date.now() - 20_000 })) }] }), completed);
+  const page = await popup(); await start(page, [items[1]]);
   await page.getByRole("button", { name: "View requests", exact: true }).click();
   await expect(page.getByRole("article", { name: "Activate Application Support", exact: true })).toHaveCount(0);
   await expect(page.getByRole("article", { name: "Activate Deployment Owners", exact: true })).toBeInViewport();
-  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("request in progress");
   await page.screenshot({ path: info.outputPath("only-running-request.png") });
   expect((await evidence()).operations).toHaveLength(2);
 });
 
-test("completed results below the scroll fold are not consumed until viewed", async () => {
-  let page = await popup();
-  for (const item of items.slice(0, 3)) await start(page, [item]);
-  await page.close(); await release();
-  await expect.poll(async () => (await evidence()).operations.filter((op) => op.state === "complete").length).toBe(3);
-  page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
-  await expect.poll(async () => (await evidence()).operations.filter((op) => op.popupResultSeenAt).length).toBe(1);
-  await page.close(); page = await popup();
-  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("2 new results");
-  expect((await evidence()).operations).toHaveLength(3);
+test("old unread results stay in history without returning to the popup", async () => {
+  const result = await seedUiResult();
+  await worker.evaluate(async (result) => chrome.storage.local.set({ "quickPimRequestOperations.v2": [{ ...result, startedAt: Date.now() - 30_000, terminalAt: Date.now() - 20_000, updatedAt: Date.now() - 20_000 }] }), result);
+  const page = await popup(); await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+  expect((await evidence()).operations).toHaveLength(1);
+  const settings = await context.newPage(); await settings.setViewportSize({ width: 1000, height: 720 });
+  await settings.goto(`chrome-extension://${extensionId}/settings.html#activity`);
+  await settings.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(settings.getByRole("article", { name: "Activate Application Support", exact: true })).toBeVisible();
 });
 
 async function seedUiResult(selected = [items[0]], failLast = false) {
@@ -407,12 +404,20 @@ async function seedUiResult(selected = [items[0]], failLast = false) {
     tenantId: tenant, principalId: principal, startedAt: now, updatedAt: now, durationHours: 4, justification: reason,
     items: createRequestOperationItems(selected, now).map((item, index) => ({ ...item, state: "terminal", result: { itemId: item.itemId, itemName: item.itemName, success: !(failLast && index === selected.length - 1), requestStatus: failLast && index === selected.length - 1 ? "failed" : "active", ...(failLast && index === selected.length - 1 ? { error: "The final item was denied by policy." } : {}) } }))
   };
-  await worker.evaluate(async (operation) => chrome.storage.local.set({ "quickPimRequestOperations.v2": [operation] }), operation);
+  await worker.evaluate(async ({ operation, selected }) => {
+    const data = await chrome.storage.local.get(["quickPimDataCache.v1", "requestTestHarness"]); const cache = data["quickPimDataCache.v1"];
+    const successful = selected.filter((_item, index) => operation.items?.[index]?.result?.success);
+    for (const target of ["directoryRole", "pimGroup", "azureRole"]) {
+      cache.activeByTarget[target].items = successful.filter(item => item.type === target)
+        .map(item => ({ ...item, status: "active", activeAssignmentType: "activated", activeUntil: new Date(Date.now() + 3600_000).toISOString() }));
+    }
+    await chrome.storage.local.set({ "quickPimRequestOperations.v2": [operation], "quickPimDataCache.v1": cache, requestTestHarness: { ...data.requestTestHarness, confirmedGroups: successful.filter((item: any) => item.groupId).map((item: any) => item.groupId) } });
+  }, { operation, selected });
   return operation;
 }
 async function afterPaint(page: Page) { await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))); }
 
-test("audit: a bundle is unread until every final outcome has been visible", async ({}, info) => {
+test("audit: bundle outcomes remain readable through the last partial failure", async ({}, info) => {
   const selected = Array.from({ length: 12 }, (_, index) => ({ ...items[0], id: `pimGroup:audit-${index}:member`, groupId: `audit-${index}`, displayName: `Audit bundle item ${index + 1}` }));
   await seedUiResult(selected, true);
   const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
@@ -421,13 +426,12 @@ test("audit: a bundle is unread until every final outcome has been visible", asy
   expect((await evidence()).operations[0].popupResultSeenAt).toBeUndefined();
   for (const label of await labels.all()) { await label.scrollIntoViewIfNeeded(); await afterPaint(page); }
   await expect(labels.last()).toHaveText("Failed");
-  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
+  await expect(labels.last()).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("bundle-final-outcome.png") });
 });
 
 test("audit: new work does not remove a result whose parameters are being inspected", async ({}, info) => {
   await seedUiResult(); const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
-  await expect.poll(async () => Boolean((await evidence()).operations[0].popupResultSeenAt)).toBe(true);
   const card = page.getByRole("article", { name: "Activate Application Support", exact: true });
   await card.getByText("Parameters and result", { exact: true }).click(); await card.locator("summary").focus();
   await start(page, [items[1]]);
@@ -473,14 +477,15 @@ test("audit: failed result acknowledgement can be retried without losing history
     };
   });
   await page.goto(`chrome-extension://${extensionId}/popup.html`); await page.getByRole("button", { name: "View requests", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("Could not remember");
+  await page.getByRole("button", { name: "Dismiss result", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("Could not dismiss");
   expect((await evidence()).operations[0].popupResultSeenAt).toBeUndefined();
   await page.evaluate(() => (window as any).restoreAuditWrite());
   await page.getByRole("button", { name: "Dismiss result", exact: true }).click();
   await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
   expect((await evidence()).operations).toHaveLength(1);
   await start(page, [items[1]]); await page.getByRole("button", { name: "View requests", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Requests", exact: true })).not.toContainText("Could not remember");
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).not.toContainText("Could not dismiss");
 });
 
 test("audit: changing accounts resets expanded request details and preserves account boundaries", async () => {
@@ -505,7 +510,9 @@ test("audit: request details, queued disable retries and banners keep footer con
   const active = { ...items[1], status: "active", activeAssignmentType: "activated", activeFrom: new Date(now - 10_000).toISOString(), activeUntil: new Date(now + 3600_000).toISOString(), assignmentScheduleId: "audit-schedule", assignmentScheduleInstanceId: "audit-instance" };
   await worker.evaluate(async ({ active, now }) => chrome.storage.local.set({ "quickPimDeactivationRetries.v1": [{ id: "audit-retry", item: active, justification: "Incorrect role selected for the approved task", ticketInfo: {}, state: "queued", createdAt: now, updatedAt: now, retryAt: now + 290_000 }] }), { active, now });
   const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await page.getByRole("button", { name: "Hide requests", exact: true }).click();
   await expect(page.getByRole("button", { name: "Cancel retry", exact: true })).toBeInViewport();
+  if (await page.getByRole("dialog", { name: "Request details", exact: true }).isVisible()) await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
   expect(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight)).toBe(true);
   await page.screenshot({ path: info.outputPath("stacked-notices.png") });
@@ -528,12 +535,96 @@ test("audit: long parameters, dark mode, reduced motion and rapid disclosure tog
   const page = await popup(); await page.emulateMedia({ reducedMotion: "reduce" });
   await page.getByRole("button", { name: "View requests", exact: true }).click(); await page.locator(".request-activity-card summary").click();
   const pane = page.locator(".request-activity-details"); expect(await pane.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  if (await page.getByRole("dialog", { name: "Request details", exact: true }).isVisible()) await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("long-parameters-dark.png") });
   await start(page, [items[1]]);
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
   for (let index = 0; index < 8; index++) await page.getByRole("button", { name: index % 2 ? "View requests" : "Hide requests", exact: true }).click();
   await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(page.locator(".request-activity-progress > span")).toHaveCSS("animation-name", "none");
+  for (const indicator of await page.locator(".request-activity-progress > span").all()) await expect(indicator).toHaveCSS("animation-name", "none");
+});
+
+test("regression: refresh icon turns from submission while progress can be expanded", async ({}, info) => {
+  const page = await popup(); await submitFromUI(page, items[0].displayName);
+  await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1);
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await expect(page.getByRole("progressbar", { name: "Request details progress", exact: true })).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: info.outputPath("submission-progress.png") });
+  await expect(page.locator(".refresh-button")).toHaveClass(/spinning/);
+  await expect(page.locator("#request-activity-details").getByText("Submitting to Microsoft", { exact: true })).toBeInViewport({ ratio: 1 });
+});
+
+test("regression: completed notices expire automatically without expanding or dismissing", async () => {
+  await seedUiResult(); let page = await popup();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("1 new result");
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0, { timeout: 13_000 });
+  expect((await evidence()).operations).toHaveLength(1);
+  await page.close(); page = await popup();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0);
+});
+
+test("regression: accepted activation keeps its role pending while active assignments refresh", async () => {
+  const page = await popup(); await submitFromUI(page, items[0].displayName);
+  await release(false, false); await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
+  const row = page.locator(".role-row").filter({ hasText: items[0].displayName });
+  await expect(row).toContainText("Confirming activation");
+  await expect(row.locator('input[type="checkbox"]')).toHaveCount(0);
+  await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeInViewport({ ratio: 1 });
+  await worker.evaluate(async () => { const data = await chrome.storage.local.get("requestTestHarness"); await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, confirmedGroups: ["group-a"] } }); });
+  await page.locator(".refresh-button").click();
+  await expect(row).toContainText("PIM active");
+  await expect(page.locator(".refresh-button")).not.toHaveClass(/spinning/);
+  await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toHaveCount(0);
+  expect((await evidence()).harness.writes).toHaveLength(1);
+});
+
+test("regression: expanded progress keeps readable height with larger text and a new request form", async ({}, info) => {
+  const page = await popup(); await start(page, [items[0]]);
+  await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+  await page.locator(".role-row").filter({ hasText: items[1].displayName }).locator('input[type="checkbox"]').check();
+  await page.getByRole("button", { name: /Continue/ }).click();
+  await writeFile(path.join(extensionPath, "larger-text.css"), ".request-activity { font-size: 32px; } .request-activity-heading .btn { font-size: 24px; }");
+  await page.addStyleTag({ url: `chrome-extension://${extensionId}/larger-text.css` });
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  await page.screenshot({ path: info.outputPath("expanded-large-text.png") });
+  expect(await page.locator("#request-activity-details").evaluate(el => el.clientHeight)).toBeGreaterThanOrEqual(140);
+  await expect(page.locator("#request-activity-details").getByText("Submitting to Microsoft", { exact: true })).toBeInViewport({ ratio: 1 });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "View requests", exact: true })).toBeFocused();
+  await expect(page.getByRole("button", { name: "Activate 1 selected", exact: true })).toBeInViewport({ ratio: 1 });
+});
+
+test("regression: automatic expiry closes inspected results and returns keyboard focus", async () => {
+  await seedUiResult(); const page = await popup(); await page.getByRole("button", { name: "View requests", exact: true }).click();
+  const parameters = page.locator(".request-activity-card summary"); await parameters.click(); await parameters.focus();
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0, { timeout: 13_000 });
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeFocused();
+  expect((await evidence()).operations).toHaveLength(1);
+});
+
+test("regression: awaiting approval stays visible without endlessly spinning", async () => {
+  const page = await popup(); await submitFromUI(page, items[0].displayName); await release(true);
+  await expect(page.locator(".role-row").filter({ hasText: items[0].displayName })).toContainText("Awaiting approval");
+  await expect(page.locator(".refresh-button")).not.toHaveClass(/spinning/);
+  await page.getByRole("button", { name: "View requests", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Request details", exact: true }); await expect(dialog).toContainText("Awaiting approval");
+  for (let index = 0; index < 8; index++) { await page.keyboard.press("Tab"); expect(await page.evaluate(() => document.activeElement === document.body || Boolean(document.activeElement?.closest("dialog")))).toBe(true); }
+  await page.keyboard.press("Escape"); await expect(page.getByRole("button", { name: "View requests", exact: true })).toBeFocused();
+});
+
+test("regression: finishing one request does not stop another request spinner or show a success check", async () => {
+  const page = await popup(); await start(page, items.slice(0, 2));
+  await expect.poll(async () => (await evidence()).harness.writes.length).toBe(2);
+  await worker.evaluate(async () => { const data = await chrome.storage.local.get("requestTestHarness"); await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, hold: false, holdGroup: "group-b", confirmedGroups: ["group-a"] } }); });
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toContainText("request in progress");
+  await expect.poll(async () => (await evidence()).operations[0].items?.filter(item => item.requestId === "request-1").length).toBe(1);
+  await expect(page.locator(".refresh-button")).toHaveClass(/spinning/);
+  await expect(page.locator(".refresh-success-indicator")).toHaveCount(0);
+  await worker.evaluate(async () => { const data = await chrome.storage.local.get("requestTestHarness"); await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, holdGroup: undefined, confirmedGroups: ["group-a", "group-b"] } }); });
+  await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
+  await expect(page.locator(".refresh-button")).not.toHaveClass(/spinning/);
+  expect((await evidence()).harness.writes).toHaveLength(2);
 });
 
 function installOfflineMicrosoft() {
@@ -554,13 +645,14 @@ function installOfflineMicrosoft() {
         await chrome.storage.local.set({ requestTestHarness: harness });
       }); await serial;
       let harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness;
-      while (harness.hold) { await new Promise((resolve) => setTimeout(resolve, 25)); harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness; }
+      while (harness.hold || (harness.holdGroup && harness.holdGroup === body.groupId)) { await new Promise((resolve) => setTimeout(resolve, 25)); harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness; }
       if (harness.failGroup && body.groupId === harness.failGroup) return json({ error: { code: "Denied", message: "The test policy denied this request." } }, 403);
       const status = body.action === "selfDeactivate" ? "Revoked" : harness.approval ? "PendingApproval" : "Provisioned";
       return json({ id, ...body, status, ...(body.properties ? { properties: { ...body.properties, status } } : {}) }, 201);
     }
     if (["graph.microsoft.com", "management.azure.com"].includes(url.hostname)) {
       const harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness;
+      if (url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: (harness?.items || []).filter((item: any) => (harness?.confirmedGroups || []).includes(item.groupId)).map((item: any) => ({ id: `instance-${item.groupId}`, assignmentScheduleId: `schedule-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId, assignmentType: "Activated", startDateTime: new Date(Date.now() - 10_000).toISOString(), endDateTime: new Date(Date.now() + 3600_000).toISOString() })) });
       if (url.pathname.includes("/privilegedAccess/group/eligibilityScheduleInstances")) return json({ value: (harness?.items || []).filter((item: ActivationItem) => item.type === "pimGroup").map((item: any) => ({ id: `eligibility-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId })) });
       if (url.pathname.endsWith("/$batch")) return json({ responses: (body.requests || []).map((request: { id: string; url: string }) => ({ id: request.id, status: 200, body: { id: "group-a", displayName: request.url.includes("group-b") ? "Deployment Owners" : "Application Support", value: [] } })) });
       return json({ value: [] });

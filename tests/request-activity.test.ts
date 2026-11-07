@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { getRequestItemProgress, requestBlocksItem, getRequestActivitySummary, isRequestOperationFinished, shouldShowPopupRequest } from "../src/lib/requestActivity";
+import { getRequestItemProgress, requestBlocksItem, getRequestActivitySummary, isRequestOperationFinished, shouldShowPopupRequest, getRequestRowProgress, POPUP_RESULT_NOTICE_MS, REQUEST_CONFIRMATION_MS } from "../src/lib/requestActivity";
 import { archiveLegacyPopupResults, createRequestOperationItems, markRequestOperationResultsSeen, sanitizeRequestOperations, REQUEST_OPERATIONS_LOCAL_KEY } from "../src/lib/requestOperations";
 import { validateQuickPimMessage } from "../src/lib/messages";
 import type { ActivationItem, RequestOperationRecord, TrackedPimRequest } from "../src/lib/types";
@@ -39,13 +39,13 @@ describe("durable request presentation", () => {
     expect(getRequestItemProgress(entry, entry.items![0], [tracked]).label).toBe("Deactivated");
     expect(getRequestActivitySummary([entry], [tracked])).toBe("1 new result");
   });
-  test("only acknowledged final results disappear; pending and unresolved outcomes remain visible", () => {
+  test("acknowledged and expired final notices disappear; pending and unresolved outcomes remain visible", () => {
     const entry = operation(); entry.state = "complete"; entry.items![0].state = "terminal";
     const tracked = { operationId: entry.id, itemId: item.id, tenantId: item.tenantId, principalId: item.principalId, status: "active", activeFrom: new Date(Date.now() - 60_000).toISOString() } as TrackedPimRequest;
     expect(shouldShowPopupRequest(entry, [tracked])).toBe(true);
     entry.popupResultSeenAt = Date.now();
     expect(shouldShowPopupRequest(entry, [tracked])).toBe(false);
-    expect(shouldShowPopupRequest(entry, [tracked], true)).toBe(true);
+    expect(shouldShowPopupRequest(entry, [tracked], Date.now() + POPUP_RESULT_NOTICE_MS)).toBe(false);
     for (const status of ["pendingApproval", "provisioning", "scheduled", "unknown", "statusUnavailable"] as const) {
       tracked.status = status;
       tracked.activeFrom = new Date(Date.now() + 60_000).toISOString();
@@ -55,6 +55,40 @@ describe("durable request presentation", () => {
     tracked.status = "failed";
     expect(isRequestOperationFinished(entry, [tracked])).toBe(true);
     expect(shouldShowPopupRequest(entry, [tracked])).toBe(false);
+  });
+  test("final notices have an absolute deadline even when never opened or acknowledged", () => {
+    const entry = operation(); entry.state = "complete"; entry.items![0].state = "terminal";
+    expect(shouldShowPopupRequest(entry, [], entry.updatedAt + POPUP_RESULT_NOTICE_MS - 1)).toBe(true);
+    expect(shouldShowPopupRequest(entry, [], entry.updatedAt + POPUP_RESULT_NOTICE_MS)).toBe(false);
+    expect(shouldShowPopupRequest(entry, [], entry.updatedAt + 86_400_000)).toBe(false);
+    expect(shouldShowPopupRequest(entry, [], entry.updatedAt - 1)).toBe(false);
+    entry.state = "uncertain"; entry.items![0].state = "uncertain";
+    expect(shouldShowPopupRequest(entry, [], entry.updatedAt + 86_400_000)).toBe(true);
+  });
+  test("request rows retain exact phases and bridge assignment discovery without reviving old writes", () => {
+    const entry = operation(); entry.items![0].state = "sending";
+    expect(getRequestRowProgress([entry], item, [])?.label).toBe("Submitting to Microsoft");
+    entry.state = "complete"; entry.items![0].state = "terminal";
+    entry.items![0].result = { itemId: item.id, itemName: item.displayName, success: true, requestStatus: "active" };
+    expect(getRequestRowProgress([entry], item, [])?.label).toBe("Confirming activation");
+    expect(getRequestRowProgress([entry], { ...item, status: "active" }, [])).toBeUndefined();
+    expect(getRequestRowProgress([entry], { ...item, principalId: "other" }, [])).toBeUndefined();
+    expect(getRequestRowProgress([entry], { ...item, id: "directoryRole:role-1:/" }, [])).toBeUndefined();
+    expect(getRequestRowProgress([entry], item, [], entry.updatedAt + REQUEST_CONFIRMATION_MS)).toBeUndefined();
+    const approved = { operationId: entry.id, itemId: item.id, tenantId: item.tenantId, principalId: item.principalId, status: "active", updatedAt: new Date(entry.updatedAt + 3600_000).toISOString() } as TrackedPimRequest;
+    expect(getRequestRowProgress([entry], item, [approved], entry.updatedAt + 3600_001)?.label).toBe("Confirming activation");
+    expect(getRequestRowProgress([entry], item, [approved], entry.updatedAt + 3600_000 + REQUEST_CONFIRMATION_MS)).toBeUndefined();
+    approved.activeAssignmentMissingSince = new Date(entry.updatedAt).toISOString();
+    expect(getRequestRowProgress([entry], item, [approved], entry.updatedAt + 3600_001)).toBeUndefined();
+    entry.action = "deactivate"; entry.items![0].result.requestStatus = "completed";
+    expect(getRequestRowProgress([entry], { ...item, status: "active" }, [])?.label).toBe("Confirming deactivation");
+    expect(getRequestRowProgress([entry], item, [])).toBeUndefined();
+  });
+  test("an unresolved older write stays guarded even if newer history contains a failure", () => {
+    const older = operation(); older.items![0].state = "uncertain"; older.state = "uncertain";
+    const latest = { ...operation(), id: "latest_request", startedAt: older.startedAt + 1, state: "complete" as const };
+    latest.items![0].state = "terminal"; latest.items![0].result = { itemId: item.id, itemName: item.displayName, success: false, requestStatus: "failed" };
+    expect(getRequestRowProgress([older, latest], item, [])?.label).toContain("Outcome unknown");
   });
   test("acknowledging a result preserves its journal and parameters and refuses pending work", async () => {
     const finished = operation(); finished.state = "complete"; finished.items![0].state = "terminal";

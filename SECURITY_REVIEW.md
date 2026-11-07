@@ -1,6 +1,10 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.19.
+Reviewed for v2.18.20.
+
+## v2.18.20 Progress and Notice Lifecycle
+
+Expanded progress uses a native dialog with bounded scrolling and browser focus/Escape handling. Completed popup notices expire after ten seconds; acknowledgement and expiry retain the execution journal and Activity history. Pending approvals, scheduled requests, uncertain writes, and unavailable tracking remain unresolved. Role rows retain submission and bounded assignment-confirmation phases, including after approval; unresolved older writes remain duplicate-protected. Session token changes refresh the popup identity and clear stale account data before loading the new account. These changes do not add permissions, dependencies, automatic privileged writes, or write retries. Synthetic browser regressions verify account switching, popup closure, restart recovery, completion expiry, partial requests, keyboard access, and status-refresh transitions.
 
 ## v2.18.19 Request UI Recovery
 

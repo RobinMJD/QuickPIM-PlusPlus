@@ -19,6 +19,7 @@ import {
   normalizeActivationItemId
 } from "../lib/activationIdentity";
 import type { ActivationItem, PopupRequestMode, QuickPimSettings, ReferenceDataCache } from "../lib/types";
+import type { RequestItemProgress } from "../lib/requestActivity";
 
 const MAX_EXPIRY_TIMER_DELAY_MS = 2_147_000_000;
 
@@ -39,6 +40,7 @@ export function RoleList({
   onToggleFavorite,
   onActivationExpired,
   isRequestPending,
+  getRequestProgress,
   readonly = false
 }: {
   items: ActivationItem[];
@@ -57,6 +59,7 @@ export function RoleList({
   onToggleFavorite?: (itemId: string) => void;
   onActivationExpired?: (item: ActivationItem) => void;
   isRequestPending?: (item: ActivationItem) => boolean;
+  getRequestProgress?: (item: ActivationItem) => RequestItemProgress | undefined;
   readonly?: boolean;
 }) {
   const [activeNow, setActiveNow] = useState(() => Date.now());
@@ -119,7 +122,8 @@ export function RoleList({
         const usage = getUsage(item, settings);
         const actionState = getRowActionState(item);
         const itemMode = actionState.mode;
-        const requestPending = Boolean(isRequestPending?.(item));
+        const requestProgress = getRequestProgress?.(item);
+        const requestPending = Boolean(requestProgress || isRequestPending?.(item));
         const isActionable = !readonly && !requestPending && actionState.selectable && Boolean(itemMode);
         const isSelectable = Boolean(isActionable && (!requestMode || requestMode === itemMode));
         const selected = isSelectable && [...selectedIds].some((itemId) =>
@@ -182,8 +186,8 @@ export function RoleList({
                   {usage.activationCount}
                 </span>
               ) : null}
-              <span className={`badge status-badge ${statusBadgeClass}`} title={statusTitle}>
-                {requestPending ? "request in progress" : formatActivationItemStatusLabel(item)}
+              <span className={`badge status-badge ${requestPending ? "request-pending" : statusBadgeClass}`} title={requestProgress?.label || statusTitle}>
+                {requestProgress?.label || (requestPending ? "request in progress" : formatActivationItemStatusLabel(item))}
               </span>
               {shouldShowRemainingActivationTime(item, showRemainingActivationTime) && item.activeUntil ? (
                 <RemainingActivationTime activeUntil={item.activeUntil} onExpired={handleActivationExpired} />

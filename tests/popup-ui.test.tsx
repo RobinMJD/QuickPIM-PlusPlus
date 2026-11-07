@@ -9,6 +9,13 @@ import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
 import type { ActivationItem, RequestOperationRecord } from "../src/lib/types";
 import { CHROME_WEB_STORE_EXTENSION_ID, EDGE_ADDONS_URL } from "../src/lib/distribution";
 
+// jsdom has no native dialog top layer. Focus, Escape and real rendering are
+// verified in the Chromium extension tests; these mocks support unit fixtures.
+if (!HTMLDialogElement.prototype.showModal) {
+  HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new Event("close")); };
+}
+
 afterEach(() => {
   const cleanupWindow = window as Window & { __quickPimPopupUnmount?: () => void };
   cleanupWindow.__quickPimPopupUnmount?.();

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { sanitizeErrorMessage } from "../lib/security";
 import { formatLoadMessages } from "../lib/popupModel";
 import { loadRequestOperations, markRequestOperationResultsSeen, requestOperationMatchesIdentity, REQUEST_OPERATIONS_LOCAL_KEY } from "../lib/requestOperations";
 import { loadTrackedRequests, REQUEST_TRACKING_KEY } from "../lib/requestTracking";
-import { getRequestActivitySummary, getRequestItemProgress, isRequestOperationFinished, shouldShowPopupRequest } from "../lib/requestActivity";
+import { getRequestActivitySummary, getRequestResultVisibleUntil, getRequestItemProgress, isRequestOperationFinished, shouldShowPopupRequest } from "../lib/requestActivity";
 import { formatExtensionDuration } from "../lib/requestExtension";
+import type { RequestProgressResolver } from "../lib/requestActivity";
 import { sendRuntimeMessage } from "../lib/runtimeMessaging";
 import type { RequestOperationRecord, TrackedPimRequest } from "../lib/types";
 
@@ -60,47 +61,20 @@ export function useRequestActivity() {
   return { operations, tracked, error, reload, retry };
 }
 
-function RequestResult({ id, label, finished, onViewed, children }: { id: string; label: string; finished: boolean; onViewed: (id: string) => void; children: ReactNode }) {
-  const card = useRef<HTMLElement>(null);
-  useEffect(() => {
-    const results = [...(card.current?.querySelectorAll(".request-result-label") || [])];
-    if (!finished || !results.length || typeof IntersectionObserver === "undefined") return;
-    const viewed = new Set<Element>();
-    const footer = card.current?.closest(".app-shell")?.querySelector<HTMLElement>(".activation-bar");
-    let observer: IntersectionObserver | undefined;
-    const observe = () => {
-      observer?.disconnect();
-      // The sticky footer can cover part of a crowded popup. Covered outcomes
-      // must not be counted as read just because they intersect the viewport.
-      const covered = footer ? Math.max(0, Math.min(innerHeight, innerHeight - footer.getBoundingClientRect().top)) : 0;
-      observer = new IntersectionObserver((entries) => {
-        if (document.visibilityState !== "visible") return;
-        for (const entry of entries) if (entry.isIntersecting && entry.intersectionRatio >= 0.99) viewed.add(entry.target);
-        if (viewed.size === results.length) onViewed(id);
-      }, { threshold: 0.99, rootMargin: `0px 0px -${covered}px 0px` });
-      for (const result of results) observer.observe(result);
-    };
-    const resize = typeof ResizeObserver !== "undefined" ? new ResizeObserver(observe) : undefined;
-    if (footer) resize?.observe(footer);
-    observe();
-    document.addEventListener("visibilitychange", observe);
-    return () => { observer?.disconnect(); resize?.disconnect(); document.removeEventListener("visibilitychange", observe); };
-  }, [finished, id, onViewed]);
-  return <article ref={card} className="request-activity-card" data-operation-id={id} aria-label={label}>{children}</article>;
-}
-
-export function RequestActivity({ operations, tracked, error, identity = {}, onOpenAccess, mode = "popup", onDismiss, onRetry }: {
+export function RequestActivity({ operations, tracked, error, identity = {}, onOpenAccess, mode = "popup", onDismiss, onRetry, getProgress = getRequestItemProgress }: {
   operations: RequestOperationRecord[]; tracked: TrackedPimRequest[]; error?: string;
   identity?: { tenantId?: string; principalId?: string };
   onOpenAccess?: () => void;
   mode?: "popup" | "history";
   onDismiss?: (id: string) => Promise<void>;
   onRetry?: () => Promise<void>;
+  getProgress?: RequestProgressResolver;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [actionError, setActionError] = useState("");
   const [retrying, setRetrying] = useState(false);
   const section = useRef<HTMLElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
   const toggle = useRef<HTMLButtonElement>(null);
   const previousIdentity = useRef<{ tenantId?: string; principalId?: string }>({});
   const restoreFocusAfterRemoval = () => {
@@ -109,12 +83,13 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
       || section.current?.closest(".panel")?.querySelector<HTMLElement>(".panel-title-row h2");
     return () => { if (containedFocus) requestAnimationFrame(() => {
       if (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
-      const target = toggle.current || (fallback?.isConnected ? fallback : undefined);
+      const target = dialog.current?.open ? dialog.current.querySelector<HTMLButtonElement>("button")
+        : toggle.current || (fallback?.isConnected ? fallback : undefined);
       if (target) { if (!target.matches("button, [tabindex]")) target.tabIndex = -1; target.focus(); }
     }); };
   };
-  const shownThisPopup = useRef(new Set<string>());
-  const knownOperations = useRef(new Set<string>());
+  const archived = useRef(new Set<string>());
+  const [, updateClock] = useState(0);
   const [dismissed, setDismissed] = useState<string[]>([]);
   const matching = operations.filter((operation) => requestOperationMatchesIdentity(operation, identity));
   useEffect(() => {
@@ -123,37 +98,40 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
     const changed = (previous.tenantId && next.tenantId && previous.tenantId !== next.tenantId)
       || (previous.principalId && next.principalId && previous.principalId !== next.principalId);
     if (changed) {
-      shownThisPopup.current.clear(); knownOperations.current.clear(); setDismissed([]); setExpanded(false); setActionError("");
+      archived.current.clear(); setDismissed([]); setExpanded(false); setActionError("");
     }
     previousIdentity.current = changed ? next : { tenantId: next.tenantId || previous.tenantId, principalId: next.principalId || previous.principalId };
   }, [identity.tenantId, identity.principalId]);
+  const now = Date.now();
+  const isFinished = (operation: RequestOperationRecord) => isRequestOperationFinished(operation, tracked)
+    && !operation.items?.some((item) => getProgress(operation, item, tracked).pending);
+  const visible = matching.filter((operation) => mode === "history" ||
+    (!isRequestOperationFinished(operation, tracked) || (!operation.popupResultSeenAt && !dismissed.includes(operation.id)
+      && (!isFinished(operation) || shouldShowPopupRequest(operation, tracked, now)))));
   useEffect(() => {
-    const hasNewRequest = matching.some((operation) => !knownOperations.current.has(operation.id));
-    knownOperations.current = new Set(matching.map((operation) => operation.id));
-    if (mode !== "popup" || !hasNewRequest || !shownThisPopup.current.size) return;
-    const cards = [...(section.current?.querySelectorAll<HTMLElement>("[data-operation-id]") || [])];
-    const viewed = [...shownThisPopup.current].filter((id) => {
-      const card = cards.find((candidate) => candidate.dataset.operationId === id);
-      return !card || !(card.contains(document.activeElement) || card.querySelector("details[open]") || card.matches(":hover"));
-    });
-    if (!viewed.length) return;
-    for (const id of viewed) shownThisPopup.current.delete(id);
-    setDismissed((current) => [...new Set([...current, ...viewed])]);
-  }, [operations, mode, identity.tenantId, identity.principalId]);
-  const recordViewed = useCallback((id: string) => {
-    if (shownThisPopup.current.has(id)) return;
-    shownThisPopup.current.add(id);
-    void markRequestOperationResultsSeen([id]).then((acknowledged) => {
-      if (!acknowledged.includes(id)) shownThisPopup.current.delete(id);
-      else setActionError("");
-    }).catch(() => {
-      shownThisPopup.current.delete(id);
-      setActionError("Could not remember this result as viewed. It will remain available.");
-    });
-  }, []);
-  const visible = matching.filter((operation) => (mode === "history" || ((!isRequestOperationFinished(operation, tracked) || !dismissed.includes(operation.id))
-    && shouldShowPopupRequest(operation, tracked, shownThisPopup.current.has(operation.id)))));
+    if (mode !== "popup") return;
+    const final = matching.filter((operation) => isFinished(operation) && !operation.popupResultSeenAt && !archived.current.has(operation.id));
+    if (!final.length) return;
+    const deadline = Math.min(...final.map((operation) => getRequestResultVisibleUntil(operation, tracked)));
+    const timer = setTimeout(() => {
+      const restoreFocus = restoreFocusAfterRemoval();
+      const expired = final.filter((operation) => getRequestResultVisibleUntil(operation, tracked) <= Date.now()).map((operation) => operation.id);
+      for (const id of expired) archived.current.add(id);
+      setDismissed((current) => [...new Set([...current, ...expired])]);
+      updateClock((current) => current + 1);
+      // This is presentation housekeeping. History and execution are retained;
+      // the absolute timeout also applies if acknowledgement cannot be saved.
+      if (expired.length) void markRequestOperationResultsSeen(expired).catch(() => undefined);
+      restoreFocus();
+    }, Math.max(0, deadline - Date.now()));
+    return () => clearTimeout(timer);
+  }, [operations, tracked, mode, identity.tenantId, identity.principalId, dismissed, getProgress]);
   useEffect(() => { if (!visible.length) setExpanded(false); }, [visible.length]);
+  useEffect(() => {
+    const element = dialog.current;
+    if (expanded && element && !element.open) element.showModal();
+    else if (!expanded && element?.open) element.close();
+  }, [expanded]);
   const dismissResult = async (id: string) => {
     const restoreFocus = restoreFocusAfterRemoval();
     try {
@@ -161,7 +139,7 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
       else {
         const acknowledged = await markRequestOperationResultsSeen([id]);
         if (!acknowledged.includes(id)) return;
-        shownThisPopup.current.delete(id); setDismissed((current) => [...new Set([...current, id])]);
+        setDismissed((current) => [...new Set([...current, id])]);
       }
       setActionError(""); restoreFocus();
     } catch { setActionError("Could not dismiss this result. Try again."); }
@@ -175,16 +153,15 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
   };
   if (!visible.length && !error && !actionError) return null;
   const summary = mode === "history" && visible.every((operation) => isRequestOperationFinished(operation, tracked))
-    ? `${visible.length} recent request${visible.length === 1 ? "" : "s"}` : getRequestActivitySummary(visible, tracked);
-  const pending = visible.some((operation) => operation.items?.some((item) => getRequestItemProgress(operation, item, tracked).pending));
+    ? `${visible.length} recent request${visible.length === 1 ? "" : "s"}` : getRequestActivitySummary(visible, tracked, getProgress);
+  const pending = visible.some((operation) => operation.items?.some((item) => getProgress(operation, item, tracked).pending));
   return <section className={`request-activity${expanded ? " is-expanded" : ""}${pending ? " has-pending" : ""}`} aria-label="Requests" ref={section}>
     <div className="request-activity-heading">
       <span role="status" aria-live="polite">{error ? "Request status temporarily unavailable" : !visible.length ? "Request notice" : summary}</span>
-      {visible.length ? <button ref={toggle} className="btn subtle" aria-expanded={expanded} aria-controls={expanded ? "request-activity-details" : undefined} onClick={() => {
+      {visible.length ? <button ref={toggle} className="btn subtle" aria-expanded={expanded} aria-haspopup="dialog" aria-controls={expanded ? "request-activity-dialog" : undefined} onClick={() => {
         const restoreFocus = restoreFocusAfterRemoval();
-        if (expanded) shownThisPopup.current.clear();
         setExpanded((current) => !current); restoreFocus();
-      }}>{expanded ? "Hide requests" : "View requests"}</button> : null}
+      }}>View requests</button> : null}
       {error && onRetry ? <button className="btn subtle" aria-label="Retry request status" disabled={retrying} onClick={() => void retryStatus()}>{retrying ? "Checking…" : "Retry status"}</button> : null}
       {!visible.length && actionError && !error ? <button className="btn subtle" onClick={() => {
         const restoreFocus = restoreFocusAfterRemoval(); setActionError(""); restoreFocus();
@@ -192,14 +169,19 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
     </div>
     {!visible.length ? <p className="request-activity-empty" role="status">{actionError || error}</p> : null}
     {pending ? <div className="request-activity-progress" role="progressbar" aria-label="Request progress" aria-valuetext={error ? "Request status temporarily unavailable" : summary}><span /></div> : null}
-    {expanded ? <div className="request-activity-details" id="request-activity-details">
-      <p className="muted">{mode === "popup" ? "You can close this popup or start another request. Finished results appear once; full history stays in Activity & Usage." : "Request journal, including completed results and their original parameters."}</p>
+    {expanded ? <dialog ref={dialog} className="request-activity-dialog" id="request-activity-dialog" aria-label="Request details" onClose={() => setExpanded(false)}>
+      <div className="request-activity-heading"><span>Request details</span><button className="btn subtle" onClick={() => {
+        const restoreFocus = restoreFocusAfterRemoval(); dialog.current?.close(); setExpanded(false); restoreFocus();
+      }}>Hide requests</button></div>
+      {pending ? <div className="request-activity-progress" role="progressbar" aria-label="Request details progress" aria-valuetext={summary}><span /></div> : null}
+      <div className="request-activity-details" id="request-activity-details">
+      <p className="muted">{mode === "popup" ? "Requests continue when you close this popup. Completed notices clear automatically after 10 seconds. Full history stays in Activity & Usage." : "Request journal, including completed results and their original parameters."}</p>
       {error || actionError ? <p role="status">{actionError || error}</p> : null}
       {visible.map((operation) => {
-        const progress = (operation.items || []).map((item) => getRequestItemProgress(operation, item, tracked));
-        const canDismiss = isRequestOperationFinished(operation, tracked);
+        const progress = (operation.items || []).map((item) => getProgress(operation, item, tracked));
+        const canDismiss = isFinished(operation);
         const verb = operation.kind === "extension" ? "Extend" : operation.action === "activate" ? "Activate" : "Deactivate";
-        return <RequestResult key={operation.id} id={operation.id} label={`${verb} ${operation.bundleName || operation.items?.[0]?.itemName || "request"}`} finished={canDismiss && mode === "popup"} onViewed={recordViewed}>
+        return <article key={operation.id} className="request-activity-card" data-operation-id={operation.id} aria-label={`${verb} ${operation.bundleName || operation.items?.[0]?.itemName || "request"}`}>
           <strong>{verb}{operation.bundleName ? ` bundle ${operation.bundleName}` : ""}{operation.itemIds.length > 1 ? ` · ${operation.itemIds.length} items` : ""}</strong>
           <time dateTime={new Date(operation.startedAt).toISOString()}>{new Date(operation.startedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
           <ul>{operation.items?.map((item, index) => <li key={item.itemId}>
@@ -224,8 +206,8 @@ export function RequestActivity({ operations, tracked, error, identity = {}, onO
           </details>
           {progress.some((item) => item.attention) && onOpenAccess ? <button className="btn subtle" onClick={onOpenAccess}>Access details</button> : null}
           {canDismiss && (mode === "popup" || onDismiss) ? <button className="btn subtle" onClick={() => void dismissResult(operation.id)}>Dismiss result</button> : null}
-        </RequestResult>;
+        </article>;
       })}
-    </div> : null}
+    </div></dialog> : null}
   </section>;
 }

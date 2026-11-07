@@ -102,7 +102,9 @@ import {
   stringifySettingsBackup
 } from "../lib/settingsBackup";
 import { RequestActivity, useRequestActivity } from "../components/RequestActivity";
-import { requestBlocksItem } from "../lib/requestActivity";
+import { getRequestItemProgress, getRequestResultVisibleUntil, getRequestRowProgress, POPUP_RESULT_NOTICE_MS, type RequestProgressResolver } from "../lib/requestActivity";
+import { requestOperationMatchesIdentity } from "../lib/requestOperations";
+import { TOKEN_STORAGE_KEYS } from "../lib/tokenStorage";
 import type { QuickPimMessage } from "../lib/messages";
 import { RoleList } from "./RoleList";
 import { SmartProgressPanel } from "../components/SmartProgressPanel";
@@ -537,6 +539,47 @@ function PopupApp() {
   const durationOptions = useMemo(() => getDurationOptions(requestMode === "activate" ? selectedItems : []), [requestMode, selectedItems]);
   const accessSetupTargets = useMemo(() => getAccessSetupTargets(accessCapabilities), [accessCapabilities]);
   const identityContext = useMemo(() => getIdentityContext(tokenStatus), [tokenStatus]);
+  useEffect(() => {
+    let disposed = false, revision = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area !== "session" || !TOKEN_STORAGE_KEYS.some((key) => changes[key])) return;
+      const currentRevision = ++revision;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        void readTokenStatusWithRetry(tokenStatusRef.current).then((next) => {
+          if (disposed || currentRevision !== revision) return;
+          const previous = getIdentityContext(tokenStatusRef.current);
+          const current = getIdentityContext(next);
+          const changedAccount = previous.tenantId !== current.tenantId || previous.principalId !== current.principalId || previous.mismatch !== current.mismatch;
+          publishTokenStatus(next);
+          if (changedAccount) {
+            setEligibleItems([]); setActiveItems([]);
+            void refresh({ force: false, showLoading: false, suppressMessage: true, targets: enabledRoleFeatures,
+              recoverMissingPortalAccess: false }).catch(() => undefined);
+          }
+        }).catch(() => undefined);
+      }, 100);
+    };
+    chrome.storage.onChanged?.addListener(changed);
+    return () => { disposed = true; revision++; clearTimeout(timer); chrome.storage.onChanged?.removeListener(changed); };
+  }, [enabledRoleFeatures.join("|")]);
+  const requestRowProgress = useMemo(() => new Map(displayItems.map((item) =>
+    [item, getRequestRowProgress(requestActivity.operations, item, requestActivity.tracked)])), [displayItems, requestActivity.operations, requestActivity.tracked]);
+  const requestProgressForItem = (item: ActivationItem) => requestRowProgress.has(item) ? requestRowProgress.get(item)
+    : getRequestRowProgress(requestActivity.operations, item, requestActivity.tracked);
+  const activityProgress: RequestProgressResolver = (operation, entry, tracked) => {
+    const item = displayItems.find((candidate) => activationItemIdentitiesMatch(candidate.id, entry.itemId)
+      && candidate.tenantId?.toLowerCase() === operation.tenantId?.toLowerCase()
+      && candidate.principalId?.toLowerCase() === operation.principalId?.toLowerCase());
+    const row = item ? requestProgressForItem(item) : undefined;
+    return row?.operationId === operation.id ? row : getRequestItemProgress(operation, entry, tracked);
+  };
+  const isRequestBusy = isActivating || requestActivity.operations.some((operation) => requestOperationMatchesIdentity(operation, identityContext)
+    && operation.items?.some((item) => {
+      const progress = getRequestItemProgress(operation, item, requestActivity.tracked);
+      return progress.pending && !["Awaiting approval", "Scheduled"].includes(progress.label) && !progress.label.startsWith("Waiting for Microsoft");
+    })) || displayItems.some((item) => requestProgressForItem(item)?.label.startsWith("Confirming"));
   const accessSourceStatuses = useMemo(
     () => getPopupAccessSourceStatuses(enabledRoleFeatures, tokenStatus, accessCapabilities),
     [accessCapabilities, enabledRoleFeatures.join("|"), tokenStatus]
@@ -804,12 +847,18 @@ function PopupApp() {
 
   useEffect(() => {
     if (!hasActivationDataLoaded) return;
-    const completed = requestActivity.operations.filter((operation) => operation.response && !refreshedOperations.current.has(operation.id));
+    const completed = requestActivity.operations.filter((operation) => {
+      if (!operation.response || !requestOperationMatchesIdentity(operation, identityContext)
+        || getRequestResultVisibleUntil(operation, requestActivity.tracked) - POPUP_RESULT_NOTICE_MS < Date.now() - 60_000) return false;
+      const key = `${operation.id}:${operation.items?.map((item) => getRequestItemProgress(operation, item, requestActivity.tracked).label).join("|")}`;
+      if (refreshedOperations.current.has(key)) return false;
+      refreshedOperations.current.add(key);
+      return true;
+    });
     if (!completed.length) return;
-    completed.forEach((operation) => refreshedOperations.current.add(operation.id));
     const targets = [...new Set(completed.flatMap((operation) => operation.targets))];
     void refresh({ force: true, showLoading: false, suppressMessage: true, targets }).catch(() => undefined);
-  }, [requestActivity.operations, hasActivationDataLoaded]);
+  }, [requestActivity.operations, requestActivity.tracked, hasActivationDataLoaded, identityContext.tenantId, identityContext.principalId]);
 
   const visibleEligibleItems = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -1802,7 +1851,7 @@ function PopupApp() {
 
   async function submitRequest(request: Extract<QuickPimMessage, { action: "activateItems" | "deactivateItems" }>) {
     if (activationRequestInFlight.current) return;
-    if (request.items.some((item) => requestActivity.operations.some((operation) => requestBlocksItem(operation, item, requestActivity.tracked)))) {
+    if (request.items.some((item) => requestProgressForItem(item))) {
       setError("A request for this item and scope is already in progress. You can request other items.");
       return;
     }
@@ -2066,7 +2115,8 @@ function PopupApp() {
           </div>
           <AccessStatusMenu sources={accessSourceStatuses} summary={accessStatusSummary} />
           <button
-            className={`btn icon-btn refresh-button ${isRefreshing ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing ? "needs-attention" : ""}`}
+            className={`btn icon-btn refresh-button ${isRefreshing || isRequestBusy ? "spinning" : ""} ${needsRefreshAttention && !isRefreshing && !isRequestBusy ? "needs-attention" : ""}`}
+            aria-busy={isRefreshing || isRequestBusy}
             onClick={() => {
               if (manualRefreshRunId.current !== undefined) {
                 return;
@@ -2092,7 +2142,7 @@ function PopupApp() {
             aria-label={manualRefreshTargets.length ? manualRefreshLabel : "No enabled role source needs refreshing"}
           >
             <RefreshIcon />
-            {refreshSuccessKey ? (
+            {refreshSuccessKey && !isRefreshing && !isRequestBusy ? (
               <span className="refresh-success-indicator" key={refreshSuccessKey} aria-label="Refresh completed">
                 <CheckIcon />
               </span>
@@ -2130,6 +2180,7 @@ function PopupApp() {
       ) : null}
 
       <RequestActivity operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error} onRetry={requestActivity.retry}
+        getProgress={activityProgress}
         identity={identityContext} onOpenAccess={() => void openSettingsSection("role-access")} />
 
       {!showInitialAccessState && visibleTabs.length ? (
@@ -2285,7 +2336,7 @@ function PopupApp() {
           <section className="content" id="popup-tab-panel" role="tabpanel" aria-label={tabLabel(currentRoleTab)}>
             <RoleList
               items={visibleEligibleItems}
-              isRequestPending={(item) => requestActivity.operations.some((operation) => requestBlocksItem(operation, item, requestActivity.tracked))}
+              getRequestProgress={requestProgressForItem}
               settings={settings}
               referenceData={referenceData}
               selectedIds={selectedIds}
