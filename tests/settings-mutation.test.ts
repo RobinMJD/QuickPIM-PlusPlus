@@ -4,6 +4,7 @@ import {
   SETTINGS_KEY,
   SETTINGS_REVISION_KEY,
   compareAndSetSettingsInStorage,
+  loadSettingsSnapshotInStorage,
   mutateSettings
 } from "../src/lib/settings";
 
@@ -17,7 +18,7 @@ describe("settings mutations", () => {
     vi.stubGlobal("chrome", {
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: data[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, data[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => {
             await Promise.resolve();
             Object.assign(data, value);
@@ -49,7 +50,7 @@ describe("settings mutations", () => {
       [SETTINGS_REVISION_KEY]: 0
     };
     const storage = {
-      get: vi.fn(async (key: string) => ({ [key]: data[key] })),
+      get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, data[key]]))),
       set: vi.fn(async (value: Record<string, unknown>) => {
         Object.assign(data, value);
       })
@@ -78,5 +79,27 @@ describe("settings mutations", () => {
       preferences: { darkMode: true }
     });
     expect(data[SETTINGS_REVISION_KEY]).toBe(2);
+  });
+
+  test("never pairs old settings with a concurrently advanced revision", async () => {
+    const initial = structuredClone(DEFAULT_SETTINGS);
+    const edited = { ...initial, aliasesByItemId: { "directoryRole:reader:/": "Preserve concurrent edit" } };
+    let data: Record<string, unknown> = { [SETTINGS_KEY]: initial, [SETTINGS_REVISION_KEY]: 0 };
+    const storage = {
+      get: vi.fn(async (keys: string | string[]) => {
+        const snapshot = Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, data[key]]));
+        // A writer lands after this storage snapshot. The old implementation
+        // made a second read here and combined revision1 with initial settings.
+        if (keys === SETTINGS_KEY || Array.isArray(keys)) data = { [SETTINGS_KEY]: edited, [SETTINGS_REVISION_KEY]: 1 };
+        return snapshot;
+      }),
+      set: vi.fn(async (value: Record<string, unknown>) => { Object.assign(data, value); })
+    };
+    const snapshot = await loadSettingsSnapshotInStorage(storage);
+    const result = await compareAndSetSettingsInStorage(storage, snapshot.revision, {
+      ...snapshot.settings, preferences: { ...snapshot.settings.preferences, darkMode: true }
+    });
+    expect(result.applied).toBe(false);
+    expect(result.settings.aliasesByItemId).toEqual(edited.aliasesByItemId);
   });
 });

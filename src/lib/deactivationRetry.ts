@@ -10,6 +10,7 @@ export const MINIMUM_ACTIVE_MS = 5 * 60_000;
 const RETRY_MARGIN_MS = 5_000;
 const MAX_LATE_MS = 15 * 60_000;
 const RETENTION_MS = 24 * 60 * 60_000;
+export const DEACTIVATION_RETRY_NOTICE_MS = 10_000;
 const withMutation = createStorageMutationLock("quickPimDeactivationRetryMutation");
 
 export interface DeactivationRetry {
@@ -27,6 +28,12 @@ export interface DeactivationRetry {
 export interface RetryStorage {
   get(key: string): Promise<Record<string, unknown>>;
   set(value: Record<string, unknown>): Promise<void>;
+}
+
+export function visibleDeactivationRetries(entries: DeactivationRetry[], identity: { tenantId?: string; principalId?: string }, now = Date.now()): DeactivationRetry[] {
+  return entries.filter((entry) => (!identity.tenantId || entry.item.tenantId?.toLowerCase() === identity.tenantId.toLowerCase())
+    && (!identity.principalId || entry.item.principalId.toLowerCase() === identity.principalId.toLowerCase())
+    && (!["submitted", "failed"].includes(entry.state) || now < entry.updatedAt + DEACTIVATION_RETRY_NOTICE_MS));
 }
 
 export function isMinimumActiveDurationMessage(message: string): boolean {

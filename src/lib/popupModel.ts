@@ -365,6 +365,7 @@ export function mergeEligibleWithActive(
           ...item,
           status: activeItem.status,
           activeAssignmentType: activeItem.activeAssignmentType || item.activeAssignmentType,
+          activeFrom: activeItem.activeFrom,
           activeUntil: activeItem.activeUntil || item.activeUntil,
           assignmentScheduleId: activeItem.assignmentScheduleId || item.assignmentScheduleId,
           assignmentScheduleInstanceId: activeItem.assignmentScheduleInstanceId || item.assignmentScheduleInstanceId,

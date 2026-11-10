@@ -3,6 +3,7 @@ import {
   PORTAL_RECOVERY_GROUP_TITLE,
   PORTAL_RECOVERY_INTERACTION_TIMEOUT_MS,
   PORTAL_RECOVERY_SESSION_KEY,
+  PORTAL_RECOVERY_BROWSER_SESSION_KEY,
   PORTAL_RECOVERY_SESSION_TTL_MS,
   closeExpiredPortalRecoveryTabs,
   closeOrphanedPortalRecoveryTabs,
@@ -348,6 +349,35 @@ describe("managed portal recovery tabs", () => {
     expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({
       tabsByTarget: { directoryRole: 42 }
     });
+  });
+
+  test("browser restart never adopts an occupied stale ID or closes an ordinary PIM tab", async () => {
+    const fixture = createApis();
+    const session: Record<string, unknown> = {};
+    fixture.apis.sessionStorage = {
+      get: async (key) => ({ [key]: session[key] }),
+      set: async (values) => { Object.assign(session, values); },
+      remove: async (key) => { delete session[key]; }
+    };
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+    const original = fixture.tabs.get(1)!;
+    fixture.tabs.set(42, { ...original, id: 42 });
+    fixture.tabs.set(1, { ...original, id: 1, url: ENTRA_PORTAL_URLS.directoryRole });
+    delete session[PORTAL_RECOVERY_BROWSER_SESSION_KEY];
+    await getPortalRecoveryStatus(fixture.apis, 1100);
+    expect(fixture.storageData[PORTAL_RECOVERY_SESSION_KEY]).toMatchObject({ tabsByTarget: { directoryRole: 42 } });
+    await closePortalRecoveryTabsForTargets(["directoryRole"], fixture.apis, 1000);
+    expect(fixture.tabs.has(42)).toBe(false);
+    expect(fixture.tabs.has(1)).toBe(true);
+  });
+
+  test("a group name alone never authorizes closing unmarked portal tabs", async () => {
+    const fixture = createApis();
+    await openPortalRecoveryTabs(["directoryRole"], missingTokenStatus(), fixture.apis, 1000);
+    delete fixture.storageData[PORTAL_RECOVERY_SESSION_KEY];
+    fixture.tabs.get(1)!.url = ENTRA_PORTAL_URLS.directoryRole;
+    expect(await closeOrphanedPortalRecoveryTabs(fixture.apis, 1100)).toEqual([]);
+    expect(fixture.tabs.has(1)).toBe(true);
   });
 
   test("does not close or keep managing a recovery tab after the user navigates it elsewhere", async () => {

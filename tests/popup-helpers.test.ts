@@ -118,6 +118,7 @@ describe("popup action helpers", () => {
       ...assigned,
       activeAssignmentType: "activated" as const,
       assignmentScheduleId: "pim-schedule-1",
+      activeFrom: "2026-05-18T15:55:00.000Z",
       activeUntil: "2026-05-18T16:00:00.000Z"
     };
 
@@ -125,7 +126,8 @@ describe("popup action helpers", () => {
       id: eligible.id,
       status: "active",
       activeAssignmentType: "activated",
-      assignmentScheduleId: "pim-schedule-1"
+      assignmentScheduleId: "pim-schedule-1",
+      activeFrom: activated.activeFrom
     }]);
     expect(mergeEligibleWithActive([eligible], [assigned, activated], { includeActiveOnly: true })).toHaveLength(1);
 

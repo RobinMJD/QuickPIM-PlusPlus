@@ -37,6 +37,11 @@ const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60_000;
 const MAX_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const withRequestOperationMutationLock = createStorageMutationLock("quickPimRequestOperationMutation");
 
+export function requestOperationMayHaveWritten(operation: RequestOperationRecord | undefined): boolean {
+  return !operation || operation.state === "uncertain" || operation.items?.some((item) =>
+    ["sending", "accepted", "tracking", "uncertain"].includes(item.state) || item.result?.outcomeUnknown === true) === true;
+}
+
 export type RequestOperationIdentity = Pick<RequestOperationRecord, "id" | "action" | "itemIds" | "targets"> &
   Partial<Pick<RequestOperationRecord, "tenantId" | "principalId" | "durationHours" | "justification" | "ticketInfo" | "bundleName" | "sourceInstallationId" | "kind" | "scheduledStartAt" | "sourceRequestId">>;
 

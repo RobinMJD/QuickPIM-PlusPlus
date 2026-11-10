@@ -309,7 +309,8 @@ export function validateQuickPimMessage(message: unknown): QuickPimMessage {
 
     const justification = typeof message.justification === "string" ? message.justification : "";
     const ticketInfo = validateTicketInfo(message.ticketInfo);
-    assertPolicyRequirements(items, justification, ticketInfo);
+    // activationRequirements describe selfActivate rules. Self-deactivation
+    // accepts an optional note/ticket; Microsoft enforces that action's rules.
     return {
       action: "deactivateItems",
       items,

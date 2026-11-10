@@ -19,6 +19,9 @@ import {
   mutateTrackedRequests,
   normalizeTrackedRequestStatus,
   reconcileTrackedExtensionSources,
+  reconcileCompletedDeactivations,
+  mergeRestoredTrackedRequests,
+  clearTrackedRequests,
   reconcileTrackedRequestWithActiveAssignments,
   sanitizeTrackedRequestStore,
   trackedRequestMatchesValidatedToken,
@@ -77,6 +80,29 @@ function createStorage(initial?: TrackedPimRequestStore) {
 }
 
 describe("tracked PIM requests", () => {
+  test("clearing or restoring history preserves local in-progress tracking", async () => {
+    const timestamps = { requestedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    const pending = createRequest({ status: "pendingApproval", nextCheckAt: new Date(Date.now() + 30_000).toISOString(), ...timestamps });
+    const active = createRequest({ requestId: "still-active", status: "active", activeUntil: new Date(Date.now() + 3600_000).toISOString(), ...timestamps });
+    const done = createRequest({ requestId: "finished", action: "deactivate", status: "completed", rawStatus: "Revoked", ...timestamps });
+    const storage = createStorage({ version: 1, requests: [pending, active, done] });
+    const cleared = await clearTrackedRequests(storage.area);
+    expect(cleared.requests).toHaveLength(2);
+    expect(cleared.requests).toEqual(expect.arrayContaining([pending, expect.objectContaining({ id: active.id, status: "active" })]));
+    const restored = mergeRestoredTrackedRequests({ version: 1, requests: [pending] }, { version: 1, requests: [{ ...pending, status: "failed" }, done] });
+    expect(restored.requests.find((request) => request.id === pending.id)?.status).toBe("pendingApproval");
+    expect(restored.requests.find((request) => request.id === done.id)?.status).toBe("completed");
+  });
+  test("completed disables reconcile only the same original tenant, account and schedule", () => {
+    const activation = createRequest({ status: "active", targetScheduleId: "schedule-original", activeUntil: new Date(NOW + 3600_000).toISOString() });
+    const disabled = createRequest({ id: "disable", requestId: "disable", action: "deactivate", status: "completed",
+      targetScheduleId: "schedule-original", completedAt: new Date(NOW).toISOString() });
+    expect(reconcileCompletedDeactivations({ version: 1, requests: [activation, disabled] }, NOW).requests[0].status).toBe("completed");
+    for (const update of [{ targetScheduleId: "replacement" }, { tenantId: "other" }, { principalId: "other" }, { status: "submitted" as const }]) {
+      const store = { version: 1 as const, requests: [activation, { ...disabled, ...update }] };
+      expect(reconcileCompletedDeactivations(store, NOW)).toBe(store);
+    }
+  });
   test("creates a bounded local record from a Microsoft request response", () => {
     const request = createTrackedPimRequest({
       item: directoryRole,

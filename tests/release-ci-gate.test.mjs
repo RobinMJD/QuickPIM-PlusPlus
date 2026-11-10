@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { describe, expect, test } from "vitest";
 import {
   buildWorkflowRunsUrl,
@@ -8,6 +9,29 @@ import {
 } from "../scripts/require-successful-main-ci.mjs";
 
 describe("release exact-commit CI gate", () => {
+  test("tags and default manual runs cannot publish either Store", () => {
+    const workflow = readFileSync(".github/workflows/release.yml", "utf8");
+    expect(workflow).toMatch(/publish_target:[\s\S]*?default: github/);
+    expect(workflow).toMatch(/publish_stores:[\s\S]*?default: false/);
+    for (const [job, target] of [["chrome-web-store", "chrome"], ["microsoft-edge-add-ons", "edge"]]) {
+      const condition = workflow.split(`  ${job}:`)[1].match(/\n    if: \$\{\{ (.+) \}\}/)[1]
+        .replace(/needs\.([a-z-]+)/g, (_, key) => `needs["${key}"]`);
+      const allowed = (event, publishStores, publicationTarget = "all", verify = "success", githubResult = "success", manualTag = "") => runInNewContext(condition, {
+        always: () => true, github: { event_name: event }, inputs: { tag: "v9.8.7", publish_stores: publishStores, publish_target: publicationTarget },
+        needs: { "verify-package": { result: verify }, "github-release": { result: githubResult } },
+        vars: { EDGE_ADDONS_MANUAL_SUBMISSION_TAG: manualTag }
+      });
+      expect(allowed("push", true, "all")).toBe(false);
+      expect(allowed("workflow_dispatch", undefined)).toBe(false);
+      expect(allowed("workflow_dispatch", false)).toBe(false);
+      expect(allowed("workflow_dispatch", true, "github")).toBe(false);
+      expect(allowed("workflow_dispatch", true, target)).toBe(true);
+      expect(allowed("workflow_dispatch", true, target, "failure")).toBe(false);
+      expect(allowed("workflow_dispatch", true, target, "success", "failure")).toBe(false);
+      expect(allowed("workflow_dispatch", true, target, "success", "skipped")).toBe(true);
+      if (target === "edge") expect(allowed("workflow_dispatch", true, target, "success", "success", "v9.8.7")).toBe(false);
+    }
+  });
   test("selects the latest push attempt for the tagged commit", () => {
     const run = selectLatestCiRun([
       { id: 1, head_sha: "abc", event: "push", run_attempt: 1, status: "completed", conclusion: "failure" },

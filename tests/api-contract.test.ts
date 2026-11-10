@@ -47,9 +47,10 @@ describe("Microsoft PIM API contracts", () => {
 
   test("keeps bearer requests on allowlisted Microsoft endpoints without ambient credentials or redirects", () => {
     expect(background).toContain("assertAllowedApiUrl(url);");
-    expect(background).toContain('credentials: "omit"');
-    expect(background).toContain('redirect: "error"');
-    expect(background).toContain('referrerPolicy: "no-referrer"');
+    const transport = readFileSync("src/lib/microsoftFetch.ts", "utf8");
+    expect(transport).toContain('credentials: "omit"');
+    expect(transport).toContain('redirect: "error"');
+    expect(transport).toContain('referrerPolicy: "no-referrer"');
   });
 
   test("reacts to per-installation browser sync records and queues local edits made during sync", () => {
@@ -180,7 +181,7 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("chrome.notifications.onButtonClicked?.addListener(trackedNotificationButtonClicked)");
     expect(background).toContain("buildTrackedRequestExtensionPlan");
     expect(background).toContain("continuationOfRequestId: source.requestId");
-    expect(background).toContain('extensionAttemptState: "uncertain"');
+    expect(background).toContain('extensionAttemptState: uncertain ? "uncertain" : undefined');
     expect(background).toContain("check Microsoft PIM before retrying");
     expect(background).toContain("trackedNotificationHasExplicitActions(notificationId)");
     expect(background).toContain("await clearNotification(notificationId)");

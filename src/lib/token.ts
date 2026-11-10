@@ -100,7 +100,8 @@ export function decodeToken(token: string): Record<string, unknown> | null {
     }
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const decoded = JSON.parse(atob(padded));
+    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+    const decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     return decoded && typeof decoded === "object" && !Array.isArray(decoded) ? decoded as Record<string, unknown> : null;
   } catch {
     return null;

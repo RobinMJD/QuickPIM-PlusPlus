@@ -1,4 +1,4 @@
-import { getEffectiveTrackedRequestStatus } from "./requestTracking";
+import { getEffectiveTrackedRequestStatus, trackedRequestMatchesActiveItem } from "./requestTracking";
 import { getGenericJustificationWarning } from "./justifications";
 import type {
   ActivationItem,
@@ -142,6 +142,19 @@ export function buildTrackedRequestExtensionPlan(
     justification,
     ticketInfo
   };
+}
+
+export function verifyTrackedExtensionSource(request: TrackedPimRequest, activeItems: ActivationItem[], now = Date.now()): void {
+  const matches = activeItems.filter((item) => trackedRequestMatchesActiveItem(request, item)
+    && item.activeAssignmentType === "activated"
+    && (!item.activeFrom || Date.parse(item.activeFrom) <= now)
+    && item.activeUntil && Date.parse(item.activeUntil) > now);
+  if (matches.length !== 1) throw new Error("The original activation is no longer active or could not be verified. Refresh Activity before extending; no extension was sent.");
+  const current = matches[0];
+  if (Math.abs(Date.parse(current.activeUntil!) - Date.parse(request.activeUntil || "")) > 1000
+    || (request.activeFrom && current.activeFrom && Math.abs(Date.parse(request.activeFrom) - Date.parse(current.activeFrom)) > 1000)) {
+    throw new Error("The activation schedule changed. Refresh Activity before extending; no extension was sent.");
+  }
 }
 
 function trackedRequestToEligibleItem(request: TrackedPimRequest): ActivationItem {

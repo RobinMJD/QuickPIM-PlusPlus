@@ -97,8 +97,21 @@ export async function mutateTrackedRequests(
   });
 }
 
-export async function clearTrackedRequests(storage: StorageAreaLike = chrome.storage.local): Promise<void> {
-  await withTrackedRequestMutationLock(() => storage.remove(REQUEST_TRACKING_KEY));
+export async function clearTrackedRequests(storage: StorageAreaLike = chrome.storage.local): Promise<TrackedPimRequestStore> {
+  return mutateTrackedRequests((current) => ({ version: 1, requests: current.requests.filter(isUnresolvedTrackedRequest) }), storage);
+}
+
+function isUnresolvedTrackedRequest(request: TrackedPimRequest): boolean {
+  const status = getEffectiveTrackedRequestStatus(request);
+  return isTrackedRequestPending(request) || status === "active" || status === "unknown" || status === "statusUnavailable";
+}
+
+export function mergeRestoredTrackedRequests(current: TrackedPimRequestStore, incoming: TrackedPimRequestStore): TrackedPimRequestStore {
+  const protectedRequests = current.requests.filter(isUnresolvedTrackedRequest);
+  const ids = new Set(protectedRequests.map((request) => request.id));
+  const restored = sanitizeTrackedRequestStore(incoming).requests.filter((request) => !ids.has(request.id))
+    .slice(0, Math.max(0, MAX_TRACKED_REQUESTS - protectedRequests.length));
+  return sanitizeTrackedRequestStore({ version: 1, requests: [...protectedRequests, ...restored] });
 }
 
 export function createTrackedPimRequest(input: CreateTrackedRequestInput): TrackedPimRequest | undefined {
@@ -143,7 +156,7 @@ export function createTrackedPimRequest(input: CreateTrackedRequestInput): Track
     activationRequirements: input.item.activationRequirements,
     continuationOfRequestId: input.continuationOfRequestId,
     approvalId: details.approvalId,
-    targetScheduleId: details.targetScheduleId,
+    targetScheduleId: details.targetScheduleId || (input.action === "deactivate" ? input.item.assignmentScheduleId : undefined),
     checkCount: 0,
     nextCheckAt: shouldContinueTracking(details.status, details.activeUntil)
       ? new Date(now + getRequestPollDelayMs(0)).toISOString()
@@ -764,7 +777,7 @@ function sanitizeTrackedRequest(value: unknown, now = Date.now()): TrackedPimReq
   };
 }
 
-function trackedRequestMatchesActiveItem(request: TrackedPimRequest, item: ActivationItem): boolean {
+export function trackedRequestMatchesActiveItem(request: TrackedPimRequest, item: ActivationItem): boolean {
   if (item.type !== request.itemType || item.status !== "active" || item.activeAssignmentType === "assigned") {
     return false;
   }
@@ -774,6 +787,8 @@ function trackedRequestMatchesActiveItem(request: TrackedPimRequest, item: Activ
   if (!request.principalId || !item.principalId || normalizeIdentifier(request.principalId) !== normalizeIdentifier(item.principalId)) {
     return false;
   }
+  if (request.targetScheduleId && ![item.assignmentScheduleId, item.assignmentScheduleInstanceId]
+    .some((id) => scheduleIdentifiersMatch(request.targetScheduleId, id))) return false;
   if (item.type === "directoryRole") {
     return roleDefinitionIdsMatch(request.roleDefinitionId, item.roleDefinitionId)
       && normalizeResourcePath(request.directoryScopeId || "/") === normalizeResourcePath(item.directoryScopeId);
@@ -784,6 +799,30 @@ function trackedRequestMatchesActiveItem(request: TrackedPimRequest, item: Activ
   }
   return roleDefinitionIdsMatch(request.roleDefinitionId, item.roleDefinitionId)
     && normalizeResourcePath(request.azureScope || "") === normalizeResourcePath(item.scope);
+}
+
+function scheduleIdentifiersMatch(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  const a = normalizeIdentifier(left), b = normalizeIdentifier(right);
+  return a === b || a.split("/").filter(Boolean).at(-1) === b.split("/").filter(Boolean).at(-1);
+}
+
+export function reconcileCompletedDeactivations(store: TrackedPimRequestStore, now = Date.now()): TrackedPimRequestStore {
+  const disabled = store.requests.filter((request) => request.action === "deactivate"
+    && getEffectiveTrackedRequestStatus(request, now) === "completed" && request.targetScheduleId);
+  let changed = false;
+  const requests = store.requests.map((request) => {
+    if (request.action !== "activate" || getEffectiveTrackedRequestStatus(request, now) !== "active" || !request.targetScheduleId) return request;
+    const match = disabled.find((entry) => entry.tenantId?.toLowerCase() === request.tenantId?.toLowerCase()
+      && entry.principalId.toLowerCase() === request.principalId.toLowerCase()
+      && entry.itemType === request.itemType
+      && scheduleIdentifiersMatch(entry.targetScheduleId, request.targetScheduleId));
+    if (!match) return request;
+    changed = true;
+    return { ...request, status: "completed" as const, completedAt: match.completedAt || match.updatedAt,
+      updatedAt: new Date(now).toISOString(), nextCheckAt: undefined, activeAssignmentMissingSince: undefined };
+  });
+  return changed ? { version: 1, requests } : store;
 }
 
 function roleDefinitionIdsMatch(left: string | undefined, right: string | undefined): boolean {

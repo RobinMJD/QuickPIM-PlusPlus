@@ -65,7 +65,7 @@ describe("Microsoft Edge Add-ons publisher", () => {
     expect(workflow).toContain("EDGE_ADDONS_PRODUCT_ID");
     expect(workflow).not.toContain("vars.EDGE_ADDONS_CERTIFICATION_NOTES");
     expect(workflow).toContain(
-      "EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name)"
+      "EDGE_ADDONS_MANUAL_SUBMISSION_TAG != inputs.tag"
     );
     expect(workflow).not.toContain("EDGE_ADDONS_MANUAL_SUBMISSION_TAG != env.RELEASE_TAG");
     expect(workflow).toContain("quickpim-plusplus-${{ env.RELEASE_TAG }}-chromium-stores.zip");

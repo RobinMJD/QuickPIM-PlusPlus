@@ -5,7 +5,8 @@ import {
   formatExtensionDuration,
   getTrackedRequestExtensionSubmissionCopy,
   requireTrackedRequestExtensionRequestId,
-  sanitizeExtensionDurationHours
+  sanitizeExtensionDurationHours,
+  verifyTrackedExtensionSource
 } from "../src/lib/requestExtension";
 import { createTrackedPimRequest } from "../src/lib/requestTracking";
 import type { ActivationItem } from "../src/lib/types";
@@ -57,6 +58,20 @@ const pimGroup: ActivationItem = {
 };
 
 describe("tracked PIM request extension", () => {
+  test("requires a live original schedule with the same expiry before extending", () => {
+    const request = createTrackedPimRequest({ item: { ...directoryRole, tenantId: "tenant-one" }, action: "activate",
+      requestId: "source-original", tenantId: "tenant-one", requestedAt: new Date(NOW - 60_000).toISOString(),
+      payload: { status: "Provisioned", targetScheduleId: "original", scheduleInfo: { startDateTime: new Date(NOW - 60_000).toISOString(),
+        expiration: { endDateTime: new Date(NOW + 3600_000).toISOString() } } }, now: NOW })!;
+    const active = { ...directoryRole, tenantId: "tenant-one", status: "active" as const, activeAssignmentType: "activated" as const,
+      assignmentScheduleId: "original", assignmentScheduleInstanceId: "instance-original", activeFrom: request.activeFrom, activeUntil: request.activeUntil };
+    expect(() => verifyTrackedExtensionSource(request, [active], NOW)).not.toThrow();
+    for (const items of [[], [{ ...active, assignmentScheduleId: "replacement" }], [{ ...active, principalId: "different-account" }],
+      [{ ...active, tenantId: "different-tenant" }], [{ ...active, activeAssignmentType: "assigned" as const }]]) {
+      expect(() => verifyTrackedExtensionSource(request, items, NOW)).toThrow(/no longer active|could not be verified/);
+    }
+    expect(() => verifyTrackedExtensionSource(request, [{ ...active, activeUntil: new Date(NOW + 7200_000).toISOString() }], NOW)).toThrow(/schedule changed/);
+  });
   test("uses a 30-minute default and accepts only supported preferences", () => {
     expect(DEFAULT_EXTENSION_DURATION_HOURS).toBe(0.5);
     expect(sanitizeExtensionDurationHours(undefined)).toBe(0.5);

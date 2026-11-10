@@ -61,6 +61,8 @@ import { sanitizePortalRecoveryStatus } from "../lib/portalRecoveryTabs";
 import { EXTENSION_DURATION_OPTIONS, buildTrackedRequestExtensionPlan, formatExtensionDuration } from "../lib/requestExtension";
 import { getIdentityContext } from "../lib/identityContext";
 import { stringifySupportReport } from "../lib/supportReport";
+import { sanitizeErrorMessage } from "../lib/security";
+import { DEACTIVATION_RETRY_KEY, loadDeactivationRetries, type DeactivationRetry } from "../lib/deactivationRetry";
 import {
   CHROME_WEB_STORE_URL,
   EDGE_ADDONS_URL,
@@ -1103,7 +1105,7 @@ function HomePanel({ onNavigate }: { onNavigate: (tab: SettingsTab) => void }) {
           </div>
           <div>
             <strong>Local setup</strong>
-            <span>Settings stay in this browser profile and portal tokens are captured from Microsoft pages.</span>
+            <span>Portal tokens stay in this browser session. Selected preferences and history can sync through your browser account.</span>
           </div>
           <div>
             <strong>Cleaner management</strong>
@@ -1216,7 +1218,7 @@ function AboutPanel({
         </div>
         <div>
           <strong>Privacy</strong>
-          <p className="muted">Tokens and settings stay in this browser profile. QuickPIM++ only calls Microsoft Graph and Azure Management APIs.</p>
+          <p className="muted">Portal tokens stay in this browser session and are sent only to Microsoft Graph or Azure Management. Selected preferences and history can sync through your browser account. The changelog reads public GitHub metadata.</p>
         </div>
         <div>
           <strong>Repository</strong>
@@ -1740,6 +1742,7 @@ function ActivityPanel({
   onMutate: (mutator: SettingsMutator, message?: string) => Promise<boolean>;
 }) {
   const requestActivity = useRequestActivity();
+  const [disableRetries, setDisableRetries] = useState<DeactivationRetry[]>([]);
   const [view, setView] = useState<"requests" | "history" | "usage">("requests");
   const [requestSearch, setRequestSearch] = useState("");
   const [requestStatusFilter, setRequestStatusFilter] = useState<"all" | "pending" | "active" | "attention" | "finished">("all");
@@ -1757,17 +1760,26 @@ function ActivityPanel({
   const [now, setNow] = useState(() => Date.now());
   const [confirmingClear, setConfirmingClear] = useState<"requests" | "history" | "usage" | undefined>();
   const selectedRequest = trackedRequests.requests.find((request) => request.id === selectedRequestId);
+  useEffect(() => {
+    let disposed = false;
+    const reload = () => void loadDeactivationRetries().then((entries) => { if (!disposed) setDisableRetries(entries); }).catch(() => undefined);
+    const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area === "local" && changes[DEACTIVATION_RETRY_KEY]) reload();
+    };
+    reload(); chrome.storage.onChanged?.addListener(changed);
+    return () => { disposed = true; chrome.storage.onChanged?.removeListener(changed); };
+  }, []);
   const filteredRequests = useMemo(() => {
     const term = requestSearch.trim().toLowerCase();
     return trackedRequests.requests.filter((request) => {
-      const status = getEffectiveTrackedRequestStatus(request);
+      const status = getEffectiveTrackedRequestStatus(request, now);
       if (!matchesTrackedRequestFilter(status, requestStatusFilter)) return false;
       if (!term) return true;
       const source = resolveActivitySource(request.sourceInstallationId, request.sourceDeviceName, browserSyncStatus);
       return [request.itemName, request.scopeLabel, request.bundleName, request.justification, request.requestId, trackedRequestStatusLabel(status), source?.name, source?.shortId]
         .some((value) => value?.toLowerCase().includes(term));
     });
-  }, [browserSyncStatus, requestSearch, requestStatusFilter, trackedRequests.requests]);
+  }, [browserSyncStatus, requestSearch, requestStatusFilter, trackedRequests.requests, now]);
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     return settings.activityHistory.filter((entry) => {
@@ -1873,12 +1885,16 @@ function ActivityPanel({
   }
 
   async function clearRequests() {
-    await sendMessage({ action: "clearTrackedRequests" });
-    onTrackedRequestsChange({ version: 1, requests: [] });
-    setSelectedRequestId(undefined);
     setRequestError("");
-    setRequestMessage("Tracked requests cleared.");
-    setConfirmingClear(undefined);
+    try {
+      const store = sanitizeTrackedRequestStore(await sendMessage<TrackedPimRequestStore>({ action: "clearTrackedRequests" }));
+      onTrackedRequestsChange(store);
+      setSelectedRequestId(undefined);
+      setRequestMessage(store.requests.length ? "Finished requests cleared. Active and unresolved requests keep tracking." : "Tracked requests cleared.");
+      setConfirmingClear(undefined);
+    } catch (error) {
+      setRequestError(sanitizeErrorMessage(error));
+    }
   }
 
   async function saveHistoryLimit() {
@@ -1911,7 +1927,9 @@ function ActivityPanel({
       ticketSystem: "",
       ticketNumber: "",
       isActivationReviewOpen: true,
-      requestMode
+      requestMode,
+      tenantId: request.tenantId,
+      principalId: request.principalId
     });
     try {
       if (!chrome.action?.openPopup) {
@@ -1948,6 +1966,13 @@ function ActivityPanel({
     <section className="panel">
       <RequestActivity mode="history" operations={requestActivity.operations} tracked={requestActivity.tracked} error={requestActivity.error} onRetry={requestActivity.retry}
         onDismiss={async (id) => { await sendMessage({ action: "dismissRequestOperations", operationIds: [id] }); await requestActivity.reload(); }} />
+      {disableRetries.length ? <details className="request-activity-card">
+        <summary>Disable retry history ({disableRetries.length})</summary>
+        <ul>{disableRetries.map((entry) => <li key={entry.id}>
+          <strong>{entry.item.displayName}</strong> · {entry.item.scopeLabel} · {entry.state}
+          <p>{entry.detail || `Retry at ${new Date(entry.retryAt).toLocaleString()}`}</p>
+        </li>)}</ul>
+      </details> : null}
       <div className="panel-title-row">
         <div>
           <h2>Activity & Usage</h2>
@@ -1971,7 +1996,7 @@ function ActivityPanel({
         <div className="settings-confirmation danger" role="alertdialog" aria-label={`Confirm ${confirmingClear} clear`}>
           <span>
             {confirmingClear === "requests"
-              ? "Remove all locally tracked request details? Microsoft requests are not canceled."
+              ? "Remove finished request details? Active and unresolved requests will keep tracking. Microsoft requests are not canceled."
               : confirmingClear === "history"
                 ? "Clear the local activation and deactivation history?"
                 : "Reset all local activation counters?"}
@@ -3165,6 +3190,8 @@ function AliasesPanel({
 }) {
   const [itemId, setItemId] = useState("");
   const [alias, setAlias] = useState("");
+  const selectedAliasItemRef = useRef(itemId);
+  selectedAliasItemRef.current = itemId;
   const selectedItem = items.find((item) => activationItemMatchesIdentity(item, itemId));
   const aliasPickerGroups = useMemo(() => {
     const compareRawItems = (left: ActivationItem, right: ActivationItem) =>
@@ -3186,6 +3213,7 @@ function AliasesPanel({
 
   async function saveAlias() {
     if (!selectedItem || !alias.trim()) return;
+    const submittedItemId = itemId;
     const itemIdentity = getActivationItemIdentity(selectedItem);
     const nextAlias = alias.trim();
     if (await onMutate((latest) => ({
@@ -3195,7 +3223,7 @@ function AliasesPanel({
         [itemIdentity]: nextAlias
       }
     }))) {
-      setAlias("");
+      if (selectedAliasItemRef.current === submittedItemId) setAlias((current) => current.trim() === nextAlias ? "" : current);
     }
   }
 
@@ -3335,7 +3363,7 @@ function JustificationsPanel({
         savedJustifications: exists ? latest.savedJustifications : [trimmed, ...latest.savedJustifications]
       };
     })) {
-      setValue("");
+      setValue((current) => current.trim() === trimmed ? "" : current);
     }
   }
 
@@ -3378,7 +3406,7 @@ function JustificationsPanel({
       </div>
       {confirmRestore ? (
         <div className="settings-confirmation" role="alertdialog" aria-label="Restore Justifications defaults">
-          <span>Restore the recent-history limit? Saved and recent justifications will not be removed.</span>
+          <span>Restore the recent-history limit to {DEFAULT_SETTINGS.preferences.recentJustificationLimit}? Older recent entries beyond this limit will be removed. Saved justifications are kept.</span>
           <div className="button-row nowrap">
             <button className="btn primary" onClick={() => void restoreRecentLimit()}>Restore</button>
             <button className="btn" onClick={() => setConfirmRestore(false)}>Cancel</button>

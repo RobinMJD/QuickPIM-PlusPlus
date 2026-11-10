@@ -84,7 +84,7 @@ function createBlockedEdgeChrome(settings: typeof DEFAULT_SETTINGS) {
     },
     storage: {
       local: {
-        get: vi.fn(async (key: string) => ({ [key]: key === SETTINGS_KEY ? settings : undefined })),
+        get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, key === SETTINGS_KEY ? settings : undefined]))),
         set: vi.fn(async () => undefined),
         remove: vi.fn(async () => undefined)
       }
@@ -170,7 +170,7 @@ describe("popup loading UI", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -272,7 +272,7 @@ describe("popup loading UI", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -375,7 +375,7 @@ describe("popup loading UI", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -465,7 +465,7 @@ describe("popup loading UI", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -543,7 +543,7 @@ describe("popup loading UI", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -645,7 +645,7 @@ describe("popup loading UI", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -706,7 +706,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -795,7 +795,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -890,7 +890,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -976,7 +976,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1132,7 +1132,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1227,7 +1227,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1326,7 +1326,7 @@ describe("popup compact controls", () => {
       runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1392,7 +1392,7 @@ describe("popup compact controls", () => {
       runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1491,7 +1491,7 @@ describe("popup compact controls", () => {
       runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1562,7 +1562,7 @@ describe("popup compact controls", () => {
       runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1705,7 +1705,7 @@ describe("popup compact controls", () => {
       runtime: { getURL: (path: string) => `chrome-extension://quickpim/${path}`, sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1796,7 +1796,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1874,7 +1874,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1955,7 +1955,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2028,7 +2028,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2106,7 +2106,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2172,7 +2172,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2222,7 +2222,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2308,7 +2308,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2452,7 +2452,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2551,7 +2551,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2627,7 +2627,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2692,7 +2692,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2763,7 +2763,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2857,7 +2857,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2963,7 +2963,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3055,7 +3055,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3151,7 +3151,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3315,7 +3315,7 @@ describe("popup compact controls", () => {
       runtime: { sendMessage },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3423,7 +3423,7 @@ describe("popup compact controls", () => {
         },
         storage: {
           local: {
-            get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+            get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
             set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
             remove: vi.fn(async () => undefined)
           }
@@ -3512,7 +3512,7 @@ describe("popup compact controls", () => {
         },
         storage: {
           local: {
-            get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+            get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
             set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
             remove: vi.fn(async () => undefined)
           }
@@ -3623,7 +3623,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3714,7 +3714,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3795,7 +3795,7 @@ describe("popup compact controls", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3871,7 +3871,7 @@ describe("popup activation guardrails", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3949,7 +3949,7 @@ describe("popup activation guardrails", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -4035,7 +4035,7 @@ describe("popup draft persistence", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async (key: string) => {
             delete storageData[key];
@@ -4047,6 +4047,27 @@ describe("popup draft persistence", () => {
       }
     };
   }
+
+  test("a failed draft read preserves the stored draft while role access remains usable", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: DEFAULT_SETTINGS,
+      [POPUP_DRAFT_KEY]: { selectedIds: [pimGroupItem.id], updatedAt: Date.now(), tab: "pimGroup", sortMode: "name", durationHours: 1 } };
+    const original = structuredClone(storageData[POPUP_DRAFT_KEY]);
+    const api = popupChromeMock(storageData);
+    const get = api.storage.local.get;
+    api.storage.local.get = vi.fn(async (keys: string | string[]) => {
+      if (keys === POPUP_DRAFT_KEY) throw new Error("Storage temporarily unavailable");
+      return get(keys);
+    });
+    vi.stubGlobal("chrome", api);
+    vi.resetModules();
+    await import("../src/popup/main");
+    await waitFor(() => expect(document.body.textContent).toContain("Privileged Group"));
+    expect(document.body.textContent).toContain("Your saved draft could not be read");
+    setFieldValue(document.querySelector<HTMLInputElement>('input[aria-label="Filter roles"]')!, "new search");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(storageData[POPUP_DRAFT_KEY]).toEqual(original);
+  });
 
   test("migrates and displays a legacy PIM group alias for the current tenant", async () => {
     document.body.innerHTML = '<div id="root"></div>';
@@ -4730,7 +4751,7 @@ describe("popup dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }

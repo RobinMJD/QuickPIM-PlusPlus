@@ -48,6 +48,7 @@ describe("reference data cache", () => {
       }
     };
     expect(getDisplayName(withLearnedName, aliasedSettings, learned)).toBe("Local Alias");
+    expect(getDisplayName({ ...withLearnedName, displayName: "Local Alias" }, DEFAULT_SETTINGS, learned)).toBe("Global Reader");
 
     expect(getDisplayName(rawDirectoryRole, DEFAULT_SETTINGS, DEFAULT_REFERENCE_DATA)).toBe("reader");
   });

@@ -12,12 +12,23 @@ import {
   selectNextRequestOperation,
   sanitizeRequestOperations,
   trackedRequestMatchesOperation,
-  touchRequestOperation
+  touchRequestOperation,
+  requestOperationMayHaveWritten
 } from "../src/lib/requestOperations";
 
 const NOW = Date.parse("2026-07-22T10:00:00.000Z");
 
 describe("background request operation journal", () => {
+  test("failure classification distinguishes prepared validation from a possible write", () => {
+    const operation = { id: "failure-boundary", action: "activate" as const, state: "running" as const,
+      startedAt: NOW, updatedAt: NOW, itemIds: ["directoryRole:reader:/"], targets: ["directoryRole" as const],
+      items: [{ itemId: "directoryRole:reader:/", itemName: "Reader", itemType: "directoryRole" as const, state: "prepared" as const, updatedAt: NOW }] };
+    expect(requestOperationMayHaveWritten(operation)).toBe(false);
+    for (const state of ["sending", "accepted", "tracking", "uncertain"] as const) {
+      expect(requestOperationMayHaveWritten({ ...operation, items: [{ ...operation.items[0], state }] })).toBe(true);
+    }
+    expect(requestOperationMayHaveWritten(undefined)).toBe(true);
+  });
   test("retains item names and scopes when preparation slightly precedes operation creation", async () => {
     const data: Record<string, unknown> = {}; const storage = makeStorage(data);
     await beginRequestOperation({ id: "request_scope_timestamp", action: "activate", itemIds: ["directoryRole:groups:/administrativeUnits/unit-a"], targets: ["directoryRole"], startedAt: NOW,

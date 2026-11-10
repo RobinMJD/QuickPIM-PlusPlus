@@ -14,13 +14,19 @@ import {
   hasGraphActivationScope
 } from "../src/lib/graphTokenCapabilities";
 import { validateQuickPimMessage } from "../src/lib/messages";
-import { buildActivationRequest } from "../src/lib/pim";
+import { buildActivationRequest, buildDeactivationRequest } from "../src/lib/pim";
 import { assertFreshToken, makeTokenStatus } from "../src/lib/token";
 import type { ActivationItem } from "../src/lib/types";
 
 const now = Date.parse("2026-05-18T12:00:00.000Z");
 
 describe("security allowlists and token validation", () => {
+  test("decodes international account names as UTF-8 without changing identity claims", () => {
+    const payload = { tid: "tenant-1", oid: "user-1", name: "Jérémy · 李明 · 🔐", aud: "https://graph.microsoft.com", exp: (now + 60_000) / 1000 };
+    const token = `header.${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}.signature`;
+    expect(makeTokenStatus(token, now, "portal", now).principalName).toBe(payload.name);
+    expect(validateCapturedToken(token, "graph", now)).toMatchObject({ ok: true, decoded: { tid: payload.tid, oid: payload.oid } });
+  });
   test("only allows Graph and Azure Management HTTPS API URLs plus Entra portal token sources", () => {
     expect(getAllowedTokenKindForUrl("https://graph.microsoft.com/v1.0/me")).toBe("graph");
     expect(getAllowedTokenKindForUrl("https://management.azure.com/subscriptions?api-version=2020-01-01")).toBe(
@@ -384,6 +390,17 @@ describe("activation request validation", () => {
     scopeLabel: "Tenant",
     status: "eligible"
   };
+
+  test("does not apply activation-only justification and ticket rules to selfDeactivate", () => {
+    const item = { ...directoryRole, tenantId: "tenant-1", status: "active" as const, activeAssignmentType: "activated" as const,
+      assignmentScheduleId: "schedule-1", activationRequirements: { justification: true, ticket: true, maxDurationHours: 1 } };
+    const message = validateQuickPimMessage({ action: "deactivateItems", operationId: "disable-policy-test", items: [item], justification: "", ticketInfo: {} });
+    expect(message.action).toBe("deactivateItems");
+    expect(buildDeactivationRequest(item).body).toMatchObject({ action: "selfDeactivate", targetScheduleId: "schedule-1" });
+    expect(buildDeactivationRequest(item).body).not.toHaveProperty("justification");
+    expect(() => validateQuickPimMessage({ action: "activateItems", operationId: "activate-policy-test",
+      items: [{ ...item, status: "eligible" }], durationHours: 1, justification: "", ticketInfo: {} })).toThrow(/justification/);
+  });
 
   test("rejects invalid activation duration, oversized strings, and unsafe Azure scopes", () => {
     expect(() => buildActivationRequest(directoryRole, 0.25, "Need production access")).toThrow(/duration/i);

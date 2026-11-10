@@ -70,6 +70,13 @@ async function seed(restoreOnlyTokens = false) {
   }, { now, graph, azure, cache, items, restoreOnlyTokens });
 }
 async function popup() { const page = await context.newPage(); await page.goto(`chrome-extension://${extensionId}/popup.html`); return page; }
+async function trackExtensionSource(source: Record<string, unknown>) {
+  await worker.evaluate(async (source) => {
+    const { requestTestHarness: harness } = await chrome.storage.local.get("requestTestHarness");
+    await chrome.storage.local.set({ "quickPimRequests.v1": { version: 1, requests: [source] },
+      requestTestHarness: { ...harness, extensionSource: source } });
+  }, source);
+}
 async function evidence() { return worker.evaluate(async () => { const data = await chrome.storage.local.get(["requestTestHarness", "quickPimRequestOperations.v2", "quickPimPopupDraft.v1"]); return { harness: data.requestTestHarness as { hold: boolean; writes: Array<Record<string, any>>; unexpected: string[] }, operations: (data["quickPimRequestOperations.v2"] || []) as RequestOperationRecord[], draft: data["quickPimPopupDraft.v1"] }; }); }
 async function release(approval = false, confirm = true) {
   await expect.poll(async () => (await evidence()).harness.writes.length).toBeGreaterThan(0);
@@ -171,7 +178,7 @@ test("deactivation continues after popup closure and reports its own parameters"
 test("access extensions use durable progress after their requesting page closes", async () => {
   const page = await popup();
   const source = { id: "tracked-original", itemId: items[0].id, itemType: "pimGroup", itemName: items[0].displayName, action: "activate", requestId: "source-original", principalId: principal, tenantId: tenant, groupId: "group-a", accessId: "member", scopeLabel: "Member", status: "active", requestedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), activeUntil: new Date(Date.now() + 3600_000).toISOString(), durationHours: 1, justification: reason, activationRequirements: { justification: false, ticket: false }, checkCount: 0 };
-  await worker.evaluate(async (source) => chrome.storage.local.set({ "quickPimRequests.v1": { version: 1, requests: [source] } }), source);
+  await trackExtensionSource(source);
   const result = await page.evaluate(async () => chrome.runtime.sendMessage({ action: "startRequestOperation", request: { action: "extendTrackedRequest", requestId: "source-original" } }));
   expect(result, JSON.stringify(result)).toMatchObject({ success: true }); await page.close();
   await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1);
@@ -181,6 +188,180 @@ test("access extensions use durable progress after their requesting page closes"
   await release(); await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
   expect((await evidence()).harness.writes).toHaveLength(1);
 });
+
+test("review: disable accepts an empty optional note despite required activation fields", async () => {
+  const active = { ...items[0], status: "active", activeAssignmentType: "activated", assignmentScheduleId: "schedule-a",
+    assignmentScheduleInstanceId: "instance-a", activeFrom: new Date(Date.now() - 600_000).toISOString(),
+    activeUntil: new Date(Date.now() + 3600_000).toISOString(), activationRequirements: { justification: true, ticket: true } };
+  await worker.evaluate(async (active) => {
+    const data = await chrome.storage.local.get("quickPimDataCache.v1");
+    data["quickPimDataCache.v1"].activeByTarget.pimGroup.items = [active];
+    data["quickPimDataCache.v1"].eligibleByTarget.pimGroup.items[0].activationRequirements = active.activationRequirements;
+    await chrome.storage.local.set(data);
+  }, active);
+  const page = await popup();
+  await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+  await page.locator(".role-row").filter({ hasText: items[0].displayName }).locator('input[type="checkbox"]').check();
+  await page.getByRole("button", { name: /Continue/ }).click();
+  await expect(page.getByLabel("Optional note")).toHaveValue("");
+  await page.getByRole("button", { name: "Disable 1 selected", exact: true }).click();
+  await page.close();
+  await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1);
+  await release();
+  await expect.poll(async () => (await evidence()).operations[0].state).toBe("complete");
+  expect((await evidence()).harness.writes[0]).toMatchObject({ action: "selfDeactivate", targetScheduleId: "schedule-a" });
+});
+
+test("review: a stale extension source is rejected before any privileged write", async () => {
+  const source = { id: "tracked-original", itemId: items[0].id, itemType: "pimGroup", itemName: items[0].displayName,
+    action: "activate", requestId: "source-original", principalId: principal, tenantId: tenant, groupId: "group-a", accessId: "member",
+    scopeLabel: "Member", status: "active", requestedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    activeUntil: new Date(Date.now() + 3600_000).toISOString(), durationHours: 1, justification: reason,
+    activationRequirements: { justification: false, ticket: false }, checkCount: 0 };
+  await trackExtensionSource(source);
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("requestTestHarness");
+    await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, extensionNoLongerActive: true } });
+  });
+  const page = await popup();
+  const reply = await page.evaluate(() => chrome.runtime.sendMessage({ action: "startRequestOperation", request: { action: "extendTrackedRequest", requestId: "source-original" } }));
+  expect(reply.success).toBe(true);
+  await page.close();
+  await expect.poll(async () => (await evidence()).operations[0]?.state).toBe("error");
+  expect((await evidence()).operations[0].items?.some((item) => item.state === "uncertain")).toBe(false);
+  expect((await evidence()).harness.writes).toHaveLength(0);
+});
+
+test("review: missing Azure policy data stays unresolved and blocks activation", async () => {
+  const page = await popup();
+  const item = { ...items[3], activationPolicyState: "pending" as const };
+  const enriched = await page.evaluate((item) => chrome.runtime.sendMessage({ action: "enrichActivationPolicies", items: [item] }), item);
+  expect(enriched.success, enriched.error).toBe(true);
+  expect(enriched.data[0].activationPolicyState).toBe("pending");
+  const response = await start(page, [item]);
+  expect(response.success, response.error).toBe(true);
+  await expect.poll(async () => (await evidence()).operations[0]?.state).toBe("error");
+  expect((await evidence()).operations[0].items?.some((item) => item.state === "uncertain")).toBe(false);
+  expect((await evidence()).harness.writes).toHaveLength(0);
+});
+
+test("review: policy lookups reject stale accounts and tenants across all role sources", async () => {
+  const page = await popup();
+  for (const item of [items[0], items[2], items[3]]) {
+    for (const changed of [{ principalId: "33333333-3333-4333-8333-333333333333" }, { tenantId: "44444444-4444-4444-8444-444444444444" }]) {
+      const response = await page.evaluate((item) => chrome.runtime.sendMessage({ action: "enrichActivationPolicies", items: [item] }), { ...item, ...changed });
+      expect(response.success).toBe(false);
+      expect(response.error).toContain("another signed-in account or tenant");
+    }
+  }
+  expect((await evidence()).harness.writes).toHaveLength(0);
+});
+
+test("review: idle request polling slows down and new work promptly restores progress polling", async () => {
+  await worker.evaluate(() => {
+    (globalThis as any).requestPollCount = 0;
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.action === "getRequestOperations") (globalThis as any).requestPollCount++;
+      return false;
+    });
+  });
+  const page = await popup();
+  const polls = () => worker.evaluate(() => (globalThis as any).requestPollCount as number);
+  await expect.poll(polls).toBe(1);
+  await page.waitForTimeout(4_000);
+  expect(await polls()).toBe(1);
+  await submitFromUI(page, items[0].displayName);
+  await expect.poll(polls, { timeout: 6_000 }).toBeGreaterThan(1);
+  await expect(page.getByRole("progressbar", { name: "Request progress", exact: true })).toBeVisible();
+  await release();
+});
+
+test("review: an old settings read cannot undo a concurrent settings reset", async () => {
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("quickPimSettings.v1");
+    await chrome.storage.local.set({ "quickPimSettings.v1": { ...data["quickPimSettings.v1"], preferences: { ...data["quickPimSettings.v1"].preferences, darkMode: true } }, "quickPimSettingsRevision.v1": 42 });
+  });
+  const page = await context.newPage();
+  await page.addInitScript(() => {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes["quickPimSettings.v1"] && changes["quickPimSettingsRevision.v1"]?.newValue === 0) {
+        (globalThis as any).settingsResetObserved = true;
+      }
+    });
+    const original = chrome.storage.local.get.bind(chrome.storage.local);
+    let held = false;
+    (chrome.storage.local as any).get = async (keys: string | string[]) => {
+      const snapshot = await original(keys);
+      if (!held && Array.isArray(keys) && keys.includes("quickPimSettings.v1")) {
+        held = true;
+        await new Promise<void>((resolve) => { (globalThis as any).releaseSettingsRead = resolve; });
+      }
+      return snapshot;
+    };
+  });
+  await page.goto(`chrome-extension://${extensionId}/popup.html`);
+  await page.waitForFunction(() => typeof (globalThis as any).releaseSettingsRead === "function");
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("quickPimSettings.v1");
+    await chrome.storage.local.set({ "quickPimSettings.v1": { ...data["quickPimSettings.v1"], preferences: { ...data["quickPimSettings.v1"].preferences, darkMode: false } }, "quickPimSettingsRevision.v1": 0 });
+  });
+  // Wait until the real storage event has published the new settings before
+  // allowing the older read (with its larger pre-reset revision) to finish.
+  await page.waitForFunction(() => (globalThis as any).settingsResetObserved === true);
+  await page.evaluate(() => (globalThis as any).releaseSettingsRead());
+  await expect(page.locator(".role-row").first()).toBeVisible();
+  await expect(page.locator("body")).not.toHaveClass(/dark/);
+});
+
+test("review: expired disable notices leave history intact and restore keyboard focus", async () => {
+  const now = Date.now();
+  const active = { ...items[0], status: "active", activeAssignmentType: "activated", activeFrom: new Date(now - 600_000).toISOString(),
+    activeUntil: new Date(now + 3600_000).toISOString(), assignmentScheduleId: "source-schedule", assignmentScheduleInstanceId: "source-instance" };
+  await worker.evaluate(async ({ active, now }) => chrome.storage.local.set({ "quickPimDeactivationRetries.v1": [{ id: "expired-retry", item: active,
+    justification: "Incident resolved", ticketInfo: {}, state: "submitted", createdAt: now - 10_000, updatedAt: now - 8_000,
+    retryAt: now - 9_000, detail: "Disable request submitted." }] }), { active, now });
+  const page = await popup();
+  const dismiss = page.getByRole("region", { name: "Disable retries" }).getByRole("button", { name: "Dismiss", exact: true });
+  await dismiss.focus();
+  await expect(page.getByRole("region", { name: "Disable retries" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeFocused();
+  const settings = await context.newPage();
+  await settings.goto(`chrome-extension://${extensionId}/settings.html#activity`);
+  await settings.getByText("Disable retry history (1)", { exact: true }).click();
+  await expect(settings.getByText("Disable request submitted.", { exact: true })).toBeVisible();
+});
+
+for (const deactivate of [false, true]) {
+  test(`review: a failed ${deactivate ? "disable" : "activation"} checkpoint never claims a write happened`, async () => {
+    await worker.evaluate(() => {
+      const original = chrome.storage.local.set.bind(chrome.storage.local);
+      let failed = false;
+      chrome.storage.local.set = async (values) => {
+        const records = (values as Record<string, unknown>)["quickPimRequestOperations.v2"];
+        if (!failed && Array.isArray(records) && records.some((record) => record.items?.some((item: any) => item.state === "sending"))) {
+          failed = true;
+          throw new Error("Storage temporarily unavailable before sending");
+        }
+        return original(values);
+      };
+    });
+    const item = deactivate ? { ...items[0], status: "active" as const, activeAssignmentType: "activated" as const,
+      assignmentScheduleId: "schedule-a", activeFrom: new Date(Date.now() - 600_000).toISOString(), activeUntil: new Date(Date.now() + 3600_000).toISOString() } : items[0];
+    const page = await popup();
+    const reply = await start(page, [item], deactivate ? "deactivateItems" : "activateItems");
+    expect(reply.success).toBe(true);
+    await expect.poll(async () => (await evidence()).operations[0]?.state).toBe("complete");
+    const operation = (await evidence()).operations[0];
+    expect(operation.items?.[0].result).toMatchObject({ success: false });
+    expect(operation.items?.[0].result?.outcomeUnknown).not.toBe(true);
+    expect((await evidence()).harness.writes).toHaveLength(0);
+    // The failed checkpoint was definitely before the HTTP mutation: a new
+    // explicit request for this item remains available and sends only once.
+    expect((await start(page, [item], deactivate ? "deactivateItems" : "activateItems")).success).toBe(true);
+    await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1);
+    await release();
+  });
+}
 
 test("real browser restart preserves uncertain writes without submitting them again", async ({}, info) => {
   const page = await popup(); expect((await start(page, [items[0]])).success).toBe(true);
@@ -261,7 +442,7 @@ for (const type of ["directoryRole", "azureRole"] as const) {
   test(`${type} extension survives closing its requesting popup`, async () => {
     const page = await popup(); const item = items.find((item) => item.type === type)!;
     const source = { ...item, id: "source-extension", itemId: item.id, itemType: item.type, itemName: item.displayName, ...(item.type === "azureRole" ? { azureScope: item.scope, roleEligibilityScheduleId: "eligibility-original" } : {}), action: "activate", requestId: "source-original", status: "active", requestedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), activeUntil: new Date(Date.now() + 3600_000).toISOString(), justification: reason, checkCount: 0 };
-    await worker.evaluate(async (source) => chrome.storage.local.set({ "quickPimRequests.v1": { version: 1, requests: [source] } }), source);
+    await trackExtensionSource(source);
     const result = await page.evaluate(async () => chrome.runtime.sendMessage({ action: "startRequestOperation", request: { action: "extendTrackedRequest", requestId: "source-original" } }));
     expect(result, JSON.stringify(result)).toMatchObject({ success: true }); await page.close();
     await expect.poll(async () => (await evidence()).harness.writes.length).toBe(1); await release();
@@ -652,6 +833,24 @@ function installOfflineMicrosoft() {
     }
     if (["graph.microsoft.com", "management.azure.com"].includes(url.hostname)) {
       const harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness;
+      const source = harness?.extensionSource;
+      if (source && !harness?.extensionNoLongerActive) {
+        if (source.itemType === "pimGroup" && url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: [{
+          id: "source-instance", assignmentScheduleId: "source-schedule", groupId: source.groupId, principalId: source.principalId,
+          accessId: source.accessId, assignmentType: "Activated", startDateTime: source.activeFrom || new Date(Date.now() - 60_000).toISOString(), endDateTime: source.activeUntil
+        }] });
+        if (source.itemType === "directoryRole" && url.pathname.includes("/roleManagement/directory/roleAssignmentScheduleInstances")) return json({ value: [{
+          id: "source-instance", roleAssignmentScheduleId: "source-schedule", roleDefinitionId: source.roleDefinitionId, principalId: source.principalId,
+          directoryScopeId: source.directoryScopeId, assignmentType: "Activated", startDateTime: source.activeFrom || new Date(Date.now() - 60_000).toISOString(),
+          endDateTime: source.activeUntil, roleDefinition: { id: source.roleDefinitionId, displayName: source.itemName }
+        }] });
+        if (source.itemType === "azureRole" && url.pathname.endsWith("/roleAssignmentScheduleInstances")) return json({ value: [{
+          id: "source-instance", properties: { roleAssignmentScheduleId: "source-schedule", roleAssignmentScheduleInstanceId: "source-instance",
+            roleDefinitionId: source.roleDefinitionId, scope: source.azureScope, principalId: source.principalId, assignmentType: "Activated",
+            startDateTime: source.activeFrom || new Date(Date.now() - 60_000).toISOString(), endDateTime: source.activeUntil }
+        }] });
+      }
+      if (source?.itemType === "azureRole" && url.pathname === "/subscriptions") return json({ value: [{ subscriptionId: "sub-a", displayName: "Subscription A" }] });
       if (url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: (harness?.items || []).filter((item: any) => (harness?.confirmedGroups || []).includes(item.groupId)).map((item: any) => ({ id: `instance-${item.groupId}`, assignmentScheduleId: `schedule-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId, assignmentType: "Activated", startDateTime: new Date(Date.now() - 10_000).toISOString(), endDateTime: new Date(Date.now() + 3600_000).toISOString() })) });
       if (url.pathname.includes("/privilegedAccess/group/eligibilityScheduleInstances")) return json({ value: (harness?.items || []).filter((item: ActivationItem) => item.type === "pimGroup").map((item: any) => ({ id: `eligibility-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId })) });
       if (url.pathname.endsWith("/$batch")) return json({ responses: (body.requests || []).map((request: { id: string; url: string }) => ({ id: request.id, status: 200, body: { id: "group-a", displayName: request.url.includes("group-b") ? "Deployment Owners" : "Application Support", value: [] } })) });

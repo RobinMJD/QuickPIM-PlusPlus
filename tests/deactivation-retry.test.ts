@@ -3,6 +3,7 @@ import {
   DEACTIVATION_RETRY_KEY, acceptDeactivationRetry, cancelDeactivationRetry,
   getDeactivationRetryTime, isMinimumActiveDurationMessage, loadDeactivationRetries,
   offerDeactivationRetry, recoverInterruptedDeactivationRetries, runDueDeactivationRetries,
+  visibleDeactivationRetries,
   type RetryStorage
 } from "../src/lib/deactivationRetry";
 import { validateQuickPimMessage } from "../src/lib/messages";
@@ -19,6 +20,18 @@ const item: PimGroupItem = {
 };
 
 describe("one-shot deactivation retry", () => {
+  test("keeps queued work visible but expires terminal notices and hides other accounts", () => {
+    const entry = { id: "retry", item, justification: "", ticketInfo: {}, state: "queued" as const,
+      createdAt: rejectedAt, updatedAt: rejectedAt, retryAt: rejectedAt + 60_000 };
+    const identity = { tenantId: item.tenantId, principalId: item.principalId };
+    expect(visibleDeactivationRetries([entry], identity, rejectedAt + 60_000)).toHaveLength(1);
+    for (const state of ["submitted", "failed"] as const) {
+      expect(visibleDeactivationRetries([{ ...entry, state }], identity, rejectedAt + 9999)).toHaveLength(1);
+      expect(visibleDeactivationRetries([{ ...entry, state }], identity, rejectedAt + 10_000)).toEqual([]);
+    }
+    expect(visibleDeactivationRetries([entry], { ...identity, tenantId: "other" }, rejectedAt)).toEqual([]);
+    expect(visibleDeactivationRetries([entry], { ...identity, principalId: "other" }, rejectedAt)).toEqual([]);
+  });
   let values: Record<string, unknown>;
   let storage: RetryStorage;
   beforeEach(() => {

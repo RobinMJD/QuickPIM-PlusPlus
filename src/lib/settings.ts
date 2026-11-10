@@ -58,7 +58,7 @@ export function runWithSettingsMutationLock<T>(operation: () => Promise<T>): Pro
 }
 
 export interface SettingsStorageAreaLike {
-  get(key: string): Promise<Record<string, unknown>>;
+  get(keys: string | string[]): Promise<Record<string, unknown>>;
   set(items: Record<string, unknown>): Promise<void>;
 }
 
@@ -255,13 +255,12 @@ async function loadSettingsFromStorage(storage: SettingsStorageAreaLike): Promis
 }
 
 async function loadSettingsSnapshotFromStorage(storage: SettingsStorageAreaLike): Promise<SettingsSnapshot> {
-  const [settingsResult, revisionResult] = await Promise.all([
-    storage.get(SETTINGS_KEY),
-    storage.get(SETTINGS_REVISION_KEY)
-  ]);
-  const rawRevision = revisionResult[SETTINGS_REVISION_KEY];
+  // State and revision must come from one storage snapshot. Two independent
+  // reads can pair old settings with a newer revision and pass a stale CAS.
+  const stored = await storage.get([SETTINGS_KEY, SETTINGS_REVISION_KEY]);
+  const rawRevision = stored[SETTINGS_REVISION_KEY];
   const revision = Number.isSafeInteger(rawRevision) && Number(rawRevision) >= 0 ? Number(rawRevision) : 0;
-  const rawSettings = settingsResult[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined;
+  const rawSettings = stored[SETTINGS_KEY] as Partial<QuickPimSettings> | undefined;
   const settings = mergeSettings(rawSettings);
   return {
     settings,
@@ -278,7 +277,8 @@ export function getDisplayName(
   const alias = getActivationItemIdentityCandidates(item)
     .map((identity) => settings.aliasesByItemId[identity]?.trim())
     .find(Boolean);
-  return alias || getReferenceDisplayName(item, referenceData) || item.displayName || item.sourceName || "Unknown";
+  const canonical = { ...item, displayName: item.sourceName || item.displayName } as ActivationItem;
+  return alias || getReferenceDisplayName(canonical, referenceData) || canonical.displayName || "Unknown";
 }
 
 export function migrateLegacyAliasesByItemId(
@@ -555,7 +555,8 @@ function mergeUsageStatsForMigration(left: UsageStats, right: UsageStats): Usage
 }
 
 export function getScopeLabel(item: ActivationItem, referenceData?: ReferenceDataCache): string {
-  return getReferenceScopeLabel(item, referenceData) || item.scopeLabel || "Scope";
+  const canonical = { ...item, scopeLabel: item.sourceScopeLabel || item.scopeLabel } as ActivationItem;
+  return getReferenceScopeLabel(canonical, referenceData) || canonical.scopeLabel || "Scope";
 }
 
 export function getUsage(item: ActivationItem, settings: QuickPimSettings) {

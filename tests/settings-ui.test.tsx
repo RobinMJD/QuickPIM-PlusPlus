@@ -120,7 +120,7 @@ function createBasicSettingsChrome(storageData: Record<string, unknown>, options
     },
     storage: {
       local: {
-        get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+        get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
         set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
         remove: vi.fn(async () => undefined)
       }
@@ -172,7 +172,7 @@ describe("settings Home page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -262,7 +262,7 @@ describe("settings Home page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -333,7 +333,7 @@ describe("settings Home page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -383,7 +383,7 @@ describe("settings About page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -406,7 +406,9 @@ describe("settings About page", () => {
     expect(text).toContain("independent React and TypeScript implementation with a fully rewritten application codebase");
     expect(text).toContain("role bundles, saved justifications, favorites, aliases, dark mode, learned names, access setup, and much more!");
     expect(text).not.toContain("security hardening");
-    expect(text).toContain("Tokens and settings stay in this browser profile.");
+    expect(text).toContain("Portal tokens stay in this browser session");
+    expect(text).toContain("history can sync through your browser account");
+    expect(text).toContain("public GitHub metadata");
   });
 });
 
@@ -519,7 +521,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -614,7 +616,7 @@ describe("settings Access Setup page", () => {
       tabs: { create: vi.fn() },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -737,7 +739,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -837,7 +839,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -901,7 +903,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -992,7 +994,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1085,7 +1087,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1163,7 +1165,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -1213,7 +1215,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1282,7 +1284,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -1365,7 +1367,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -1446,7 +1448,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1525,7 +1527,7 @@ describe("settings Access Setup page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1604,7 +1606,7 @@ describe("settings Activity page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1701,7 +1703,7 @@ describe("settings Activity page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => {
             Object.assign(storageData, value);
           }),
@@ -1752,6 +1754,23 @@ describe("settings Activity page", () => {
 });
 
 describe("settings justification guardrails", () => {
+  test("saving a reason does not erase a different reason typed during persistence", async () => {
+    document.body.innerHTML = '<div id="root"></div>';
+    window.history.replaceState(null, "", "#justifications");
+    const storageData: Record<string, unknown> = { [SETTINGS_KEY]: createDefaultSettings() };
+    const chromeMock = createBasicSettingsChrome(storageData);
+    let releaseWrite!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    chromeMock.storage.local.set.mockImplementationOnce(async (values) => { await gate; return Object.assign(storageData, values); });
+    vi.stubGlobal("chrome", chromeMock); vi.resetModules(); await import("../src/settings/main");
+    await waitFor(() => expect(document.querySelector('input[placeholder="Reusable justification"]')).toBeTruthy());
+    const input = document.querySelector<HTMLInputElement>('input[placeholder="Reusable justification"]')!;
+    setFieldValue(input, "Investigate incident one"); clickExactButton("Add");
+    await waitFor(() => expect(chromeMock.storage.local.set).toHaveBeenCalled());
+    setFieldValue(input, "Prepare incident two"); releaseWrite();
+    await waitFor(() => expect(storageData[SETTINGS_KEY]).toMatchObject({ savedJustifications: ["Investigate incident one"] }));
+    expect(input.value).toBe("Prepare incident two");
+  });
   test("top-aligns saved and recent reasons and copies a recent justification", async () => {
     document.body.innerHTML = '<div id="root"></div>';
     window.history.replaceState(null, "", "#justifications");
@@ -1815,7 +1834,7 @@ describe("settings justification guardrails", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -1872,7 +1891,7 @@ describe("settings justification guardrails", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -1938,7 +1957,7 @@ describe("settings justification guardrails", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2038,7 +2057,7 @@ describe("settings Bundles page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2095,7 +2114,7 @@ describe("settings Bundles page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2164,7 +2183,7 @@ describe("settings Bundles page", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2271,7 +2290,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -2318,7 +2337,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         },
@@ -2377,7 +2396,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => {
             const next = value[SETTINGS_KEY] as typeof DEFAULT_SETTINGS | undefined;
             if (next?.preferences.showActivationCounters && !next.savedJustifications.length) {
@@ -2429,7 +2448,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => {
             const nextSettings = value[SETTINGS_KEY] as typeof DEFAULT_SETTINGS | undefined;
             if (nextSettings?.preferences.showActivationCounters) {
@@ -2489,7 +2508,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2535,7 +2554,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2584,7 +2603,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2661,7 +2680,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => {
             Object.assign(storageData, value);
           }),
@@ -2756,7 +2775,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2833,7 +2852,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -2919,7 +2938,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3039,7 +3058,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }
@@ -3110,7 +3129,7 @@ describe("settings dark mode", () => {
       },
       storage: {
         local: {
-          get: vi.fn(async (key: string) => ({ [key]: storageData[key] })),
+          get: vi.fn(async (keys: string | string[]) => Object.fromEntries((Array.isArray(keys) ? keys : [keys]).map((key) => [key, storageData[key]]))),
           set: vi.fn(async (value: Record<string, unknown>) => Object.assign(storageData, value)),
           remove: vi.fn(async () => undefined)
         }

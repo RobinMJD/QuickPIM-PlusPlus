@@ -12,7 +12,7 @@ import {
   splitActivationResultByTarget,
   updateCacheFromTargetResults
 } from "../lib/cache";
-import { DEACTIVATION_RETRY_KEY, loadDeactivationRetries, type DeactivationRetry } from "../lib/deactivationRetry";
+import { DEACTIVATION_RETRY_KEY, DEACTIVATION_RETRY_NOTICE_MS, loadDeactivationRetries, visibleDeactivationRetries, type DeactivationRetry } from "../lib/deactivationRetry";
 
 import {
   buildAccessCapabilityItems,
@@ -50,6 +50,8 @@ import {
 } from "../lib/popupModel";
 import {
   DEFAULT_SETTINGS,
+  SETTINGS_KEY,
+  SETTINGS_REVISION_KEY,
   addSavedJustification,
   buildFeatureCacheKey,
   expandBundle,
@@ -58,11 +60,13 @@ import {
   getEnabledRoleFeatures,
   getDefaultSortDirection,
   getScopeLabel,
-  loadSettings,
+  loadSettingsSnapshot,
+  mergeSettings,
   migrateLegacyItemSettingsForItems,
   mutateSettingsViaBackground,
   sortItems
 } from "../lib/settings";
+import type { SettingsSnapshot } from "../lib/settings";
 import {
   learnReferenceDataFromItems,
   loadReferenceData,
@@ -339,9 +343,10 @@ function PopupApp() {
   const [activationFailureNotice, setActivationFailureNotice] = useState<ActivationFailureNotice | null>(null);
   const [deactivationRetries, setDeactivationRetries] = useState<DeactivationRetry[]>([]);
   const [retryActionId, setRetryActionId] = useState<string>();
+  const shownDeactivationRetries = visibleDeactivationRetries(deactivationRetries, getIdentityContext(tokenStatus));
   const visibleFailureErrors = activationFailureNotice?.errors.filter((text) =>
     !text.includes("at least 5 minutes before it can be disabled")
-    || !deactivationRetries.some((entry) => ["offered", "queued"].includes(entry.state)
+    || !shownDeactivationRetries.some((entry) => ["offered", "queued"].includes(entry.state)
       && text.startsWith(`${entry.item.displayName}:`)));
   const visibleActivationFailureNotice = activationFailureNotice && visibleFailureErrors?.length
     ? { ...activationFailureNotice, errors: visibleFailureErrors } : null;
@@ -352,6 +357,7 @@ function PopupApp() {
   const [requestMode, setRequestMode] = useState<PopupRequestMode | undefined>();
   const [selectionIdentity, setSelectionIdentity] = useState<{ tenantId?: string; principalId?: string }>({});
   const [isPopupDraftReady, setIsPopupDraftReady] = useState(false);
+  const [draftStorageError, setDraftStorageError] = useState("");
   const [hasRestoredPopupDraft, setHasRestoredPopupDraft] = useState(false);
   const [hasActivationDataLoaded, setHasActivationDataLoaded] = useState(false);
   const [resolvedActivationTargets, setResolvedActivationTargets] = useState<Set<AccessSetupTarget>>(new Set());
@@ -375,6 +381,9 @@ function PopupApp() {
   const restoredDraftSelectionNeedsValidation = useRef(false);
   const latestPopupDraft = useRef<PopupDraftInput | undefined>(undefined);
   const settingsMutationQueue = useRef<Promise<void>>(Promise.resolve());
+  const settingsRef = useRef(settings);
+  const settingsRevision = useRef(-1);
+  const settingsEventGeneration = useRef(0);
   const tokenStatusRef = useRef<TokenStatus | null>(tokenStatus);
   const portalRecoveryStatusRef = useRef<PortalRecoveryStatus>(portalRecoveryStatus);
   const resolvedActivationIdentityKey = useRef<string | undefined>(undefined);
@@ -392,6 +401,26 @@ function PopupApp() {
     chrome.storage.onChanged?.addListener(changed);
     return () => { disposed = true; chrome.storage.onChanged?.removeListener(changed); };
   }, []);
+
+  useEffect(() => {
+    const now = Date.now();
+    const deadlines = deactivationRetries.filter((entry) => ["submitted", "failed"].includes(entry.state))
+      .map((entry) => entry.updatedAt + DEACTIVATION_RETRY_NOTICE_MS).filter((deadline) => deadline > now);
+    if (!deadlines.length) return;
+    const timer = setTimeout(() => {
+      const focusedId = document.activeElement?.closest<HTMLElement>("[data-retry-id]")?.dataset.retryId;
+      const expired = (entry: DeactivationRetry) => ["submitted", "failed"].includes(entry.state)
+        && Date.now() >= entry.updatedAt + DEACTIVATION_RETRY_NOTICE_MS;
+      const restoreFocus = deactivationRetries.some((entry) => entry.id === focusedId && expired(entry));
+      setDeactivationRetries((current) => current.filter((entry) => !expired(entry)));
+      if (restoreFocus) requestAnimationFrame(() => {
+        if (!document.activeElement || document.activeElement === document.body) {
+          document.querySelector<HTMLButtonElement>(".activation-settings-button")?.focus();
+        }
+      });
+    }, Math.min(...deadlines) - now);
+    return () => clearTimeout(timer);
+  }, [deactivationRetries]);
 
   async function changeDeactivationRetry(entry: DeactivationRetry, accept: boolean): Promise<void> {
     setRetryActionId(entry.id);
@@ -435,6 +464,34 @@ function PopupApp() {
     tokenStatusRef.current = nextStatus;
     setTokenStatus(nextStatus);
   }
+
+  function publishSettingsSnapshot(snapshot: SettingsSnapshot): void {
+    if (snapshot.revision < settingsRevision.current) return;
+    settingsRevision.current = snapshot.revision;
+    settingsRef.current = snapshot.settings;
+    setSettings(snapshot.settings);
+  }
+
+  async function reloadSettingsSnapshot(): Promise<QuickPimSettings> {
+    const generation = settingsEventGeneration.current;
+    const snapshot = await loadSettingsSnapshot();
+    if (generation === settingsEventGeneration.current) publishSettingsSnapshot(snapshot);
+    return settingsRef.current;
+  }
+
+  useEffect(() => {
+    const changed = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+      if (area !== "local" || !changes[SETTINGS_KEY]) return;
+      settingsEventGeneration.current++;
+      const removed = changes[SETTINGS_KEY].newValue === undefined;
+      if (removed) settingsRevision.current = -1;
+      const revision = changes[SETTINGS_REVISION_KEY]?.newValue;
+      publishSettingsSnapshot({ settings: mergeSettings(changes[SETTINGS_KEY].newValue as Partial<QuickPimSettings> | undefined),
+        revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : Math.max(0, settingsRevision.current) });
+    };
+    chrome.storage.onChanged?.addListener(changed);
+    return () => chrome.storage.onChanged?.removeListener(changed);
+  }, []);
 
   function markActivationTargetsResolved(identityKey: string, targets: Iterable<AccessSetupTarget>): void {
     const nextTargets = [...targets];
@@ -565,7 +622,7 @@ function PopupApp() {
     return () => { disposed = true; revision++; clearTimeout(timer); chrome.storage.onChanged?.removeListener(changed); };
   }, [enabledRoleFeatures.join("|")]);
   const requestRowProgress = useMemo(() => new Map(displayItems.map((item) =>
-    [item, getRequestRowProgress(requestActivity.operations, item, requestActivity.tracked)])), [displayItems, requestActivity.operations, requestActivity.tracked]);
+    [item, getRequestRowProgress(requestActivity.operations, item, requestActivity.tracked)])), [displayItems, requestActivity.operations, requestActivity.tracked, requestActivity.clock]);
   const requestProgressForItem = (item: ActivationItem) => requestRowProgress.has(item) ? requestRowProgress.get(item)
     : getRequestRowProgress(requestActivity.operations, item, requestActivity.tracked);
   const activityProgress: RequestProgressResolver = (operation, entry, tracked) => {
@@ -790,7 +847,7 @@ function PopupApp() {
     const draft = buildCurrentPopupDraft();
     latestPopupDraft.current = draft;
     if (!hasPopupDraftContent(draft)) {
-      void clearPopupDraft();
+      void clearPopupDraft().catch(() => setDraftStorageError("Your draft could not be saved. Keep this popup open to avoid losing changes."));
       return;
     }
 
@@ -798,7 +855,7 @@ function PopupApp() {
       clearTimeout(draftSaveTimer.current);
     }
     draftSaveTimer.current = setTimeout(() => {
-      void savePopupDraft(draft);
+      void savePopupDraft(draft).catch(() => setDraftStorageError("Your draft could not be saved. Keep this popup open to avoid losing changes."));
     }, 50);
 
     return () => {
@@ -831,9 +888,9 @@ function PopupApp() {
     const saveLatestDraft = () => {
       const draft = latestPopupDraft.current;
       if (draft && hasPopupDraftContent(draft)) {
-        void savePopupDraft(draft);
+        void savePopupDraft(draft).catch(() => undefined);
       } else {
-        void clearPopupDraft();
+        void clearPopupDraft().catch(() => undefined);
       }
     };
 
@@ -924,8 +981,12 @@ function PopupApp() {
         restoredDraftSelectionNeedsValidation.current = Boolean(draft.selectedIds.length);
         setHasRestoredPopupDraft(true);
       }
-    } finally {
       setIsPopupDraftReady(true);
+    } catch {
+      // A failed read must not authorize autosaving an empty replacement over
+      // a draft we could not inspect. Request execution remains available.
+      setDraftStorageError("Your saved draft could not be read. Reopen this popup to retry; new draft changes will not be saved until then.");
+    } finally {
       void refresh({
         force: false,
         quietWhenCached: true,
@@ -938,8 +999,7 @@ function PopupApp() {
     const distribution = await getExtensionDistributionInfo();
     setDistributionInfo(distribution);
     if (distribution.blockedInEdge) {
-      const loadedSettings = await loadSettings();
-      setSettings(loadedSettings);
+      const loadedSettings = await reloadSettingsSnapshot();
       setPortableDataAvailable(hasPortableSettingsData(loadedSettings));
       setIsLoading(false);
       setIsPopupDraftReady(true);
@@ -991,17 +1051,22 @@ function PopupApp() {
   }
 
   async function flushPopupDraft(overrides: Partial<PopupDraftInput> = {}) {
+    if (!isPopupDraftReady) return;
     if (draftSaveTimer.current) {
       clearTimeout(draftSaveTimer.current);
       draftSaveTimer.current = undefined;
     }
     const draft = buildCurrentPopupDraft(overrides);
-    if (hasPopupDraftContent(draft)) {
-      latestPopupDraft.current = draft;
-      await savePopupDraft(draft);
-    } else {
-      latestPopupDraft.current = undefined;
-      await clearPopupDraft();
+    try {
+      if (hasPopupDraftContent(draft)) {
+        latestPopupDraft.current = draft;
+        await savePopupDraft(draft);
+      } else {
+        latestPopupDraft.current = undefined;
+        await clearPopupDraft();
+      }
+    } catch {
+      setDraftStorageError("Your draft could not be saved. Keep this popup open to avoid losing changes.");
     }
   }
 
@@ -1022,7 +1087,7 @@ function PopupApp() {
     setActivationFailureNotice(null);
     setError("");
     latestPopupDraft.current = undefined;
-    await clearPopupDraft();
+    await clearPopupDraft().catch(() => setDraftStorageError("The saved draft could not be cleared. Reopen this popup to check it before submitting."));
   }
 
   async function refresh(options: {
@@ -1126,14 +1191,15 @@ function PopupApp() {
       }
     }
     try {
+      const settingsGenerationAtRead = settingsEventGeneration.current;
       const [
-        loadedSettings,
+        loadedSettingsSnapshot,
         currentCache,
         loadedReferenceData,
         loadedTokens,
         loadedRecoveryStatus
       ] = await Promise.all([
-        loadSettings(),
+        loadSettingsSnapshot(),
         loadDataCache(),
         loadReferenceData(),
         readTokenStatusWithRetry(tokenStatusRef.current),
@@ -1144,9 +1210,10 @@ function PopupApp() {
       }
 
       const now = Date.now();
+      if (settingsGenerationAtRead === settingsEventGeneration.current) publishSettingsSnapshot(loadedSettingsSnapshot);
+      const loadedSettings = settingsRef.current;
       const enabledRoleFeatures = getEnabledRoleFeatures(loadedSettings);
       const refreshTargets = normalizeRefreshTargets(options.targets || enabledRoleFeatures, enabledRoleFeatures);
-      setSettings(loadedSettings);
       publishTokenStatus(loadedTokens);
       publishPortalRecoveryStatus(loadedRecoveryStatus);
       setReferenceData(loadedReferenceData);
@@ -1179,7 +1246,6 @@ function PopupApp() {
 
       if (canShowCachedData) {
         renderLoadedActivationData(
-          loadedSettings,
           loadedTokens,
           currentCache,
           progressiveReferenceData,
@@ -1400,7 +1466,6 @@ function PopupApp() {
       if (!staleTargets.length) {
         if (!canShowCachedData) {
           renderLoadedActivationData(
-            loadedSettings,
             progressiveTokens,
             currentCache,
             progressiveReferenceData,
@@ -1479,7 +1544,6 @@ function PopupApp() {
             fetchedAt
           );
           renderLoadedActivationData(
-            loadedSettings,
             progressiveTokens,
             progressiveCache,
             progressiveReferenceData,
@@ -1520,7 +1584,6 @@ function PopupApp() {
               );
               const enrichedView = getActivationCacheView(progressiveCache, progressiveTokens, enabledRoleFeatures, Date.now());
               renderLoadedActivationData(
-                loadedSettings,
                 progressiveTokens,
                 progressiveCache,
                 progressiveReferenceData,
@@ -1578,7 +1641,8 @@ function PopupApp() {
         return;
       }
 
-      let nextSettings = loadedSettings;
+      const settingsBeforeAutoDetection = settingsRef.current;
+      let nextSettings = settingsBeforeAutoDetection;
       const allFeatureResultsResolved = enabledRoleFeatures.every((target) => {
         const eligibleResult = eligibleResultsByTarget[target];
         const activeResult = activeResultsByTarget[target];
@@ -1590,18 +1654,18 @@ function PopupApp() {
         );
         return Boolean(eligibleResolved && activeResolved);
       });
-      if (!loadedSettings.preferences.autoEnabledFeaturesInitialized && allFeatureResultsResolved) {
+      if (!settingsBeforeAutoDetection.preferences.autoEnabledFeaturesInitialized && allFeatureResultsResolved) {
         const resolvedItems = enabledRoleFeatures.flatMap((target) => [
           ...(progressiveCache.eligibleByTarget?.[target]?.items || []),
           ...(progressiveCache.activeByTarget?.[target]?.items || [])
         ]);
         nextSettings = {
-          ...loadedSettings,
+          ...settingsBeforeAutoDetection,
           preferences: {
-            ...loadedSettings.preferences,
+            ...settingsBeforeAutoDetection.preferences,
             enabledFeatures: getAutoEnabledFeatures(
               resolvedItems,
-              loadedSettings.preferences.enabledFeatures?.includes("bundles") !== false
+              settingsBeforeAutoDetection.preferences.enabledFeatures?.includes("bundles") !== false
             ),
             autoEnabledFeaturesInitialized: true
           }
@@ -1609,9 +1673,9 @@ function PopupApp() {
       }
 
       const finalEnabledRoleFeatures = getEnabledRoleFeatures(nextSettings);
+      settingsRef.current = nextSettings;
       const finalView = getActivationCacheView(progressiveCache, progressiveTokens, finalEnabledRoleFeatures, Date.now());
       renderLoadedActivationData(
-        nextSettings,
         progressiveTokens,
         progressiveCache,
         progressiveReferenceData,
@@ -1624,15 +1688,15 @@ function PopupApp() {
       await Promise.all([
         saveDataCache(progressiveCache),
         saveReferenceData(progressiveReferenceData),
-        ...(nextSettings === loadedSettings ? [] : [
-          mutateSettingsViaBackground((latest) => ({
+        ...(nextSettings === settingsBeforeAutoDetection ? [] : [
+          mutateSettingsViaBackground((latest) => latest.preferences.autoEnabledFeaturesInitialized ? latest : ({
             ...latest,
             preferences: {
               ...latest.preferences,
               enabledFeatures: [...nextSettings.preferences.enabledFeatures],
               autoEnabledFeaturesInitialized: true
             }
-          })).then((saved) => setSettings(saved))
+          })).then(() => reloadSettingsSnapshot())
         ])
       ]);
       const nextAccessCapabilities = buildAccessCapabilityItems(progressiveTokens, progressiveCache, finalEnabledRoleFeatures);
@@ -1741,7 +1805,6 @@ function PopupApp() {
   }
 
   function renderLoadedActivationData(
-    nextSettings: QuickPimSettings,
     nextTokens: TokenStatus,
     nextCache: QuickPimDataCache,
     nextReferenceData: ReferenceDataCache,
@@ -1751,8 +1814,9 @@ function PopupApp() {
     const identifiedEligibleItems = attachKnownTenantIdentities(eligible.items, nextTokens);
     const identifiedActiveItems = attachKnownTenantIdentities(active.items, nextTokens);
     const identifiedItems = [...identifiedEligibleItems, ...identifiedActiveItems];
-    const displaySettings = migrateLegacyItemSettingsForItems(nextSettings, identifiedItems);
-    if (displaySettings !== nextSettings) {
+    const currentSettings = settingsRef.current;
+    const displaySettings = migrateLegacyItemSettingsForItems(currentSettings, identifiedItems);
+    if (displaySettings !== currentSettings) {
       const fingerprint = JSON.stringify([
         displaySettings.aliasesByItemId,
         displaySettings.favoriteItemIds,
@@ -1764,9 +1828,9 @@ function PopupApp() {
       if (itemSettingsMigrationFingerprint.current !== fingerprint) {
         itemSettingsMigrationFingerprint.current = fingerprint;
         void mutateSettingsViaBackground((latest) => migrateLegacyItemSettingsForItems(latest, identifiedItems))
-          .then((saved) => {
+          .then(async () => {
             if (itemSettingsMigrationFingerprint.current === fingerprint) {
-              setSettings(saved);
+              await reloadSettingsSnapshot();
             }
           })
           .catch(() => {
@@ -2026,7 +2090,7 @@ function PopupApp() {
     let result = settings;
     const operation = settingsMutationQueue.current.then(async () => {
       result = await mutateSettingsViaBackground(updater);
-      setSettings(result);
+      await reloadSettingsSnapshot();
     });
     settingsMutationQueue.current = operation.catch(() => undefined);
     await operation;
@@ -2239,10 +2303,10 @@ function PopupApp() {
       ) : error && refreshProgress?.status !== "error" ? (
         <DismissibleErrorMessage onDismiss={() => setError("")}>{error}</DismissibleErrorMessage>
       ) : null}
-      {deactivationRetries.length ? (
+      {shownDeactivationRetries.length ? (
         <section className="deactivation-retries" aria-label="Disable retries" aria-live="polite">
-          {deactivationRetries.map((entry) => (
-            <div className="deactivation-retry" key={entry.id}>
+          {shownDeactivationRetries.map((entry) => (
+            <div className="deactivation-retry" key={entry.id} data-retry-id={entry.id}>
               <div>
                 <strong>{entry.item.displayName}</strong><span className="muted"> · {entry.item.scopeLabel}</span>
                 <p>{entry.state === "offered" ? "Retry once after Microsoft's five-minute minimum."
@@ -2264,6 +2328,7 @@ function PopupApp() {
           ))}
         </section>
       ) : null}
+      {draftStorageError ? <DismissibleErrorMessage onDismiss={() => setDraftStorageError("")}>{draftStorageError}</DismissibleErrorMessage> : null}
       {message && !activationFailureNotice && !(showInitialAccessState && isMissingAccessSummary(message)) ? <p className="message">{message}</p> : null}
       {isLoading ? (
         refreshProgress ? (
@@ -2973,8 +3038,10 @@ function ActivationBar(props: {
           ) : null}
           {isActivateMode && props.durationOptions.length ? (
             <div className="field">
-              <label>Activation time</label>
+              <label htmlFor="activation-duration">Activation time</label>
               <select
+                id="activation-duration"
+                disabled={props.isActivating}
                 className="select"
                 value={String(selectedDuration)}
                 onChange={(event) => props.setDurationHours(Number(event.target.value))}
@@ -2990,11 +3057,13 @@ function ActivationBar(props: {
           ) : null}
           {showJustificationField ? (
             <div className="field activation-form-field">
-              <label>
+              <label htmlFor="activation-justification">
                 {isDeactivateMode ? "Optional note" : "Justification"} {props.requirements.needsJustification ? <span className="required-marker" aria-label="required">*</span> : null}
               </label>
               <div className="justification-input-wrapper">
                 <textarea
+                  id="activation-justification"
+                  disabled={props.isActivating}
                   className="textarea justification-textarea"
                   rows={2}
                   maxLength={MAX_USER_JUSTIFICATION_LENGTH}
@@ -3006,7 +3075,7 @@ function ActivationBar(props: {
                   className="btn icon-btn save-justification-button justification-save-overlay"
                   type="button"
                   onClick={props.onSaveJustification}
-                  disabled={!props.justification.trim()}
+                  disabled={props.isActivating || !props.justification.trim()}
                   title="Save this justification for reuse"
                   aria-label="Save justification"
                 >
@@ -3050,6 +3119,7 @@ function ActivationBar(props: {
                 {visibleJustifications.map((item) => (
                   <button
                     className="justification-picker-option"
+                    disabled={props.isActivating}
                     type="button"
                     key={`${justificationView}:${item}`}
                     onClick={() => props.setJustification(item)}
@@ -3062,8 +3132,8 @@ function ActivationBar(props: {
           ) : null}
           {isActivateMode && props.requirements.needsTicket ? (
             <div className="activation-grid">
-              <input className="input" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
-              <input className="input" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
+              <input className="input" disabled={props.isActivating} maxLength={128} aria-label="Ticket system" value={props.ticketSystem} onChange={(event) => props.setTicketSystem(event.target.value)} placeholder="Ticket system" />
+              <input className="input" disabled={props.isActivating} maxLength={128} aria-label="Ticket number" value={props.ticketNumber} onChange={(event) => props.setTicketNumber(event.target.value)} placeholder="Ticket number" />
             </div>
           ) : null}
         </div>

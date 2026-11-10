@@ -1,4 +1,5 @@
 import { hasRequiredPortalToken } from "./access";
+import { createStorageMutationLock } from "./storageMutation";
 import { ENTRA_PORTAL_URLS } from "./popupModel";
 import type {
   AccessSetupTarget,
@@ -10,6 +11,7 @@ import type {
 } from "./types";
 
 export const PORTAL_RECOVERY_SESSION_KEY = "quickPimPortalRecovery.v1";
+export const PORTAL_RECOVERY_BROWSER_SESSION_KEY = "quickPimPortalRecoveryBrowserSession.v1";
 export const PORTAL_RECOVERY_GROUP_TITLE = "QuickPIM++ access refresh";
 export const PORTAL_RECOVERY_SESSION_TTL_MS = 10 * 60_000;
 export const PORTAL_RECOVERY_ABSOLUTE_TTL_MS = 90 * 60_000;
@@ -26,6 +28,7 @@ interface PortalRecoverySession {
   createdAt: number;
   lastProgressAt: number;
   lastRequestedAt: number;
+  browserSessionId?: string;
   groupId?: number;
   windowId?: number;
   tabsByTarget: Partial<Record<AccessSetupTarget, number>>;
@@ -61,12 +64,14 @@ export interface PortalRecoveryApis {
   tabs: PortalRecoveryTabsLike;
   tabGroups?: PortalRecoveryTabGroupsLike;
   storage: PortalRecoveryStorageLike;
+  sessionStorage?: PortalRecoveryStorageLike;
   windows?: {
     update(windowId: number, updateInfo: chrome.windows.UpdateInfo): Promise<chrome.windows.Window>;
   };
 }
 
 let portalRecoveryMutationQueue: Promise<void> = Promise.resolve();
+const withBrowserSessionLock = createStorageMutationLock("quickPimPortalRecoveryBrowserSession");
 
 export async function openPortalRecoveryTabs(
   requestedTargets: AccessSetupTarget[],
@@ -76,7 +81,7 @@ export async function openPortalRecoveryTabs(
 ): Promise<PortalRecoveryOpenResult> {
   return enqueuePortalRecoveryMutation(async () => {
     const targets = uniqueTargets(requestedTargets);
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (session) {
       session = await pruneMissingOrNavigatedTabs(session, apis.tabs, now);
     }
@@ -96,7 +101,7 @@ export async function openPortalRecoveryTabs(
 
     await closeOrphanedPortalRecoveryTabsInternal(apis, session);
 
-    session = session || newPortalRecoverySession(now);
+    session = session || { ...newPortalRecoverySession(now), browserSessionId: await getBrowserSessionId(apis) };
     const advancedTargets = await advanceAuthenticationStage(session, tokenStatus, apis, now);
     const managedBeforeOpen = getManagedTargets(session);
     const reusedTargets = targets.filter((target) => managedBeforeOpen.includes(target));
@@ -166,7 +171,7 @@ export async function getPortalRecoveryStatus(
   tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryStatus> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (!session) {
       return idlePortalRecoveryStatus();
     }
@@ -192,7 +197,7 @@ export async function focusPortalRecoveryTabs(
   tokenStatus?: TokenStatus
 ): Promise<PortalRecoveryFocusResult> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (!session) {
       return { focused: false, status: idlePortalRecoveryStatus() };
     }
@@ -273,7 +278,7 @@ export async function closePortalRecoveryTabsForTargets(
   expectedJourneyCreatedAt?: number
 ): Promise<AccessSetupTarget[]> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage);
+    let session = await loadOwnedPortalRecoverySession(apis);
     if (!session) {
       return [];
     }
@@ -301,7 +306,7 @@ export async function getPortalRecoveryJourneyCreatedAt(
   now = Date.now()
 ): Promise<number | undefined> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (!session) return undefined;
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs, now);
     if (await shouldExpirePortalRecoverySession(session, apis.tabs, now)) {
@@ -317,7 +322,7 @@ export async function closeExpiredPortalRecoveryTabs(
   now = Date.now()
 ): Promise<AccessSetupTarget[]> {
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (!session) {
       return [];
     }
@@ -343,7 +348,7 @@ export async function closeOrphanedPortalRecoveryTabs(
   now = Date.now()
 ): Promise<number[]> {
   return enqueuePortalRecoveryMutation(async () => {
-    const session = await loadPortalRecoverySession(apis.storage, now);
+    const session = await loadOwnedPortalRecoverySession(apis, now);
     return closeOrphanedPortalRecoveryTabsInternal(apis, session);
   });
 }
@@ -355,7 +360,7 @@ export async function isPortalRecoveryManagedTabId(
 ): Promise<boolean> {
   if (!Number.isInteger(tabId) || tabId < 0) return false;
   return enqueuePortalRecoveryMutation(async () => {
-    let session = await loadPortalRecoverySession(apis.storage, now);
+    let session = await loadOwnedPortalRecoverySession(apis, now);
     if (!session) return false;
     session = await pruneMissingOrNavigatedTabs(session, apis.tabs, now);
     if (await shouldExpirePortalRecoverySession(session, apis.tabs, now)) {
@@ -769,14 +774,8 @@ async function removeTabIdsWithFallback(tabIds: number[], tabs: PortalRecoveryTa
 }
 
 function isRecognizablePortalRecoveryTab(tab: chrome.tabs.Tab): boolean {
-  const url = tab.url || tab.pendingUrl;
-  if (!url) return true;
-  return Boolean(
-    getPortalRecoveryMarker(url)
-    || isMicrosoftAuthenticationUrl(url)
-    || (["directoryRole", "pimGroup", "azureRole"] as AccessSetupTarget[])
-      .some((target) => isPortalRecoveryUrlForTarget(url, target))
-  );
+  // A familiar group title or Microsoft blade alone is not tab ownership.
+  return Boolean(getPortalRecoveryMarker(tab.url || tab.pendingUrl));
 }
 
 async function shouldExpirePortalRecoverySession(
@@ -1127,6 +1126,42 @@ async function saveOrRemoveSession(session: PortalRecoverySession, storage: Port
   }
 }
 
+async function getBrowserSessionId(apis: PortalRecoveryApis): Promise<string | undefined> {
+  if (!apis.sessionStorage) return undefined;
+  const storage = apis.sessionStorage;
+  return withBrowserSessionLock(async () => {
+    const value = (await storage.get(PORTAL_RECOVERY_BROWSER_SESSION_KEY))[PORTAL_RECOVERY_BROWSER_SESSION_KEY];
+    if (typeof value === "string" && /^[a-zA-Z0-9-]{1,100}$/.test(value)) return value;
+    const id = crypto.randomUUID();
+    await storage.set({ [PORTAL_RECOVERY_BROWSER_SESSION_KEY]: id });
+    return id;
+  });
+}
+
+async function loadOwnedPortalRecoverySession(apis: PortalRecoveryApis, now = Date.now()): Promise<PortalRecoverySession | undefined> {
+  const session = await loadPortalRecoverySession(apis.storage, now);
+  if (!session || !apis.sessionStorage) return session;
+  const browserSessionId = await getBrowserSessionId(apis);
+  if (session.browserSessionId === browserSessionId) return session;
+  // Tab/group IDs are stable across worker suspension, but can be reassigned
+  // after browser restart. Reconstruct from exact journey markers before any
+  // old numeric ID may focus, authorize capture from, or close a tab.
+  session.tabsByTarget = {};
+  session.lastKnownUrlsByTarget = {};
+  delete session.authenticationTarget;
+  delete session.authenticationObserved;
+  delete session.groupId;
+  delete session.windowId;
+  await restoreTaggedRecoveryTabs(session, apis.tabs, now);
+  if (!Object.keys(session.tabsByTarget).length) {
+    await apis.storage.remove(PORTAL_RECOVERY_SESSION_KEY);
+    return undefined;
+  }
+  session.browserSessionId = browserSessionId;
+  await apis.storage.set({ [PORTAL_RECOVERY_SESSION_KEY]: session });
+  return session;
+}
+
 async function loadPortalRecoverySession(
   storage: PortalRecoveryStorageLike,
   now = Date.now()
@@ -1166,6 +1201,7 @@ async function loadPortalRecoverySession(
     createdAt: record.createdAt,
     lastProgressAt,
     lastRequestedAt,
+    ...(typeof record.browserSessionId === "string" && /^[a-zA-Z0-9-]{1,100}$/.test(record.browserSessionId) ? { browserSessionId: record.browserSessionId } : {}),
     tabsByTarget,
     baselineTokenSignatures,
     deferredTargets,

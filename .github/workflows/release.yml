@@ -13,13 +13,18 @@ on:
       publish_target:
         description: Publication step to retry
         required: true
-        default: all
+        default: github
         type: choice
         options:
           - all
           - github
           - chrome
           - edge
+      publish_stores:
+        description: Publish to Chrome/Edge only after explicit user authorization
+        required: true
+        default: false
+        type: boolean
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -149,7 +154,7 @@ jobs:
 
   chrome-web-store:
     needs: [verify-package, github-release]
-    if: ${{ always() && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && (github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || inputs.publish_target == 'chrome') }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && (inputs.publish_target == 'all' || inputs.publish_target == 'chrome') }}
     runs-on: ubuntu-latest
     environment: chrome-web-store
     permissions:
@@ -185,7 +190,7 @@ jobs:
 
   microsoft-edge-add-ons:
     needs: [verify-package, github-release]
-    if: ${{ always() && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != (github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name) && (github.event_name != 'workflow_dispatch' || inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != inputs.tag && (inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
     runs-on: ubuntu-latest
     environment: microsoft-edge-add-ons
     permissions:

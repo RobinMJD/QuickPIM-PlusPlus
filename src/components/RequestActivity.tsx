@@ -13,6 +13,7 @@ export function useRequestActivity() {
   const [operations, setOperations] = useState<RequestOperationRecord[]>([]);
   const [tracked, setTracked] = useState<TrackedPimRequest[]>([]);
   const [error, setError] = useState("");
+  const [clock, setClock] = useState(Date.now);
   const reloadRef = useRef<() => Promise<void>>(async () => undefined);
   const retryRef = useRef<() => Promise<void>>(async () => undefined);
   const reload = useCallback(() => reloadRef.current(), []);
@@ -21,13 +22,27 @@ export function useRequestActivity() {
     let disposed = false, storageFailed = false, runtimeFailed = false;
     let reading: Promise<void> | undefined, polling: Promise<void> | undefined;
     let again = false;
+    let fastPolling = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const updateError = () => { if (!disposed) setError(storageFailed || runtimeFailed
       ? "Request status is temporarily unavailable. Your submitted work continues in the background." : ""); };
     const read = (): Promise<void> => {
       if (reading) { again = true; return reading; }
       reading = Promise.all([loadRequestOperations(), loadTrackedRequests()]).then(([next, store]) => {
-        if (!disposed) { setOperations(next); setTracked(store.requests); storageFailed = false; updateError(); }
+        if (!disposed) {
+          setOperations((current) => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+          setTracked((current) => JSON.stringify(current) === JSON.stringify(store.requests) ? current : store.requests);
+          const now = Date.now();
+          const needsClock = next.some((operation) => !isRequestOperationFinished(operation, store.requests)
+            || getRequestResultVisibleUntil(operation, store.requests) > now - 50_000);
+          if (needsClock && !fastPolling && !polling) {
+            clearTimeout(timer);
+            timer = setTimeout(() => void poll(), 3_000);
+          }
+          if (needsClock || fastPolling) setClock(now);
+          fastPolling = needsClock;
+          storageFailed = false; updateError();
+        }
       }).catch(() => { storageFailed = true; updateError(); })
         .finally(() => { reading = undefined; if (again && !disposed) { again = false; void read(); } });
       return reading;
@@ -42,7 +57,7 @@ export function useRequestActivity() {
         if (!disposed) await read();
       })().finally(() => {
         polling = undefined;
-        if (!disposed) timer = setTimeout(() => void poll(), 3_000);
+        if (!disposed) timer = setTimeout(() => void poll(), fastPolling || storageFailed || runtimeFailed ? 3_000 : 30_000);
       });
       return polling;
     };
@@ -58,7 +73,7 @@ export function useRequestActivity() {
       reloadRef.current = retryRef.current = async () => undefined;
     };
   }, []);
-  return { operations, tracked, error, reload, retry };
+  return { operations, tracked, error, reload, retry, clock };
 }
 
 export function RequestActivity({ operations, tracked, error, identity = {}, onOpenAccess, mode = "popup", onDismiss, onRetry, getProgress = getRequestItemProgress }: {

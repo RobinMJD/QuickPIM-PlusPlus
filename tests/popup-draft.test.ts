@@ -3,15 +3,41 @@ import {
   POPUP_DRAFT_KEY,
   clearPopupDraft,
   clearSubmittedPopupDraft,
+  loadPopupDraft,
   hasPopupDraftContent,
   sanitizePopupDraft,
   savePopupDraft
 } from "../src/lib/popupDraft";
 import { MAX_USER_JUSTIFICATION_LENGTH } from "../src/lib/justifications";
+import { REQUEST_OPERATIONS_LOCAL_KEY } from "../src/lib/requestOperations";
 
 const now = Date.parse("2026-06-12T12:00:00.000Z");
 
 describe("popup draft storage", () => {
+  test("reopening preserves a distinct draft and suppresses only the exact submitted intent", async () => {
+    const draft = { updatedAt: Date.now(), tab: "directoryRole", sortMode: "name", selectedIds: ["directoryRole:reader:/"],
+      durationHours: 1, justification: "Investigate production issue", ticketSystem: "ServiceNow", ticketNumber: "INC-123",
+      isActivationReviewOpen: true, requestMode: "activate", tenantId: "tenant-one", principalId: "principal-one" };
+    const operation = { id: "existing-operation", action: "activate", state: "running", startedAt: draft.updatedAt,
+      updatedAt: draft.updatedAt, itemIds: draft.selectedIds, targets: ["directoryRole"], tenantId: draft.tenantId,
+      principalId: draft.principalId, durationHours: draft.durationHours, justification: draft.justification,
+      ticketInfo: { ticketSystem: draft.ticketSystem, ticketNumber: draft.ticketNumber } };
+    for (const update of [{ durationHours: 2 }, { ticketNumber: "INC-999" }, { ticketSystem: "Other" },
+      { principalId: "other-account" }, { tenantId: "other-tenant" }, { justification: "Investigate a different incident" }]) {
+      vi.stubGlobal("chrome", { storage: { local: {
+        get: async () => ({ [POPUP_DRAFT_KEY]: { ...draft, ...update }, [REQUEST_OPERATIONS_LOCAL_KEY]: [operation] }),
+        set: async () => undefined, remove: async () => undefined
+      } } });
+      expect((await loadPopupDraft())?.selectedIds).toEqual(draft.selectedIds);
+    }
+    vi.stubGlobal("chrome", { storage: { local: {
+      get: async () => ({ [POPUP_DRAFT_KEY]: draft, [REQUEST_OPERATIONS_LOCAL_KEY]: [operation] }),
+      set: async () => undefined, remove: async () => undefined
+    } } });
+    expect((await loadPopupDraft())?.selectedIds).toEqual([]);
+    vi.unstubAllGlobals();
+  });
+
   test("cleans the submitted raw draft after popup closure without reconstructing its form", async () => {
     const draft = { updatedAt: Date.now(), submittedOperationId: "submitted_test_1234", tab: "directoryRole", sortMode: "name", selectedIds: ["directoryRole:reader:/"], durationHours: 1, justification: "Investigate production issue", ticketSystem: "ServiceNow", ticketNumber: "INC-123", isActivationReviewOpen: true, requestMode: "activate", tenantId: "tenant-one", principalId: "principal-one" };
     const remove = vi.fn(async () => undefined);

@@ -93,6 +93,27 @@ for (const scenario of [
   });
 }
 
+for (const failDuringValidation of [true, false]) {
+  test(`review: transport failure during ${failDuringValidation ? "validation stays retryable" : "the actual write stays uncertain"}`, async () => {
+    const item = await installHarness("/", false);
+    await worker.evaluate((validation) => {
+      const original = globalThis.fetch;
+      globalThis.fetch = async (input, init) => {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        if (body.action === "selfActivate" && Boolean(body.isValidationOnly) === validation) throw new TypeError("Failed to fetch");
+        return original(input, init);
+      };
+    }, failDuringValidation);
+    const page = await context.newPage();
+    await page.goto(`chrome-extension://${extensionId}/popup.html`);
+    const reply = await page.evaluate((item) => chrome.runtime.sendMessage({ action: "activateItems", items: [item], operationId: crypto.randomUUID(),
+      durationHours: 1, justification: "Maintain groups in the selected administrative scope" }), item);
+    expect(reply.success, reply.error).toBe(true);
+    expect(reply.data.results[0].success).toBe(false);
+    expect(reply.data.results[0].outcomeUnknown === true).toBe(!failDuringValidation);
+  });
+}
+
 async function installHarness(scope: string, rejectActual: boolean): Promise<DirectoryRoleItem> {
   return worker.evaluate(async ({ targetScope, rejectWrite }) => {
     const now = Date.now();

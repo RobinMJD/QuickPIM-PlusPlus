@@ -73,10 +73,10 @@ import {
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
   reconcileTrackedRequestWithActiveAssignments,
+  reconcileCompletedDeactivations,
+  mergeRestoredTrackedRequests,
   mutateTrackedRequests,
   runWithTrackedRequestMutationLock,
-  saveTrackedRequests,
-  sanitizeTrackedRequestStore,
   reconcileTrackedExtensionSources,
   trackedRequestMatchesValidatedToken,
   trackedRequestStatusLabel,
@@ -116,6 +116,8 @@ import {
   type GraphTokenTarget
 } from "./lib/graphTokenCapabilities";
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
+import { fetchMicrosoftApi } from "./lib/microsoftFetch";
+import { requestOperationMayHaveWritten } from "./lib/requestOperations";
 import {
   EXTENSION_RESET_PENDING_KEY,
   resetExtensionData,
@@ -171,7 +173,8 @@ import {
   buildTrackedRequestExtensionPlan,
   formatExtensionDuration,
   getTrackedRequestExtensionSubmissionCopy,
-  requireTrackedRequestExtensionRequestId
+  requireTrackedRequestExtensionRequestId,
+  verifyTrackedExtensionSource
 } from "./lib/requestExtension";
 import {
   formatUnknownWriteOutcome,
@@ -840,7 +843,7 @@ async function performTrackedRequestMaintenance(
   );
   const hasRetryableExtension = reconcileTrackedExtensionSources(initialStore, now) !== initialStore;
   const updatedStore = updates.size || hasEffectiveStatusChanges || hasRetryableExtension
-    ? await mutateTrackedRequests((current) => reconcileTrackedExtensionSources({
+    ? await mutateTrackedRequests((current) => reconcileTrackedExtensionSources(reconcileCompletedDeactivations({
       version: 1,
       requests: current.requests.map((request) => {
         const update = updates.get(request.id);
@@ -852,7 +855,7 @@ async function performTrackedRequestMaintenance(
           ? request
           : { ...request, status: effectiveStatus, updatedAt: new Date(now).toISOString(), nextCheckAt: undefined };
       })
-    }, now))
+    }, now), now))
     : initialStore;
   const notifiedStore = await notifyTrackedRequestChanges(initialStore, updatedStore, settings, now);
   const invalidationTargets = getTrackedRequestActiveCacheInvalidationTargets(initialStore, notifiedStore);
@@ -1572,13 +1575,15 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       return enrichActivationPolicies(message.items);
     case "refreshTrackedRequests":
       return runTrackedRequestMaintenance(message.requestIds, true);
-    case "clearTrackedRequests":
-      await clearTrackedRequests();
+    case "clearTrackedRequests": {
+      const store = await clearTrackedRequests();
       await clearTrackedRequestNotifications();
-      await updateTrackedRequestBadge({ version: 1, requests: [] });
-      return true;
+      await updateTrackedRequestBadge(store);
+      await scheduleTrackedRequestMaintenance(store, await loadSettings());
+      return store;
+    }
     case "restoreTrackedRequests": {
-      const store = await saveTrackedRequests(message.store);
+      const store = await mutateTrackedRequests((current) => mergeRestoredTrackedRequests(current, message.store));
       const settings = await loadSettings();
       await Promise.all([
         updateTrackedRequestBadge(store),
@@ -1590,7 +1595,7 @@ async function handleMessage(message: ReturnType<typeof validateQuickPimMessage>
       const restored = await runWithSettingsMutationLock(() => runWithTrackedRequestMutationLock(async () => {
         const snapshot = await loadSettingsSnapshot();
         const settings = mergeSettings(message.settings);
-        const store = sanitizeTrackedRequestStore(message.store);
+        const store = mergeRestoredTrackedRequests(await loadTrackedRequests(), message.store);
         await chrome.storage.local.set({
           [SETTINGS_KEY]: settings,
           [SETTINGS_REVISION_KEY]: snapshot.revision + 1,
@@ -1793,6 +1798,12 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
     // Register synchronously before awaiting source metadata; concurrent readers
     // must not reconcile a resuming operation as an abandoned write.
     const task = runWithServiceWorkerKeepAlive(async () => {
+      if (operation.kind === "extension") {
+        const store = await loadTrackedRequests();
+        const source = store.requests.find((request) => request.requestId === operation.sourceRequestId);
+        if (!source || !unsent[0]) throw new Error("The original activation is unavailable. No extension was sent.");
+        await verifyLiveTrackedExtensionSource(source, unsent[0]);
+      }
       const response = operation.action === "activate"
         ? await activateItems(unsent, payload.durationHours!, payload.justification || "", payload.ticketInfo || {}, payload.bundleName, { operationId: operation.id, startDateTime: operation.scheduledStartAt, continuationOfRequestId: operation.sourceRequestId })
         : await deactivateItems(unsent, payload.justification || "", payload.ticketInfo || {}, { operationId: operation.id });
@@ -1817,7 +1828,10 @@ async function reconcileOrphanedRequestOperation(operation: RequestOperationReco
       return combined;
     });
     requestOperationTasks.set(operation.id, { fingerprint: getRequestOperationFingerprint(operation), task });
-    void task.catch((error) => failRequestOperation(operation.id, sanitizeErrorMessage(error), { uncertain: true })).finally(() => requestOperationTasks.delete(operation.id)).catch(() => undefined);
+    void task.catch(async (error) => {
+      const latest = (await loadRequestOperations()).find((record) => record.id === operation.id);
+      await failRequestOperation(operation.id, sanitizeErrorMessage(error), { uncertain: requestOperationMayHaveWritten(latest) });
+    }).finally(() => requestOperationTasks.delete(operation.id)).catch(() => undefined);
     return;
   }
   await retryPendingTrackedRequests(operation);
@@ -2038,8 +2052,7 @@ async function runDurableRequestOperation(
     } catch (error) {
       const detail = sanitizeErrorMessage(error);
       const latestOperation = (await loadRequestOperations()).find((item) => item.id === operation.id);
-      const outcomeUnknown = latestOperation?.state === "uncertain"
-        || latestOperation?.items?.some((item) => item.state === "uncertain") === true;
+      const outcomeUnknown = requestOperationMayHaveWritten(latestOperation);
       const failedResults = activityItems.map((item) => ({
         itemId: item.id,
         itemName: item.displayName,
@@ -2289,9 +2302,10 @@ async function performTrackedRequestExtension(requestId: string, onAccepted?: (i
   }
 
   let writePrepared = false;
+  let operationId: string | undefined;
 
   try {
-    const operationId = `extension-${crypto.randomUUID()}`;
+    operationId = `extension-${crypto.randomUUID()}`;
     const response = await runDurableRequestOperation({
       id: operationId, action: "activate", kind: "extension", sourceRequestId: source.requestId,
       scheduledStartAt: plan.startDateTime, itemIds: [plan.item.id], targets: [plan.item.type],
@@ -2300,6 +2314,10 @@ async function performTrackedRequestExtension(requestId: string, onAccepted?: (i
       justification: plan.justification, ticketInfo: plan.ticketInfo,
       resumePayload: { items: [plan.item], durationHours: plan.durationHours, justification: plan.justification, ticketInfo: plan.ticketInfo }
     }, async () => {
+      // This read belongs to the durable operation: the popup may disappear
+      // while it verifies that historical/imported expiry still describes a
+      // live activation. Never turn stale history into a new future grant.
+      await verifyLiveTrackedExtensionSource(source, plan.item);
       await patchTrackedExtensionSource(source.id, {
         extensionAttemptState: "submitting", extensionRequestedAt: new Date().toISOString(),
         extensionRequestId: undefined, extensionLastError: undefined
@@ -2320,7 +2338,7 @@ async function performTrackedRequestExtension(requestId: string, onAccepted?: (i
     const result = response.results[0];
     if (!result?.success) {
       const detail = result?.error || "Microsoft did not accept the extension request.";
-      const ambiguous = isAmbiguousMicrosoftWriteFailure(detail, Boolean(result?.accessRecoveryTarget));
+      const ambiguous = result?.outcomeUnknown === true;
       await patchTrackedExtensionSource(source.id, {
         extensionAttemptState: ambiguous ? "uncertain" : undefined,
         extensionRequestId: undefined,
@@ -2353,16 +2371,31 @@ async function performTrackedRequestExtension(requestId: string, onAccepted?: (i
   } catch (error) {
     const detail = sanitizeErrorMessage(error);
     if (!writePrepared) return extensionFailure(source.requestId, detail);
+    const latest = await loadRequestOperations().then((records) => records.find((record) => record.id === operationId)).catch(() => undefined);
+    const uncertain = requestOperationMayHaveWritten(latest);
     await patchTrackedExtensionSource(source.id, {
-      extensionAttemptState: "uncertain",
+      extensionAttemptState: uncertain ? "uncertain" : undefined,
       extensionRequestId: undefined,
       extensionLastError: detail
     });
     return extensionFailure(
       source.requestId,
-      `${detail} The result may be unknown; check Microsoft PIM before retrying.`
+      uncertain ? `${detail} The result may be unknown; check Microsoft PIM before retrying.` : detail
     );
   }
+}
+
+async function verifyLiveTrackedExtensionSource(source: TrackedPimRequest, item: ActivationItem): Promise<void> {
+  const settings = await loadSettings();
+  if (!settings.preferences.enabledFeatures.includes(source.itemType)) throw new Error("This role source is disabled. No extension was sent.");
+  const tokens = await getStoredTokens();
+  const kind = source.itemType === "azureRole" ? "azureManagement" : "graph";
+  const token = getTokenForActivation(tokens, item, kind);
+  if (!token) throw createPortalAccessRequiredError(item, kind, "activation");
+  assertRequestTokenReady(item, token, kind, "activation");
+  const active = await getActiveItems([source.itemType]);
+  if (active.errors.length) throw new Error(active.errors.join(" "));
+  verifyTrackedExtensionSource(source, active.items);
 }
 
 function extensionSuccess(
@@ -2736,6 +2769,7 @@ function getPortalRecoveryApis(): PortalRecoveryApis {
     // Recovery ownership is non-secret and must survive a browser restart.
     // Access tokens themselves remain exclusively in storage.session.
     storage: chrome.storage.local,
+    sessionStorage: chrome.storage.session,
     windows: chrome.windows
   };
 }
@@ -3543,10 +3577,16 @@ async function enrichActivationPolicies(items: ActivationItem[]): Promise<Activa
   const enrichedGroups = await Promise.all(
     targets.map(async (target) => {
       const targetItems = items.filter((item) => item.type === target);
+      const tokenKind: TokenKind = target === "azureRole" ? "azureManagement" : "graph";
+      const token = target === "azureRole" ? tokens.azureManagementToken : getGraphTokenForTarget(tokens, target);
+      if (!token) throw new Error(target === "azureRole" ? "Azure Management token is missing." : "Graph token is missing.");
+      assertFreshToken(token, tokenKind);
+      const identity = decodeToken(token);
+      if (targetItems.some((item) => !item.tenantId || item.tenantId.toLowerCase() !== String(identity?.tid || "").toLowerCase()
+        || item.principalId.toLowerCase() !== String(identity?.oid || "").toLowerCase())) {
+        throw new Error("The selected role belongs to another signed-in account or tenant. Refresh role data before checking its policy.");
+      }
       if (target === "directoryRole") {
-        const token = getGraphTokenForTarget(tokens, "directoryRole");
-        if (!token) throw new Error("Graph token is missing.");
-        assertFreshToken(token, "graph");
         const requirements = await getDirectoryRolePolicyRequirementsBestEffort(token);
         return targetItems.map((item) => {
           if (item.type !== "directoryRole") return markActivationPolicyReady(item);
@@ -3559,9 +3599,6 @@ async function enrichActivationPolicies(items: ActivationItem[]): Promise<Activa
         });
       }
       if (target === "pimGroup") {
-        const token = getGraphTokenForTarget(tokens, "pimGroup");
-        if (!token) throw new Error("Graph token is missing.");
-        assertFreshToken(token, "graph");
         const groupIds = [...new Set(targetItems.map((item) => item.type === "pimGroup" ? item.groupId : "").filter(Boolean))];
         const requirements = await getPimGroupPolicyRequirementsBestEffort(token, groupIds);
         return targetItems.map((item) => {
@@ -3573,12 +3610,7 @@ async function enrichActivationPolicies(items: ActivationItem[]): Promise<Activa
             : markActivationPolicyPending(item);
         });
       }
-      const token = tokens.azureManagementToken;
-      if (!token) throw new Error("Azure Management token is missing.");
-      assertFreshToken(token, "azureManagement");
-      return (await applyAzureRolePolicyRequirements(targetItems, token)).map((item) =>
-        item.activationRequirements ? markActivationPolicyReady(item) : markActivationPolicyPending(item)
-      );
+      return applyAzureRolePolicyRequirements(targetItems, token);
     })
   );
   const enrichedById = new Map(enrichedGroups.flat().map((item) => [item.id, item]));
@@ -4506,7 +4538,9 @@ async function applyAzureRolePolicyRequirements(items: ActivationItem[], token: 
     const requirements = getRoleDefinitionLookupKeys(item.roleDefinitionId)
       .map((key) => scopeRequirements[key])
       .find(Boolean);
-    return applyActivationRequirements(item, requirements);
+    return requirements
+      ? markActivationPolicyReady(applyActivationRequirements(item, requirements))
+      : markActivationPolicyPending(item);
   });
 }
 
@@ -4830,17 +4864,10 @@ async function activateItems(
     4,
     async (item) => {
       let microsoftAccepted = false;
+      let actualWriteStarted = false;
       let acceptedRequestId: string | undefined;
       try {
         return await runWithActivationItemLock(item, async () => {
-          if (options.operationId) {
-            await updateRequestOperationItem(options.operationId, item.id, {
-              state: "sending",
-              itemName: item.displayName,
-              itemType: item.type,
-              ...(item.tenantId ? { tenantId: item.tenantId } : {})
-            });
-          }
           const request = buildActivationRequest(item, durationHours, justification.trim(), ticketInfo, startDateTime);
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
@@ -4858,7 +4885,16 @@ async function activateItems(
           const data = await runWithActivationPreflight(
             item,
             validationRequest ? () => sendActivationRequest(validationRequest, token) : undefined,
-            () => sendActivationRequest(request, token)
+            async () => {
+              if (options.operationId) {
+                await updateRequestOperationItem(options.operationId, item.id, {
+                  state: "sending", itemName: item.displayName, itemType: item.type,
+                  ...(item.tenantId ? { tenantId: item.tenantId } : {})
+                });
+              }
+              actualWriteStarted = true;
+              return sendActivationRequest(request, token);
+            }
           );
           const requestId = getResponseIdentifier(data.payload, request, data.location);
           microsoftAccepted = true;
@@ -4926,7 +4962,7 @@ async function activateItems(
       } catch (error) {
         const accessRecoveryTarget = getPortalAccessRecoveryTarget(error, item);
         const detail = sanitizeErrorMessage(error);
-        const outcomeUnknown = microsoftAccepted || isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
+        const outcomeUnknown = microsoftAccepted || (actualWriteStarted && isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget)));
         const result: ActivationResult = {
           itemId: item.id,
           itemName: item.displayName,
@@ -4964,23 +5000,17 @@ async function activateItems(
 }
 
 async function sendActivationRequest(request: ActivationRequest, token: string): Promise<ActivationWriteResponse> {
-  const response = await fetchMicrosoftApi(request.endpoint, {
+  return fetchMicrosoftApi(request.endpoint, {
     method: request.method,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(request.body)
-  }, MICROSOFT_API_WRITE_TIMEOUT_MS);
-
-  if (!response.ok) {
-    throw await readMicrosoftApiError(response);
-  }
-
-  return {
-    payload: await safeJson(response),
-    location: getAllowedResponseLocation(response)
-  };
+  }, MICROSOFT_API_WRITE_TIMEOUT_MS, async (response) => {
+    if (!response.ok) throw await readMicrosoftApiError(response);
+    return { payload: await safeJson(response), location: getAllowedResponseLocation(response) };
+  });
 }
 
 async function deactivateItems(
@@ -5000,17 +5030,10 @@ async function deactivateItems(
     4,
     async (item) => {
       let microsoftAccepted = false;
+      let actualWriteStarted = false;
       let acceptedRequestId: string | undefined;
       try {
         return await runWithActivationItemLock(item, async () => {
-          if (options.operationId) {
-            await updateRequestOperationItem(options.operationId, item.id, {
-              state: "sending",
-              itemName: item.displayName,
-              itemType: item.type,
-              ...(item.tenantId ? { tenantId: item.tenantId } : {})
-            });
-          }
           const request = buildDeactivationRequest(item, justification.trim(), ticketInfo, startDateTime);
           assertAllowedApiUrl(request.endpoint, request.tokenKind);
           const token = getTokenForActivation(tokens, item, request.tokenKind);
@@ -5019,6 +5042,13 @@ async function deactivateItems(
           }
           assertRequestTokenReady(item, token, request.tokenKind, "deactivation");
           assertTokenCanActivate(item, token, request.tokenKind, "deactivation");
+          if (options.operationId) {
+            await updateRequestOperationItem(options.operationId, item.id, {
+              state: "sending", itemName: item.displayName, itemType: item.type,
+              ...(item.tenantId ? { tenantId: item.tenantId } : {})
+            });
+          }
+          actualWriteStarted = true;
           const data = await sendActivationRequest(request, token);
           const requestId = getResponseIdentifier(data.payload, request, data.location);
           microsoftAccepted = true;
@@ -5090,7 +5120,7 @@ async function deactivateItems(
           const tenantId = token ? getTokenTenantId(token) : undefined;
           if (tenantId) await offerDeactivationRetry({ ...item, tenantId }, justification.trim(), ticketInfo).catch(() => undefined);
         }
-        const outcomeUnknown = microsoftAccepted || isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget));
+        const outcomeUnknown = microsoftAccepted || (actualWriteStarted && isAmbiguousMicrosoftWriteFailure(detail, Boolean(accessRecoveryTarget)));
         const result: ActivationResult = {
           itemId: item.id,
           itemName: item.displayName,
@@ -5232,18 +5262,15 @@ async function fetchAllPages<T>(url: string, token: string, signal?: AbortSignal
 
 async function fetchJson<T>(url: string, token: string, signal?: AbortSignal): Promise<T> {
   assertAllowedApiUrl(url);
-  const response = await fetchMicrosoftApi(url, {
+  return fetchMicrosoftApi(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     }
-  }, MICROSOFT_API_READ_TIMEOUT_MS, signal);
-
-  if (!response.ok) {
-    throw new Error(await getSafeApiErrorMessage(response));
-  }
-
-  return (await response.json()) as T;
+  }, MICROSOFT_API_READ_TIMEOUT_MS, async (response) => {
+    if (!response.ok) throw new Error(await getSafeApiErrorMessage(response));
+    return (await response.json()) as T;
+  }, signal);
 }
 
 async function fetchGraphBatch<T>(
@@ -5256,18 +5283,17 @@ async function fetchGraphBatch<T>(
   }
   const url = graphApiUrl("/v1.0/$batch");
   assertAllowedApiUrl(url, "graph");
-  const response = await fetchMicrosoftApi(url, {
+  return fetchMicrosoftApi(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json"
     },
     body: JSON.stringify({ requests })
-  }, MICROSOFT_API_READ_TIMEOUT_MS, signal);
-  if (!response.ok) {
-    throw new Error(await getSafeApiErrorMessage(response));
-  }
-  return (await response.json()) as GraphBatchResponse<T>;
+  }, MICROSOFT_API_READ_TIMEOUT_MS, async (response) => {
+    if (!response.ok) throw new Error(await getSafeApiErrorMessage(response));
+    return (await response.json()) as GraphBatchResponse<T>;
+  }, signal);
 }
 
 function chunkItems<T>(items: T[], chunkSize: number): T[][] {
@@ -5277,41 +5303,6 @@ function chunkItems<T>(items: T[], chunkSize: number): T[][] {
     chunks.push(items.slice(index, index + safeChunkSize));
   }
   return chunks;
-}
-
-async function fetchMicrosoftApi(url: string, init: RequestInit, timeoutMs: number, parentSignal?: AbortSignal): Promise<Response> {
-  assertAllowedApiUrl(url);
-  const controller = new AbortController();
-  let requestTimedOut = false;
-  const timeout = setTimeout(() => {
-    requestTimedOut = true;
-    controller.abort();
-  }, timeoutMs);
-  const cancelFromParent = () => controller.abort();
-  if (parentSignal?.aborted) {
-    controller.abort();
-  } else {
-    parentSignal?.addEventListener("abort", cancelFromParent, { once: true });
-  }
-  try {
-    return await fetch(url, {
-      ...init,
-      credentials: "omit",
-      redirect: "error",
-      referrerPolicy: "no-referrer",
-      signal: controller.signal
-    });
-  } catch (error) {
-    if (controller.signal.aborted) {
-      throw new Error(requestTimedOut
-        ? `Microsoft API request timed out after ${Math.ceil(timeoutMs / 1000)} seconds.`
-        : "Microsoft API request was canceled because the refresh deadline expired.");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-    parentSignal?.removeEventListener("abort", cancelFromParent);
-  }
 }
 
 async function safeJson(response: Response): Promise<unknown> {
@@ -5336,7 +5327,7 @@ async function persistTrackedSubmissionsBestEffort(requests: TrackedPimRequest[]
   }
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const store = await mutateTrackedRequests((current) => upsertTrackedRequests(current, requests));
+      const store = await mutateTrackedRequests((current) => reconcileCompletedDeactivations(upsertTrackedRequests(current, requests)));
       const settings = await loadSettings();
       await Promise.all([
         updateTrackedRequestBadge(store),

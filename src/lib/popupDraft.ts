@@ -12,7 +12,7 @@ const POPUP_DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_SELECTED_IDS = 100;
 const MAX_ITEM_ID_LENGTH = 512;
 const MAX_SEARCH_LENGTH = 120;
-const MAX_TICKET_FIELD_LENGTH = 120;
+const MAX_TICKET_FIELD_LENGTH = 128;
 const MAX_IDENTITY_FIELD_LENGTH = 128;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const withPopupDraftMutationLock = createStorageMutationLock("quickPimPopupDraftMutation");
@@ -53,10 +53,7 @@ export async function loadPopupDraft(now = Date.now()): Promise<PopupDraft | und
   if (draft?.selectedIds.length) {
     const operations = await loadRequestOperations();
     const submitted = operations.some((operation) => operation.id === draft.submittedOperationId
-      || (["running", "uncertain"].includes(operation.state) && operation.action === draft.requestMode
-        && operation.itemIds.length === draft.selectedIds.length
-        && operation.justification === (draft.justification || undefined)
-        && draft.selectedIds.every((id) => operation.itemIds.some((candidate) => activationItemIdentitiesMatch(id, candidate)))));
+      || (["running", "uncertain"].includes(operation.state) && draftMatchesOperation(draft, operation)));
     if (submitted) return { ...draft, selectedIds: [], isActivationReviewOpen: false, requestMode: undefined, justification: "", ticketSystem: "", ticketNumber: "" };
   }
   return draft;
@@ -86,17 +83,21 @@ export async function clearSubmittedPopupDraft(operation: Pick<RequestOperationR
     // selections and would prevent this cleanup after the popup disappeared.
     const stored = await storage.get(POPUP_DRAFT_KEY);
     const draft = sanitizePopupDraft(stored[POPUP_DRAFT_KEY]);
-    if (!draft || draft.selectedIds.length !== operation.itemIds.length
-      || draft.requestMode !== operation.action
-      || (draft.tenantId && operation.tenantId && draft.tenantId.toLowerCase() !== operation.tenantId.toLowerCase())
-      || (draft.principalId && operation.principalId && draft.principalId.toLowerCase() !== operation.principalId.toLowerCase())
-      || draft.justification.trim() !== (operation.justification || "").trim()
-      || draft.ticketSystem.trim() !== (operation.ticketInfo?.ticketSystem || "").trim()
-      || draft.ticketNumber.trim() !== (operation.ticketInfo?.ticketNumber || "").trim()
-      || (operation.action === "activate" && draft.durationHours !== operation.durationHours)
-      || draft.selectedIds.some((id) => !operation.itemIds.some((submitted) => activationItemIdentitiesMatch(id, submitted)))) return;
+    if (!draft || !draftMatchesOperation(draft, operation)) return;
     await storage.remove(POPUP_DRAFT_KEY);
   });
+}
+
+function draftMatchesOperation(draft: PopupDraft, operation: Pick<RequestOperationRecord, "itemIds" | "action" | "justification" | "durationHours" | "tenantId" | "principalId" | "ticketInfo">): boolean {
+  return draft.selectedIds.length === operation.itemIds.length
+    && draft.requestMode === operation.action
+    && (draft.tenantId || "").toLowerCase() === (operation.tenantId || "").toLowerCase()
+    && (draft.principalId || "").toLowerCase() === (operation.principalId || "").toLowerCase()
+    && draft.justification.trim() === (operation.justification || "").trim()
+    && draft.ticketSystem.trim() === (operation.ticketInfo?.ticketSystem || "").trim()
+    && draft.ticketNumber.trim() === (operation.ticketInfo?.ticketNumber || "").trim()
+    && (operation.action !== "activate" || draft.durationHours === operation.durationHours)
+    && draft.selectedIds.every((id) => operation.itemIds.some((submitted) => activationItemIdentitiesMatch(id, submitted)));
 }
 
 export function sanitizePopupDraft(value: unknown, now = Date.now()): PopupDraft | undefined {
