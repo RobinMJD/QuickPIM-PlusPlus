@@ -20,6 +20,6 @@ Changes since [vPREVIOUS](https://github.com/RobinMJD/QuickPIM-PlusPlus/releases
 [Compare changes](https://github.com/RobinMJD/QuickPIM-PlusPlus/compare/vPREVIOUS...vCURRENT)
 ```
 
-Keep changes concise and useful to extension users. Use level-three topic or version headings when a release covers several areas or unpublished application versions. Preserve historical entries, attribution, and license details. Use actual Markdown newlines, never literal `\n` sequences. Do not equate a Store submission with public availability.
+Keep changes concise and useful to extension users. Include product changes and completed validation only; keep private conversations, owner instructions, approval history, and temporary release coordination out of public release notes and repository documentation. Use level-three topic or version headings when a release covers several areas or unpublished application versions. Preserve historical entries, attribution, and license details. Use actual Markdown newlines, never literal `\n` sequences. Do not equate a Store submission with public availability.
 
 Add the new notes file in the version-bump commit. Release verification requires the tagged file; GitHub publication reads that file instead of generating a comparison-only changelog. Existing release assets and tags remain immutable; correcting a release body is a metadata-only action and does not require rebuilding or republishing the extension.

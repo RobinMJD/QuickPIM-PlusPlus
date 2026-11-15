@@ -21,7 +21,7 @@ on:
           - chrome
           - edge
       publish_stores:
-        description: Publish to Chrome/Edge only after explicit user authorization
+        description: Submit the verified package to the selected extension stores
         required: true
         default: false
         type: boolean

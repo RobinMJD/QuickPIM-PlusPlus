@@ -10,7 +10,7 @@ Deactivation no longer inherits activation-only mandatory fields. Extension requ
 
 Settings and their revision are read atomically; concurrent settings events take priority over earlier reads, including resets. History clearing and restore preserve active and unresolved tracking. Draft matching includes account, scope, duration, reason, and ticket parameters; failed draft reads cannot overwrite unseen saved work. Recovery tab IDs are owned by a browser session and reconstructed from exact journey markers after restart. JWT display claims decode as UTF-8. The active eligibility overlay retains the original activation start time for disable retry scheduling.
 
-Idle popup request polling slows to thirty seconds and switches back to three seconds when work arrives. Terminal disable notices expire after ten seconds while their local history remains accessible in Settings. Privacy and activation-field descriptions match the implementation. No permissions or dependencies are added. Release tags publish to GitHub only; Store jobs require a separate manual dispatch with explicit Store publication enabled, which remains unauthorized for this release.
+Idle popup request polling slows to thirty seconds and switches back to three seconds when work arrives. Terminal disable notices expire after ten seconds while their local history remains accessible in Settings. Privacy and activation-field descriptions match the implementation. No permissions or dependencies are added.
 
 ## v2.18.20 Progress and Notice Lifecycle
 

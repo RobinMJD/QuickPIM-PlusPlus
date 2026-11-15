@@ -165,7 +165,7 @@ release/quickpim-plusplus-vX.Y.Z-chromium-stores.zip
 
 Chrome Web Store and Microsoft Edge Add-ons currently receive the same immutable archive because the extension uses one compatible manifest and payload. `npm run check:edge` rejects unsupported Edge API use, Chrome-specific Store metadata, or an `update_url` before packaging.
 
-Tagged releases run version synchronization, type checking, tests, dependency audit, production build, package verification, and GitHub release attachment. Chrome and Edge publication is held: either Store requires a separately authorized manual workflow run with `publish_stores` enabled and the intended `publish_target` selected. Manual runs default to GitHub only; tag pushes never submit Store updates.
+Tagged releases run version synchronization, type checking, tests, dependency audit, production build, package verification, and GitHub release attachment.
 
 The approved listing copy and reusable Store graphics live under `store/`. Run `npm run assets:stores` only when those tracked screenshots or promotional assets need to be regenerated.
 
