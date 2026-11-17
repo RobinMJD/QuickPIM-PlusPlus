@@ -784,6 +784,50 @@ test("regression: automatic expiry closes inspected results and returns keyboard
   expect((await evidence()).operations).toHaveLength(1);
 });
 
+test("regression: active assignment clears stale approval, unlocks disable and survives reopening", async ({}, info) => {
+  let page = await popup(); await submitFromUI(page, items[0].displayName); await release(true);
+  const row = () => page.locator(".role-row").filter({ hasText: items[0].displayName });
+  await expect(row()).toContainText("Awaiting approval");
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("requestTestHarness");
+    await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, staleApproval: true, confirmedGroups: ["group-a"] } });
+  });
+  await page.locator(".refresh-button").click();
+  await expect(row()).toContainText("PIM active");
+  await expect(row()).not.toContainText("Awaiting approval");
+  await expect(row().locator('input[type="checkbox"]')).toBeEnabled();
+  await expect(row().locator(".remaining-activation-time")).toBeVisible();
+  await page.screenshot({ path: info.outputPath("approved-group-active.png") });
+  await page.close(); page = await popup();
+  await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+  await expect(row()).toContainText("PIM active");
+  await expect(page.getByRole("region", { name: "Requests", exact: true })).toHaveCount(0, { timeout: 13_000 });
+  await row().locator('input[type="checkbox"]').check();
+  await page.getByRole("button", { name: /Continue/ }).click();
+  await expect(page.getByRole("button", { name: "Disable 1 selected", exact: true })).toBeEnabled();
+  expect((await evidence()).harness.writes).toHaveLength(1);
+});
+
+test("regression: background polling confirms approval from an assignment while the request endpoint lags", async () => {
+  let page = await popup(); await submitFromUI(page, items[0].displayName); await release(true);
+  await expect(page.locator(".role-row").filter({ hasText: items[0].displayName })).toContainText("Awaiting approval");
+  await page.close();
+  await worker.evaluate(async () => {
+    const data = await chrome.storage.local.get("requestTestHarness");
+    await chrome.storage.local.set({ requestTestHarness: { ...data.requestTestHarness, staleApproval: true, confirmedGroups: ["group-a"] } });
+  });
+  const settings = await context.newPage(); await settings.goto(`chrome-extension://${extensionId}/settings.html#activity`);
+  const reply = await settings.evaluate(() => chrome.runtime.sendMessage({ action: "refreshTrackedRequests" }));
+  expect(reply.success, reply.error).toBe(true);
+  const tracked = await worker.evaluate(async () => (await chrome.storage.local.get("quickPimRequests.v1"))["quickPimRequests.v1"].requests);
+  expect(tracked[0]).toMatchObject({ status: "active", targetScheduleId: "schedule-group-a" });
+  await settings.close(); page = await popup();
+  await page.getByRole("tab", { name: "PIM Groups", exact: true }).click();
+  await page.locator(".refresh-button").click();
+  await expect(page.locator(".role-row").filter({ hasText: items[0].displayName })).toContainText("PIM active");
+  expect((await evidence()).harness.writes).toHaveLength(1);
+});
+
 test("regression: awaiting approval stays visible without endlessly spinning", async () => {
   const page = await popup(); await submitFromUI(page, items[0].displayName); await release(true);
   await expect(page.locator(".role-row").filter({ hasText: items[0].displayName })).toContainText("Awaiting approval");
@@ -833,6 +877,10 @@ function installOfflineMicrosoft() {
     }
     if (["graph.microsoft.com", "management.azure.com"].includes(url.hostname)) {
       const harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness;
+      if (harness?.staleApproval && url.pathname.includes("/privilegedAccess/group/assignmentScheduleRequests")) {
+        const requests = harness.writes.map((write: any) => ({ ...write, id: write.testId, status: "PendingApproval" }));
+        return json(url.pathname.includes("/request-") ? requests.find((request: any) => url.pathname.endsWith(`/${request.id}`)) || {} : { value: requests });
+      }
       const source = harness?.extensionSource;
       if (source && !harness?.extensionNoLongerActive) {
         if (source.itemType === "pimGroup" && url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: [{
@@ -851,7 +899,7 @@ function installOfflineMicrosoft() {
         }] });
       }
       if (source?.itemType === "azureRole" && url.pathname === "/subscriptions") return json({ value: [{ subscriptionId: "sub-a", displayName: "Subscription A" }] });
-      if (url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: (harness?.items || []).filter((item: any) => (harness?.confirmedGroups || []).includes(item.groupId)).map((item: any) => ({ id: `instance-${item.groupId}`, assignmentScheduleId: `schedule-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId, assignmentType: "Activated", startDateTime: new Date(Date.now() - 10_000).toISOString(), endDateTime: new Date(Date.now() + 3600_000).toISOString() })) });
+      if (url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: (harness?.items || []).filter((item: any) => (harness?.confirmedGroups || []).includes(item.groupId)).map((item: any) => ({ id: `instance-${item.groupId}`, assignmentScheduleId: `schedule-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId, assignmentType: "Activated", startDateTime: harness.writes.find((write: any) => write.groupId === item.groupId && write.action === "selfActivate")?.scheduleInfo?.startDateTime || new Date(Date.now() - 10_000).toISOString(), endDateTime: new Date(Date.now() + 3600_000).toISOString() })) });
       if (url.pathname.includes("/privilegedAccess/group/eligibilityScheduleInstances")) return json({ value: (harness?.items || []).filter((item: ActivationItem) => item.type === "pimGroup").map((item: any) => ({ id: `eligibility-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId })) });
       if (url.pathname.endsWith("/$batch")) return json({ responses: (body.requests || []).map((request: { id: string; url: string }) => ({ id: request.id, status: 200, body: { id: "group-a", displayName: request.url.includes("group-b") ? "Deployment Owners" : "Application Support", value: [] } })) });
       return json({ value: [] });

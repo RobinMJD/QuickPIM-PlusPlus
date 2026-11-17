@@ -23,6 +23,7 @@ import {
   mergeRestoredTrackedRequests,
   clearTrackedRequests,
   reconcileTrackedRequestWithActiveAssignments,
+  mergeTrackedRequestCheck,
   sanitizeTrackedRequestStore,
   trackedRequestMatchesValidatedToken,
   trackedRequestMatchesTokenIdentity,
@@ -80,6 +81,52 @@ function createStorage(initial?: TrackedPimRequestStore) {
 }
 
 describe("tracked PIM requests", () => {
+  test("confirms an approved activation from the exact new active assignment despite a stale request status", () => {
+    const pending = createRequest({ status: "pendingApproval", activeUntil: new Date(NOW + 4 * 3600_000).toISOString() });
+    const active: ActivationItem = { ...directoryRole, status: "active", activeAssignmentType: "activated", assignmentScheduleId: "approved-schedule",
+      activeFrom: new Date(NOW + 30_000).toISOString(), activeUntil: new Date(NOW + 1830_000).toISOString() };
+    const confirmed = reconcileTrackedRequestWithActiveAssignments(pending, [active], NOW + 60_000);
+    expect(confirmed).toMatchObject({ status: "active", activeFrom: active.activeFrom, activeUntil: active.activeUntil,
+      targetScheduleId: "approved-schedule", completedAt: new Date(NOW + 60_000).toISOString(), nextCheckAt: undefined });
+    expect(reconcileTrackedRequestWithActiveAssignments(confirmed, [active], NOW + 90_000)).toBe(confirmed);
+    const stale = updateTrackedRequestFromPayload(confirmed, { status: "PendingApproval" }, NOW + 90_000);
+    expect(stale).toMatchObject({ status: "active", activeUntil: active.activeUntil, completedAt: confirmed.completedAt, nextCheckAt: undefined });
+    expect(getEffectiveTrackedRequestStatus(updateTrackedRequestFromPayload(confirmed, { status: "PendingApproval" }, NOW + 3600_000), NOW + 3600_000)).toBe("expired");
+    expect(updateTrackedRequestFromPayload(confirmed, { status: "Revoked" }, NOW + 90_000).status).toBe("completed");
+    expect(mergeTrackedRequestCheck(confirmed, { ...pending, updatedAt: new Date(NOW + 90_000).toISOString() })).toBe(confirmed);
+  });
+
+  test("pending approval cannot be confirmed by an older, ambiguous, unrelated or future activation", () => {
+    const pending = createRequest({ status: "pendingApproval", targetScheduleId: "approved-schedule" });
+    const active: ActivationItem = { ...directoryRole, status: "active", activeAssignmentType: "activated", assignmentScheduleId: "approved-schedule",
+      activeFrom: new Date(NOW + 30_000).toISOString(), activeUntil: new Date(NOW + 1830_000).toISOString() };
+    for (const change of [{ tenantId: "other" }, { principalId: "other" }, { directoryScopeId: "/administrativeUnits/other" },
+      { assignmentScheduleId: "old-schedule" }, { activeAssignmentType: "assigned" as const }, { activeFrom: undefined },
+      { activeFrom: new Date(NOW - 30_000).toISOString() }, { activeFrom: new Date(NOW + 90_000).toISOString() },
+      { activeUntil: new Date(NOW - 1).toISOString() }]) {
+      expect(reconcileTrackedRequestWithActiveAssignments(pending, [{ ...active, ...change }], NOW + 60_000)).toBe(pending);
+    }
+    expect(reconcileTrackedRequestWithActiveAssignments(pending, [active, { ...active, assignmentScheduleInstanceId: "another-instance" }], NOW + 60_000)).toBe(pending);
+    const future = { ...pending, activeFrom: new Date(NOW + 3600_000).toISOString() };
+    expect(reconcileTrackedRequestWithActiveAssignments(future, [active], NOW + 60_000)).toBe(future);
+    for (const status of ["denied", "failed", "canceled", "expired"] as const) {
+      const terminal = { ...pending, status };
+      expect(reconcileTrackedRequestWithActiveAssignments(terminal, [active], NOW + 60_000)).toBe(terminal);
+    }
+    const base = { principalId: "principal-1", tenantId: "tenant-1", sourceName: "Role", displayName: "Role", scopeLabel: "Scope", status: "eligible" as const };
+    const otherSources: ActivationItem[] = [
+      { ...base, type: "pimGroup", id: "pimGroup:group-1:member", groupId: "group-1", accessId: "member" },
+      { ...base, type: "azureRole", id: "azureRole:role-1:/subscriptions/sub-1", roleDefinitionId: "role-1", scope: "/subscriptions/sub-1" }
+    ];
+    for (const item of otherSources) {
+      const request = createTrackedPimRequest({ item, tenantId: item.tenantId, action: "activate", requestId: "approved-request", payload: { status: "PendingApproval" }, requestedAt: new Date(NOW).toISOString(), now: NOW })!;
+      const assignment = { ...item, status: "active" as const, activeAssignmentType: "activated" as const, activeFrom: active.activeFrom, activeUntil: active.activeUntil };
+      expect(reconcileTrackedRequestWithActiveAssignments(request, [assignment], NOW + 60_000).status).toBe("active");
+      const unrelated = assignment.type === "pimGroup" ? { ...assignment, accessId: "owner" as const } : { ...assignment, scope: "/subscriptions/other" };
+      expect(reconcileTrackedRequestWithActiveAssignments(request, [unrelated], NOW + 60_000)).toBe(request);
+    }
+  });
+
   test("clearing or restoring history preserves local in-progress tracking", async () => {
     const timestamps = { requestedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     const pending = createRequest({ status: "pendingApproval", nextCheckAt: new Date(Date.now() + 30_000).toISOString(), ...timestamps });

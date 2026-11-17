@@ -73,12 +73,15 @@ import {
   loadTrackedRequests,
   markTrackedRequestCheckFailure,
   reconcileTrackedRequestWithActiveAssignments,
+  needsActiveAssignmentReconciliation,
+  mergeTrackedRequestCheck,
   reconcileCompletedDeactivations,
   mergeRestoredTrackedRequests,
   mutateTrackedRequests,
   runWithTrackedRequestMutationLock,
   reconcileTrackedExtensionSources,
   trackedRequestMatchesValidatedToken,
+  trackedRequestMatchesActiveItem,
   trackedRequestStatusLabel,
   updateTrackedRequestFromPayload,
   upsertTrackedRequests,
@@ -848,7 +851,7 @@ async function performTrackedRequestMaintenance(
       requests: current.requests.map((request) => {
         const update = updates.get(request.id);
         if (update) {
-          return { ...request, ...update };
+          return mergeTrackedRequestCheck(request, update);
         }
         const effectiveStatus = getEffectiveTrackedRequestStatus(request, now);
         return effectiveStatus === request.status
@@ -893,7 +896,7 @@ async function pollDirectoryTrackedRequests(
         token
       )
     );
-    await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActiveDirectoryRoles(token));
+    await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActiveDirectoryRoles(token), token));
   } catch (error) {
     for (const request of trackable) {
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
@@ -941,7 +944,7 @@ async function pollPimGroupTrackedRequests(
       }
     }
   });
-  await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActivePimGroups(token));
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActivePimGroups(token), token));
 }
 
 async function pollAzureTrackedRequests(
@@ -967,7 +970,7 @@ async function pollAzureTrackedRequests(
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
     }
   });
-  await reconcileRequestsWithActiveAssignments(trackable, updates, now, () => getActiveAzureRoles(token));
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActiveAzureRoles(token), token));
 }
 
 async function reconcileRequestsWithActiveAssignments(
@@ -978,9 +981,7 @@ async function reconcileRequestsWithActiveAssignments(
 ): Promise<void> {
   const candidates = requests
     .map((request) => updates.get(request.id) || request)
-    .filter((request) => request.action === "activate"
-      && getEffectiveTrackedRequestStatus(request, now) === "active"
-      && !request.activeUntil);
+    .filter((request) => needsActiveAssignmentReconciliation(request, now));
   if (!candidates.length) return;
 
   try {
@@ -993,6 +994,29 @@ async function reconcileRequestsWithActiveAssignments(
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
     }
   }
+}
+
+async function reconcileDiscoveredActiveAssignments(items: ActivationItem[]): Promise<void> {
+  if (!items.some((item) => item.status === "active" && item.activeAssignmentType === "activated")) return;
+  const change = await runWithTrackedRequestMutationLock(async () => {
+    const previous = await loadTrackedRequests();
+    const now = Date.now();
+    let changed = false;
+    const requests = previous.requests.map((request) => {
+      if (!items.some((item) => trackedRequestMatchesActiveItem(request, item))) return request;
+      const next = reconcileTrackedRequestWithActiveAssignments(request, items, now, false);
+      changed ||= next !== request;
+      return next;
+    });
+    if (!changed) return;
+    const next: TrackedPimRequestStore = { version: 1, requests };
+    await chrome.storage.local.set({ [REQUEST_TRACKING_KEY]: next });
+    return { previous, next, now };
+  });
+  if (!change) return;
+  const settings = await loadSettings();
+  const store = await notifyTrackedRequestChanges(change.previous, change.next, settings, change.now);
+  await Promise.all([updateTrackedRequestBadge(store), scheduleTrackedRequestMaintenance(store, settings)]);
 }
 
 function markRequestsWaitingForMatchingToken(
@@ -3432,6 +3456,7 @@ async function getActiveItems(targets: AccessSetupTarget[] = ["directoryRole", "
     pimGroup: () => fetchItemGroup("pimGroup", "graph", getGraphTokenForTarget(tokens, "pimGroup"), getActivePimGroups, "active")
   };
   const results = await Promise.all(targets.map((target) => fetchers[target]()));
+  await reconcileDiscoveredActiveAssignments(results.flatMap((result) => result.items)).catch(() => undefined);
 
   return {
     items: dedupeItems(results.flatMap((result) => result.items)),
@@ -3508,6 +3533,7 @@ async function getActivationSnapshot(targets: AccessSetupTarget[] = ["directoryR
       return makeFailedTargetSnapshot(target, error);
     }
   }));
+  await reconcileDiscoveredActiveAssignments(results.flatMap((result) => result.active.items)).catch(() => undefined);
   return {
     eligible: combineSnapshotResults(results, "eligible"),
     active: combineSnapshotResults(results, "active"),
@@ -3562,6 +3588,7 @@ async function getActivationCoreSnapshot(targets: AccessSetupTarget[] = ["direct
       return makeFailedTargetSnapshot(target, error);
     }
   }));
+  await reconcileDiscoveredActiveAssignments(results.flatMap((result) => result.active.items)).catch(() => undefined);
   return {
     eligible: combineSnapshotResults(results, "eligible"),
     active: combineSnapshotResults(results, "active"),

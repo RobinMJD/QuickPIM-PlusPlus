@@ -1,0 +1,10 @@
+{
+  "name": "@quickpim/picomatch-hardened",
+  "version": "4.0.7-quickpim.1",
+  "private": true,
+  "license": "MIT",
+  "main": "index.js",
+  "engines": {
+    "node": ">=12"
+  }
+}

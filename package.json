@@ -1,6 +1,6 @@
 {
   "name": "quickpim-plusplus",
-  "version": "2.18.21",
+  "version": "2.18.22",
   "private": true,
   "packageManager": "npm@11.6.2",
   "engines": {
@@ -32,6 +32,10 @@
     "jsdom": "^26.0.0",
     "typescript": "^5.8.0",
     "vite": "^8.0.16",
-    "vitest": "^4.1.12"
+    "vitest": "^4.1.12",
+    "picomatch": "file:vendor/quickpim-picomatch"
+  },
+  "overrides": {
+    "picomatch": "$picomatch"
   }
 }

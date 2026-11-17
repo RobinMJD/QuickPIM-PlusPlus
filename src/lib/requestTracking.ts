@@ -207,6 +207,12 @@ export function updateTrackedRequestFromPayload(
     now,
     request.activeFrom
   );
+  // A request endpoint can lag behind the assignment endpoint after approval.
+  // The same request cannot move from an established activation back to waiting.
+  if (request.action === "activate" && ["active", "expired"].includes(request.status)
+    && request.activeUntil && ["submitted", "pendingApproval", "provisioning", "scheduled"].includes(details.status)) {
+    return { ...request, lastCheckedAt: new Date(now).toISOString(), nextCheckAt: undefined, lastError: undefined };
+  }
   const checkCount = request.checkCount + 1;
   const status = details.status;
   const canContinue = shouldContinueTracking(status, details.activeUntil || request.activeUntil)
@@ -235,16 +241,20 @@ export function reconcileTrackedRequestWithActiveAssignments(
   now = Date.now(),
   activeItemsComplete = true
 ): TrackedPimRequest {
-  if (request.action !== "activate" || getEffectiveTrackedRequestStatus(request, now) !== "active" || request.activeUntil) {
-    return request;
-  }
+  if (!needsActiveAssignmentReconciliation(request, now)) return request;
+  const wasActive = getEffectiveTrackedRequestStatus(request, now) === "active";
 
-  const activeItem = activeItems.find((item) => trackedRequestMatchesActiveItem(request, item));
+  const matches = activeItems.filter((item) => trackedRequestMatchesActiveItem(request, item)
+    && (wasActive || isNewActiveAssignmentForRequest(request, item, now)));
+  const activeItem = matches.length === 1 ? matches[0] : undefined;
   if (activeItem) {
     const candidate = {
       ...request,
       status: "active",
       activeUntil: activeItem.activeUntil,
+      activeFrom: activeItem.activeFrom || request.activeFrom,
+      targetScheduleId: request.targetScheduleId || activeItem.assignmentScheduleId,
+      completedAt: wasActive ? request.completedAt : new Date(now).toISOString(),
       activeAssignmentMissingSince: undefined,
       updatedAt: new Date(now).toISOString(),
       lastCheckedAt: new Date(now).toISOString(),
@@ -255,6 +265,8 @@ export function reconcileTrackedRequestWithActiveAssignments(
     };
     return sanitizeTrackedRequest(candidate, now) || request;
   }
+  // Absence of proof is not rejection or expiry of an approval request.
+  if (!wasActive) return request;
 
   const missingSince = request.activeAssignmentMissingSince || new Date(now).toISOString();
   const missingSinceMs = Date.parse(missingSince);
@@ -270,6 +282,29 @@ export function reconcileTrackedRequestWithActiveAssignments(
     nextCheckAt: visibilityExpired ? undefined : new Date(now + ACTIVE_ASSIGNMENT_RECHECK_MS).toISOString(),
     lastError: visibilityExpired ? undefined : "Waiting for the active assignment to become visible."
   }, now) || request;
+}
+
+export function needsActiveAssignmentReconciliation(request: TrackedPimRequest, now = Date.now()): boolean {
+  if (request.action !== "activate") return false;
+  const status = getEffectiveTrackedRequestStatus(request, now);
+  return status === "active" ? !request.activeUntil
+    : ["submitted", "pendingApproval", "provisioning", "unknown", "statusUnavailable"].includes(status);
+}
+
+function isNewActiveAssignmentForRequest(request: TrackedPimRequest, item: ActivationItem, now: number): boolean {
+  const start = Date.parse(item.activeFrom || "");
+  const end = Date.parse(item.activeUntil || "");
+  const expectedStart = Math.max(Date.parse(request.requestedAt), Date.parse(request.activeFrom || request.requestedAt));
+  return item.activeAssignmentType === "activated" && Number.isFinite(start) && Number.isFinite(end)
+    && start <= now && end > now && start >= expectedStart - 1_000;
+}
+
+export function mergeTrackedRequestCheck(current: TrackedPimRequest, update: TrackedPimRequest): TrackedPimRequest {
+  if (current.id !== update.id || current.tenantId !== update.tenantId || current.principalId !== update.principalId
+    || Date.parse(current.updatedAt) > Date.parse(update.updatedAt)) return current;
+  if (current.action === "activate" && ["active", "expired"].includes(current.status) && current.activeUntil
+    && ["submitted", "pendingApproval", "provisioning", "scheduled"].includes(update.status)) return current;
+  return { ...current, ...update };
 }
 
 export function markTrackedRequestCheckFailure(

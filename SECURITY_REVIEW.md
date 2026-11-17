@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.21.
+Reviewed for v2.18.22.
+
+## v2.18.22 Approval-State Reconciliation
+
+Newly observed PIM activations reconcile pending request tracking with the same tenant, principal, role/scope or group relationship, schedule identifier when available, and activation window. Older activations, direct assignments, ambiguous matches, future continuations and terminal requests do not confirm a pending activation. Tracking updates persist across popup closure; stale pending responses and older concurrent polls cannot overwrite an established activation. The completion timestamp remains stable so notices expire once. Background assignment reads retain the token's tenant identity. No permissions or privileged write retries are added. Regression checks use synthetic accounts and offline Microsoft responses, including an unchanged request endpoint that continues returning PendingApproval after the activation becomes visible.
+
+The build and test tools use a checked-in, restricted picomatch fork to address [GHSA-fc5q-39xc-vjpf](https://github.com/advisories/GHSA-fc5q-39xc-vjpf). The parser rejects repeated extglobs and disables raw regex plus and star quantifier handling. Tests verify that Vite, Vitest, tinyglobby and fdir resolve the restricted parser and that ordinary file discovery still works. This dependency is development-only.
 
 ## v2.18.21 Full Application Review
 
