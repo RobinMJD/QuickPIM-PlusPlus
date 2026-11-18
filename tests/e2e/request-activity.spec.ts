@@ -4,6 +4,7 @@ import path from "node:path";
 import { buildTargetCacheKey } from "../../src/lib/access";
 import { makeTokenStatus } from "../../src/lib/token";
 import { createRequestOperationItems } from "../../src/lib/requestOperations";
+import { createTrackedPimRequest } from "../../src/lib/requestTracking";
 import type { ActivationItem, RequestOperationRecord, TokenStatus } from "../../src/lib/types";
 
 let context: BrowserContext, worker: Worker, extensionId: string, extensionPath: string, profile: string;
@@ -828,6 +829,33 @@ test("regression: background polling confirms approval from an assignment while 
   expect((await evidence()).harness.writes).toHaveLength(1);
 });
 
+for (const [type, itemIndex] of [["directoryRole", 2], ["azureRole", 3]] as const) {
+  test(`background confirms a ${type} approval when another Microsoft read fails`, async () => {
+    const item = items[itemIndex];
+    const now = Date.now();
+    const pending = createTrackedPimRequest({
+      item, tenantId: tenant, action: "activate", requestId: "approval-test",
+      payload: { status: "PendingApproval" }, requestedAt: new Date(now - 60_000).toISOString(), now
+    })!;
+    await worker.evaluate(async ({ pending, type, now }) => {
+      const { requestTestHarness: harness } = await chrome.storage.local.get("requestTestHarness");
+      await chrome.storage.local.set({
+        "quickPimRequests.v1": { version: 1, requests: [pending] },
+        requestTestHarness: { ...harness, approvalReadFailure: type, extensionSource: {
+          ...pending, activeFrom: new Date(now - 15_000).toISOString(), activeUntil: new Date(now + 3600_000).toISOString()
+        } }
+      });
+    }, { pending, type, now });
+    const settings = await context.newPage();
+    await settings.goto(`chrome-extension://${extensionId}/settings.html#activity`);
+    const reply = await settings.evaluate(() => chrome.runtime.sendMessage({ action: "refreshTrackedRequests" }));
+    expect(reply.success, reply.error).toBe(true);
+    const tracked = await worker.evaluate(async () => (await chrome.storage.local.get("quickPimRequests.v1"))["quickPimRequests.v1"].requests);
+    expect(tracked[0]).toMatchObject({ status: "active", targetScheduleId: "source-schedule" });
+    expect((await evidence()).harness.writes).toHaveLength(0);
+  });
+}
+
 test("regression: awaiting approval stays visible without endlessly spinning", async () => {
   const page = await popup(); await submitFromUI(page, items[0].displayName); await release(true);
   await expect(page.locator(".role-row").filter({ hasText: items[0].displayName })).toContainText("Awaiting approval");
@@ -877,6 +905,13 @@ function installOfflineMicrosoft() {
     }
     if (["graph.microsoft.com", "management.azure.com"].includes(url.hostname)) {
       const harness = (await chrome.storage.local.get("requestTestHarness")).requestTestHarness;
+      if (harness?.approvalReadFailure === "directoryRole" && url.pathname.includes("/roleManagement/directory/roleAssignmentScheduleRequests")) {
+        return json({ error: { message: "Request listing temporarily unavailable." } }, 503);
+      }
+      if (harness?.approvalReadFailure === "azureRole") {
+        if (url.pathname.includes("/roleAssignmentScheduleRequests/")) return json({ properties: { status: "PendingApproval" } });
+        if (url.pathname.startsWith("/subscriptions/sub-b/")) return json({ error: { message: "Subscription access denied." } }, 403);
+      }
       if (harness?.staleApproval && url.pathname.includes("/privilegedAccess/group/assignmentScheduleRequests")) {
         const requests = harness.writes.map((write: any) => ({ ...write, id: write.testId, status: "PendingApproval" }));
         return json(url.pathname.includes("/request-") ? requests.find((request: any) => url.pathname.endsWith(`/${request.id}`)) || {} : { value: requests });
@@ -898,7 +933,10 @@ function installOfflineMicrosoft() {
             startDateTime: source.activeFrom || new Date(Date.now() - 60_000).toISOString(), endDateTime: source.activeUntil }
         }] });
       }
-      if (source?.itemType === "azureRole" && url.pathname === "/subscriptions") return json({ value: [{ subscriptionId: "sub-a", displayName: "Subscription A" }] });
+      if (source?.itemType === "azureRole" && url.pathname === "/subscriptions") return json({
+        value: [{ subscriptionId: "sub-a", displayName: "Subscription A" },
+          ...(harness.approvalReadFailure === "azureRole" ? [{ subscriptionId: "sub-b", displayName: "Subscription B" }] : [])]
+      });
       if (url.pathname.includes("/privilegedAccess/group/assignmentScheduleInstances")) return json({ value: (harness?.items || []).filter((item: any) => (harness?.confirmedGroups || []).includes(item.groupId)).map((item: any) => ({ id: `instance-${item.groupId}`, assignmentScheduleId: `schedule-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId, assignmentType: "Activated", startDateTime: harness.writes.find((write: any) => write.groupId === item.groupId && write.action === "selfActivate")?.scheduleInfo?.startDateTime || new Date(Date.now() - 10_000).toISOString(), endDateTime: new Date(Date.now() + 3600_000).toISOString() })) });
       if (url.pathname.includes("/privilegedAccess/group/eligibilityScheduleInstances")) return json({ value: (harness?.items || []).filter((item: ActivationItem) => item.type === "pimGroup").map((item: any) => ({ id: `eligibility-${item.groupId}`, groupId: item.groupId, principalId: item.principalId, accessId: item.accessId })) });
       if (url.pathname.endsWith("/$batch")) return json({ responses: (body.requests || []).map((request: { id: string; url: string }) => ({ id: request.id, status: 200, body: { id: "group-a", displayName: request.url.includes("group-b") ? "Deployment Owners" : "Application Support", value: [] } })) });

@@ -3,12 +3,27 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   window.localStorage.clear();
   window.sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
 describe("portal token collector", () => {
+  test("uses the available token store when opening another storage area is denied", async () => {
+    const token = createJwt({ aud: "https://graph.microsoft.com", exp: Date.now() / 1_000 + 3600 });
+    window.sessionStorage.setItem("msal-token", token);
+    vi.spyOn(window, "localStorage", "get").mockImplementation(() => {
+      throw new DOMException("Storage access denied", "SecurityError");
+    });
+    const sendMessage = vi.fn((_message: unknown, callback: (response: unknown) => void) => callback({ success: true }));
+    vi.stubGlobal("chrome", { runtime: { sendMessage, onMessage: { addListener: vi.fn() } } });
+    vi.stubGlobal("setInterval", vi.fn(() => 1));
+    new Function(readFileSync(join(process.cwd(), "public/portalTokenCollector.js"), "utf8"))();
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ tokens: [token] }), expect.any(Function)
+    ));
+  });
   test("skips malformed expiries while still collecting a fractional NumericDate", async () => {
     const audience = { aud: "https://graph.microsoft.com" };
     const usable = createJwt({ ...audience, exp: Date.now() / 1000 + 3600.25 });

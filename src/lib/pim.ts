@@ -124,10 +124,8 @@ export function getActiveUntilFromScheduleInfo(scheduleInfo: unknown): string | 
   }
   const startMs = new Date(startDateTime).getTime();
   const durationMs = parseIsoDurationMs(duration);
-  if (!Number.isFinite(startMs) || durationMs <= 0) {
-    return undefined;
-  }
-  return new Date(startMs + durationMs).toISOString();
+  const end = new Date(startMs + durationMs);
+  return durationMs > 0 && Number.isFinite(end.getTime()) ? end.toISOString() : undefined;
 }
 
 export function applyActivationRequirements<T extends ActivationItem>(
@@ -482,13 +480,14 @@ export function parseIsoDurationMs(duration: string): number {
   }
 
   const [, days, hours, minutes, seconds] = match;
-  return (
+  const milliseconds = (
     (Number(days || 0) * 24 * 60 * 60 +
       Number(hours || 0) * 60 * 60 +
       Number(minutes || 0) * 60 +
       Number(seconds || 0)) *
     1000
   );
+  return Number.isFinite(milliseconds) ? milliseconds : 0;
 }
 
 function addTicketInfo(target: Record<string, unknown>, ticketInfo: TicketInfo) {

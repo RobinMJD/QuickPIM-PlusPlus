@@ -19,7 +19,7 @@ import {
   isBrowserSyncPayloadStorageKey,
   markBrowserSyncReminderShown,
   purgeBrowserSyncData,
-  queueBrowserSyncPurgeRetry,
+  createBrowserSyncPurgeMarker,
   renameBrowserSyncDevice,
   sanitizeBrowserSyncSnapshot,
   setBrowserSyncEnabled,
@@ -1406,9 +1406,13 @@ describe("native browser sync", () => {
     await synchronizeBrowserData({ local: sourceLocal, sync, distribution: edgeStore, now: 1_000, platform: "Windows" });
 
     const resetLocal = new MemoryStorage({ [SETTINGS_KEY]: structuredClone(DEFAULT_SETTINGS) });
-    await queueBrowserSyncPurgeRetry(resetLocal, new Error("sync unavailable"), 2_000);
+    await resetLocal.set({ [BROWSER_SYNC_PENDING_PURGE_KEY]: createBrowserSyncPurgeMarker(new Error("sync unavailable"), 2_000) });
+    const pending = await getBrowserSyncStatus({ local: resetLocal, sync, distribution: edgeStore, now: 2_500 });
+    expect(pending).toMatchObject({ pendingResetPurge: true, lastError: expect.stringMatching(/waiting to be deleted/i) });
     sync.failReads = true;
 
+    const blocked = await setBrowserSyncEnabled({ local: resetLocal, sync, distribution: edgeStore, now: 2_600 }, true);
+    expect(blocked).toMatchObject({ enabled: false, pendingResetPurge: true });
     const interrupted = await synchronizeBrowserData({ local: resetLocal, sync, distribution: edgeStore, now: 3_000, platform: "macOS" });
     expect(interrupted.lastError).toMatch(/still needs deletion/i);
     expect(resetLocal.data[BROWSER_SYNC_PENDING_PURGE_KEY]).toBeDefined();
@@ -1417,6 +1421,7 @@ describe("native browser sync", () => {
     sync.failReads = false;
     const recovered = await synchronizeBrowserData({ local: resetLocal, sync, distribution: edgeStore, now: 4_000, platform: "macOS" });
     expect(recovered.enabled).toBe(false);
+    expect(recovered.pendingResetPurge).toBeUndefined();
     expect(resetLocal.data[BROWSER_SYNC_PENDING_PURGE_KEY]).toBeUndefined();
     expect((resetLocal.data[SETTINGS_KEY] as QuickPimSettings).savedJustifications).toEqual([]);
     expect(Object.keys(sync.data).filter((key) => key.startsWith(BROWSER_SYNC_KEY_PREFIX)).sort()).toEqual([

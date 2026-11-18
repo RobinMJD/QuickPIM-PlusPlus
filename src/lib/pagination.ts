@@ -1,5 +1,5 @@
 export interface PaginatedResponse<T> {
-  value?: T[];
+  value: T[];
   "@odata.nextLink"?: string;
   nextLink?: string;
 }
@@ -27,7 +27,7 @@ export async function collectPaginatedValues<T>(
     if (!data || typeof data !== "object" || Array.isArray(data)) {
       throw new Error("Microsoft API pagination response was malformed.");
     }
-    const pageValues = data.value === undefined ? [] : data.value;
+    const pageValues = data.value;
     if (!Array.isArray(pageValues)) {
       throw new Error("Microsoft API pagination response was malformed.");
     }

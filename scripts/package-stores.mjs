@@ -135,6 +135,7 @@ export function packageStores({ distDir = "dist", releaseDir = "release", versio
   files.forEach((file) => utimesSync(resolve(distPath, file), packageTimestamp, packageTimestamp));
   execFileSync("zip", ["-X", "-q", paths.shared, "-@"], {
     cwd: distPath,
+    env: { ...process.env, TZ: "UTC" },
     input: `${files.join("\n")}\n`,
     stdio: ["pipe", "inherit", "inherit"]
   });

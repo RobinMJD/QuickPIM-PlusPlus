@@ -16,8 +16,8 @@ describe("release exact-commit CI gate", () => {
     for (const [job, target] of [["chrome-web-store", "chrome"], ["microsoft-edge-add-ons", "edge"]]) {
       const condition = workflow.split(`  ${job}:`)[1].match(/\n    if: \$\{\{ (.+) \}\}/)[1]
         .replace(/needs\.([a-z-]+)/g, (_, key) => `needs["${key}"]`);
-      const allowed = (event, publishStores, publicationTarget = "all", verify = "success", githubResult = "success", manualTag = "") => runInNewContext(condition, {
-        always: () => true, github: { event_name: event }, inputs: { tag: "v9.8.7", publish_stores: publishStores, publish_target: publicationTarget },
+      const allowed = (event, publishStores, publicationTarget = "all", verify = "success", githubResult = "success", manualTag = "", canceled = false) => runInNewContext(condition, {
+        cancelled: () => canceled, github: { event_name: event }, inputs: { tag: "v9.8.7", publish_stores: publishStores, publish_target: publicationTarget },
         needs: { "verify-package": { result: verify }, "github-release": { result: githubResult } },
         vars: { EDGE_ADDONS_MANUAL_SUBMISSION_TAG: manualTag }
       });
@@ -28,6 +28,8 @@ describe("release exact-commit CI gate", () => {
       expect(allowed("workflow_dispatch", true, target)).toBe(true);
       expect(allowed("workflow_dispatch", true, target, "failure")).toBe(false);
       expect(allowed("workflow_dispatch", true, target, "success", "failure")).toBe(false);
+      expect(allowed("workflow_dispatch", true, target, "success", "cancelled")).toBe(false);
+      expect(allowed("workflow_dispatch", true, target, "success", "skipped", "", true)).toBe(false);
       expect(allowed("workflow_dispatch", true, target, "success", "skipped")).toBe(true);
       if (target === "edge") expect(allowed("workflow_dispatch", true, target, "success", "success", "v9.8.7")).toBe(false);
     }

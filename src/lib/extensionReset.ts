@@ -1,3 +1,4 @@
+import { BROWSER_SYNC_PENDING_PURGE_KEY, createBrowserSyncPurgeMarker } from "./browserSync";
 import type { RequestOperationRecord } from "./types";
 
 export interface ExtensionResetApis {
@@ -7,10 +8,8 @@ export interface ExtensionResetApis {
   clearNotifications(): Promise<void>;
   removeNotificationPermission(): Promise<unknown>;
   purgeSyncedData(): Promise<unknown>;
-  queueSyncedDataPurge(error: unknown): Promise<void>;
-  prepareResetRecovery(): Promise<void>;
-  clearLocalStorage(): Promise<void>;
-  clearSessionStorage(): Promise<void>;
+  local: ResetStorageAreaLike;
+  session: ResetSessionStorageLike;
   clearAlarms(): Promise<unknown>;
   clearActionBadge(): Promise<unknown>;
 }
@@ -18,19 +17,28 @@ export interface ExtensionResetApis {
 export const EXTENSION_RESET_PENDING_KEY = "quickPimResetPending.v1";
 
 interface ResetStorageAreaLike {
-  get(key: string): Promise<Record<string, unknown>>;
+  get(key: string | null): Promise<Record<string, unknown>>;
   set(items: Record<string, unknown>): Promise<void>;
+  remove(keys: string | string[]): Promise<void>;
+}
+
+interface ResetSessionStorageLike {
   clear(): Promise<void>;
 }
 
 export async function resumePendingExtensionReset(
   local: ResetStorageAreaLike,
-  session: Pick<ResetStorageAreaLike, "clear">
+  session: ResetSessionStorageLike
 ): Promise<boolean> {
-  const result = await local.get(EXTENSION_RESET_PENDING_KEY);
-  if (!result[EXTENSION_RESET_PENDING_KEY]) return false;
+  const { [EXTENSION_RESET_PENDING_KEY]: marker } = await local.get(EXTENSION_RESET_PENDING_KEY);
+  if (!marker) return false;
+  const keepSyncPurge = typeof marker === "object" && "keepSyncPurge" in marker && marker.keepSyncPurge === true;
   await session.clear();
-  await local.clear();
+  const dataKeys = Object.keys(await local.get(null)).filter((key) =>
+    key !== EXTENSION_RESET_PENDING_KEY && !(keepSyncPurge && key === BROWSER_SYNC_PENDING_PURGE_KEY)
+  );
+  if (dataKeys.length) await local.remove(dataKeys);
+  await local.remove(EXTENSION_RESET_PENDING_KEY);
   return true;
 }
 
@@ -41,13 +49,13 @@ export async function resetExtensionData(apis: ExtensionResetApis): Promise<void
   }
 
   // A cloud outage must never trap local data. If the purge cannot be written,
-  // retain only a non-secret retry marker after the local clear; browser sync
+  // retain a non-secret retry marker during the local reset; browser sync
   // refuses to apply remote data until that deletion succeeds.
-  let syncPurgeError: unknown;
+  let pendingSyncPurge: ReturnType<typeof createBrowserSyncPurgeMarker> | undefined;
   try {
     await apis.purgeSyncedData();
   } catch (error) {
-    syncPurgeError = error;
+    pendingSyncPurge = createBrowserSyncPurgeMarker(error);
   }
 
   await Promise.allSettled([
@@ -56,16 +64,13 @@ export async function resetExtensionData(apis: ExtensionResetApis): Promise<void
     apis.removeNotificationPermission()
   ]);
 
-  // Persist intent before either storage area is touched. Session data is
-  // cleared first so a local-clear failure leaves the durable marker behind;
-  // startup can then finish the reset instead of exposing a half-reset state.
-  await apis.prepareResetRecovery();
-  await apis.clearSessionStorage();
-  await apis.clearLocalStorage();
-
-  if (syncPurgeError) {
-    await apis.queueSyncedDataPurge(syncPurgeError);
-  }
+  // Persist both markers together and retain them until the data is removed.
+  // Startup can finish an interrupted reset without losing the cloud deletion.
+  await apis.local.set({
+    [EXTENSION_RESET_PENDING_KEY]: { version: 1, keepSyncPurge: Boolean(pendingSyncPurge) },
+    ...(pendingSyncPurge ? { [BROWSER_SYNC_PENDING_PURGE_KEY]: pendingSyncPurge } : {})
+  });
+  await resumePendingExtensionReset(apis.local, apis.session);
 
   await Promise.allSettled([
     apis.clearAlarms(),

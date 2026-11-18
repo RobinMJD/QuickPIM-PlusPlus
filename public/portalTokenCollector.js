@@ -103,8 +103,8 @@
 
   async function collectPortalTokens(includeIndexedDb) {
     const tokens = new Set();
-    collectStorageTokens(window.localStorage, tokens);
-    collectStorageTokens(window.sessionStorage, tokens);
+    collectStorageTokens("localStorage", tokens);
+    collectStorageTokens("sessionStorage", tokens);
     if (includeIndexedDb) {
       await collectIndexedDbTokens(tokens);
     }
@@ -113,8 +113,9 @@
       .slice(0, MAX_TOKENS);
   }
 
-  function collectStorageTokens(storage, tokens) {
+  function collectStorageTokens(storageName, tokens) {
     try {
+      const storage = window[storageName];
       const keys = Array.from({ length: storage.length }, (_, index) => storage.key(index))
         .filter(Boolean)
         .sort((left, right) => storageKeyPriority(right) - storageKeyPriority(left) || left.localeCompare(right));
@@ -128,17 +129,13 @@
   }
 
   async function collectIndexedDbTokens(tokens) {
-    if (
-      tokens.size >= MAX_TOKEN_CANDIDATES ||
-      !window.indexedDB ||
-      typeof window.indexedDB.databases !== "function"
-    ) {
-      return;
-    }
+    if (tokens.size >= MAX_TOKEN_CANDIDATES) return;
 
     let databases;
     try {
-      databases = await window.indexedDB.databases();
+      const indexedDb = window.indexedDB;
+      if (typeof indexedDb?.databases !== "function") return;
+      databases = await indexedDb.databases();
     } catch {
       return;
     }

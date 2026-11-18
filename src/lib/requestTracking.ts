@@ -1,4 +1,5 @@
-import { parseIsoDurationMs } from "./pim";
+import { getUnscopedActivationItemIdentity } from "./activationIdentity";
+import { durationHoursToIso, getActiveUntilFromScheduleInfo } from "./pim";
 import { sanitizeErrorMessage, validateCapturedToken } from "./security";
 import { createStorageMutationLock } from "./storageMutation";
 import type {
@@ -266,11 +267,11 @@ export function reconcileTrackedRequestWithActiveAssignments(
     return sanitizeTrackedRequest(candidate, now) || request;
   }
   // Absence of proof is not rejection or expiry of an approval request.
-  if (!wasActive) return request;
+  if (!wasActive || !activeItemsComplete) return request;
 
   const missingSince = request.activeAssignmentMissingSince || new Date(now).toISOString();
   const missingSinceMs = Date.parse(missingSince);
-  const visibilityExpired = activeItemsComplete && Number.isFinite(missingSinceMs)
+  const visibilityExpired = Number.isFinite(missingSinceMs)
     && now - missingSinceMs >= ACTIVE_ASSIGNMENT_VISIBILITY_GRACE_MS;
   return sanitizeTrackedRequest({
     ...request,
@@ -489,31 +490,19 @@ export function reconcileTrackedExtensionSources(
   store: TrackedPimRequestStore,
   now = Date.now()
 ): TrackedPimRequestStore {
-  const retryableSourceIds = new Set(
-    store.requests.flatMap((request) => {
-      if (!request.continuationOfRequestId) return [];
-      const status = getEffectiveTrackedRequestStatus(request, now);
-      return status === "denied" || status === "failed" || status === "canceled" || status === "expired"
-        ? [request.continuationOfRequestId.toLowerCase()]
-        : [];
-    })
-  );
   let changed = false;
   const requests = store.requests.map((request) => {
-    const continuationExists = request.extensionRequestId
-      ? store.requests.some((candidate) => candidate.requestId.toLowerCase() === request.extensionRequestId?.toLowerCase())
-      : false;
+    if (request.extensionAttemptState !== "queued") return request;
+    const continuationId = normalizeIdentifier(request.extensionRequestId);
+    const continuations = store.requests.filter((candidate) => trackedRequestIsContinuationOf(candidate, request)
+      && (!continuationId || normalizeIdentifier(candidate.requestId) === continuationId));
+    const continuationFailed = continuations.length > 0 && continuations.every((candidate) =>
+      ["denied", "failed", "canceled", "expired"].includes(getEffectiveTrackedRequestStatus(candidate, now)));
     const extensionRequestedAt = request.extensionRequestedAt ? Date.parse(request.extensionRequestedAt) : Number.NaN;
-    const orphanedContinuation = request.extensionAttemptState === "queued"
-      && !continuationExists
+    const orphanedContinuation = !continuations.length
       && Number.isFinite(extensionRequestedAt)
       && now - extensionRequestedAt >= ACTIVE_ASSIGNMENT_VISIBILITY_GRACE_MS;
-    if (
-      request.extensionAttemptState !== "queued"
-      || (!retryableSourceIds.has(request.requestId.toLowerCase()) && !orphanedContinuation)
-    ) {
-      return request;
-    }
+    if (!continuationFailed && !orphanedContinuation) return request;
     changed = true;
     return {
       ...request,
@@ -524,6 +513,20 @@ export function reconcileTrackedExtensionSources(
     };
   });
   return changed ? { version: 1, requests } : store;
+}
+
+export function trackedRequestIsContinuationOf(candidate: TrackedPimRequest, source: TrackedPimRequest): boolean {
+  return candidate.id !== source.id
+    && candidate.action === "activate" && source.action === "activate"
+    && normalizeIdentifier(candidate.continuationOfRequestId) === normalizeIdentifier(source.requestId)
+    && trackedRequestsShareTarget(candidate, source);
+}
+
+function trackedRequestsShareTarget(left: TrackedPimRequest, right: TrackedPimRequest): boolean {
+  return normalizeIdentifier(left.tenantId) === normalizeIdentifier(right.tenantId)
+    && normalizeIdentifier(left.principalId) === normalizeIdentifier(right.principalId)
+    && left.itemType === right.itemType
+    && getUnscopedActivationItemIdentity(left.itemId) === getUnscopedActivationItemIdentity(right.itemId);
 }
 
 export function trackedRequestMatchesTokenIdentity(
@@ -823,23 +826,23 @@ export function trackedRequestMatchesActiveItem(request: TrackedPimRequest, item
     return false;
   }
   if (request.targetScheduleId && ![item.assignmentScheduleId, item.assignmentScheduleInstanceId]
-    .some((id) => scheduleIdentifiersMatch(request.targetScheduleId, id))) return false;
+    .some((id) => resourceIdentifiersMatch(request.targetScheduleId, id))) return false;
   if (item.type === "directoryRole") {
-    return roleDefinitionIdsMatch(request.roleDefinitionId, item.roleDefinitionId)
+    return resourceIdentifiersMatch(request.roleDefinitionId, item.roleDefinitionId)
       && normalizeResourcePath(request.directoryScopeId || "/") === normalizeResourcePath(item.directoryScopeId);
   }
   if (item.type === "pimGroup") {
     return normalizeIdentifier(request.groupId) === normalizeIdentifier(item.groupId)
       && request.accessId === item.accessId;
   }
-  return roleDefinitionIdsMatch(request.roleDefinitionId, item.roleDefinitionId)
+  return resourceIdentifiersMatch(request.roleDefinitionId, item.roleDefinitionId)
     && normalizeResourcePath(request.azureScope || "") === normalizeResourcePath(item.scope);
 }
 
-function scheduleIdentifiersMatch(left: string | undefined, right: string | undefined): boolean {
-  if (!left || !right) return false;
-  const a = normalizeIdentifier(left), b = normalizeIdentifier(right);
-  return a === b || a.split("/").filter(Boolean).at(-1) === b.split("/").filter(Boolean).at(-1);
+function resourceIdentifiersMatch(left: string | undefined, right: string | undefined): boolean {
+  const leftLeaf = normalizeIdentifier(left).split("/").filter(Boolean).at(-1);
+  const rightLeaf = normalizeIdentifier(right).split("/").filter(Boolean).at(-1);
+  return Boolean(leftLeaf && leftLeaf === rightLeaf);
 }
 
 export function reconcileCompletedDeactivations(store: TrackedPimRequestStore, now = Date.now()): TrackedPimRequestStore {
@@ -848,24 +851,16 @@ export function reconcileCompletedDeactivations(store: TrackedPimRequestStore, n
   let changed = false;
   const requests = store.requests.map((request) => {
     if (request.action !== "activate" || getEffectiveTrackedRequestStatus(request, now) !== "active" || !request.targetScheduleId) return request;
-    const match = disabled.find((entry) => entry.tenantId?.toLowerCase() === request.tenantId?.toLowerCase()
-      && entry.principalId.toLowerCase() === request.principalId.toLowerCase()
-      && entry.itemType === request.itemType
-      && scheduleIdentifiersMatch(entry.targetScheduleId, request.targetScheduleId));
+    const activationStartedAt = Math.max(Date.parse(request.requestedAt), Date.parse(request.activeFrom || request.requestedAt));
+    const match = disabled.find((entry) => Date.parse(entry.requestedAt) >= activationStartedAt
+      && trackedRequestsShareTarget(entry, request)
+      && resourceIdentifiersMatch(entry.targetScheduleId, request.targetScheduleId));
     if (!match) return request;
     changed = true;
     return { ...request, status: "completed" as const, completedAt: match.completedAt || match.updatedAt,
       updatedAt: new Date(now).toISOString(), nextCheckAt: undefined, activeAssignmentMissingSince: undefined };
   });
   return changed ? { version: 1, requests } : store;
-}
-
-function roleDefinitionIdsMatch(left: string | undefined, right: string | undefined): boolean {
-  if (!left || !right) return false;
-  const normalizedLeft = normalizeIdentifier(left);
-  const normalizedRight = normalizeIdentifier(right);
-  return normalizedLeft === normalizedRight
-    || normalizedLeft.split("/").filter(Boolean).at(-1) === normalizedRight.split("/").filter(Boolean).at(-1);
 }
 
 function normalizeIdentifier(value: string | undefined): string {
@@ -928,18 +923,17 @@ function getRequestPayloadDetails(
     properties.endDateTime,
     expiration.endDateTime
   );
-  const explicitOrServerDurationEnd = firstTimestamp(
-    root.endDateTime,
-    properties.endDateTime,
-    expiration.endDateTime
-  ) || getDurationEndDate(effectiveStart, stringValue(expiration.duration));
+  const explicitOrServerDurationEnd = explicitEnd || getActiveUntilFromScheduleInfo({ startDateTime: effectiveStart, expiration });
   const scheduledStartMs = scheduledStartAt ? Date.parse(scheduledStartAt) : Number.NaN;
   const requestedAtMs = Date.parse(requestedAt);
+  const plannedDuration = normalizeDuration(durationHours);
   const plannedContinuationEnd = Number.isFinite(scheduledStartMs)
     && Number.isFinite(requestedAtMs)
     && scheduledStartMs > requestedAtMs + 500
-    && normalizeDuration(durationHours)
-      ? new Date(scheduledStartMs + Number(durationHours) * 60 * 60_000).toISOString()
+    && plannedDuration
+      ? getActiveUntilFromScheduleInfo({
+        startDateTime: scheduledStartAt, expiration: { duration: durationHoursToIso(plannedDuration) }
+      })
       : undefined;
   const activeUntil = explicitOrServerDurationEnd || plannedContinuationEnd;
   return {
@@ -959,15 +953,6 @@ function getRequestPayloadDetails(
       MAX_ID_LENGTH
     )
   };
-}
-
-function getDurationEndDate(requestedAt: string, isoDuration: string | undefined): string | undefined {
-  const start = Date.parse(requestedAt);
-  const durationMs = isoDuration ? parseIsoDurationMs(isoDuration) : 0;
-  if (!Number.isFinite(start) || !durationMs) {
-    return undefined;
-  }
-  return new Date(start + durationMs).toISOString();
 }
 
 function getRequestPollDelayMs(checkCount: number): number {

@@ -30,7 +30,7 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -154,7 +154,7 @@ jobs:
 
   chrome-web-store:
     needs: [verify-package, github-release]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && (inputs.publish_target == 'all' || inputs.publish_target == 'chrome') }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && (needs.github-release.result == 'success' || needs.github-release.result == 'skipped') && (inputs.publish_target == 'all' || inputs.publish_target == 'chrome') }}
     runs-on: ubuntu-latest
     environment: chrome-web-store
     permissions:
@@ -190,7 +190,7 @@ jobs:
 
   microsoft-edge-add-ons:
     needs: [verify-package, github-release]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && needs.github-release.result != 'failure' && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != inputs.tag && (inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish_stores == true && needs.verify-package.result == 'success' && (needs.github-release.result == 'success' || needs.github-release.result == 'skipped') && vars.EDGE_ADDONS_MANUAL_SUBMISSION_TAG != inputs.tag && (inputs.publish_target == 'all' || inputs.publish_target == 'edge') }}
     runs-on: ubuntu-latest
     environment: microsoft-edge-add-ons
     permissions:

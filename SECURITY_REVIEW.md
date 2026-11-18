@@ -1,6 +1,12 @@
 # QuickPIM++ Security Review
 
-Reviewed for v2.18.22.
+Reviewed for v2.18.23.
+
+## v2.18.23 Request and Data Integrity Review
+
+The review covered extension permissions, token handling, Microsoft API requests, activation and deactivation, request progress and recovery, settings and sync, and the release pipeline. Active-assignment evidence can confirm a request after a partial provider failure. Request reconciliation matches the tenant, principal and target, and older deactivations or continuations cannot replace a newer request's state. Invalid collection and schedule responses are handled before they can clear cached results or interrupt tracking.
+
+Reset keeps the browser-sync deletion marker through interruption and retries a pending deletion before restoring synced data. The release ZIP uses UTC timestamps, and canceled release jobs cannot start Store submission. This update adds no browser permissions or dependencies.
 
 ## v2.18.22 Approval-State Reconciliation
 

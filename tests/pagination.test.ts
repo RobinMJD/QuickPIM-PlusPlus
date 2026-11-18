@@ -15,6 +15,8 @@ describe("bounded API pagination", () => {
   });
 
   test("rejects malformed Microsoft page shapes with a stable error", async () => {
+    await expect(collectPaginatedValues("page-1", async () => ({} as never)))
+      .rejects.toThrow("pagination response was malformed");
     await expect(collectPaginatedValues("page-1", async () => ({ value: {} as never })))
       .rejects.toThrow("pagination response was malformed");
     await expect(collectPaginatedValues("page-1", async () => ({ value: [], nextLink: { url: "page-2" } as never })))

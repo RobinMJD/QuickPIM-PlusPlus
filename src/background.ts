@@ -76,6 +76,7 @@ import {
   needsActiveAssignmentReconciliation,
   mergeTrackedRequestCheck,
   reconcileCompletedDeactivations,
+  trackedRequestIsContinuationOf,
   mergeRestoredTrackedRequests,
   mutateTrackedRequests,
   runWithTrackedRequestMutationLock,
@@ -121,11 +122,7 @@ import {
 import { isTrustedRuntimeSender, validateQuickPimMessage } from "./lib/messages";
 import { fetchMicrosoftApi } from "./lib/microsoftFetch";
 import { requestOperationMayHaveWritten } from "./lib/requestOperations";
-import {
-  EXTENSION_RESET_PENDING_KEY,
-  resetExtensionData,
-  resumePendingExtensionReset
-} from "./lib/extensionReset";
+import { resetExtensionData, resumePendingExtensionReset } from "./lib/extensionReset";
 import { isPrivilegedAzureRoleDefinition } from "./lib/privilegedRoles";
 import {
   assertAllowedApiUrl,
@@ -213,7 +210,6 @@ import {
   isBrowserSyncPayloadStorageKey,
   markBrowserSyncReminderShown,
   purgeBrowserSyncData,
-  queueBrowserSyncPurgeRetry,
   renameBrowserSyncDevice,
   setBrowserSyncEnabled,
   synchronizeBrowserData,
@@ -651,7 +647,7 @@ async function initializeBrowserSync(): Promise<void> {
 
 async function updateBrowserSyncAlarm(status: BrowserSyncStatus): Promise<void> {
   if (!chrome.alarms) return;
-  if (status.supported && status.enabled) {
+  if (status.supported && (status.enabled || status.pendingResetPurge)) {
     const existing = await chrome.alarms.get(BROWSER_SYNC_ALARM_NAME);
     const retrySoon = isTransientBrowserSyncError(status.lastError);
     const retryDeadline = status.writeRetryAt && status.writeRetryAt > Date.now()
@@ -896,12 +892,15 @@ async function pollDirectoryTrackedRequests(
         token
       )
     );
-    await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActiveDirectoryRoles(token), token));
   } catch (error) {
     for (const request of trackable) {
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
     }
   }
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, token, async () => {
+    const instances = await fetchDirectoryActiveInstances(token);
+    return getDirectoryRoleActiveInstanceItems(instances, {}, {});
+  });
 }
 
 async function pollPimGroupTrackedRequests(
@@ -944,7 +943,10 @@ async function pollPimGroupTrackedRequests(
       }
     }
   });
-  await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActivePimGroups(token), token));
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, token, async () => {
+    const instances = await fetchPimGroupActiveInstances(token);
+    return getActivePimGroupInstanceItems(instances, {}, {});
+  });
 }
 
 async function pollAzureTrackedRequests(
@@ -970,13 +972,14 @@ async function pollAzureTrackedRequests(
       updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
     }
   });
-  await reconcileRequestsWithActiveAssignments(trackable, updates, now, async () => attachTenantIdentity(await getActiveAzureRoles(token), token));
+  await reconcileRequestsWithActiveAssignments(trackable, updates, now, token, () => getActiveAzureRoles(token));
 }
 
 async function reconcileRequestsWithActiveAssignments(
   requests: TrackedPimRequest[],
   updates: Map<string, TrackedPimRequest>,
   now: number,
+  token: string,
   loadActiveItems: () => Promise<ActivationItem[]>
 ): Promise<void> {
   const candidates = requests
@@ -985,13 +988,15 @@ async function reconcileRequestsWithActiveAssignments(
   if (!candidates.length) return;
 
   try {
-    const activeItems = await loadActiveItems();
+    const activeItems = attachTenantIdentity(await loadActiveItems(), token);
     for (const request of candidates) {
       updates.set(request.id, reconcileTrackedRequestWithActiveAssignments(request, activeItems, now));
     }
   } catch (error) {
+    const partialItems = error instanceof PartialActivationDataError ? attachTenantIdentity(error.items, token) : [];
     for (const request of candidates) {
-      updates.set(request.id, markTrackedRequestCheckFailure(request, error, now));
+      const confirmed = reconcileTrackedRequestWithActiveAssignments(request, partialItems, now, false);
+      updates.set(request.id, confirmed === request ? markTrackedRequestCheckFailure(request, error, now) : confirmed);
     }
   }
 }
@@ -1088,17 +1093,8 @@ async function notifyTrackedRequestChanges(
   }
 
   const previousById = new Map(previousStore.requests.map((request) => [request.id, request]));
-  const continuationBySourceRequestId = new Map<string, TrackedPimRequest>();
-  for (const candidate of nextStore.requests) {
-    if (!candidate.continuationOfRequestId) continue;
-    const status = getEffectiveTrackedRequestStatus(candidate, now);
-    if (isTerminalExtensionRequestStatus(status)) continue;
-    const key = candidate.continuationOfRequestId.toLowerCase();
-    const current = continuationBySourceRequestId.get(key);
-    if (!current || candidate.updatedAt > current.updatedAt) {
-      continuationBySourceRequestId.set(key, candidate);
-    }
-  }
+  const continuations = nextStore.requests.filter((candidate) => candidate.continuationOfRequestId
+    && !isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(candidate, now)));
   const patches = new Map<string, Partial<TrackedPimRequest>>();
   const reminderMinutes = settings.preferences.expiryReminderMinutes;
   await mapWithConcurrency(nextStore.requests, 3, async (request) => {
@@ -1130,7 +1126,7 @@ async function notifyTrackedRequestChanges(
             request,
             reminderMinutes,
             settings.preferences.defaultExtensionDurationHours,
-            continuationBySourceRequestId.get(request.requestId.toLowerCase())
+            continuations.find((candidate) => trackedRequestIsContinuationOf(candidate, request))
           )
         : await showMissedExpiryReminderNotification(request);
       patches.set(request.id, {
@@ -1757,12 +1753,8 @@ async function resetAllExtensionData(): Promise<void> {
         ? chrome.permissions.remove({ permissions: ["notifications"] })
         : Promise.resolve(false),
       purgeSyncedData: async () => purgeBrowserSyncData(getBrowserSyncApis(await getDistributionInfo())),
-      queueSyncedDataPurge: (error) => queueBrowserSyncPurgeRetry(chrome.storage.local, error),
-      prepareResetRecovery: () => chrome.storage.local.set({
-        [EXTENSION_RESET_PENDING_KEY]: { version: 1, startedAt: Date.now() }
-      }),
-      clearLocalStorage: () => chrome.storage.local.clear(),
-      clearSessionStorage: () => chrome.storage.session.clear(),
+      local: chrome.storage.local,
+      session: chrome.storage.session,
       clearAlarms: () => chrome.alarms?.clearAll ? chrome.alarms.clearAll() : Promise.resolve(false),
       clearActionBadge: () => chrome.action?.setBadgeText ? chrome.action.setBadgeText({ text: "" }) : Promise.resolve()
     });
@@ -2111,7 +2103,7 @@ async function runDurableRequestOperation(
       clearInterval(heartbeat);
     }
 
-    if (source) await annotateTrackedRequestSources(result, source).catch(() => undefined);
+    if (source) await annotateTrackedRequestSources(operation.id, result, source).catch(() => undefined);
     const response: ActivationResponse = {
       ...result,
       ...(source?.installationId ? { sourceInstallationId: source.installationId } : {}),
@@ -2151,6 +2143,7 @@ function getSharedPrincipalId(items: ActivationItem[]): string | undefined {
 }
 
 async function annotateTrackedRequestSources(
+  operationId: string,
   response: ActivationResponse,
   source: { installationId: string; deviceName: string }
 ): Promise<void> {
@@ -2160,7 +2153,7 @@ async function annotateTrackedRequestSources(
   if (!requestIds.size) return;
   await mutateTrackedRequests((current) => ({
     ...current,
-    requests: current.requests.map((request) => requestIds.has(request.requestId)
+    requests: current.requests.map((request) => request.operationId === operationId && requestIds.has(request.requestId)
       ? {
           ...request,
           sourceInstallationId: source.installationId,
@@ -2278,13 +2271,16 @@ async function extendTrackedRequest(requestId: string, onAccepted?: (id: string)
 
 async function performTrackedRequestExtension(requestId: string, onAccepted?: (id: string) => void): Promise<TrackedRequestExtensionResult> {
   const [initialStore, settings] = await Promise.all([loadTrackedRequests(), loadSettings()]);
-  let source = initialStore.requests.find((request) => request.id === requestId || request.requestId === requestId);
+  const { requests } = reconcileTrackedExtensionSources(initialStore);
+  const exactSource = requests.find((request) => request.id === requestId);
+  const legacyCandidates = exactSource ? [] : requests.filter((request) => request.requestId === requestId);
+  const source = exactSource || (legacyCandidates.length === 1 ? legacyCandidates[0] : undefined);
   if (!source) {
     return extensionFailure(requestId, "The tracked activation is no longer available. Refresh Activity before trying again.");
   }
 
-  const continuation = initialStore.requests.find((request) =>
-    request.continuationOfRequestId === source?.requestId
+  const continuation = requests.find((request) =>
+    trackedRequestIsContinuationOf(request, source)
     && !isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(request))
   );
   if (continuation) {
@@ -2303,16 +2299,6 @@ async function performTrackedRequestExtension(requestId: string, onAccepted?: (i
       continuation.activeFrom,
       continuation.activeUntil
     );
-  }
-
-  if (source.extensionAttemptState === "queued") {
-    const failedContinuation = initialStore.requests.find((request) =>
-      request.continuationOfRequestId === source?.requestId
-      && isTerminalExtensionRequestStatus(getEffectiveTrackedRequestStatus(request))
-    );
-    if (failedContinuation) {
-      source = { ...source, extensionAttemptState: undefined, extensionRequestId: undefined };
-    }
   }
 
   let plan;
@@ -4623,11 +4609,7 @@ async function getAzureRoleScopes(token: string, signal?: AbortSignal): Promise<
 async function getActiveDirectoryRoles(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
   const [instancesResult, requestsResult] = await Promise.allSettled([
-    fetchAllPages<DirectoryRoleApi>(
-      graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
-      graphToken,
-      signal
-    ),
+    fetchDirectoryActiveInstances(graphToken, signal),
     fetchAllPages<DirectoryRoleApi>(
       graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleRequests/filterByCurrentUser(on='principal')"),
       graphToken,
@@ -4645,6 +4627,14 @@ async function getActiveDirectoryRoles(graphToken: string, signal?: AbortSignal)
     ...getDirectoryRolePendingRequestItems(requests, definitions, scopeNames),
     ...getDirectoryRoleActiveInstanceItems(instances, definitions, scopeNames)
   ];
+}
+
+function fetchDirectoryActiveInstances(graphToken: string, signal?: AbortSignal): Promise<DirectoryRoleApi[]> {
+  return fetchAllPages<DirectoryRoleApi>(
+    graphApiUrl("/v1.0/roleManagement/directory/roleAssignmentScheduleInstances/filterByCurrentUser(on='principal')?$expand=roleDefinition"),
+    graphToken,
+    signal
+  );
 }
 
 async function getActiveAzureRoles(azureManagementToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
@@ -4830,11 +4820,7 @@ async function applyAzureRoleDefinitionMetadata(items: ActivationItem[], token: 
 async function getActivePimGroups(graphToken: string, signal?: AbortSignal): Promise<ActivationItem[]> {
   assertFreshToken(graphToken, "graph");
   const [schedulesResult, requestsResult] = await Promise.allSettled([
-    fetchAllPages<PimGroupApi>(
-      graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
-      graphToken,
-      signal
-    ),
+    fetchPimGroupActiveInstances(graphToken, signal),
     fetchAllPages<PimGroupApi>(
       graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleRequests/filterByCurrentUser(on='principal')"),
       graphToken,
@@ -4857,6 +4843,14 @@ async function getActivePimGroups(graphToken: string, signal?: AbortSignal): Pro
   ]);
   const active = getActivePimGroupInstanceItems(schedules, groupInfos, policyRequirements);
   return [...getPimGroupPendingRequestItems(assignmentRequests, groupInfos, policyRequirements), ...active];
+}
+
+function fetchPimGroupActiveInstances(graphToken: string, signal?: AbortSignal): Promise<PimGroupApi[]> {
+  return fetchAllPages<PimGroupApi>(
+    graphApiUrl("/v1.0/identityGovernance/privilegedAccess/group/assignmentScheduleInstances/filterByCurrentUser(on='principal')"),
+    graphToken,
+    signal
+  );
 }
 
 async function activateItems(

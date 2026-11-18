@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   getStorePackagePath,
   getStorePackagePaths,
@@ -68,7 +68,7 @@ describe("shared Chromium Store packaging", () => {
     }
   });
 
-  test("produces identical bytes for unchanged built files", () => {
+  test("produces identical bytes for unchanged built files in different time zones", () => {
     const version = "9.8.7";
     const root = mkdtempSync(join(tmpdir(), "quickpim-store-reproducible-"));
     const distDir = join(root, "dist");
@@ -77,11 +77,15 @@ describe("shared Chromium Store packaging", () => {
     writeFileSync(join(distDir, "manifest.json"), JSON.stringify({ manifest_version: 3, version }));
     writeFileSync(join(distDir, "popup.html"), "<!doctype html>");
     try {
+      vi.stubEnv("SOURCE_DATE_EPOCH", "1784008800");
+      vi.stubEnv("TZ", "Pacific/Honolulu");
       const first = readFileSync(packageStores({ distDir, releaseDir, version }).shared);
+      vi.stubEnv("TZ", "Pacific/Auckland");
       const second = readFileSync(packageStores({ distDir, releaseDir, version }).shared);
       expect(second.equals(first)).toBe(true);
       expect(() => verifyStorePackage(join(releaseDir, "missing.zip"), version)).toThrow(/not found/i);
     } finally {
+      vi.unstubAllEnvs();
       rmSync(root, { recursive: true, force: true });
     }
   });

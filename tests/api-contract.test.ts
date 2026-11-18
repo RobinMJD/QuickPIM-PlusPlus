@@ -189,7 +189,7 @@ describe("Microsoft PIM API contracts", () => {
     expect(background).toContain("getTrackedRequestExtensionSubmissionCopy");
     expect(background).toContain('result.requiresApproval');
     expect(background).toContain('"PIM extension awaiting approval"');
-    expect(background).toContain("continuationBySourceRequestId.get(request.requestId.toLowerCase())");
+    expect(background).toContain("continuations.find((candidate) => trackedRequestIsContinuationOf(candidate, request))");
     expect(background).toContain('requestStatus: trackedRequest?.status || "submitted"');
     expect(background).toContain('status === "scheduled" || status === "active"');
     expect(background).toContain('`${isExtension ? "Extension" : "Request"} approved`');

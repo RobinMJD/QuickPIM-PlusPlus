@@ -145,7 +145,11 @@ describe("tracked PIM requests", () => {
     const disabled = createRequest({ id: "disable", requestId: "disable", action: "deactivate", status: "completed",
       targetScheduleId: "schedule-original", completedAt: new Date(NOW).toISOString() });
     expect(reconcileCompletedDeactivations({ version: 1, requests: [activation, disabled] }, NOW).requests[0].status).toBe("completed");
-    for (const update of [{ targetScheduleId: "replacement" }, { tenantId: "other" }, { principalId: "other" }, { status: "submitted" as const }]) {
+    for (const update of [
+      { targetScheduleId: "replacement" }, { tenantId: "other" }, { principalId: "other" }, { status: "submitted" as const },
+      { itemId: "directoryRole:role-1:/administrativeUnits/another-unit" },
+      { requestedAt: new Date(NOW - 60_000).toISOString() }
+    ]) {
       const store = { version: 1 as const, requests: [activation, { ...disabled, ...update }] };
       expect(reconcileCompletedDeactivations(store, NOW)).toBe(store);
     }
@@ -239,6 +243,11 @@ describe("tracked PIM requests", () => {
     );
     expect(active).toMatchObject({ status: "active", activeUntil: "2026-07-14T14:00:00.000Z", checkCount: 1 });
     expect(active.nextCheckAt).toBeUndefined();
+    const invalidSchedule = updateTrackedRequestFromPayload(pending, {
+      status: "Provisioned", scheduleInfo: { expiration: { duration: "P999999999999999D" } }
+    }, NOW + 30_000);
+    expect(invalidSchedule.status).toBe("active");
+    expect(invalidSchedule.activeUntil).toBeUndefined();
 
     const unavailable = markTrackedRequestCheckFailure(
       pending,
@@ -412,6 +421,7 @@ describe("tracked PIM requests", () => {
     });
 
     const assignedOnly = { ...matchingActive, activeAssignmentType: "assigned" as const };
+    expect(reconcileTrackedRequestWithActiveAssignments(activeWithoutEnd, [], NOW, false)).toBe(activeWithoutEnd);
     const waiting = reconcileTrackedRequestWithActiveAssignments(activeWithoutEnd, [assignedOnly], NOW);
     expect(waiting).toMatchObject({
       status: "active",
@@ -530,7 +540,11 @@ describe("tracked PIM requests", () => {
     });
 
     const reconciled = reconcileTrackedExtensionSources(
-      { version: 1, requests: [source, continuation] },
+      { version: 1, requests: [
+        source,
+        { ...continuation, tenantId: "other-tenant", id: "unrelated-denial", status: "denied" },
+        continuation
+      ] },
       NOW
     );
     expect(reconciled.requests[0]).toMatchObject({
@@ -554,11 +568,12 @@ describe("tracked PIM requests", () => {
       continuationOfRequestId: source.requestId
     });
 
-    const reconciled = reconcileTrackedExtensionSources(
-      { version: 1, requests: [source, continuation] },
-      NOW
-    );
-    expect(reconciled).toEqual({ version: 1, requests: [source, continuation] });
+    const olderDenial = createRequest({
+      requestId: "extension-denied", continuationOfRequestId: source.requestId, status: "denied"
+    });
+    const otherTenantDenial = { ...continuation, id: "unrelated-denial", tenantId: "other-tenant", status: "denied" as const };
+    const store = { version: 1 as const, requests: [source, olderDenial, otherTenantDenial, continuation] };
+    expect(reconcileTrackedExtensionSources(store, NOW)).toBe(store);
   });
 
   test("releases an orphaned extension lock after Microsoft visibility grace expires", () => {

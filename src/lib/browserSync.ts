@@ -202,6 +202,7 @@ export interface BrowserSyncStatus {
   reminderMode: BrowserSyncReminderMode;
   reminderDue: boolean;
   suspendedByPurge: boolean;
+  pendingResetPurge?: boolean;
   devices: BrowserSyncDevice[];
   crossDeviceState: "off" | "waiting" | "verified";
   otherInstallationCount: number;
@@ -344,6 +345,8 @@ async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<Brow
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
   const state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now, false);
+  const pendingPurge = await loadPendingBrowserSyncPurge(apis.local, now);
+  const pendingResetPurge = Boolean(pendingPurge && !pendingPurge.completedAt);
   let control: BrowserSyncControl = { version: 1 };
   let registry: BrowserSyncDeviceRegistry = { version: 1, devices: [] };
   let statusReadError: string | undefined;
@@ -371,13 +374,16 @@ async function getBrowserSyncStatusUnlocked(apis: BrowserSyncApis): Promise<Brow
     platform: normalizePlatform(apis.platform || detectPlatform()),
     lastSyncAt: state.lastSyncAt,
     lastSuccessAt: state.lastSuccessAt,
-    lastError: state.lastError || statusReadError,
+    lastError: state.lastError || (pendingResetPurge
+      ? "Local data was reset. Browser-synced data is waiting to be deleted."
+      : statusReadError),
     writeRetryAt: state.writeRetryAt,
     reminderMode: state.reminderMode,
     reminderDue: !capability.supported
       && state.reminderMode !== "never"
       && (!state.lastReminderAt || now - state.lastReminderAt >= BROWSER_SYNC_REMINDER_INTERVAL_MS),
     suspendedByPurge,
+    ...(pendingResetPurge ? { pendingResetPurge } : {}),
     devices: registry.devices,
     crossDeviceState: !capability.supported || !state.enabled
       ? "off"
@@ -423,20 +429,8 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
       }
     } else {
       try {
-        const status = await purgeBrowserSyncDataUnlocked(apis);
-        await apis.local.set({
-          [BROWSER_SYNC_PENDING_PURGE_KEY]: {
-            ...pendingPurge,
-            completedAt: now,
-            lastError: undefined
-          } satisfies BrowserSyncPendingPurge
-        });
-        try {
-          await apis.local.remove(BROWSER_SYNC_PENDING_PURGE_KEY);
-        } catch {
-          // The completed marker prevents a destructive purge from being repeated.
-        }
-        return status;
+        await purgeBrowserSyncDataUnlocked(apis);
+        return getBrowserSyncStatusUnlocked(apis);
       } catch (error) {
         state = {
           ...state,
@@ -581,17 +575,15 @@ async function synchronizeBrowserDataUnlocked(apis: BrowserSyncApis): Promise<Br
   return getBrowserSyncStatusUnlocked(apis);
 }
 
-export async function queueBrowserSyncPurgeRetry(
-  local: StorageAreaLike,
+export function createBrowserSyncPurgeMarker(
   error: unknown,
   now = Date.now()
-): Promise<void> {
-  const marker: BrowserSyncPendingPurge = {
+): BrowserSyncPendingPurge {
+  return {
     version: 1,
     createdAt: now,
     lastError: sanitizeSyncError(error)
   };
-  await local.set({ [BROWSER_SYNC_PENDING_PURGE_KEY]: marker });
 }
 
 async function loadPendingBrowserSyncPurge(
@@ -635,10 +627,14 @@ export async function setBrowserSyncEnabled(apis: BrowserSyncApis, enabled: bool
 async function setBrowserSyncEnabledUnlocked(apis: BrowserSyncApis, enabled: boolean): Promise<BrowserSyncStatus> {
   const now = apis.now ?? Date.now();
   const capability = getBrowserSyncCapability(apis.distribution, Boolean(apis.sync));
-  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   if (enabled && !capability.supported) {
     throw new Error(capability.reason || "Browser sync is unavailable for this installation.");
   }
+  if (enabled && await loadPendingBrowserSyncPurge(apis.local, now)) {
+    const status = await synchronizeBrowserDataUnlocked(apis);
+    if (status.pendingResetPurge) return status;
+  }
+  let state = await loadBrowserSyncLocalState(apis.local, apis.distribution, apis.platform, now);
   state = { ...state, enabled, lastError: undefined };
   await saveLocalState(apis.local, state);
   if (!apis.sync) return getBrowserSyncStatusUnlocked(apis);
@@ -820,14 +816,18 @@ async function markBrowserSyncReminderShownUnlocked(apis: BrowserSyncApis): Prom
 }
 
 export async function purgeBrowserSyncData(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
-  return withBrowserSyncOperationLock(() => purgeBrowserSyncDataUnlocked(apis));
+  return withBrowserSyncOperationLock(async () => {
+    await purgeBrowserSyncDataUnlocked(apis);
+    return getBrowserSyncStatusUnlocked(apis);
+  });
 }
 
-async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<BrowserSyncStatus> {
+async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<void> {
   if (!apis.sync) {
     throw new Error("Browser sync storage is unavailable.");
   }
   const now = apis.now ?? Date.now();
+  const pendingPurge = await loadPendingBrowserSyncPurge(apis.local, now);
   const currentControl = await loadControl(apis.sync, now);
   const purgedAt = nextSyncRevision(now, currentControl.purgedAt || 0, currentControl.epochAt || 0);
   if (purgedAt <= Math.max(currentControl.purgedAt || 0, currentControl.epochAt || 0)) {
@@ -870,7 +870,14 @@ async function purgeBrowserSyncDataUnlocked(apis: BrowserSyncApis): Promise<Brow
     omittedCategories: [],
     incompleteCategories: []
   });
-  return getBrowserSyncStatusUnlocked(apis);
+  if (pendingPurge) {
+    await apis.local.set({
+      [BROWSER_SYNC_PENDING_PURGE_KEY]: {
+        ...pendingPurge, completedAt: now, lastError: undefined
+      } satisfies BrowserSyncPendingPurge
+    });
+    await apis.local.remove(BROWSER_SYNC_PENDING_PURGE_KEY).catch(() => undefined);
+  }
 }
 
 export function sanitizeBrowserSyncStatus(value: unknown): BrowserSyncStatus | null {
@@ -906,6 +913,7 @@ export function sanitizeBrowserSyncStatus(value: unknown): BrowserSyncStatus | n
     reminderMode: value.reminderMode === "never" ? "never" : "daily",
     reminderDue: value.reminderDue === true,
     suspendedByPurge: value.suspendedByPurge === true,
+    ...(value.pendingResetPurge === true ? { pendingResetPurge: true } : {}),
     devices,
     crossDeviceState,
     otherInstallationCount: Math.min(
